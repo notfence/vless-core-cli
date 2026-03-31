@@ -1,0 +1,1533 @@
+#define _POSIX_C_SOURCE 200112L
+
+#include "tls13_reality.h"
+
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
+#include <openssl/x509.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} dynbuf_t;
+
+struct tls13_conn {
+    int fd;
+
+    uint8_t auth_key[32];
+
+    uint8_t hs_secret[32];
+    uint8_t c_hs_traffic[32];
+    uint8_t s_hs_traffic[32];
+
+    uint8_t c_app_traffic[32];
+    uint8_t s_app_traffic[32];
+
+    uint8_t c_hs_key[16], c_hs_iv[12];
+    uint8_t s_hs_key[16], s_hs_iv[12];
+
+    uint8_t c_app_key[16], c_app_iv[12];
+    uint8_t s_app_key[16], s_app_iv[12];
+
+    uint64_t c_hs_seq;
+    uint64_t s_hs_seq;
+    uint64_t c_app_seq;
+    uint64_t s_app_seq;
+
+    dynbuf_t transcript;
+    dynbuf_t app_cache;
+};
+
+static void set_err(char *err, size_t cap, const char *msg) {
+    if (err != NULL && cap > 0) {
+        snprintf(err, cap, "%s", msg);
+    }
+}
+
+static int db_reserve(dynbuf_t *b, size_t n) {
+    if (b->len + n <= b->cap) {
+        return 0;
+    }
+    size_t nc = (b->cap == 0) ? 1024 : b->cap;
+    while (nc < b->len + n) {
+        nc *= 2;
+    }
+    uint8_t *tmp = (uint8_t *)realloc(b->data, nc);
+    if (tmp == NULL) {
+        return -1;
+    }
+    b->data = tmp;
+    b->cap = nc;
+    return 0;
+}
+
+static int db_append(dynbuf_t *b, const void *src, size_t n) {
+    if (n == 0) {
+        return 0;
+    }
+    if (db_reserve(b, n) != 0) {
+        return -1;
+    }
+    memcpy(b->data + b->len, src, n);
+    b->len += n;
+    return 0;
+}
+
+static void db_consume(dynbuf_t *b, size_t n) {
+    if (n >= b->len) {
+        b->len = 0;
+        return;
+    }
+    memmove(b->data, b->data + n, b->len - n);
+    b->len -= n;
+}
+
+static void db_free(dynbuf_t *b) {
+    if (b->data != NULL) {
+        free(b->data);
+    }
+    memset(b, 0, sizeof(*b));
+}
+
+static int write_exact(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, p + off, len - off, 0);
+        if (n <= 0) {
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int read_exact(int fd, void *buf, size_t len) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = recv(fd, p + off, len - off, 0);
+        if (n <= 0) {
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int tcp_connect_host(const char *host, uint16_t port) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned int)port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+        return -1;
+    }
+
+    int fd = -1;
+    for (struct addrinfo *it = res; it != NULL; it = it->ai_next) {
+        fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(res);
+    return fd;
+}
+
+static void xor_seq_nonce(uint8_t nonce[12], const uint8_t iv[12], uint64_t seq) {
+    memcpy(nonce, iv, 12);
+    for (int i = 0; i < 8; i++) {
+        nonce[11 - i] ^= (uint8_t)((seq >> (i * 8)) & 0xFF);
+    }
+}
+
+static int sha256_hash(const uint8_t *in, size_t in_len, uint8_t out[32]) {
+    EVP_MD_CTX *m = EVP_MD_CTX_new();
+    if (m == NULL) {
+        return -1;
+    }
+    int ok = EVP_DigestInit_ex(m, EVP_sha256(), NULL) == 1;
+    if (ok && in_len > 0) {
+        ok = EVP_DigestUpdate(m, in, in_len) == 1;
+    }
+    if (ok) {
+        ok = EVP_DigestFinal_ex(m, out, NULL) == 1;
+    }
+    EVP_MD_CTX_free(m);
+    return ok ? 0 : -1;
+}
+
+static int hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *in, size_t in_len, uint8_t out[32]) {
+    unsigned int out_len = 0;
+    unsigned char *ret = HMAC(EVP_sha256(), key, (int)key_len, in, in_len, out, &out_len);
+    return (ret != NULL && out_len == 32) ? 0 : -1;
+}
+
+static int hmac_sha512(const uint8_t *key, size_t key_len, const uint8_t *in, size_t in_len, uint8_t out[64]) {
+    unsigned int out_len = 0;
+    unsigned char *ret = HMAC(EVP_sha512(), key, (int)key_len, in, in_len, out, &out_len);
+    return (ret != NULL && out_len == 64) ? 0 : -1;
+}
+
+static int hkdf_extract_sha256(const uint8_t *salt, size_t salt_len, const uint8_t *ikm, size_t ikm_len, uint8_t prk[32]) {
+    return hmac_sha256(salt, salt_len, ikm, ikm_len, prk);
+}
+
+static int hkdf_expand_sha256(const uint8_t prk[32], const uint8_t *info, size_t info_len, uint8_t *out, size_t out_len) {
+    uint8_t t[32];
+    size_t pos = 0;
+    uint8_t counter = 1;
+    size_t t_len = 0;
+
+    while (pos < out_len) {
+        HMAC_CTX *ctx = HMAC_CTX_new();
+        if (ctx == NULL) {
+            return -1;
+        }
+        if (HMAC_Init_ex(ctx, prk, 32, EVP_sha256(), NULL) != 1) {
+            HMAC_CTX_free(ctx);
+            return -1;
+        }
+        if (t_len > 0 && HMAC_Update(ctx, t, t_len) != 1) {
+            HMAC_CTX_free(ctx);
+            return -1;
+        }
+        if (info_len > 0 && HMAC_Update(ctx, info, info_len) != 1) {
+            HMAC_CTX_free(ctx);
+            return -1;
+        }
+        if (HMAC_Update(ctx, &counter, 1) != 1) {
+            HMAC_CTX_free(ctx);
+            return -1;
+        }
+        unsigned int got = 0;
+        if (HMAC_Final(ctx, t, &got) != 1 || got != 32) {
+            HMAC_CTX_free(ctx);
+            return -1;
+        }
+        HMAC_CTX_free(ctx);
+
+        size_t take = out_len - pos;
+        if (take > 32) {
+            take = 32;
+        }
+        memcpy(out + pos, t, take);
+        pos += take;
+        t_len = 32;
+        counter++;
+    }
+
+    return 0;
+}
+
+static int hkdf_expand_label_sha256(const uint8_t secret[32], const char *label, const uint8_t *ctx, size_t ctx_len, uint8_t *out,
+                                    size_t out_len) {
+    uint8_t info[256];
+    size_t label_len = strlen(label);
+    const char *prefix = "tls13 ";
+    size_t full_label_len = strlen(prefix) + label_len;
+
+    if (full_label_len > 255 || ctx_len > 255 || out_len > 65535) {
+        return -1;
+    }
+
+    size_t off = 0;
+    info[off++] = (uint8_t)(out_len >> 8);
+    info[off++] = (uint8_t)(out_len & 0xFF);
+    info[off++] = (uint8_t)full_label_len;
+    memcpy(info + off, prefix, strlen(prefix));
+    off += strlen(prefix);
+    memcpy(info + off, label, label_len);
+    off += label_len;
+    info[off++] = (uint8_t)ctx_len;
+    if (ctx_len > 0) {
+        memcpy(info + off, ctx, ctx_len);
+        off += ctx_len;
+    }
+
+    return hkdf_expand_sha256(secret, info, off, out, out_len);
+}
+
+static int derive_secret(const uint8_t secret[32], const char *label, const uint8_t transcript_hash[32], uint8_t out[32]) {
+    return hkdf_expand_label_sha256(secret, label, transcript_hash, 32, out, 32);
+}
+
+static int derive_key_iv(const uint8_t traffic_secret[32], uint8_t key[16], uint8_t iv[12]) {
+    uint8_t zero_ctx[1] = {0};
+    if (hkdf_expand_label_sha256(traffic_secret, "key", zero_ctx, 0, key, 16) != 0) {
+        return -1;
+    }
+    if (hkdf_expand_label_sha256(traffic_secret, "iv", zero_ctx, 0, iv, 12) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int x25519_generate(uint8_t priv[32], uint8_t pub[32]) {
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    if (kctx == NULL) {
+        return -1;
+    }
+    EVP_PKEY *pkey = NULL;
+    int ok = EVP_PKEY_keygen_init(kctx) == 1 && EVP_PKEY_keygen(kctx, &pkey) == 1;
+    EVP_PKEY_CTX_free(kctx);
+    if (!ok || pkey == NULL) {
+        if (pkey != NULL) {
+            EVP_PKEY_free(pkey);
+        }
+        return -1;
+    }
+
+    size_t priv_len = 32;
+    size_t pub_len = 32;
+    ok = EVP_PKEY_get_raw_private_key(pkey, priv, &priv_len) == 1 && priv_len == 32 &&
+         EVP_PKEY_get_raw_public_key(pkey, pub, &pub_len) == 1 && pub_len == 32;
+    EVP_PKEY_free(pkey);
+    return ok ? 0 : -1;
+}
+
+static int x25519_shared(const uint8_t priv[32], const uint8_t peer_pub[32], uint8_t out[32]) {
+    EVP_PKEY *sk = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv, 32);
+    EVP_PKEY *pk = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer_pub, 32);
+    if (sk == NULL || pk == NULL) {
+        if (sk != NULL) {
+            EVP_PKEY_free(sk);
+        }
+        if (pk != NULL) {
+            EVP_PKEY_free(pk);
+        }
+        return -1;
+    }
+
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(sk, NULL);
+    if (ctx == NULL) {
+        EVP_PKEY_free(sk);
+        EVP_PKEY_free(pk);
+        return -1;
+    }
+
+    size_t out_len = 32;
+    int ok = EVP_PKEY_derive_init(ctx) == 1 && EVP_PKEY_derive_set_peer(ctx, pk) == 1 &&
+             EVP_PKEY_derive(ctx, out, &out_len) == 1 && out_len == 32;
+
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(sk);
+    EVP_PKEY_free(pk);
+    return ok ? 0 : -1;
+}
+
+static uint16_t random_grease_value(void) {
+    static const uint16_t vals[] = {0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
+                                    0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa};
+    uint8_t b = 0;
+    RAND_bytes(&b, 1);
+    return vals[b % (sizeof(vals) / sizeof(vals[0]))];
+}
+
+static int add_ext(dynbuf_t *b, uint16_t etype, const uint8_t *edata, size_t elen) {
+    uint8_t hdr[4] = {(uint8_t)(etype >> 8), (uint8_t)(etype & 0xFF), (uint8_t)(elen >> 8), (uint8_t)(elen & 0xFF)};
+    if (db_append(b, hdr, 4) != 0) {
+        return -1;
+    }
+    return db_append(b, edata, elen);
+}
+
+static int ext_server_name(dynbuf_t *exts, const char *sni) {
+    uint8_t data[512];
+    size_t sni_len = strlen(sni);
+    if (sni_len == 0 || sni_len > 255) {
+        return -1;
+    }
+
+    size_t off = 0;
+    size_t list_len = 1 + 2 + sni_len;
+    data[off++] = (uint8_t)(list_len >> 8);
+    data[off++] = (uint8_t)(list_len & 0xFF);
+    data[off++] = 0x00;
+    data[off++] = (uint8_t)(sni_len >> 8);
+    data[off++] = (uint8_t)(sni_len & 0xFF);
+    memcpy(data + off, sni, sni_len);
+    off += sni_len;
+    return add_ext(exts, 0x0000, data, off);
+}
+
+static int ext_supported_groups(dynbuf_t *exts, uint16_t grease, int random_mode) {
+    uint8_t data[32];
+    uint16_t groups[4] = {grease, 0x001d, 0x0017, 0x0018};
+    size_t gcount = random_mode ? 2 : 4;
+    if (random_mode) {
+        groups[0] = 0x001d;
+        groups[1] = 0x0017;
+    }
+
+    size_t off = 0;
+    size_t glen = gcount * 2;
+    data[off++] = (uint8_t)(glen >> 8);
+    data[off++] = (uint8_t)(glen & 0xFF);
+    for (size_t i = 0; i < gcount; i++) {
+        data[off++] = (uint8_t)(groups[i] >> 8);
+        data[off++] = (uint8_t)(groups[i] & 0xFF);
+    }
+
+    return add_ext(exts, 0x000a, data, off);
+}
+
+static int ext_ec_point_formats(dynbuf_t *exts) {
+    uint8_t data[] = {0x01, 0x00};
+    return add_ext(exts, 0x000b, data, sizeof(data));
+}
+
+static int ext_sig_algs(dynbuf_t *exts) {
+    uint16_t sigs[] = {0x0403, 0x0804, 0x0503, 0x0805, 0x0806, 0x0601, 0x0501, 0x0401};
+    uint8_t data[64];
+    size_t off = 0;
+    size_t slen = sizeof(sigs);
+    data[off++] = (uint8_t)(slen >> 8);
+    data[off++] = (uint8_t)(slen & 0xFF);
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        data[off++] = (uint8_t)(sigs[i] >> 8);
+        data[off++] = (uint8_t)(sigs[i] & 0xFF);
+    }
+    return add_ext(exts, 0x000d, data, off);
+}
+
+static int ext_alpn(dynbuf_t *exts, int random_mode) {
+    const char *p1 = random_mode ? "http/1.1" : "h2";
+    const char *p2 = random_mode ? "h2" : "http/1.1";
+    size_t l1 = strlen(p1);
+    size_t l2 = strlen(p2);
+
+    uint8_t data[64];
+    size_t off = 0;
+    size_t list_len = 1 + l1 + 1 + l2;
+    data[off++] = (uint8_t)(list_len >> 8);
+    data[off++] = (uint8_t)(list_len & 0xFF);
+    data[off++] = (uint8_t)l1;
+    memcpy(data + off, p1, l1);
+    off += l1;
+    data[off++] = (uint8_t)l2;
+    memcpy(data + off, p2, l2);
+    off += l2;
+
+    return add_ext(exts, 0x0010, data, off);
+}
+
+static int ext_supported_versions(dynbuf_t *exts, uint16_t grease, int random_mode) {
+    uint8_t data[8];
+    size_t off = 0;
+    if (random_mode) {
+        data[off++] = 0x04;
+        data[off++] = 0x03;
+        data[off++] = 0x04;
+        data[off++] = 0x03;
+        data[off++] = 0x03;
+    } else {
+        data[off++] = 0x06;
+        data[off++] = (uint8_t)(grease >> 8);
+        data[off++] = (uint8_t)(grease & 0xFF);
+        data[off++] = 0x03;
+        data[off++] = 0x04;
+        data[off++] = 0x03;
+        data[off++] = 0x03;
+    }
+    return add_ext(exts, 0x002b, data, off);
+}
+
+static int ext_psk_modes(dynbuf_t *exts) {
+    uint8_t data[] = {0x01, 0x01};
+    return add_ext(exts, 0x002d, data, sizeof(data));
+}
+
+static int ext_key_share(dynbuf_t *exts, uint16_t grease, const uint8_t pubkey[32], int random_mode) {
+    uint8_t data[128];
+    size_t off = 2;
+
+    if (!random_mode) {
+        data[off++] = (uint8_t)(grease >> 8);
+        data[off++] = (uint8_t)(grease & 0xFF);
+        data[off++] = 0x00;
+        data[off++] = 0x01;
+        data[off++] = 0x00;
+    }
+
+    data[off++] = 0x00;
+    data[off++] = 0x1d;
+    data[off++] = 0x00;
+    data[off++] = 0x20;
+    memcpy(data + off, pubkey, 32);
+    off += 32;
+
+    size_t list_len = off - 2;
+    data[0] = (uint8_t)(list_len >> 8);
+    data[1] = (uint8_t)(list_len & 0xFF);
+
+    return add_ext(exts, 0x0033, data, off);
+}
+
+static int ext_padding(dynbuf_t *exts, size_t pad_len) {
+    uint8_t *z = (uint8_t *)calloc(1, pad_len);
+    if (z == NULL) {
+        return -1;
+    }
+    int rc = add_ext(exts, 0x0015, z, pad_len);
+    free(z);
+    return rc;
+}
+
+static int shuffle_indices(size_t *idx, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        idx[i] = i;
+    }
+    for (size_t i = n; i > 1; i--) {
+        uint8_t r = 0;
+        RAND_bytes(&r, 1);
+        size_t j = r % i;
+        size_t tmp = idx[i - 1];
+        idx[i - 1] = idx[j];
+        idx[j] = tmp;
+    }
+    return 0;
+}
+
+static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32], uint8_t client_pub[32], uint8_t client_random[32],
+                              uint8_t auth_key[32], uint8_t **out, size_t *out_len, size_t *sid_pos) {
+    dynbuf_t hs = {0};
+
+    if (x25519_generate(client_priv, client_pub) != 0) {
+        return -1;
+    }
+    if (RAND_bytes(client_random, 32) != 1) {
+        return -1;
+    }
+
+    uint8_t head4[4] = {0x01, 0x00, 0x00, 0x00};
+    if (db_append(&hs, head4, 4) != 0) {
+        db_free(&hs);
+        return -1;
+    }
+
+    uint8_t legacy_ver[] = {0x03, 0x03};
+    if (db_append(&hs, legacy_ver, sizeof(legacy_ver)) != 0 || db_append(&hs, client_random, 32) != 0) {
+        db_free(&hs);
+        return -1;
+    }
+
+    uint8_t sid_len = 32;
+    if (db_append(&hs, &sid_len, 1) != 0) {
+        db_free(&hs);
+        return -1;
+    }
+
+    *sid_pos = hs.len;
+    uint8_t sid_zero[32] = {0};
+    if (db_append(&hs, sid_zero, sizeof(sid_zero)) != 0) {
+        db_free(&hs);
+        return -1;
+    }
+
+    uint16_t grease = random_grease_value();
+    uint8_t suites[8];
+    size_t soff = 0;
+    if (cfg->fp_mode == FP_CHROME) {
+        suites[soff++] = (uint8_t)(grease >> 8);
+        suites[soff++] = (uint8_t)(grease & 0xFF);
+    }
+    suites[soff++] = 0x13;
+    suites[soff++] = 0x01;
+
+    uint8_t slen[2] = {(uint8_t)(soff >> 8), (uint8_t)(soff & 0xFF)};
+    if (db_append(&hs, slen, 2) != 0 || db_append(&hs, suites, soff) != 0) {
+        db_free(&hs);
+        return -1;
+    }
+
+    uint8_t comp[] = {0x01, 0x00};
+    if (db_append(&hs, comp, sizeof(comp)) != 0) {
+        db_free(&hs);
+        return -1;
+    }
+
+    dynbuf_t exts = {0};
+
+    int random_mode = (cfg->fp_mode == FP_RANDOM) ? 1 : 0;
+    if (!random_mode) {
+        if (ext_server_name(&exts, cfg->sni) != 0 || ext_supported_groups(&exts, grease, 0) != 0 || ext_ec_point_formats(&exts) != 0 ||
+            ext_sig_algs(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_supported_versions(&exts, grease, 0) != 0 ||
+            ext_psk_modes(&exts) != 0 || ext_key_share(&exts, grease, client_pub, 0) != 0 || ext_padding(&exts, 16) != 0) {
+            db_free(&exts);
+            db_free(&hs);
+            return -1;
+        }
+    } else {
+        enum { EX_SNI, EX_GROUPS, EX_SIGS, EX_ALPN, EX_VERS, EX_PSK, EX_KEYSHARE, EX_ECPF, EX_COUNT };
+        size_t order[EX_COUNT];
+        shuffle_indices(order, EX_COUNT);
+        for (size_t i = 0; i < EX_COUNT; i++) {
+            switch (order[i]) {
+                case EX_SNI:
+                    if (ext_server_name(&exts, cfg->sni) != 0) {
+                        db_free(&exts);
+                        db_free(&hs);
+                        return -1;
+                    }
+                    break;
+                case EX_GROUPS:
+                    if (ext_supported_groups(&exts, grease, 1) != 0) {
+                        db_free(&exts);
+                        db_free(&hs);
+                        return -1;
+                    }
+                    break;
+                case EX_SIGS:
+                    if (ext_sig_algs(&exts) != 0) {
+                        db_free(&exts);
+                        db_free(&hs);
+                        return -1;
+                    }
+                    break;
+                case EX_ALPN:
+                    if (ext_alpn(&exts, 1) != 0) {
+                        db_free(&exts);
+                        db_free(&hs);
+                        return -1;
+                    }
+                    break;
+                case EX_VERS:
+                    if (ext_supported_versions(&exts, grease, 1) != 0) {
+                        db_free(&exts);
+                        db_free(&hs);
+                        return -1;
+                    }
+                    break;
+                case EX_PSK:
+                    if (ext_psk_modes(&exts) != 0) {
+                        db_free(&exts);
+                        db_free(&hs);
+                        return -1;
+                    }
+                    break;
+                case EX_KEYSHARE:
+                    if (ext_key_share(&exts, grease, client_pub, 1) != 0) {
+                        db_free(&exts);
+                        db_free(&hs);
+                        return -1;
+                    }
+                    break;
+                case EX_ECPF:
+                    if (ext_ec_point_formats(&exts) != 0) {
+                        db_free(&exts);
+                        db_free(&hs);
+                        return -1;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    uint8_t elen[2] = {(uint8_t)(exts.len >> 8), (uint8_t)(exts.len & 0xFF)};
+    if (db_append(&hs, elen, 2) != 0 || db_append(&hs, exts.data, exts.len) != 0) {
+        db_free(&exts);
+        db_free(&hs);
+        return -1;
+    }
+    db_free(&exts);
+
+    size_t body_len = hs.len - 4;
+    hs.data[1] = (uint8_t)((body_len >> 16) & 0xFF);
+    hs.data[2] = (uint8_t)((body_len >> 8) & 0xFF);
+    hs.data[3] = (uint8_t)(body_len & 0xFF);
+
+    uint8_t sid_plain[16] = {0};
+    uint8_t vx = 26, vy = 3, vz = 27;
+    const char *ver_env = getenv("V2IOS6_VER");
+    if (ver_env != NULL) {
+        unsigned int tx = 0, ty = 0, tz = 0;
+        if (sscanf(ver_env, "%u.%u.%u", &tx, &ty, &tz) == 3 && tx <= 255 && ty <= 255 && tz <= 255) {
+            vx = (uint8_t)tx;
+            vy = (uint8_t)ty;
+            vz = (uint8_t)tz;
+        }
+    }
+    sid_plain[0] = vx;
+    sid_plain[1] = vy;
+    sid_plain[2] = vz;
+    sid_plain[3] = 0;
+
+    uint32_t now = (uint32_t)time(NULL);
+    sid_plain[4] = (uint8_t)(now >> 24);
+    sid_plain[5] = (uint8_t)(now >> 16);
+    sid_plain[6] = (uint8_t)(now >> 8);
+    sid_plain[7] = (uint8_t)(now & 0xFF);
+
+    if (cfg->short_id_len > 0) {
+        size_t n = cfg->short_id_len;
+        if (n > 8) {
+            n = 8;
+        }
+        memcpy(sid_plain + 8, cfg->short_id, n);
+    }
+
+    uint8_t shared[32];
+    if (x25519_shared(client_priv, cfg->pbk, shared) != 0) {
+        db_free(&hs);
+        return -1;
+    }
+
+    uint8_t prk[32];
+    if (hkdf_extract_sha256(client_random, 20, shared, 32, prk) != 0 ||
+        hkdf_expand_sha256(prk, (const uint8_t *)"REALITY", 7, auth_key, 32) != 0) {
+        db_free(&hs);
+        return -1;
+    }
+
+    EVP_CIPHER_CTX *ectx = EVP_CIPHER_CTX_new();
+    if (ectx == NULL) {
+        db_free(&hs);
+        return -1;
+    }
+
+    uint8_t ct[16];
+    uint8_t tag[16];
+    int outl = 0;
+    int ok = EVP_EncryptInit_ex(ectx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ectx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+             EVP_EncryptInit_ex(ectx, NULL, NULL, auth_key, client_random + 20) == 1 &&
+             EVP_EncryptUpdate(ectx, NULL, &outl, hs.data, (int)hs.len) == 1 &&
+             EVP_EncryptUpdate(ectx, ct, &outl, sid_plain, sizeof(sid_plain)) == 1;
+
+    int finl = 0;
+    if (ok) {
+        ok = EVP_EncryptFinal_ex(ectx, ct + outl, &finl) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ectx, EVP_CTRL_GCM_GET_TAG, 16, tag) == 1;
+    }
+    EVP_CIPHER_CTX_free(ectx);
+
+    if (!ok) {
+        db_free(&hs);
+        return -1;
+    }
+
+    memcpy(hs.data + *sid_pos, ct, 16);
+    memcpy(hs.data + *sid_pos + 16, tag, 16);
+
+    *out = hs.data;
+    *out_len = hs.len;
+    return 0;
+}
+
+static int read_record(int fd, uint8_t *rtype, uint8_t **payload, size_t *payload_len) {
+    uint8_t hdr[5];
+    if (read_exact(fd, hdr, sizeof(hdr)) != 0) {
+        return -1;
+    }
+
+    size_t len = ((size_t)hdr[3] << 8) | hdr[4];
+    uint8_t *buf = (uint8_t *)malloc(len);
+    if (buf == NULL) {
+        return -1;
+    }
+    if (read_exact(fd, buf, len) != 0) {
+        free(buf);
+        return -1;
+    }
+
+    *rtype = hdr[0];
+    *payload = buf;
+    *payload_len = len;
+    return 0;
+}
+
+static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, uint8_t server_pub[32]) {
+    if (msg_len < 4 || msg[0] != 0x02) {
+        return -1;
+    }
+    size_t body_len = ((size_t)msg[1] << 16) | ((size_t)msg[2] << 8) | msg[3];
+    if (4 + body_len > msg_len) {
+        return -1;
+    }
+
+    const uint8_t *p = msg + 4;
+    size_t n = body_len;
+
+    if (n < 2 + 32 + 1) {
+        return -1;
+    }
+    p += 2;
+    n -= 2;
+    p += 32;
+    n -= 32;
+
+    uint8_t sid_len = *p++;
+    n -= 1;
+    if (n < (size_t)sid_len + 2 + 1 + 2) {
+        return -1;
+    }
+    p += sid_len;
+    n -= sid_len;
+
+    uint16_t cipher = ((uint16_t)p[0] << 8) | p[1];
+    p += 2;
+    n -= 2;
+
+    if (cipher != 0x1301) {
+        return -1;
+    }
+
+    p += 1;
+    n -= 1;
+
+    uint16_t ext_len = ((uint16_t)p[0] << 8) | p[1];
+    p += 2;
+    n -= 2;
+    if (n < ext_len) {
+        return -1;
+    }
+
+    size_t eoff = 0;
+    while (eoff + 4 <= ext_len) {
+        uint16_t et = ((uint16_t)p[eoff] << 8) | p[eoff + 1];
+        uint16_t el = ((uint16_t)p[eoff + 2] << 8) | p[eoff + 3];
+        eoff += 4;
+        if (eoff + el > ext_len) {
+            return -1;
+        }
+
+        if (et == 0x0033) {
+            if (el < 4) {
+                return -1;
+            }
+            const uint8_t *k = p + eoff;
+            uint16_t group = ((uint16_t)k[0] << 8) | k[1];
+            uint16_t klen = ((uint16_t)k[2] << 8) | k[3];
+            if (group != 0x001d || klen != 32 || el < 4 + 32) {
+                return -1;
+            }
+            memcpy(server_pub, k + 4, 32);
+            return 0;
+        }
+
+        eoff += el;
+    }
+
+    return -1;
+}
+
+static int transcript_hash(const tls13_conn_t *c, uint8_t out[32]) {
+    return sha256_hash(c->transcript.data, c->transcript.len, out);
+}
+
+static int parse_first_cert_der(const uint8_t *cert_msg, size_t cert_msg_len, const uint8_t **der, size_t *der_len) {
+    if (cert_msg_len < 4 || cert_msg[0] != 0x0b) {
+        return -1;
+    }
+    size_t body_len = ((size_t)cert_msg[1] << 16) | ((size_t)cert_msg[2] << 8) | cert_msg[3];
+    if (4 + body_len > cert_msg_len) {
+        return -1;
+    }
+
+    const uint8_t *p = cert_msg + 4;
+    size_t n = body_len;
+
+    if (n < 1) {
+        return -1;
+    }
+    uint8_t req_ctx_len = p[0];
+    p += 1;
+    n -= 1;
+    if (n < (size_t)req_ctx_len + 3) {
+        return -1;
+    }
+    p += req_ctx_len;
+    n -= req_ctx_len;
+
+    size_t list_len = ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2];
+    p += 3;
+    n -= 3;
+
+    if (n < list_len || list_len < 3) {
+        return -1;
+    }
+
+    size_t cert_len = ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2];
+    p += 3;
+    if (cert_len == 0 || cert_len > n - 3) {
+        return -1;
+    }
+
+    *der = p;
+    *der_len = cert_len;
+    return 0;
+}
+
+static int verify_reality_cert(const uint8_t auth_key[32], const uint8_t *cert_der, size_t cert_der_len) {
+    const unsigned char *p = cert_der;
+    X509 *x = d2i_X509(NULL, &p, (long)cert_der_len);
+    if (x == NULL) {
+        return -1;
+    }
+
+    EVP_PKEY *pk = X509_get_pubkey(x);
+    if (pk == NULL || EVP_PKEY_base_id(pk) != EVP_PKEY_ED25519) {
+        if (pk != NULL) {
+            EVP_PKEY_free(pk);
+        }
+        X509_free(x);
+        return -1;
+    }
+
+    uint8_t pub[32];
+    size_t pub_len = sizeof(pub);
+    if (EVP_PKEY_get_raw_public_key(pk, pub, &pub_len) != 1 || pub_len != 32) {
+        EVP_PKEY_free(pk);
+        X509_free(x);
+        return -1;
+    }
+
+    uint8_t h[64];
+    if (hmac_sha512(auth_key, 32, pub, sizeof(pub), h) != 0) {
+        EVP_PKEY_free(pk);
+        X509_free(x);
+        return -1;
+    }
+
+    const ASN1_BIT_STRING *sig = NULL;
+    const X509_ALGOR *alg = NULL;
+    X509_get0_signature(&sig, &alg, x);
+
+    int ok = (sig != NULL && sig->length == 64 && memcmp(sig->data, h, 64) == 0) ? 0 : -1;
+
+    EVP_PKEY_free(pk);
+    X509_free(x);
+    return ok;
+}
+
+static int calc_finished_verify(const uint8_t traffic_secret[32], const uint8_t transcript_hash_val[32], uint8_t out[32]) {
+    uint8_t finished_key[32];
+    uint8_t zero_ctx[1] = {0};
+    if (hkdf_expand_label_sha256(traffic_secret, "finished", zero_ctx, 0, finished_key, 32) != 0) {
+        return -1;
+    }
+    return hmac_sha256(finished_key, 32, transcript_hash_val, 32, out);
+}
+
+static int derive_handshake_keys(tls13_conn_t *c, const uint8_t shared[32]) {
+    uint8_t zero[32] = {0};
+    uint8_t empty_hash[32];
+    uint8_t early_secret[32];
+    uint8_t derived[32];
+    uint8_t thash[32];
+
+    if (sha256_hash(NULL, 0, empty_hash) != 0) {
+        return -1;
+    }
+
+    if (hkdf_extract_sha256(zero, sizeof(zero), zero, sizeof(zero), early_secret) != 0) {
+        return -1;
+    }
+    if (derive_secret(early_secret, "derived", empty_hash, derived) != 0) {
+        return -1;
+    }
+    if (hkdf_extract_sha256(derived, sizeof(derived), shared, 32, c->hs_secret) != 0) {
+        return -1;
+    }
+    if (transcript_hash(c, thash) != 0) {
+        return -1;
+    }
+
+    if (derive_secret(c->hs_secret, "c hs traffic", thash, c->c_hs_traffic) != 0 ||
+        derive_secret(c->hs_secret, "s hs traffic", thash, c->s_hs_traffic) != 0) {
+        return -1;
+    }
+
+    if (derive_key_iv(c->c_hs_traffic, c->c_hs_key, c->c_hs_iv) != 0 ||
+        derive_key_iv(c->s_hs_traffic, c->s_hs_key, c->s_hs_iv) != 0) {
+        return -1;
+    }
+
+    c->c_hs_seq = 0;
+    c->s_hs_seq = 0;
+    return 0;
+}
+
+static int derive_app_keys(tls13_conn_t *c) {
+    uint8_t zero[32] = {0};
+    uint8_t empty_hash[32];
+    uint8_t derived2[32];
+    uint8_t master_secret[32];
+    uint8_t thash[32];
+
+    if (sha256_hash(NULL, 0, empty_hash) != 0) {
+        return -1;
+    }
+
+    if (derive_secret(c->hs_secret, "derived", empty_hash, derived2) != 0) {
+        return -1;
+    }
+    if (hkdf_extract_sha256(derived2, sizeof(derived2), zero, sizeof(zero), master_secret) != 0) {
+        return -1;
+    }
+
+    if (transcript_hash(c, thash) != 0) {
+        return -1;
+    }
+
+    if (derive_secret(master_secret, "c ap traffic", thash, c->c_app_traffic) != 0 ||
+        derive_secret(master_secret, "s ap traffic", thash, c->s_app_traffic) != 0) {
+        return -1;
+    }
+
+    if (derive_key_iv(c->c_app_traffic, c->c_app_key, c->c_app_iv) != 0 ||
+        derive_key_iv(c->s_app_traffic, c->s_app_key, c->s_app_iv) != 0) {
+        return -1;
+    }
+
+    c->c_app_seq = 0;
+    c->s_app_seq = 0;
+    return 0;
+}
+
+static int encrypt_record(const uint8_t key[16], const uint8_t iv[12], uint64_t *seq, uint8_t inner_type, const uint8_t *plain,
+                          size_t plain_len, uint8_t **out, size_t *out_len) {
+    size_t inner_len = plain_len + 1;
+    uint8_t *inner = (uint8_t *)malloc(inner_len);
+    if (inner == NULL) {
+        return -1;
+    }
+    memcpy(inner, plain, plain_len);
+    inner[plain_len] = inner_type;
+
+    size_t c_len = inner_len + 16;
+    uint8_t *record = (uint8_t *)malloc(5 + c_len);
+    if (record == NULL) {
+        free(inner);
+        return -1;
+    }
+
+    record[0] = 0x17;
+    record[1] = 0x03;
+    record[2] = 0x03;
+    record[3] = (uint8_t)(c_len >> 8);
+    record[4] = (uint8_t)(c_len & 0xFF);
+
+    uint8_t nonce[12];
+    xor_seq_nonce(nonce, iv, *seq);
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (ctx == NULL) {
+        free(inner);
+        free(record);
+        return -1;
+    }
+
+    int len1 = 0;
+    int ok = EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+             EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
+             EVP_EncryptUpdate(ctx, NULL, &len1, record, 5) == 1 &&
+             EVP_EncryptUpdate(ctx, record + 5, &len1, inner, (int)inner_len) == 1;
+
+    int len2 = 0;
+    if (ok) {
+        ok = EVP_EncryptFinal_ex(ctx, record + 5 + len1, &len2) == 1;
+    }
+    if (ok) {
+        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, record + 5 + inner_len) == 1;
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    free(inner);
+
+    if (!ok) {
+        free(record);
+        return -1;
+    }
+
+    *seq += 1;
+    *out = record;
+    *out_len = 5 + c_len;
+    return 0;
+}
+
+static int decrypt_record(const uint8_t key[16], const uint8_t iv[12], uint64_t *seq, uint8_t rtype, const uint8_t *payload,
+                          size_t payload_len, uint8_t **plain, size_t *plain_len, uint8_t *inner_type) {
+    if (rtype != 0x17 || payload_len < 16) {
+        return -1;
+    }
+
+    uint8_t hdr[5] = {rtype, 0x03, 0x03, (uint8_t)(payload_len >> 8), (uint8_t)(payload_len & 0xFF)};
+
+    size_t ct_len = payload_len - 16;
+    const uint8_t *ct = payload;
+    const uint8_t *tag = payload + ct_len;
+
+    uint8_t nonce[12];
+    xor_seq_nonce(nonce, iv, *seq);
+
+    uint8_t *buf = (uint8_t *)malloc(ct_len);
+    if (buf == NULL) {
+        return -1;
+    }
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (ctx == NULL) {
+        free(buf);
+        return -1;
+    }
+
+    int len1 = 0;
+    int ok = EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+             EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
+             EVP_DecryptUpdate(ctx, NULL, &len1, hdr, 5) == 1 && EVP_DecryptUpdate(ctx, buf, &len1, ct, (int)ct_len) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void *)tag) == 1;
+
+    int len2 = 0;
+    if (ok) {
+        ok = EVP_DecryptFinal_ex(ctx, buf + len1, &len2) == 1;
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) {
+        free(buf);
+        return -1;
+    }
+
+    size_t pt_len = ct_len;
+    size_t i = pt_len;
+    while (i > 0 && buf[i - 1] == 0x00) {
+        i--;
+    }
+    if (i == 0) {
+        free(buf);
+        return -1;
+    }
+
+    uint8_t ctype = buf[i - 1];
+    size_t content_len = i - 1;
+
+    uint8_t *content = (uint8_t *)malloc(content_len);
+    if (content == NULL) {
+        free(buf);
+        return -1;
+    }
+    memcpy(content, buf, content_len);
+    free(buf);
+
+    *seq += 1;
+    *plain = content;
+    *plain_len = content_len;
+    *inner_type = ctype;
+    return 0;
+}
+
+int tls13_get_fd(const tls13_conn_t *c) {
+    return c->fd;
+}
+
+static int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len) {
+    return db_append(&c->transcript, msg, msg_len);
+}
+
+static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    uint8_t client_priv[32];
+    uint8_t client_pub[32];
+    uint8_t client_random[32];
+    uint8_t *ch = NULL;
+    size_t ch_len = 0;
+    size_t sid_pos = 0;
+
+    if (build_client_hello(cfg, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos) != 0) {
+        set_err(err, err_cap, "failed to build ClientHello");
+        return -1;
+    }
+
+    uint8_t rec_hdr[5] = {0x16, 0x03, 0x01, (uint8_t)(ch_len >> 8), (uint8_t)(ch_len & 0xFF)};
+    if (write_exact(c->fd, rec_hdr, sizeof(rec_hdr)) != 0 || write_exact(c->fd, ch, ch_len) != 0) {
+        free(ch);
+        set_err(err, err_cap, "failed to send ClientHello");
+        return -1;
+    }
+
+    if (append_transcript(c, ch, ch_len) != 0) {
+        free(ch);
+        set_err(err, err_cap, "transcript append failed");
+        return -1;
+    }
+    free(ch);
+
+    dynbuf_t plain_hs = {0};
+    uint8_t server_pub[32];
+    int got_server_hello = 0;
+
+    for (int attempts = 0; attempts < 16 && !got_server_hello; attempts++) {
+        uint8_t rtype = 0;
+        uint8_t *pl = NULL;
+        size_t pl_len = 0;
+        if (read_record(c->fd, &rtype, &pl, &pl_len) != 0) {
+            db_free(&plain_hs);
+            set_err(err, err_cap, "failed to read ServerHello record");
+            return -1;
+        }
+
+        if (rtype == 0x16) {
+            if (db_append(&plain_hs, pl, pl_len) != 0) {
+                free(pl);
+                db_free(&plain_hs);
+                return -1;
+            }
+            free(pl);
+
+            while (plain_hs.len >= 4) {
+                size_t mlen = ((size_t)plain_hs.data[1] << 16) | ((size_t)plain_hs.data[2] << 8) | plain_hs.data[3];
+                if (plain_hs.len < 4 + mlen) {
+                    break;
+                }
+                if (plain_hs.data[0] == 0x02) {
+                    if (parse_server_hello_for_keyshare(plain_hs.data, 4 + mlen, server_pub) != 0) {
+                        db_free(&plain_hs);
+                        set_err(err, err_cap, "invalid ServerHello");
+                        return -1;
+                    }
+                    if (append_transcript(c, plain_hs.data, 4 + mlen) != 0) {
+                        db_free(&plain_hs);
+                        return -1;
+                    }
+                    got_server_hello = 1;
+                    db_consume(&plain_hs, 4 + mlen);
+                    break;
+                }
+                db_consume(&plain_hs, 4 + mlen);
+            }
+        } else {
+            free(pl);
+        }
+    }
+
+    db_free(&plain_hs);
+
+    if (!got_server_hello) {
+        set_err(err, err_cap, "ServerHello not received");
+        return -1;
+    }
+
+    uint8_t shared[32];
+    if (x25519_shared(client_priv, server_pub, shared) != 0) {
+        set_err(err, err_cap, "ECDH failed");
+        return -1;
+    }
+
+    if (derive_handshake_keys(c, shared) != 0) {
+        set_err(err, err_cap, "failed to derive handshake keys");
+        return -1;
+    }
+
+    dynbuf_t enc_hs = {0};
+    int got_finished = 0;
+    int cert_verified = 0;
+
+    while (!got_finished) {
+        uint8_t rtype = 0;
+        uint8_t *pl = NULL;
+        size_t pl_len = 0;
+        if (read_record(c->fd, &rtype, &pl, &pl_len) != 0) {
+            db_free(&enc_hs);
+            set_err(err, err_cap, "failed to read encrypted handshake");
+            return -1;
+        }
+
+        if (rtype != 0x17) {
+            free(pl);
+            continue;
+        }
+
+        uint8_t *dec = NULL;
+        size_t dec_len = 0;
+        uint8_t inner_type = 0;
+        if (decrypt_record(c->s_hs_key, c->s_hs_iv, &c->s_hs_seq, rtype, pl, pl_len, &dec, &dec_len, &inner_type) != 0) {
+            free(pl);
+            db_free(&enc_hs);
+            set_err(err, err_cap, "failed to decrypt handshake record");
+            return -1;
+        }
+        free(pl);
+
+        if (inner_type == 0x16) {
+            if (db_append(&enc_hs, dec, dec_len) != 0) {
+                free(dec);
+                db_free(&enc_hs);
+                return -1;
+            }
+            free(dec);
+
+            while (enc_hs.len >= 4) {
+                uint8_t htype = enc_hs.data[0];
+                size_t hlen = ((size_t)enc_hs.data[1] << 16) | ((size_t)enc_hs.data[2] << 8) | enc_hs.data[3];
+                if (enc_hs.len < 4 + hlen) {
+                    break;
+                }
+
+                if (htype == 0x14) {
+                    uint8_t thash[32];
+                    uint8_t expect[32];
+                    if (transcript_hash(c, thash) != 0 || calc_finished_verify(c->s_hs_traffic, thash, expect) != 0) {
+                        db_free(&enc_hs);
+                        set_err(err, err_cap, "failed to verify server finished");
+                        return -1;
+                    }
+                    if (hlen != 32 || memcmp(expect, enc_hs.data + 4, 32) != 0) {
+                        db_free(&enc_hs);
+                        set_err(err, err_cap, "server Finished mismatch");
+                        return -1;
+                    }
+                    if (append_transcript(c, enc_hs.data, 4 + hlen) != 0) {
+                        db_free(&enc_hs);
+                        return -1;
+                    }
+                    db_consume(&enc_hs, 4 + hlen);
+                    got_finished = 1;
+                    break;
+                }
+
+                if (htype == 0x0b) {
+                    const uint8_t *der = NULL;
+                    size_t der_len = 0;
+                    if (parse_first_cert_der(enc_hs.data, 4 + hlen, &der, &der_len) == 0) {
+                        if (verify_reality_cert(c->auth_key, der, der_len) == 0) {
+                            cert_verified = 1;
+                        }
+                    }
+                }
+
+                if (append_transcript(c, enc_hs.data, 4 + hlen) != 0) {
+                    db_free(&enc_hs);
+                    return -1;
+                }
+                db_consume(&enc_hs, 4 + hlen);
+            }
+        } else {
+            free(dec);
+        }
+    }
+
+    db_free(&enc_hs);
+
+    if (!cert_verified) {
+        set_err(err, err_cap, "REALITY cert verify failed");
+        return -1;
+    }
+
+    uint8_t thash[32];
+    uint8_t client_verify[32];
+    if (transcript_hash(c, thash) != 0 || calc_finished_verify(c->c_hs_traffic, thash, client_verify) != 0) {
+        set_err(err, err_cap, "failed to create client Finished");
+        return -1;
+    }
+
+    // TLS 1.3 traffic_secret_0 is derived from transcript up to server Finished.
+    if (derive_app_keys(c) != 0) {
+        set_err(err, err_cap, "failed to derive application keys");
+        return -1;
+    }
+
+    uint8_t fin_msg[36];
+    fin_msg[0] = 0x14;
+    fin_msg[1] = 0x00;
+    fin_msg[2] = 0x00;
+    fin_msg[3] = 0x20;
+    memcpy(fin_msg + 4, client_verify, 32);
+
+    uint8_t *enc_fin = NULL;
+    size_t enc_fin_len = 0;
+    if (encrypt_record(c->c_hs_key, c->c_hs_iv, &c->c_hs_seq, 0x16, fin_msg, sizeof(fin_msg), &enc_fin, &enc_fin_len) != 0) {
+        set_err(err, err_cap, "failed to encrypt client Finished");
+        return -1;
+    }
+
+    if (write_exact(c->fd, enc_fin, enc_fin_len) != 0) {
+        free(enc_fin);
+        set_err(err, err_cap, "failed to send client Finished");
+        return -1;
+    }
+    free(enc_fin);
+
+    if (append_transcript(c, fin_msg, sizeof(fin_msg)) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *err, size_t err_cap) {
+    *out = NULL;
+
+    int fd = tcp_connect_host(cfg->server_host, cfg->server_port);
+    if (fd < 0) {
+        set_err(err, err_cap, "tcp connect failed");
+        return -1;
+    }
+
+    tls13_conn_t *c = (tls13_conn_t *)calloc(1, sizeof(*c));
+    if (c == NULL) {
+        close(fd);
+        set_err(err, err_cap, "oom");
+        return -1;
+    }
+    c->fd = fd;
+
+    if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
+        tls13_reality_close(c);
+        return -1;
+    }
+
+    *out = c;
+    return 0;
+}
+
+void tls13_reality_close(tls13_conn_t *c) {
+    if (c == NULL) {
+        return;
+    }
+    if (c->fd >= 0) {
+        close(c->fd);
+    }
+    db_free(&c->transcript);
+    db_free(&c->app_cache);
+    free(c);
+}
+
+int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > 16384) {
+            chunk = 16384;
+        }
+
+        uint8_t *rec = NULL;
+        size_t rec_len = 0;
+        if (encrypt_record(c->c_app_key, c->c_app_iv, &c->c_app_seq, 0x17, buf + off, chunk, &rec, &rec_len) != 0) {
+            return -1;
+        }
+        if (write_exact(c->fd, rec, rec_len) != 0) {
+            free(rec);
+            return -1;
+        }
+        free(rec);
+        off += chunk;
+    }
+    return 0;
+}
+
+static int fill_app_cache(tls13_conn_t *c) {
+    for (;;) {
+        uint8_t rtype = 0;
+        uint8_t *pl = NULL;
+        size_t pl_len = 0;
+        if (read_record(c->fd, &rtype, &pl, &pl_len) != 0) {
+            fprintf(stderr, "[tls] read_record failed in app phase\n");
+            return -1;
+        }
+
+        if (rtype != 0x17) {
+            fprintf(stderr, "[tls] non-app record type=0x%02x in app phase\n", rtype);
+            free(pl);
+            continue;
+        }
+
+        uint8_t *dec = NULL;
+        size_t dec_len = 0;
+        uint8_t inner = 0;
+        if (decrypt_record(c->s_app_key, c->s_app_iv, &c->s_app_seq, rtype, pl, pl_len, &dec, &dec_len, &inner) != 0) {
+            fprintf(stderr, "[tls] decrypt_record failed in app phase\n");
+            free(pl);
+            return -1;
+        }
+        free(pl);
+
+        if (inner == 0x17) {
+            int rc = db_append(&c->app_cache, dec, dec_len);
+            free(dec);
+            if (rc != 0) {
+                return -1;
+            }
+            if (c->app_cache.len > 0) {
+                return 0;
+            }
+        } else {
+            if (inner == 0x15) {
+                if (dec_len >= 2) {
+                    fprintf(stderr, "[tls] alert level=%u desc=%u\n", (unsigned)dec[0], (unsigned)dec[1]);
+                } else {
+                    fprintf(stderr, "[tls] alert with short payload len=%zu\n", dec_len);
+                }
+            } else {
+                fprintf(stderr, "[tls] inner content type=0x%02x in app phase\n", inner);
+            }
+            free(dec);
+            if (inner == 0x15) {
+                return -1;
+            }
+        }
+    }
+}
+
+int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
+    *out_len = 0;
+    if (cap == 0) {
+        return 0;
+    }
+
+    if (c->app_cache.len == 0) {
+        if (fill_app_cache(c) != 0) {
+            return -1;
+        }
+    }
+
+    size_t take = c->app_cache.len;
+    if (take > cap) {
+        take = cap;
+    }
+    memcpy(buf, c->app_cache.data, take);
+    db_consume(&c->app_cache, take);
+    *out_len = take;
+    return 0;
+}
+
+int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        size_t got = 0;
+        if (tls13_read_app(c, buf + off, len - off, &got) != 0) {
+            return -1;
+        }
+        if (got == 0) {
+            return -1;
+        }
+        off += got;
+    }
+    return 0;
+}
