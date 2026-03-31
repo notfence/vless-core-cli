@@ -14,3 +14,4 @@ third_party/curl-ios6-with-ca.tar.gz
 .DS_Store
 *.swp
 *.swo
+*.o
