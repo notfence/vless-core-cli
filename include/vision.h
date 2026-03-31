@@ -1,5 +1,5 @@
-#ifndef V2RAYIOS6_VISION_H
-#define V2RAYIOS6_VISION_H
+#ifndef VLESS_CORE_VISION_H
+#define VLESS_CORE_VISION_H
 
 #include <stddef.h>
 #include <stdint.h>

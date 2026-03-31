@@ -1,5 +1,5 @@
-#ifndef V2RAYIOS6_TYPES_H
-#define V2RAYIOS6_TYPES_H
+#ifndef VLESS_CORE_TYPES_H
+#define VLESS_CORE_TYPES_H
 
 #include <stddef.h>
 #include <stdint.h>

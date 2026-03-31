@@ -1,13 +1,18 @@
 # vless-core-cli
 
-Standalone C CLI client for `VLESS + Reality + xtls-rprx-vision`.
+Standalone C CLI client for `VLESS (Reality + xtls-rprx-vision)`.
+
+## Tested Device/OS
+
+Tested only on **iOS 6.1.3** on **iPhone 4s**.
+Compatibility with other iOS versions/devices is not guaranteed.
 
 ## Binaries
 
 Build outputs:
 
 - `vless-core-linux-amd64`
-- `vless-core-darwin-amrv7` (iOS 6.1.3 / iPhone 4s armv7)
+- `vless-core-darwin-amrv7`
 
 ## Build
 

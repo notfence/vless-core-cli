@@ -1,5 +1,5 @@
-#ifndef V2RAYIOS6_UTILS_H
-#define V2RAYIOS6_UTILS_H
+#ifndef VLESS_CORE_UTILS_H
+#define VLESS_CORE_UTILS_H
 
 #include <stddef.h>
 #include <stdint.h>

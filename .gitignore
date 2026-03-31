@@ -4,11 +4,7 @@ vless-core-linux-amd64
 vless-core-darwin-amrv7
 
 # Generated third-party artifacts
-third_party/openssl-ios6-armv7/
-third_party/curl-ios6-armv7/
-third_party/cacert.pem
-third_party/curl-ios6-armv7-bin.tar.gz
-third_party/curl-ios6-with-ca.tar.gz
+third_party/*
 
 # Local clutter
 .DS_Store

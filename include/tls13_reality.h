@@ -1,5 +1,5 @@
-#ifndef V2RAYIOS6_TLS13_REALITY_H
-#define V2RAYIOS6_TLS13_REALITY_H
+#ifndef VLESS_CORE_TLS13_REALITY_H
+#define VLESS_CORE_TLS13_REALITY_H
 
 #include <stddef.h>
 #include <stdint.h>

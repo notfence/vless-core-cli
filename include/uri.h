@@ -1,5 +1,5 @@
-#ifndef V2RAYIOS6_URI_H
-#define V2RAYIOS6_URI_H
+#ifndef VLESS_CORE_URI_H
+#define VLESS_CORE_URI_H
 
 #include <stddef.h>
 

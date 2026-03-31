@@ -1,5 +1,5 @@
-#ifndef V2RAYIOS6_SOCKS5_H
-#define V2RAYIOS6_SOCKS5_H
+#ifndef VLESS_CORE_SOCKS5_H
+#define VLESS_CORE_SOCKS5_H
 
 #include <stddef.h>
 #include <stdint.h>
