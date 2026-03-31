@@ -22,7 +22,7 @@ make clean
 make all
 ```
 
-Build only Linux:
+Build only Linux (amd64):
 
 ```bash
 make linux
@@ -38,6 +38,8 @@ make ios
 
 ```bash
 ./vless-core-linux-amd64 --uri '<vless://...>' --listen-port 21080
+or
+./vless-core-darwin-amrv7 --uri '<vless://...>' --listen-port 21080
 ```
 
 Version check:
