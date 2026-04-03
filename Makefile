@@ -11,7 +11,7 @@ BIN_LINUX ?= vless-core-linux-amd64
 BIN_IOS ?= vless-core-darwin-amrv7
 
 LDFLAGS ?=
-LDLIBS ?= -lcrypto -lpthread
+LDLIBS ?= -lssl -lcrypto -lpthread
 
 IOS_TOOLCHAIN ?= $(HOME)/toolchains/ios6
 IOS_SDK ?= $(IOS_TOOLCHAIN)/SDK/iPhoneOS6.1.sdk
@@ -19,7 +19,7 @@ IOS_OPENSSL_PREFIX ?= third_party/openssl-ios6-armv7
 IOS_CC ?= $(IOS_TOOLCHAIN)/bin/arm-apple-darwin11-clang
 IOS_CFLAGS ?= $(COMMON_CFLAGS) $(INCLUDES) -I$(IOS_OPENSSL_PREFIX)/include -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=6.0
 IOS_LDFLAGS ?= -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=6.0
-IOS_LDLIBS ?= $(IOS_OPENSSL_PREFIX)/lib/libcrypto.a -lpthread
+IOS_LDLIBS ?= $(IOS_OPENSSL_PREFIX)/lib/libssl.a $(IOS_OPENSSL_PREFIX)/lib/libcrypto.a -lpthread
 CA_BUNDLE ?= third_party/cacert.pem
 CURL_IOS_BIN ?= third_party/curl-ios6-armv7/bin/curl
 

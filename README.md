@@ -1,6 +1,11 @@
 # vless-core-cli
 
-Standalone C CLI client for `VLESS (Reality + xtls-rprx-vision)`.
+Standalone C CLI client for:
+
+- `VLESS + TCP + Reality + xtls-rprx-vision`
+- `VLESS + TLS + XHTTP (mode=packet-up)`
+
+Protocol semantics are aligned with `xray-core` for the supported transports and URI parameters.
 
 ## Tested Device/OS
 
@@ -37,17 +42,49 @@ make ios
 ## Run
 
 ```bash
-./vless-core-linux-amd64 --uri '<vless://...>' --listen-port 21080
+./vless-core-linux-amd64 --uri '<vless://...>' --listen-port <port>
 or
-./vless-core-darwin-amrv7 --uri '<vless://...>' --listen-port 21080
+./vless-core-darwin-amrv7 --uri '<vless://...>' --listen-port <port>
 ```
 
-Version check:
+Show CLI help/parameters:
 
 ```bash
-./vless-core-linux-amd64 -v
-./vless-core-darwin-amrv7 -v
+./vless-core-linux-amd64 --help
+./vless-core-darwin-amrv7 --help
 ```
+
+Expected help output:
+
+```text
+Usage: vless-core-linux-amd64 --uri <vless://...> --listen-port <port>
+
+Options:
+  --uri <vless://...>      VLESS URI (Reality/Vision or TLS/XHTTP)
+  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)
+  -h, --help               Show help
+  -v, --version            Show version
+```
+
+## XHTTP TLS modes
+
+For `type=xhttp` transport you can control TLS behavior via env:
+
+```bash
+VLESS_XHTTP_TLS_MODE=auto|strict|insecure|tofu
+```
+
+- `auto` (default): try TLS verify, and if cert-verify fails fallback to insecure TLS with TOFU pin check/store.
+- `strict`: only verified TLS, no fallback.
+- `insecure`: always insecure TLS.
+- `tofu`: Trust-On-First-Use pinning (first cert is saved, next connections must match SHA-256 pin).
+
+TOFU pin file path:
+
+- `VLESS_XHTTP_PIN_FILE=/path/to/pins.txt` (override)
+- default search/write paths:
+  - `/var/mobile/Library/Preferences/vless-core/xhttp-pins.txt`
+  - `/tmp/vless-core-xhttp-pins.txt`
 
 ## iOS toolchain notes
 

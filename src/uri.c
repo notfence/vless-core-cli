@@ -105,6 +105,18 @@ static void parse_query(vless_config_t *cfg, char *query) {
             copy_trunc(cfg->flow, sizeof(cfg->flow), decoded);
         } else if (strcmp(key, "security") == 0) {
             copy_trunc(cfg->security, sizeof(cfg->security), decoded);
+        } else if (strcmp(key, "type") == 0) {
+            if (strcmp(decoded, "xhttp") == 0) {
+                cfg->transport_mode = TRANSPORT_XHTTP;
+            } else if (decoded[0] == '\0' || strcmp(decoded, "tcp") == 0) {
+                cfg->transport_mode = TRANSPORT_VISION;
+            }
+        } else if (strcmp(key, "path") == 0) {
+            copy_trunc(cfg->xhttp_path, sizeof(cfg->xhttp_path), decoded);
+        } else if (strcmp(key, "host") == 0) {
+            copy_trunc(cfg->xhttp_host, sizeof(cfg->xhttp_host), decoded);
+        } else if (strcmp(key, "mode") == 0) {
+            copy_trunc(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), decoded);
         } else if (strcmp(key, "spx") == 0) {
             copy_trunc(cfg->spider_x, sizeof(cfg->spider_x), decoded);
         }
@@ -119,9 +131,13 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
 
     memset(cfg, 0, sizeof(*cfg));
     cfg->fp_mode = FP_CHROME;
+    cfg->transport_mode = TRANSPORT_VISION;
     snprintf(cfg->flow, sizeof(cfg->flow), "xtls-rprx-vision");
     snprintf(cfg->security, sizeof(cfg->security), "reality");
     snprintf(cfg->spider_x, sizeof(cfg->spider_x), "/");
+    snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
+    cfg->xhttp_host[0] = '\0';
+    snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "packet-up");
     snprintf(cfg->original_uri, sizeof(cfg->original_uri), "%s", uri);
 
     if (strncmp(uri, "vless://", 8) != 0) {
@@ -166,24 +182,41 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         parse_query(cfg, query);
     }
 
-    if (cfg->pbk_len != 32) {
-        set_err(err, err_cap, "pbk is required and must decode to 32 bytes");
-        return -1;
-    }
+    if (cfg->transport_mode == TRANSPORT_XHTTP) {
+        if (strcmp(cfg->security, "tls") != 0) {
+            set_err(err, err_cap, "xhttp requires security=tls");
+            return -1;
+        }
+        if (strcmp(cfg->xhttp_mode, "packet-up") != 0) {
+            set_err(err, err_cap, "only xhttp mode=packet-up is supported");
+            return -1;
+        }
+        cfg->flow[0] = '\0';
+        cfg->pbk_len = 0;
+        cfg->short_id_len = 0;
+        if (cfg->xhttp_path[0] == '\0') {
+            snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
+        }
+    } else {
+        if (cfg->pbk_len != 32) {
+            set_err(err, err_cap, "pbk is required and must decode to 32 bytes");
+            return -1;
+        }
 
-    if (cfg->short_id_len > 16) {
-        set_err(err, err_cap, "sid must be <= 16 bytes");
-        return -1;
-    }
+        if (cfg->short_id_len > 16) {
+            set_err(err, err_cap, "sid must be <= 16 bytes");
+            return -1;
+        }
 
-    if (strcmp(cfg->security, "reality") != 0) {
-        set_err(err, err_cap, "only security=reality is supported");
-        return -1;
-    }
+        if (strcmp(cfg->security, "reality") != 0) {
+            set_err(err, err_cap, "only security=reality is supported");
+            return -1;
+        }
 
-    if (strcmp(cfg->flow, "xtls-rprx-vision") != 0) {
-        set_err(err, err_cap, "only flow=xtls-rprx-vision is supported");
-        return -1;
+        if (strcmp(cfg->flow, "xtls-rprx-vision") != 0) {
+            set_err(err, err_cap, "only flow=xtls-rprx-vision is supported");
+            return -1;
+        }
     }
 
     return 0;

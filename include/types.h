@@ -9,6 +9,11 @@ typedef enum {
     FP_RANDOM = 1
 } fingerprint_mode_t;
 
+typedef enum {
+    TRANSPORT_VISION = 0,
+    TRANSPORT_XHTTP = 1
+} transport_mode_t;
+
 typedef struct {
     char original_uri[2048];
 
@@ -29,6 +34,11 @@ typedef struct {
 
     char spider_x[256];
     fingerprint_mode_t fp_mode;
+
+    transport_mode_t transport_mode;
+    char xhttp_path[256];
+    char xhttp_host[256];
+    char xhttp_mode[32];
 } vless_config_t;
 
 typedef struct {

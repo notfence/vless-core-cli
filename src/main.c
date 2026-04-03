@@ -17,7 +17,7 @@
 #include "vision.h"
 #include "vless.h"
 
-#define VLESS_CORE_VERSION "1.0.0"
+#define VLESS_CORE_VERSION "1.0.1"
 
 static int write_all(int fd, const uint8_t *buf, size_t len) {
     size_t off = 0;
@@ -48,42 +48,51 @@ static void *client_worker(void *arg) {
     char err[256] = {0};
     tls13_conn_t *tls = NULL;
     if (tls13_reality_connect(&cfg, &tls, err, sizeof(err)) != 0) {
-        fprintf(stderr, "[conn] reality connect failed: %s\n", err);
+        fprintf(stderr, "[conn] upstream connect failed: %s\n", err);
         socks5_send_failure(cfd, 0x05);
         close(cfd);
         return NULL;
     }
 
+    int use_vision = (cfg.transport_mode == TRANSPORT_VISION);
     vision_wrap_t vwrap;
     vision_unpad_t vunpad;
-    vision_wrap_init(&vwrap, cfg.uuid);
-    vision_unpad_init(&vunpad, cfg.uuid);
+    if (use_vision) {
+        vision_wrap_init(&vwrap, cfg.uuid);
+        vision_unpad_init(&vunpad, cfg.uuid);
+    }
 
     if (vless_send_request(tls, &cfg, target_host, target_port) != 0) {
         fprintf(stderr, "[conn] VLESS request send failed for %s:%u\n", target_host, (unsigned)target_port);
         socks5_send_failure(cfd, 0x01);
-        vision_unpad_free(&vunpad);
+        if (use_vision) {
+            vision_unpad_free(&vunpad);
+        }
         tls13_reality_close(tls);
         close(cfd);
         return NULL;
     }
 
-    uint8_t *bootstrap = NULL;
-    size_t bootstrap_len = 0;
-    if (vision_wrap_bootstrap(&vwrap, &bootstrap, &bootstrap_len) != 0 ||
-        (bootstrap_len > 0 && tls13_write_app(tls, bootstrap, bootstrap_len) != 0)) {
+    if (use_vision) {
+        uint8_t *bootstrap = NULL;
+        size_t bootstrap_len = 0;
+        if (vision_wrap_bootstrap(&vwrap, &bootstrap, &bootstrap_len) != 0 ||
+            (bootstrap_len > 0 && tls13_write_app(tls, bootstrap, bootstrap_len) != 0)) {
+            free(bootstrap);
+            fprintf(stderr, "[conn] Vision bootstrap send failed for %s:%u\n", target_host, (unsigned)target_port);
+            socks5_send_failure(cfd, 0x01);
+            vision_unpad_free(&vunpad);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
         free(bootstrap);
-        fprintf(stderr, "[conn] Vision bootstrap send failed for %s:%u\n", target_host, (unsigned)target_port);
-        socks5_send_failure(cfd, 0x01);
-        vision_unpad_free(&vunpad);
-        tls13_reality_close(tls);
-        close(cfd);
-        return NULL;
     }
-    free(bootstrap);
 
     if (socks5_send_success(cfd) != 0) {
-        vision_unpad_free(&vunpad);
+        if (use_vision) {
+            vision_unpad_free(&vunpad);
+        }
         tls13_reality_close(tls);
         close(cfd);
         return NULL;
@@ -120,17 +129,23 @@ static void *client_worker(void *arg) {
                 continue;
             }
 
-            uint8_t *wrapped = NULL;
-            size_t wrapped_len = 0;
-            if (vision_wrap_payload(&vwrap, cbuf, (size_t)n, &wrapped, &wrapped_len) != 0) {
-                break;
-            }
+            if (use_vision) {
+                uint8_t *wrapped = NULL;
+                size_t wrapped_len = 0;
+                if (vision_wrap_payload(&vwrap, cbuf, (size_t)n, &wrapped, &wrapped_len) != 0) {
+                    break;
+                }
 
-            if (wrapped_len > 0 && tls13_write_app(tls, wrapped, wrapped_len) != 0) {
+                if (wrapped_len > 0 && tls13_write_app(tls, wrapped, wrapped_len) != 0) {
+                    free(wrapped);
+                    break;
+                }
                 free(wrapped);
-                break;
+            } else {
+                if (tls13_write_app(tls, cbuf, (size_t)n) != 0) {
+                    break;
+                }
             }
-            free(wrapped);
         }
 
         if (FD_ISSET(tfd, &rfds)) {
@@ -158,27 +173,35 @@ static void *client_worker(void *arg) {
                 break;
             }
 
-            uint8_t *plain = NULL;
-            size_t plain_len = 0;
-            int switch_to_direct = 0;
-            if (vision_unpad_feed(&vunpad, tbuf, got, &plain, &plain_len, &switch_to_direct) != 0) {
-                break;
-            }
+            if (use_vision) {
+                uint8_t *plain = NULL;
+                size_t plain_len = 0;
+                int switch_to_direct = 0;
+                if (vision_unpad_feed(&vunpad, tbuf, got, &plain, &plain_len, &switch_to_direct) != 0) {
+                    break;
+                }
 
-            if (plain_len > 0 && write_all(cfd, plain, plain_len) != 0) {
+                if (plain_len > 0 && write_all(cfd, plain, plain_len) != 0) {
+                    free(plain);
+                    break;
+                }
                 free(plain);
-                break;
-            }
-            free(plain);
 
-            if (switch_to_direct) {
-                tunnel_direct = 1;
-                fprintf(stderr, "[conn] switched to Vision direct mode for %s:%u\n", target_host, (unsigned)target_port);
+                if (switch_to_direct) {
+                    tunnel_direct = 1;
+                    fprintf(stderr, "[conn] switched to Vision direct mode for %s:%u\n", target_host, (unsigned)target_port);
+                }
+            } else {
+                if (write_all(cfd, tbuf, got) != 0) {
+                    break;
+                }
             }
         }
     }
 
-    vision_unpad_free(&vunpad);
+    if (use_vision) {
+        vision_unpad_free(&vunpad);
+    }
     tls13_reality_close(tls);
     close(cfd);
     return NULL;
@@ -186,7 +209,28 @@ static void *client_worker(void *arg) {
 
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s --uri <vless://...> --listen-port <port>\n", argv0);
-    fprintf(stderr, "       %s -v | --version\n", argv0);
+    fprintf(stderr, "\nOptions:\n");
+    fprintf(stderr, "  --uri <vless://...>      VLESS URI (Reality/Vision or TLS/XHTTP)\n");
+    fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
+    fprintf(stderr, "  -h, --help               Show help\n");
+    fprintf(stderr, "  -v, --version            Show version\n");
+}
+
+static const char *xhttp_tls_mode_startup_label(void) {
+    const char *v = getenv("VLESS_XHTTP_TLS_MODE");
+    if (v == NULL || v[0] == '\0' || strcmp(v, "auto") == 0) {
+        return "auto(selected=strict)";
+    }
+    if (strcmp(v, "strict") == 0) {
+        return "strict";
+    }
+    if (strcmp(v, "insecure") == 0) {
+        return "insecure";
+    }
+    if (strcmp(v, "tofu") == 0) {
+        return "tofu";
+    }
+    return "auto(selected=strict)";
 }
 
 int main(int argc, char **argv) {
@@ -207,13 +251,13 @@ int main(int argc, char **argv) {
             printf("vless-core %s\n", VLESS_CORE_VERSION);
             return 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            usage(argv[0]);
+            usage(prog);
             return 0;
         }
     }
 
     if (uri == NULL || listen_port <= 0 || listen_port > 65535) {
-        usage(argv[0]);
+        usage(prog);
         return 1;
     }
 
@@ -251,8 +295,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, fp=%s)\n", prog, listen_port, cfg.server_host,
-            (unsigned)cfg.server_port, cfg.sni, cfg.fp_mode == FP_RANDOM ? "random" : "chrome");
+    fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
+            cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security,
+            cfg.transport_mode == TRANSPORT_XHTTP ? "xhttp" : "vision", cfg.fp_mode == FP_RANDOM ? "random" : "chrome");
+    if (cfg.transport_mode == TRANSPORT_XHTTP) {
+        fprintf(stderr, "[xhttp] tls_mode=%s\n", xhttp_tls_mode_startup_label());
+    }
 
     while (1) {
         int cfd = accept(lfd, NULL, NULL);

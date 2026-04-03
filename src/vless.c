@@ -29,11 +29,12 @@ int vless_send_request(tls13_conn_t *tls, const vless_config_t *cfg, const char 
     if (flow_len > 64) {
         return -1;
     }
-
-    addons[addons_len++] = 0x0A;
-    addons[addons_len++] = (uint8_t)flow_len;
-    memcpy(addons + addons_len, flow, flow_len);
-    addons_len += flow_len;
+    if (flow_len > 0) {
+        addons[addons_len++] = 0x0A;
+        addons[addons_len++] = (uint8_t)flow_len;
+        memcpy(addons + addons_len, flow, flow_len);
+        addons_len += flow_len;
+    }
 
     packet[off++] = (uint8_t)addons_len;
     if (append(packet, sizeof(packet), &off, addons, addons_len) != 0) {
