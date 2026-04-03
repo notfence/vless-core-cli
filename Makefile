@@ -17,6 +17,19 @@ IOS_TOOLCHAIN ?= $(HOME)/toolchains/ios6
 IOS_SDK ?= $(IOS_TOOLCHAIN)/SDK/iPhoneOS6.1.sdk
 IOS_OPENSSL_PREFIX ?= third_party/openssl-ios6-armv7
 IOS_CC ?= $(IOS_TOOLCHAIN)/bin/arm-apple-darwin11-clang
+IOS_AR ?= $(IOS_TOOLCHAIN)/bin/arm-apple-darwin11-ar
+IOS_RANLIB ?= $(IOS_TOOLCHAIN)/bin/arm-apple-darwin11-ranlib
+IOS_STRIP ?= $(IOS_TOOLCHAIN)/bin/arm-apple-darwin11-strip
+IOS_BLOCKS_RUNTIME_LIB ?= libBlocksRuntime.so
+IOS_BLOCKS_RUNTIME_DIR ?= $(shell \
+	if [ -f "$(IOS_TOOLCHAIN)/lib/$(IOS_BLOCKS_RUNTIME_LIB)" ]; then \
+		echo "$(IOS_TOOLCHAIN)/lib"; \
+	elif [ -f "$(IOS_TOOLCHAIN)/lib64/$(IOS_BLOCKS_RUNTIME_LIB)" ]; then \
+		echo "$(IOS_TOOLCHAIN)/lib64"; \
+	else \
+		find "$(IOS_TOOLCHAIN)" -maxdepth 5 -type f -name "$(IOS_BLOCKS_RUNTIME_LIB)" -print -quit 2>/dev/null | sed 's#/$(IOS_BLOCKS_RUNTIME_LIB)$$##'; \
+	fi)
+IOS_RUNTIME_ENV = LD_LIBRARY_PATH="$(IOS_BLOCKS_RUNTIME_DIR)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}"
 IOS_CFLAGS ?= $(COMMON_CFLAGS) $(INCLUDES) -I$(IOS_OPENSSL_PREFIX)/include -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=6.0
 IOS_LDFLAGS ?= -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=6.0
 IOS_LDLIBS ?= $(IOS_OPENSSL_PREFIX)/lib/libssl.a $(IOS_OPENSSL_PREFIX)/lib/libcrypto.a -lpthread
@@ -31,19 +44,23 @@ ios: check-ios-toolchain $(BIN_IOS)
 
 check-ios-toolchain:
 	@test -x "$(IOS_CC)" || (echo "Missing iOS compiler: $(IOS_CC)"; echo "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"; exit 1)
+	@test -x "$(IOS_AR)" || (echo "Missing iOS archiver: $(IOS_AR)"; echo "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"; exit 1)
+	@test -x "$(IOS_RANLIB)" || (echo "Missing iOS ranlib: $(IOS_RANLIB)"; echo "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"; exit 1)
+	@test -x "$(IOS_STRIP)" || (echo "Missing iOS strip: $(IOS_STRIP)"; echo "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"; exit 1)
 	@test -d "$(IOS_SDK)" || (echo "Missing iOS SDK: $(IOS_SDK)"; echo "Set IOS_SDK=/path/to/iPhoneOS6.1.sdk"; exit 1)
+	@test -n "$(IOS_BLOCKS_RUNTIME_DIR)" || (echo "Missing $(IOS_BLOCKS_RUNTIME_LIB) under $(IOS_TOOLCHAIN)"; echo "Add it to the toolchain or set IOS_BLOCKS_RUNTIME_DIR=/path/to/runtime/lib"; exit 1)
 
 $(BIN_LINUX): $(OBJ_LINUX)
 	$(CC) $(LDFLAGS) -o $@ $(OBJ_LINUX) $(LDLIBS)
 
 $(BIN_IOS): $(OBJ_IOS) $(IOS_OPENSSL_PREFIX)/lib/libcrypto.a
-	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_CC) $(IOS_LDFLAGS) -o $@ $(OBJ_IOS) $(IOS_LDLIBS)
+	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_LDFLAGS) -o $@ $(OBJ_IOS) $(IOS_LDLIBS)
 
 build/linux/%.o: src/%.c | build/linux
 	$(CC) $(COMMON_CFLAGS) $(INCLUDES) -c $< -o $@
 
 build/ios/%.o: src/%.c | build/ios
-	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_CC) $(IOS_CFLAGS) -c $< -o $@
+	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_CFLAGS) -c $< -o $@
 
 build/linux:
 	mkdir -p $@

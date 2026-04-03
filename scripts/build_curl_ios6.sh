@@ -12,17 +12,80 @@ IOS_TOOLCHAIN="${IOS_TOOLCHAIN:-${HOME}/toolchains/ios6}"
 IOS_SDK="${IOS_SDK:-${IOS_TOOLCHAIN}/SDK/iPhoneOS6.1.sdk}"
 OPENSSL_PREFIX="${OPENSSL_PREFIX:-${THIRD_PARTY_DIR}/openssl-ios6-armv7}"
 
-if [[ ! -x "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-clang" ]]; then
-  echo "Missing iOS toolchain at ${IOS_TOOLCHAIN}"
-  echo "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"
+require_file() {
+  local path="$1"
+  local hint="$2"
+  if [[ ! -e "${path}" ]]; then
+    echo "Missing required path: ${path}"
+    echo "${hint}"
+    exit 1
+  fi
+}
+
+require_executable() {
+  local path="$1"
+  local hint="$2"
+  if [[ ! -x "${path}" ]]; then
+    echo "Missing required executable: ${path}"
+    echo "${hint}"
+    exit 1
+  fi
+}
+
+prepend_ld_library_if_needed() {
+  local runtime_lib="libBlocksRuntime.so"
+  local candidate=""
+  local found=""
+
+  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    IFS=':' read -r -a _ld_paths <<<"${LD_LIBRARY_PATH}"
+    for candidate in "${_ld_paths[@]}"; do
+      if [[ -n "${candidate}" && -f "${candidate}/${runtime_lib}" ]]; then
+        return 0
+      fi
+    done
+  fi
+
+  local candidates=(
+    "${IOS_TOOLCHAIN}/lib"
+    "${IOS_TOOLCHAIN}/lib64"
+  )
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}/${runtime_lib}" ]]; then
+      export LD_LIBRARY_PATH="${candidate}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      return 0
+    fi
+  done
+
+  found="$(find "${IOS_TOOLCHAIN}" -maxdepth 5 -type f -name "${runtime_lib}" -print -quit 2>/dev/null || true)"
+  if [[ -n "${found}" ]]; then
+    candidate="$(dirname "${found}")"
+    export LD_LIBRARY_PATH="${candidate}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    return 0
+  fi
+
+  echo "Missing required runtime lib: ${runtime_lib}"
+  echo "Place it under ${IOS_TOOLCHAIN} or set LD_LIBRARY_PATH to its directory."
   exit 1
+}
+
+require_executable "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-clang" \
+  "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"
+require_executable "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-ar" \
+  "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"
+require_executable "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-ranlib" \
+  "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"
+require_executable "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-strip" \
+  "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"
+require_file "${IOS_SDK}" "Set IOS_SDK=/path/to/iPhoneOS6.1.sdk"
+
+require_executable "$(command -v make || true)" "Install make"
+require_executable "$(command -v tar || true)" "Install tar"
+if [[ ! -f "${CURL_TAR}" ]]; then
+  require_executable "$(command -v curl || true)" "Install curl for host downloads"
 fi
 
-if [[ ! -d "${IOS_SDK}" ]]; then
-  echo "Missing iOS SDK at ${IOS_SDK}"
-  echo "Set IOS_SDK=/path/to/iPhoneOS6.1.sdk"
-  exit 1
-fi
+prepend_ld_library_if_needed
 
 mkdir -p "${THIRD_PARTY_DIR}"
 

@@ -11,3 +11,4 @@ third_party/*
 *.swp
 *.swo
 *.o
+scripts/release_notes.sh
