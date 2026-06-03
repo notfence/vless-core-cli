@@ -48,23 +48,29 @@ struct tls13_conn {
 
     uint8_t auth_key[32];
 
-    uint8_t hs_secret[32];
-    uint8_t c_hs_traffic[32];
-    uint8_t s_hs_traffic[32];
+    uint16_t tls_cipher_suite;
+    const EVP_MD *tls_md;
+    size_t tls_hash_len;
+    size_t tls_key_len;
 
-    uint8_t c_app_traffic[32];
-    uint8_t s_app_traffic[32];
+    uint8_t hs_secret[64];
+    uint8_t c_hs_traffic[64];
+    uint8_t s_hs_traffic[64];
 
-    uint8_t c_hs_key[16], c_hs_iv[12];
-    uint8_t s_hs_key[16], s_hs_iv[12];
+    uint8_t c_app_traffic[64];
+    uint8_t s_app_traffic[64];
 
-    uint8_t c_app_key[16], c_app_iv[12];
-    uint8_t s_app_key[16], s_app_iv[12];
+    uint8_t c_hs_key[32], c_hs_iv[12];
+    uint8_t s_hs_key[32], s_hs_iv[12];
+
+    uint8_t c_app_key[32], c_app_iv[12];
+    uint8_t s_app_key[32], s_app_iv[12];
 
     uint64_t c_hs_seq;
     uint64_t s_hs_seq;
     uint64_t c_app_seq;
     uint64_t s_app_seq;
+    uint64_t c_app_record_bytes;
 
     SSL_CTX *ssl_ctx;
     SSL *ssl;
@@ -87,6 +93,7 @@ struct tls13_conn {
     dynbuf_t xhttp_net_cache;
     dynbuf_t transcript;
     dynbuf_t app_cache;
+    int reality_raw_direct;
 };
 
 static void set_err(char *err, size_t cap, const char *msg) {
@@ -1120,12 +1127,19 @@ static void xor_seq_nonce(uint8_t nonce[12], const uint8_t iv[12], uint64_t seq)
     }
 }
 
-static int sha256_hash(const uint8_t *in, size_t in_len, uint8_t out[32]) {
+static int digest_hash(const EVP_MD *md, const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len) {
+    if (md == NULL || out == NULL) {
+        return -1;
+    }
+    size_t want = (size_t)EVP_MD_size(md);
+    if (want == 0 || out_len != want) {
+        return -1;
+    }
     EVP_MD_CTX *m = EVP_MD_CTX_new();
     if (m == NULL) {
         return -1;
     }
-    int ok = EVP_DigestInit_ex(m, EVP_sha256(), NULL) == 1;
+    int ok = EVP_DigestInit_ex(m, md, NULL) == 1;
     if (ok && in_len > 0) {
         ok = EVP_DigestUpdate(m, in, in_len) == 1;
     }
@@ -1136,10 +1150,17 @@ static int sha256_hash(const uint8_t *in, size_t in_len, uint8_t out[32]) {
     return ok ? 0 : -1;
 }
 
-static int hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *in, size_t in_len, uint8_t out[32]) {
-    unsigned int out_len = 0;
-    unsigned char *ret = HMAC(EVP_sha256(), key, (int)key_len, in, in_len, out, &out_len);
-    return (ret != NULL && out_len == 32) ? 0 : -1;
+static int hmac_digest(const EVP_MD *md, const uint8_t *key, size_t key_len, const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len) {
+    if (md == NULL || out == NULL) {
+        return -1;
+    }
+    unsigned int want = (unsigned int)EVP_MD_size(md);
+    if (want == 0 || out_len != want) {
+        return -1;
+    }
+    unsigned int got_len = 0;
+    unsigned char *ret = HMAC(md, key, (int)key_len, in, in_len, out, &got_len);
+    return (ret != NULL && got_len == want) ? 0 : -1;
 }
 
 static int hmac_sha512(const uint8_t *key, size_t key_len, const uint8_t *in, size_t in_len, uint8_t out[64]) {
@@ -1148,12 +1169,22 @@ static int hmac_sha512(const uint8_t *key, size_t key_len, const uint8_t *in, si
     return (ret != NULL && out_len == 64) ? 0 : -1;
 }
 
-static int hkdf_extract_sha256(const uint8_t *salt, size_t salt_len, const uint8_t *ikm, size_t ikm_len, uint8_t prk[32]) {
-    return hmac_sha256(salt, salt_len, ikm, ikm_len, prk);
+static int hkdf_extract_md(const EVP_MD *md, const uint8_t *salt, size_t salt_len, const uint8_t *ikm, size_t ikm_len, uint8_t *prk,
+                           size_t prk_len) {
+    return hmac_digest(md, salt, salt_len, ikm, ikm_len, prk, prk_len);
 }
 
-static int hkdf_expand_sha256(const uint8_t prk[32], const uint8_t *info, size_t info_len, uint8_t *out, size_t out_len) {
-    uint8_t t[32];
+static int hkdf_expand_md(const EVP_MD *md, const uint8_t *prk, size_t prk_len, const uint8_t *info, size_t info_len, uint8_t *out,
+                          size_t out_len) {
+    if (md == NULL || prk == NULL || out == NULL) {
+        return -1;
+    }
+    size_t hash_len = (size_t)EVP_MD_size(md);
+    if (hash_len == 0 || hash_len > 64 || prk_len != hash_len) {
+        return -1;
+    }
+
+    uint8_t t[64];
     size_t pos = 0;
     uint8_t counter = 1;
     size_t t_len = 0;
@@ -1163,7 +1194,7 @@ static int hkdf_expand_sha256(const uint8_t prk[32], const uint8_t *info, size_t
         if (ctx == NULL) {
             return -1;
         }
-        if (HMAC_Init_ex(ctx, prk, 32, EVP_sha256(), NULL) != 1) {
+        if (HMAC_Init_ex(ctx, prk, (int)prk_len, md, NULL) != 1) {
             HMAC_CTX_free(ctx);
             return -1;
         }
@@ -1180,27 +1211,27 @@ static int hkdf_expand_sha256(const uint8_t prk[32], const uint8_t *info, size_t
             return -1;
         }
         unsigned int got = 0;
-        if (HMAC_Final(ctx, t, &got) != 1 || got != 32) {
+        if (HMAC_Final(ctx, t, &got) != 1 || got != hash_len) {
             HMAC_CTX_free(ctx);
             return -1;
         }
         HMAC_CTX_free(ctx);
 
         size_t take = out_len - pos;
-        if (take > 32) {
-            take = 32;
+        if (take > hash_len) {
+            take = hash_len;
         }
         memcpy(out + pos, t, take);
         pos += take;
-        t_len = 32;
+        t_len = hash_len;
         counter++;
     }
 
     return 0;
 }
 
-static int hkdf_expand_label_sha256(const uint8_t secret[32], const char *label, const uint8_t *ctx, size_t ctx_len, uint8_t *out,
-                                    size_t out_len) {
+static int hkdf_expand_label_md(const EVP_MD *md, const uint8_t *secret, size_t secret_len, const char *label, const uint8_t *ctx,
+                                size_t ctx_len, uint8_t *out, size_t out_len) {
     uint8_t info[256];
     size_t label_len = strlen(label);
     const char *prefix = "tls13 ";
@@ -1224,19 +1255,21 @@ static int hkdf_expand_label_sha256(const uint8_t secret[32], const char *label,
         off += ctx_len;
     }
 
-    return hkdf_expand_sha256(secret, info, off, out, out_len);
+    return hkdf_expand_md(md, secret, secret_len, info, off, out, out_len);
 }
 
-static int derive_secret(const uint8_t secret[32], const char *label, const uint8_t transcript_hash[32], uint8_t out[32]) {
-    return hkdf_expand_label_sha256(secret, label, transcript_hash, 32, out, 32);
+static int derive_secret_md(const EVP_MD *md, const uint8_t *secret, size_t secret_len, const char *label, const uint8_t *transcript_hash,
+                            size_t transcript_hash_len, uint8_t *out, size_t out_len) {
+    return hkdf_expand_label_md(md, secret, secret_len, label, transcript_hash, transcript_hash_len, out, out_len);
 }
 
-static int derive_key_iv(const uint8_t traffic_secret[32], uint8_t key[16], uint8_t iv[12]) {
+static int derive_key_iv_md(const EVP_MD *md, const uint8_t *traffic_secret, size_t secret_len, size_t key_len, uint8_t *key,
+                            uint8_t iv[12]) {
     uint8_t zero_ctx[1] = {0};
-    if (hkdf_expand_label_sha256(traffic_secret, "key", zero_ctx, 0, key, 16) != 0) {
+    if (hkdf_expand_label_md(md, traffic_secret, secret_len, "key", zero_ctx, 0, key, key_len) != 0) {
         return -1;
     }
-    if (hkdf_expand_label_sha256(traffic_secret, "iv", zero_ctx, 0, iv, 12) != 0) {
+    if (hkdf_expand_label_md(md, traffic_secret, secret_len, "iv", zero_ctx, 0, iv, 12) != 0) {
         return -1;
     }
     return 0;
@@ -1301,6 +1334,38 @@ static uint16_t random_grease_value(void) {
     uint8_t b = 0;
     RAND_bytes(&b, 1);
     return vals[b % (sizeof(vals) / sizeof(vals[0]))];
+}
+
+static uint16_t random_unique_grease_value(const uint16_t *used, size_t used_len) {
+    for (int attempts = 0; attempts < 64; attempts++) {
+        uint16_t v = random_grease_value();
+        int seen = 0;
+        for (size_t i = 0; i < used_len; i++) {
+            if (used[i] == v) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            return v;
+        }
+    }
+
+    static const uint16_t vals[] = {0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
+                                    0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa};
+    for (size_t j = 0; j < sizeof(vals) / sizeof(vals[0]); j++) {
+        int seen = 0;
+        for (size_t i = 0; i < used_len; i++) {
+            if (used[i] == vals[j]) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            return vals[j];
+        }
+    }
+    return vals[0];
 }
 
 static int add_ext(dynbuf_t *b, uint16_t etype, const uint8_t *edata, size_t elen) {
@@ -1370,6 +1435,21 @@ static int ext_sig_algs(dynbuf_t *exts) {
     return add_ext(exts, 0x000d, data, off);
 }
 
+static int ext_sig_algs_qq(dynbuf_t *exts) {
+    /* Matches uTLS HelloQQ_11_1 signature algorithm ordering. */
+    uint16_t sigs[] = {0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601};
+    uint8_t data[64];
+    size_t off = 0;
+    size_t slen = sizeof(sigs);
+    data[off++] = (uint8_t)(slen >> 8);
+    data[off++] = (uint8_t)(slen & 0xFF);
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        data[off++] = (uint8_t)(sigs[i] >> 8);
+        data[off++] = (uint8_t)(sigs[i] & 0xFF);
+    }
+    return add_ext(exts, 0x000d, data, off);
+}
+
 static int ext_alpn(dynbuf_t *exts, int random_mode) {
     const char *p1 = random_mode ? "http/1.1" : "h2";
     const char *p2 = random_mode ? "h2" : "http/1.1";
@@ -1412,6 +1492,11 @@ static int ext_supported_versions(dynbuf_t *exts, uint16_t grease, int random_mo
     return add_ext(exts, 0x002b, data, off);
 }
 
+static int ext_supported_versions_qq(dynbuf_t *exts, uint16_t grease) {
+    uint8_t data[] = {0x0a, (uint8_t)(grease >> 8), (uint8_t)(grease & 0xFF), 0x03, 0x04, 0x03, 0x03, 0x03, 0x02, 0x03, 0x01};
+    return add_ext(exts, 0x002b, data, sizeof(data));
+}
+
 static int ext_psk_modes(dynbuf_t *exts) {
     uint8_t data[] = {0x01, 0x01};
     return add_ext(exts, 0x002d, data, sizeof(data));
@@ -1451,6 +1536,63 @@ static int ext_padding(dynbuf_t *exts, size_t pad_len) {
     int rc = add_ext(exts, 0x0015, z, pad_len);
     free(z);
     return rc;
+}
+
+static int ext_grease(dynbuf_t *exts, uint16_t grease) {
+    return add_ext(exts, grease, NULL, 0);
+}
+
+static int ext_grease_1byte_zero(dynbuf_t *exts, uint16_t grease) {
+    uint8_t zero = 0;
+    return add_ext(exts, grease, &zero, 1);
+}
+
+static int ext_extended_master_secret(dynbuf_t *exts) {
+    return add_ext(exts, 0x0017, NULL, 0);
+}
+
+static int ext_renegotiation_info(dynbuf_t *exts) {
+    uint8_t data[] = {0x00};
+    return add_ext(exts, 0xff01, data, sizeof(data));
+}
+
+static int ext_session_ticket(dynbuf_t *exts) {
+    return add_ext(exts, 0x0023, NULL, 0);
+}
+
+static int ext_status_request(dynbuf_t *exts) {
+    /* status_type=ocsp, empty responder_id_list and request_extensions */
+    uint8_t data[] = {0x01, 0x00, 0x00, 0x00, 0x00};
+    return add_ext(exts, 0x0005, data, sizeof(data));
+}
+
+static int ext_sct(dynbuf_t *exts) {
+    return add_ext(exts, 0x0012, NULL, 0);
+}
+
+static int ext_compress_cert_brotli(dynbuf_t *exts) {
+    /* algorithm list length=2, brotli=0x0002 */
+    uint8_t data[] = {0x02, 0x00, 0x02};
+    return add_ext(exts, 0x001b, data, sizeof(data));
+}
+
+static int ext_application_settings_h2(dynbuf_t *exts) {
+    /* ALPS (0x4469): protocol_name_list with single entry "h2". */
+    uint8_t data[] = {0x00, 0x03, 0x02, 'h', '2'};
+    return add_ext(exts, 0x4469, data, sizeof(data));
+}
+
+static size_t boring_padding_len(size_t unpadded_client_hello_len) {
+    if (unpadded_client_hello_len > 0xff && unpadded_client_hello_len < 0x200) {
+        size_t pad_len = 0x200 - unpadded_client_hello_len;
+        if (pad_len >= 5) {
+            pad_len -= 4;
+        } else {
+            pad_len = 1;
+        }
+        return pad_len;
+    }
+    return 0;
 }
 
 static int shuffle_indices(size_t *idx, size_t n) {
@@ -1505,14 +1647,33 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
     }
 
     uint16_t grease = random_grease_value();
-    uint8_t suites[8];
+    uint16_t qq_used_grease[5];
+    size_t qq_used_grease_len = 0;
+    qq_used_grease[qq_used_grease_len++] = grease;
+    uint16_t qq_grease_ext1 = random_unique_grease_value(qq_used_grease, qq_used_grease_len);
+    qq_used_grease[qq_used_grease_len++] = qq_grease_ext1;
+    uint16_t qq_grease_group = random_unique_grease_value(qq_used_grease, qq_used_grease_len);
+    qq_used_grease[qq_used_grease_len++] = qq_grease_group;
+    uint16_t qq_grease_vers = random_unique_grease_value(qq_used_grease, qq_used_grease_len);
+    qq_used_grease[qq_used_grease_len++] = qq_grease_vers;
+    uint16_t qq_grease_ext2 = random_unique_grease_value(qq_used_grease, qq_used_grease_len);
+    uint8_t suites[64];
     size_t soff = 0;
-    if (cfg->fp_mode == FP_CHROME) {
-        suites[soff++] = (uint8_t)(grease >> 8);
-        suites[soff++] = (uint8_t)(grease & 0xFF);
+    if (cfg->fp_mode == FP_QQ) {
+        uint16_t qq_suites[] = {grease, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030,
+                                0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
+        for (size_t i = 0; i < sizeof(qq_suites) / sizeof(qq_suites[0]); i++) {
+            suites[soff++] = (uint8_t)(qq_suites[i] >> 8);
+            suites[soff++] = (uint8_t)(qq_suites[i] & 0xFF);
+        }
+    } else {
+        if (cfg->fp_mode == FP_CHROME) {
+            suites[soff++] = (uint8_t)(grease >> 8);
+            suites[soff++] = (uint8_t)(grease & 0xFF);
+        }
+        suites[soff++] = 0x13;
+        suites[soff++] = 0x01;
     }
-    suites[soff++] = 0x13;
-    suites[soff++] = 0x01;
 
     uint8_t slen[2] = {(uint8_t)(soff >> 8), (uint8_t)(soff & 0xFF)};
     if (db_append(&hs, slen, 2) != 0 || db_append(&hs, suites, soff) != 0) {
@@ -1529,7 +1690,28 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
     dynbuf_t exts = {0};
 
     int random_mode = (cfg->fp_mode == FP_RANDOM) ? 1 : 0;
-    if (!random_mode) {
+    if (cfg->fp_mode == FP_QQ) {
+        size_t header_len = hs.len - 4;
+        if (ext_grease(&exts, qq_grease_ext1) != 0 || ext_server_name(&exts, cfg->sni) != 0 ||
+            ext_extended_master_secret(&exts) != 0 || ext_renegotiation_info(&exts) != 0 ||
+            ext_supported_groups(&exts, qq_grease_group, 0) != 0 || ext_ec_point_formats(&exts) != 0 ||
+            ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
+            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, qq_grease_group, client_pub, 0) != 0 ||
+            ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, qq_grease_vers) != 0 ||
+            ext_compress_cert_brotli(&exts) != 0 || ext_application_settings_h2(&exts) != 0 ||
+            ext_grease_1byte_zero(&exts, qq_grease_ext2) != 0) {
+            db_free(&exts);
+            db_free(&hs);
+            return -1;
+        }
+        size_t unpadded_len = header_len + 4 + exts.len + 2;
+        size_t pad_len = boring_padding_len(unpadded_len);
+        if (pad_len > 0 && ext_padding(&exts, pad_len) != 0) {
+            db_free(&exts);
+            db_free(&hs);
+            return -1;
+        }
+    } else if (!random_mode) {
         if (ext_server_name(&exts, cfg->sni) != 0 || ext_supported_groups(&exts, grease, 0) != 0 || ext_ec_point_formats(&exts) != 0 ||
             ext_sig_algs(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_supported_versions(&exts, grease, 0) != 0 ||
             ext_psk_modes(&exts) != 0 || ext_key_share(&exts, grease, client_pub, 0) != 0 || ext_padding(&exts, 16) != 0) {
@@ -1619,7 +1801,7 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
     hs.data[3] = (uint8_t)(body_len & 0xFF);
 
     uint8_t sid_plain[16] = {0};
-    uint8_t vx = 26, vy = 3, vz = 27;
+    uint8_t vx = 25, vy = 10, vz = 15;
     const char *ver_env = getenv("V2IOS6_VER");
     if (ver_env != NULL) {
         unsigned int tx = 0, ty = 0, tz = 0;
@@ -1655,8 +1837,8 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
     }
 
     uint8_t prk[32];
-    if (hkdf_extract_sha256(client_random, 20, shared, 32, prk) != 0 ||
-        hkdf_expand_sha256(prk, (const uint8_t *)"REALITY", 7, auth_key, 32) != 0) {
+    if (hkdf_extract_md(EVP_sha256(), client_random, 20, shared, 32, prk, sizeof(prk)) != 0 ||
+        hkdf_expand_md(EVP_sha256(), prk, sizeof(prk), (const uint8_t *)"REALITY", 7, auth_key, 32) != 0) {
         db_free(&hs);
         return -1;
     }
@@ -1718,7 +1900,24 @@ static int read_record(int fd, uint8_t *rtype, uint8_t **payload, size_t *payloa
     return 0;
 }
 
-static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, uint8_t server_pub[32]) {
+static int configure_tls_cipher(tls13_conn_t *c, uint16_t suite) {
+    c->tls_cipher_suite = suite;
+    if (suite == 0x1301) {
+        c->tls_md = EVP_sha256();
+        c->tls_hash_len = 32;
+        c->tls_key_len = 16;
+        return 0;
+    }
+    if (suite == 0x1302) {
+        c->tls_md = EVP_sha384();
+        c->tls_hash_len = 48;
+        c->tls_key_len = 32;
+        return 0;
+    }
+    return -1;
+}
+
+static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, uint16_t *cipher_out, uint8_t server_pub[32]) {
     if (msg_len < 4 || msg[0] != 0x02) {
         return -1;
     }
@@ -1750,8 +1949,11 @@ static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, u
     p += 2;
     n -= 2;
 
-    if (cipher != 0x1301) {
+    if (cipher != 0x1301 && cipher != 0x1302) {
         return -1;
+    }
+    if (cipher_out != NULL) {
+        *cipher_out = cipher;
     }
 
     p += 1;
@@ -1793,8 +1995,8 @@ static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, u
     return -1;
 }
 
-static int transcript_hash(const tls13_conn_t *c, uint8_t out[32]) {
-    return sha256_hash(c->transcript.data, c->transcript.len, out);
+static int transcript_hash(const tls13_conn_t *c, uint8_t *out) {
+    return digest_hash(c->tls_md, c->transcript.data, c->transcript.len, out, c->tls_hash_len);
 }
 
 static int parse_first_cert_der(const uint8_t *cert_msg, size_t cert_msg_len, const uint8_t **der, size_t *der_len) {
@@ -1882,46 +2084,46 @@ static int verify_reality_cert(const uint8_t auth_key[32], const uint8_t *cert_d
     return ok;
 }
 
-static int calc_finished_verify(const uint8_t traffic_secret[32], const uint8_t transcript_hash_val[32], uint8_t out[32]) {
-    uint8_t finished_key[32];
+static int calc_finished_verify(const tls13_conn_t *c, const uint8_t *traffic_secret, const uint8_t *transcript_hash_val, uint8_t *out) {
+    uint8_t finished_key[64];
     uint8_t zero_ctx[1] = {0};
-    if (hkdf_expand_label_sha256(traffic_secret, "finished", zero_ctx, 0, finished_key, 32) != 0) {
+    if (hkdf_expand_label_md(c->tls_md, traffic_secret, c->tls_hash_len, "finished", zero_ctx, 0, finished_key, c->tls_hash_len) != 0) {
         return -1;
     }
-    return hmac_sha256(finished_key, 32, transcript_hash_val, 32, out);
+    return hmac_digest(c->tls_md, finished_key, c->tls_hash_len, transcript_hash_val, c->tls_hash_len, out, c->tls_hash_len);
 }
 
 static int derive_handshake_keys(tls13_conn_t *c, const uint8_t shared[32]) {
-    uint8_t zero[32] = {0};
-    uint8_t empty_hash[32];
-    uint8_t early_secret[32];
-    uint8_t derived[32];
-    uint8_t thash[32];
+    uint8_t zero[64] = {0};
+    uint8_t empty_hash[64];
+    uint8_t early_secret[64];
+    uint8_t derived[64];
+    uint8_t thash[64];
 
-    if (sha256_hash(NULL, 0, empty_hash) != 0) {
+    if (digest_hash(c->tls_md, NULL, 0, empty_hash, c->tls_hash_len) != 0) {
         return -1;
     }
 
-    if (hkdf_extract_sha256(zero, sizeof(zero), zero, sizeof(zero), early_secret) != 0) {
+    if (hkdf_extract_md(c->tls_md, zero, c->tls_hash_len, zero, c->tls_hash_len, early_secret, c->tls_hash_len) != 0) {
         return -1;
     }
-    if (derive_secret(early_secret, "derived", empty_hash, derived) != 0) {
+    if (derive_secret_md(c->tls_md, early_secret, c->tls_hash_len, "derived", empty_hash, c->tls_hash_len, derived, c->tls_hash_len) != 0) {
         return -1;
     }
-    if (hkdf_extract_sha256(derived, sizeof(derived), shared, 32, c->hs_secret) != 0) {
+    if (hkdf_extract_md(c->tls_md, derived, c->tls_hash_len, shared, 32, c->hs_secret, c->tls_hash_len) != 0) {
         return -1;
     }
     if (transcript_hash(c, thash) != 0) {
         return -1;
     }
 
-    if (derive_secret(c->hs_secret, "c hs traffic", thash, c->c_hs_traffic) != 0 ||
-        derive_secret(c->hs_secret, "s hs traffic", thash, c->s_hs_traffic) != 0) {
+    if (derive_secret_md(c->tls_md, c->hs_secret, c->tls_hash_len, "c hs traffic", thash, c->tls_hash_len, c->c_hs_traffic, c->tls_hash_len) != 0 ||
+        derive_secret_md(c->tls_md, c->hs_secret, c->tls_hash_len, "s hs traffic", thash, c->tls_hash_len, c->s_hs_traffic, c->tls_hash_len) != 0) {
         return -1;
     }
 
-    if (derive_key_iv(c->c_hs_traffic, c->c_hs_key, c->c_hs_iv) != 0 ||
-        derive_key_iv(c->s_hs_traffic, c->s_hs_key, c->s_hs_iv) != 0) {
+    if (derive_key_iv_md(c->tls_md, c->c_hs_traffic, c->tls_hash_len, c->tls_key_len, c->c_hs_key, c->c_hs_iv) != 0 ||
+        derive_key_iv_md(c->tls_md, c->s_hs_traffic, c->tls_hash_len, c->tls_key_len, c->s_hs_key, c->s_hs_iv) != 0) {
         return -1;
     }
 
@@ -1931,20 +2133,20 @@ static int derive_handshake_keys(tls13_conn_t *c, const uint8_t shared[32]) {
 }
 
 static int derive_app_keys(tls13_conn_t *c) {
-    uint8_t zero[32] = {0};
-    uint8_t empty_hash[32];
-    uint8_t derived2[32];
-    uint8_t master_secret[32];
-    uint8_t thash[32];
+    uint8_t zero[64] = {0};
+    uint8_t empty_hash[64];
+    uint8_t derived2[64];
+    uint8_t master_secret[64];
+    uint8_t thash[64];
 
-    if (sha256_hash(NULL, 0, empty_hash) != 0) {
+    if (digest_hash(c->tls_md, NULL, 0, empty_hash, c->tls_hash_len) != 0) {
         return -1;
     }
 
-    if (derive_secret(c->hs_secret, "derived", empty_hash, derived2) != 0) {
+    if (derive_secret_md(c->tls_md, c->hs_secret, c->tls_hash_len, "derived", empty_hash, c->tls_hash_len, derived2, c->tls_hash_len) != 0) {
         return -1;
     }
-    if (hkdf_extract_sha256(derived2, sizeof(derived2), zero, sizeof(zero), master_secret) != 0) {
+    if (hkdf_extract_md(c->tls_md, derived2, c->tls_hash_len, zero, c->tls_hash_len, master_secret, c->tls_hash_len) != 0) {
         return -1;
     }
 
@@ -1952,22 +2154,33 @@ static int derive_app_keys(tls13_conn_t *c) {
         return -1;
     }
 
-    if (derive_secret(master_secret, "c ap traffic", thash, c->c_app_traffic) != 0 ||
-        derive_secret(master_secret, "s ap traffic", thash, c->s_app_traffic) != 0) {
+    if (derive_secret_md(c->tls_md, master_secret, c->tls_hash_len, "c ap traffic", thash, c->tls_hash_len, c->c_app_traffic, c->tls_hash_len) != 0 ||
+        derive_secret_md(c->tls_md, master_secret, c->tls_hash_len, "s ap traffic", thash, c->tls_hash_len, c->s_app_traffic, c->tls_hash_len) != 0) {
         return -1;
     }
 
-    if (derive_key_iv(c->c_app_traffic, c->c_app_key, c->c_app_iv) != 0 ||
-        derive_key_iv(c->s_app_traffic, c->s_app_key, c->s_app_iv) != 0) {
+    if (derive_key_iv_md(c->tls_md, c->c_app_traffic, c->tls_hash_len, c->tls_key_len, c->c_app_key, c->c_app_iv) != 0 ||
+        derive_key_iv_md(c->tls_md, c->s_app_traffic, c->tls_hash_len, c->tls_key_len, c->s_app_key, c->s_app_iv) != 0) {
         return -1;
     }
 
     c->c_app_seq = 0;
     c->s_app_seq = 0;
+    c->c_app_record_bytes = 0;
     return 0;
 }
 
-static int encrypt_record(const uint8_t key[16], const uint8_t iv[12], uint64_t *seq, uint8_t inner_type, const uint8_t *plain,
+static const EVP_CIPHER *record_cipher_for_conn(const tls13_conn_t *c) {
+    if (c->tls_cipher_suite == 0x1301 && c->tls_key_len == 16) {
+        return EVP_aes_128_gcm();
+    }
+    if (c->tls_cipher_suite == 0x1302 && c->tls_key_len == 32) {
+        return EVP_aes_256_gcm();
+    }
+    return NULL;
+}
+
+static int encrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t inner_type, const uint8_t *plain,
                           size_t plain_len, uint8_t **out, size_t *out_len) {
     size_t inner_len = plain_len + 1;
     uint8_t *inner = (uint8_t *)malloc(inner_len);
@@ -1999,9 +2212,16 @@ static int encrypt_record(const uint8_t key[16], const uint8_t iv[12], uint64_t 
         free(record);
         return -1;
     }
+    const EVP_CIPHER *cipher = record_cipher_for_conn(c);
+    if (cipher == NULL) {
+        EVP_CIPHER_CTX_free(ctx);
+        free(inner);
+        free(record);
+        return -1;
+    }
 
     int len1 = 0;
-    int ok = EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) == 1 &&
+    int ok = EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL) == 1 &&
              EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
              EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
              EVP_EncryptUpdate(ctx, NULL, &len1, record, 5) == 1 &&
@@ -2029,7 +2249,7 @@ static int encrypt_record(const uint8_t key[16], const uint8_t iv[12], uint64_t 
     return 0;
 }
 
-static int decrypt_record(const uint8_t key[16], const uint8_t iv[12], uint64_t *seq, uint8_t rtype, const uint8_t *payload,
+static int decrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t rtype, const uint8_t *payload,
                           size_t payload_len, uint8_t **plain, size_t *plain_len, uint8_t *inner_type) {
     if (rtype != 0x17 || payload_len < 16) {
         return -1;
@@ -2054,9 +2274,15 @@ static int decrypt_record(const uint8_t key[16], const uint8_t iv[12], uint64_t 
         free(buf);
         return -1;
     }
+    const EVP_CIPHER *cipher = record_cipher_for_conn(c);
+    if (cipher == NULL) {
+        EVP_CIPHER_CTX_free(ctx);
+        free(buf);
+        return -1;
+    }
 
     int len1 = 0;
-    int ok = EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) == 1 &&
+    int ok = EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL) == 1 &&
              EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
              EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
              EVP_DecryptUpdate(ctx, NULL, &len1, hdr, 5) == 1 && EVP_DecryptUpdate(ctx, buf, &len1, ct, (int)ct_len) == 1 &&
@@ -2105,6 +2331,10 @@ int tls13_get_fd(const tls13_conn_t *c) {
     return c->fd;
 }
 
+int tls13_reality_is_raw_direct(const tls13_conn_t *c) {
+    return (c != NULL && c->reality_raw_direct);
+}
+
 static int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len) {
     return db_append(&c->transcript, msg, msg_len);
 }
@@ -2138,6 +2368,7 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
 
     dynbuf_t plain_hs = {0};
     uint8_t server_pub[32];
+    uint16_t server_cipher = 0;
     int got_server_hello = 0;
 
     for (int attempts = 0; attempts < 16 && !got_server_hello; attempts++) {
@@ -2164,9 +2395,14 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
                     break;
                 }
                 if (plain_hs.data[0] == 0x02) {
-                    if (parse_server_hello_for_keyshare(plain_hs.data, 4 + mlen, server_pub) != 0) {
+                    if (parse_server_hello_for_keyshare(plain_hs.data, 4 + mlen, &server_cipher, server_pub) != 0) {
                         db_free(&plain_hs);
                         set_err(err, err_cap, "invalid ServerHello");
+                        return -1;
+                    }
+                    if (configure_tls_cipher(c, server_cipher) != 0) {
+                        db_free(&plain_hs);
+                        set_err(err, err_cap, "unsupported TLS cipher suite");
                         return -1;
                     }
                     if (append_transcript(c, plain_hs.data, 4 + mlen) != 0) {
@@ -2224,7 +2460,7 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
         uint8_t *dec = NULL;
         size_t dec_len = 0;
         uint8_t inner_type = 0;
-        if (decrypt_record(c->s_hs_key, c->s_hs_iv, &c->s_hs_seq, rtype, pl, pl_len, &dec, &dec_len, &inner_type) != 0) {
+        if (decrypt_record(c, c->s_hs_key, c->s_hs_iv, &c->s_hs_seq, rtype, pl, pl_len, &dec, &dec_len, &inner_type) != 0) {
             free(pl);
             db_free(&enc_hs);
             set_err(err, err_cap, "failed to decrypt handshake record");
@@ -2248,14 +2484,14 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
                 }
 
                 if (htype == 0x14) {
-                    uint8_t thash[32];
-                    uint8_t expect[32];
-                    if (transcript_hash(c, thash) != 0 || calc_finished_verify(c->s_hs_traffic, thash, expect) != 0) {
+                    uint8_t thash[64];
+                    uint8_t expect[64];
+                    if (transcript_hash(c, thash) != 0 || calc_finished_verify(c, c->s_hs_traffic, thash, expect) != 0) {
                         db_free(&enc_hs);
                         set_err(err, err_cap, "failed to verify server finished");
                         return -1;
                     }
-                    if (hlen != 32 || memcmp(expect, enc_hs.data + 4, 32) != 0) {
+                    if (hlen != c->tls_hash_len || memcmp(expect, enc_hs.data + 4, c->tls_hash_len) != 0) {
                         db_free(&enc_hs);
                         set_err(err, err_cap, "server Finished mismatch");
                         return -1;
@@ -2297,9 +2533,9 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
         return -1;
     }
 
-    uint8_t thash[32];
-    uint8_t client_verify[32];
-    if (transcript_hash(c, thash) != 0 || calc_finished_verify(c->c_hs_traffic, thash, client_verify) != 0) {
+    uint8_t thash[64];
+    uint8_t client_verify[64];
+    if (transcript_hash(c, thash) != 0 || calc_finished_verify(c, c->c_hs_traffic, thash, client_verify) != 0) {
         set_err(err, err_cap, "failed to create client Finished");
         return -1;
     }
@@ -2310,17 +2546,30 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
         return -1;
     }
 
-    uint8_t fin_msg[36];
+    uint8_t fin_msg[68];
+    size_t fin_msg_len = 4 + c->tls_hash_len;
     fin_msg[0] = 0x14;
     fin_msg[1] = 0x00;
     fin_msg[2] = 0x00;
-    fin_msg[3] = 0x20;
-    memcpy(fin_msg + 4, client_verify, 32);
+    fin_msg[3] = (uint8_t)c->tls_hash_len;
+    memcpy(fin_msg + 4, client_verify, c->tls_hash_len);
 
     uint8_t *enc_fin = NULL;
     size_t enc_fin_len = 0;
-    if (encrypt_record(c->c_hs_key, c->c_hs_iv, &c->c_hs_seq, 0x16, fin_msg, sizeof(fin_msg), &enc_fin, &enc_fin_len) != 0) {
+    if (encrypt_record(c, c->c_hs_key, c->c_hs_iv, &c->c_hs_seq, 0x16, fin_msg, fin_msg_len, &enc_fin, &enc_fin_len) != 0) {
         set_err(err, err_cap, "failed to encrypt client Finished");
+        return -1;
+    }
+
+    /*
+     * uTLS/Go middlebox-compat TLS 1.3 sends ChangeCipherSpec after the server
+     * handshake flight and immediately before the encrypted Client Finished.
+     * It is not included in the handshake transcript.
+     */
+    uint8_t ccs_rec[6] = {0x14, 0x03, 0x03, 0x00, 0x01, 0x01};
+    if (write_exact(c->fd, ccs_rec, sizeof(ccs_rec)) != 0) {
+        free(enc_fin);
+        set_err(err, err_cap, "failed to send compatibility CCS");
         return -1;
     }
 
@@ -2331,7 +2580,7 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
     }
     free(enc_fin);
 
-    if (append_transcript(c, fin_msg, sizeof(fin_msg)) != 0) {
+    if (append_transcript(c, fin_msg, fin_msg_len) != 0) {
         return -1;
     }
 
@@ -2483,19 +2732,29 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
         size_t chunk = len - off;
+        /*
+         * Go/uTLS uses dynamic TLS record sizing and keeps early app records
+         * near one TCP MSS. REALITY/Vision peers can be sensitive to this
+         * fingerprint, especially for the first VLESS+Vision flush.
+         */
+        size_t dynamic_limit = (c->c_app_record_bytes < 128 * 1024) ? 1186 : 16384;
+        if (chunk > dynamic_limit) {
+            chunk = dynamic_limit;
+        }
         if (chunk > 16384) {
             chunk = 16384;
         }
 
         uint8_t *rec = NULL;
         size_t rec_len = 0;
-        if (encrypt_record(c->c_app_key, c->c_app_iv, &c->c_app_seq, 0x17, buf + off, chunk, &rec, &rec_len) != 0) {
+        if (encrypt_record(c, c->c_app_key, c->c_app_iv, &c->c_app_seq, 0x17, buf + off, chunk, &rec, &rec_len) != 0) {
             return -1;
         }
         if (write_exact(c->fd, rec, rec_len) != 0) {
             free(rec);
             return -1;
         }
+        c->c_app_record_bytes += rec_len;
         free(rec);
         off += chunk;
     }
@@ -2521,7 +2780,21 @@ static int fill_reality_app_cache(tls13_conn_t *c) {
         uint8_t *dec = NULL;
         size_t dec_len = 0;
         uint8_t inner = 0;
-        if (decrypt_record(c->s_app_key, c->s_app_iv, &c->s_app_seq, rtype, pl, pl_len, &dec, &dec_len, &inner) != 0) {
+        if (decrypt_record(c, c->s_app_key, c->s_app_iv, &c->s_app_seq, rtype, pl, pl_len, &dec, &dec_len, &inner) != 0) {
+            if (rtype == 0x17 && pl_len > 0 && pl_len <= 18432) {
+                uint8_t hdr[5] = {0x17, 0x03, 0x03, (uint8_t)(pl_len >> 8), (uint8_t)(pl_len & 0xFF)};
+                int rc = db_append(&c->app_cache, hdr, sizeof(hdr));
+                if (rc == 0) {
+                    rc = db_append(&c->app_cache, pl, pl_len);
+                }
+                free(pl);
+                if (rc != 0) {
+                    return -1;
+                }
+                c->reality_raw_direct = 1;
+                fprintf(stderr, "[tls] decrypt_record failed in app phase, switching to raw direct fallback\n");
+                return 0;
+            }
             fprintf(stderr, "[tls] decrypt_record failed in app phase\n");
             free(pl);
             return -1;

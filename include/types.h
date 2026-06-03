@@ -6,7 +6,8 @@
 
 typedef enum {
     FP_CHROME = 0,
-    FP_RANDOM = 1
+    FP_RANDOM = 1,
+    FP_QQ = 2
 } fingerprint_mode_t;
 
 typedef enum {

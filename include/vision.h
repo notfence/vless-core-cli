@@ -6,7 +6,10 @@
 
 typedef struct {
     uint8_t uuid[16];
-    int first_payload;
+    int uuid_sent;
+    int padding_active;
+    int packets_left;
+    int bootstrap_sent;
 } vision_wrap_t;
 
 typedef struct {

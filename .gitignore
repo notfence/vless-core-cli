@@ -12,3 +12,5 @@ third_party/*
 *.swo
 *.o
 scripts/release_notes.sh
+scripts/release.sh
+scripts/build.sh

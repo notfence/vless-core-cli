@@ -17,7 +17,112 @@
 #include "vision.h"
 #include "vless.h"
 
-#define VLESS_CORE_VERSION "1.0.1"
+#define VLESS_CORE_VERSION "1.0.2"
+
+static ssize_t read_with_timeout(int fd, uint8_t *buf, size_t cap, int timeout_ms) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+    int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+    if (rc < 0) {
+        return -1;
+    }
+    if (rc == 0 || !FD_ISSET(fd, &rfds)) {
+        return 0;
+    }
+    return recv(fd, buf, cap, 0);
+}
+
+static int tls_records_needed(const uint8_t *buf, size_t len, size_t *needed) {
+    size_t pos = 0;
+
+    if (needed != NULL) {
+        *needed = len;
+    }
+    if (buf == NULL || len == 0) {
+        return 0;
+    }
+
+    if (len < 5) {
+        if (buf[0] == 0x14 || buf[0] == 0x16 || buf[0] == 0x17) {
+            if (needed != NULL) {
+                *needed = 5;
+            }
+            return 1;
+        }
+        return 0;
+    }
+
+    while (pos < len) {
+        if (len - pos < 5) {
+            if (needed != NULL) {
+                *needed = pos + 5;
+            }
+            return 1;
+        }
+
+        uint8_t rtype = buf[pos];
+        uint8_t vmajor = buf[pos + 1];
+        uint16_t rlen = ((uint16_t)buf[pos + 3] << 8) | (uint16_t)buf[pos + 4];
+        if ((rtype != 0x14 && rtype != 0x16 && rtype != 0x17) || vmajor != 0x03 || rlen > 18432) {
+            return 0;
+        }
+
+        size_t end = pos + 5 + (size_t)rlen;
+        if (end > len) {
+            if (needed != NULL) {
+                *needed = end;
+            }
+            return 1;
+        }
+        pos = end;
+    }
+
+    if (needed != NULL) {
+        *needed = len;
+    }
+    return 1;
+}
+
+static ssize_t read_initial_payload(int fd, uint8_t *buf, size_t cap) {
+    ssize_t n = read_with_timeout(fd, buf, cap, 500);
+    if (n <= 0) {
+        return n;
+    }
+
+    size_t len = (size_t)n;
+    int tls_waits_left = 6;
+
+    while (len < cap) {
+        size_t needed = len;
+        int tls_like = tls_records_needed(buf, len, &needed);
+        int timeout_ms = 25;
+
+        if (tls_like && needed > len) {
+            if (needed > cap || tls_waits_left <= 0) {
+                break;
+            }
+            timeout_ms = 200;
+            tls_waits_left--;
+        }
+
+        ssize_t more = read_with_timeout(fd, buf + len, cap - len, timeout_ms);
+        if (more < 0) {
+            return -1;
+        }
+        if (more == 0) {
+            break;
+        }
+        len += (size_t)more;
+    }
+
+    return (ssize_t)len;
+}
 
 static int write_all(int fd, const uint8_t *buf, size_t len) {
     size_t off = 0;
@@ -62,34 +167,97 @@ static void *client_worker(void *arg) {
         vision_unpad_init(&vunpad, cfg.uuid);
     }
 
-    if (vless_send_request(tls, &cfg, target_host, target_port) != 0) {
-        fprintf(stderr, "[conn] VLESS request send failed for %s:%u\n", target_host, (unsigned)target_port);
-        socks5_send_failure(cfd, 0x01);
-        if (use_vision) {
-            vision_unpad_free(&vunpad);
-        }
-        tls13_reality_close(tls);
-        close(cfd);
-        return NULL;
-    }
+    int socks_success_sent = 0;
+    uint8_t first_payload[8192];
+    ssize_t first_payload_len = 0;
 
     if (use_vision) {
-        uint8_t *bootstrap = NULL;
-        size_t bootstrap_len = 0;
-        if (vision_wrap_bootstrap(&vwrap, &bootstrap, &bootstrap_len) != 0 ||
-            (bootstrap_len > 0 && tls13_write_app(tls, bootstrap, bootstrap_len) != 0)) {
-            free(bootstrap);
-            fprintf(stderr, "[conn] Vision bootstrap send failed for %s:%u\n", target_host, (unsigned)target_port);
-            socks5_send_failure(cfd, 0x01);
+        uint8_t vless_req[2048];
+        size_t vless_req_len = 0;
+        uint8_t *vision_first = NULL;
+        size_t vision_first_len = 0;
+        uint8_t *first_packet = NULL;
+        size_t first_packet_len = 0;
+
+        if (socks5_send_success(cfd) != 0) {
             vision_unpad_free(&vunpad);
             tls13_reality_close(tls);
             close(cfd);
             return NULL;
         }
-        free(bootstrap);
+        socks_success_sent = 1;
+
+        first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
+        if (first_payload_len < 0) {
+            fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
+            vision_unpad_free(&vunpad);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+
+        if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
+            fprintf(stderr, "[conn] VLESS/Vision request build failed for %s:%u\n", target_host, (unsigned)target_port);
+            vision_unpad_free(&vunpad);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+
+        if (first_payload_len > 0) {
+            if (vision_wrap_payload(&vwrap, first_payload, (size_t)first_payload_len, &vision_first, &vision_first_len) != 0) {
+                fprintf(stderr, "[conn] first Vision payload wrap failed for %s:%u\n", target_host, (unsigned)target_port);
+                vision_unpad_free(&vunpad);
+                tls13_reality_close(tls);
+                close(cfd);
+                return NULL;
+            }
+        } else if (vision_wrap_bootstrap(&vwrap, &vision_first, &vision_first_len) != 0) {
+            fprintf(stderr, "[conn] Vision bootstrap build failed for %s:%u\n", target_host, (unsigned)target_port);
+            vision_unpad_free(&vunpad);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+
+        first_packet_len = vless_req_len + vision_first_len;
+        first_packet = (uint8_t *)malloc(first_packet_len);
+        if (first_packet == NULL) {
+            free(vision_first);
+            fprintf(stderr, "[conn] VLESS/Vision request alloc failed for %s:%u\n", target_host, (unsigned)target_port);
+            vision_unpad_free(&vunpad);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+
+        memcpy(first_packet, vless_req, vless_req_len);
+        if (vision_first_len > 0) {
+            memcpy(first_packet + vless_req_len, vision_first, vision_first_len);
+        }
+        free(vision_first);
+
+        if (tls13_write_app(tls, first_packet, first_packet_len) != 0) {
+            free(first_packet);
+            fprintf(stderr, "[conn] VLESS/Vision request send failed for %s:%u\n", target_host, (unsigned)target_port);
+            vision_unpad_free(&vunpad);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+        free(first_packet);
+
+    } else {
+        if (vless_send_request(tls, &cfg, target_host, target_port) != 0) {
+            fprintf(stderr, "[conn] VLESS request send failed for %s:%u\n", target_host, (unsigned)target_port);
+            socks5_send_failure(cfd, 0x01);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
     }
 
-    if (socks5_send_success(cfd) != 0) {
+    if (!socks_success_sent && socks5_send_success(cfd) != 0) {
         if (use_vision) {
             vision_unpad_free(&vunpad);
         }
@@ -102,7 +270,9 @@ static void *client_worker(void *arg) {
     uint8_t cbuf[8192];
     uint8_t tbuf[8192];
     int got_vless_response = 0;
-    int tunnel_direct = 0;
+    int upstream_direct = 0;
+    int downstream_direct = 0;
+    int forwarded_client_payload = (first_payload_len > 0) ? 1 : 0;
 
     while (1) {
         fd_set rfds;
@@ -121,11 +291,11 @@ static void *client_worker(void *arg) {
             if (n <= 0) {
                 break;
             }
-
-            if (tunnel_direct) {
+            if (upstream_direct) {
                 if (write_all(tfd, cbuf, (size_t)n) != 0) {
                     break;
                 }
+                forwarded_client_payload = 1;
                 continue;
             }
 
@@ -141,15 +311,19 @@ static void *client_worker(void *arg) {
                     break;
                 }
                 free(wrapped);
+                if (wrapped_len > 0) {
+                    forwarded_client_payload = 1;
+                }
             } else {
                 if (tls13_write_app(tls, cbuf, (size_t)n) != 0) {
                     break;
                 }
+                forwarded_client_payload = 1;
             }
         }
 
         if (FD_ISSET(tfd, &rfds)) {
-            if (tunnel_direct) {
+            if (downstream_direct) {
                 ssize_t n = recv(tfd, tbuf, sizeof(tbuf), 0);
                 if (n <= 0) {
                     break;
@@ -161,6 +335,9 @@ static void *client_worker(void *arg) {
             }
 
             if (!got_vless_response) {
+                if (!forwarded_client_payload) {
+                    continue;
+                }
                 if (vless_read_response(tls) != 0) {
                     fprintf(stderr, "[conn] VLESS response read failed for %s:%u\n", target_host, (unsigned)target_port);
                     break;
@@ -174,6 +351,18 @@ static void *client_worker(void *arg) {
             }
 
             if (use_vision) {
+                if (tls13_reality_is_raw_direct(tls)) {
+                    if (write_all(cfd, tbuf, got) != 0) {
+                        break;
+                    }
+                    if (!downstream_direct) {
+                        downstream_direct = 1;
+                        fprintf(stderr, "[conn] switched to Vision downstream direct mode by raw fallback for %s:%u\n", target_host,
+                                (unsigned)target_port);
+                    }
+                    continue;
+                }
+
                 uint8_t *plain = NULL;
                 size_t plain_len = 0;
                 int switch_to_direct = 0;
@@ -188,8 +377,8 @@ static void *client_worker(void *arg) {
                 free(plain);
 
                 if (switch_to_direct) {
-                    tunnel_direct = 1;
-                    fprintf(stderr, "[conn] switched to Vision direct mode for %s:%u\n", target_host, (unsigned)target_port);
+                    downstream_direct = 1;
+                    fprintf(stderr, "[conn] switched to Vision downstream direct mode for %s:%u\n", target_host, (unsigned)target_port);
                 }
             } else {
                 if (write_all(cfd, tbuf, got) != 0) {
@@ -234,6 +423,7 @@ static const char *xhttp_tls_mode_startup_label(void) {
 }
 
 int main(int argc, char **argv) {
+    setvbuf(stderr, NULL, _IONBF, 0);
     srand((unsigned int)time(NULL));
 
     const char *prog = strrchr(argv[0], '/');
@@ -295,9 +485,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const char *fp_label = "chrome";
+    if (cfg.fp_mode == FP_RANDOM) {
+        fp_label = "random";
+    } else if (cfg.fp_mode == FP_QQ) {
+        fp_label = "qq";
+    }
     fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
             cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security,
-            cfg.transport_mode == TRANSPORT_XHTTP ? "xhttp" : "vision", cfg.fp_mode == FP_RANDOM ? "random" : "chrome");
+            cfg.transport_mode == TRANSPORT_XHTTP ? "xhttp" : "vision", fp_label);
     if (cfg.transport_mode == TRANSPORT_XHTTP) {
         fprintf(stderr, "[xhttp] tls_mode=%s\n", xhttp_tls_mode_startup_label());
     }

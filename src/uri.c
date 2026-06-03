@@ -98,6 +98,8 @@ static void parse_query(vless_config_t *cfg, char *query) {
         } else if (strcmp(key, "fp") == 0) {
             if (strcmp(decoded, "random") == 0) {
                 cfg->fp_mode = FP_RANDOM;
+            } else if (strcmp(decoded, "qq") == 0) {
+                cfg->fp_mode = FP_QQ;
             } else {
                 cfg->fp_mode = FP_CHROME;
             }
