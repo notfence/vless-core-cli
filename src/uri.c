@@ -108,7 +108,7 @@ static void parse_query(vless_config_t *cfg, char *query) {
         } else if (strcmp(key, "security") == 0) {
             copy_trunc(cfg->security, sizeof(cfg->security), decoded);
         } else if (strcmp(key, "type") == 0) {
-            if (strcmp(decoded, "xhttp") == 0) {
+            if (strcmp(decoded, "xhttp") == 0 || strcmp(decoded, "splithttp") == 0) {
                 cfg->transport_mode = TRANSPORT_XHTTP;
             } else if (decoded[0] == '\0' || strcmp(decoded, "tcp") == 0) {
                 cfg->transport_mode = TRANSPORT_VISION;
@@ -139,7 +139,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     snprintf(cfg->spider_x, sizeof(cfg->spider_x), "/");
     snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
     cfg->xhttp_host[0] = '\0';
-    snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "packet-up");
+    snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "auto");
     snprintf(cfg->original_uri, sizeof(cfg->original_uri), "%s", uri);
 
     if (strncmp(uri, "vless://", 8) != 0) {
@@ -185,17 +185,37 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     }
 
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
-        if (strcmp(cfg->security, "tls") != 0) {
-            set_err(err, err_cap, "xhttp requires security=tls");
+        int xhttp_tls = (strcmp(cfg->security, "tls") == 0);
+        int xhttp_reality = (strcmp(cfg->security, "reality") == 0);
+        if (!xhttp_tls && !xhttp_reality) {
+            set_err(err, err_cap, "xhttp requires security=tls or security=reality");
             return -1;
         }
-        if (strcmp(cfg->xhttp_mode, "packet-up") != 0) {
-            set_err(err, err_cap, "only xhttp mode=packet-up is supported");
+        if (strcmp(cfg->xhttp_mode, "auto") == 0 || cfg->xhttp_mode[0] == '\0') {
+            snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "%s", xhttp_reality ? "stream-one" : "packet-up");
+        }
+        if (xhttp_tls && strcmp(cfg->xhttp_mode, "packet-up") != 0) {
+            set_err(err, err_cap, "only xhttp/tls mode=packet-up is supported");
+            return -1;
+        }
+        if (xhttp_reality && strcmp(cfg->xhttp_mode, "stream-one") != 0) {
+            set_err(err, err_cap, "only xhttp/reality mode=auto or mode=stream-one is supported");
             return -1;
         }
         cfg->flow[0] = '\0';
-        cfg->pbk_len = 0;
-        cfg->short_id_len = 0;
+        if (xhttp_tls) {
+            cfg->pbk_len = 0;
+            cfg->short_id_len = 0;
+        } else {
+            if (cfg->pbk_len != 32) {
+                set_err(err, err_cap, "pbk is required and must decode to 32 bytes");
+                return -1;
+            }
+            if (cfg->short_id_len > 16) {
+                set_err(err, err_cap, "sid must be <= 16 bytes");
+                return -1;
+            }
+        }
         if (cfg->xhttp_path[0] == '\0') {
             snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
         }

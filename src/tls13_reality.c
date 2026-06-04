@@ -30,7 +30,8 @@ typedef struct {
 
 typedef enum {
     CONN_MODE_REALITY = 0,
-    CONN_MODE_XHTTP = 1
+    CONN_MODE_XHTTP_TLS = 1,
+    CONN_MODE_XHTTP_REALITY = 2
 } conn_mode_t;
 
 typedef enum {
@@ -91,10 +92,21 @@ struct tls13_conn {
     char xhttp_pin_key[320];
 
     dynbuf_t xhttp_net_cache;
+    dynbuf_t h2_net_cache;
     dynbuf_t transcript;
     dynbuf_t app_cache;
     int reality_raw_direct;
+
+    uint32_t h2_stream_id;
+    uint32_t h2_peer_initial_window;
+    uint32_t h2_peer_max_frame_size;
+    int64_t h2_peer_conn_window;
+    int64_t h2_peer_stream_window;
+    int h2_stream_eof;
 };
+
+static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len);
+static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache);
 
 static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
@@ -948,6 +960,589 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
     }
 }
 
+enum {
+    H2_FRAME_DATA = 0x0,
+    H2_FRAME_HEADERS = 0x1,
+    H2_FRAME_RST_STREAM = 0x3,
+    H2_FRAME_SETTINGS = 0x4,
+    H2_FRAME_PING = 0x6,
+    H2_FRAME_GOAWAY = 0x7,
+    H2_FRAME_WINDOW_UPDATE = 0x8,
+};
+
+enum {
+    H2_FLAG_END_STREAM = 0x1,
+    H2_FLAG_END_HEADERS = 0x4,
+    H2_FLAG_PADDED = 0x8,
+    H2_FLAG_PRIORITY = 0x20,
+    H2_FLAG_ACK = 0x1,
+};
+
+#define H2_DEFAULT_WINDOW 65535
+#define H2_CONNECTION_WINDOW_INC (16U * 1024U * 1024U)
+#define H2_DEFAULT_MAX_FRAME 16384U
+
+static int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_id, const uint8_t *payload, size_t len) {
+    if (len > 0xFFFFFFU) {
+        return -1;
+    }
+    uint8_t hdr[9];
+    hdr[0] = (uint8_t)(len >> 16);
+    hdr[1] = (uint8_t)(len >> 8);
+    hdr[2] = (uint8_t)len;
+    hdr[3] = type;
+    hdr[4] = flags;
+    stream_id &= 0x7FFFFFFFU;
+    hdr[5] = (uint8_t)(stream_id >> 24);
+    hdr[6] = (uint8_t)(stream_id >> 16);
+    hdr[7] = (uint8_t)(stream_id >> 8);
+    hdr[8] = (uint8_t)stream_id;
+
+    if (reality_write_app_records(c, hdr, sizeof(hdr)) != 0) {
+        return -1;
+    }
+    if (len > 0 && reality_write_app_records(c, payload, len) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int h2_send_window_update(tls13_conn_t *c, uint32_t stream_id, uint32_t increment) {
+    if (increment == 0 || increment > 0x7FFFFFFFU) {
+        return -1;
+    }
+    uint8_t payload[4] = {
+        (uint8_t)(increment >> 24),
+        (uint8_t)(increment >> 16),
+        (uint8_t)(increment >> 8),
+        (uint8_t)increment,
+    };
+    return h2_send_frame(c, H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload, sizeof(payload));
+}
+
+static int h2_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        if (c->h2_net_cache.len == 0 && fill_reality_plain_cache(c, &c->h2_net_cache) != 0) {
+            return -1;
+        }
+        size_t take = c->h2_net_cache.len;
+        if (take > len - off) {
+            take = len - off;
+        }
+        memcpy(buf + off, c->h2_net_cache.data, take);
+        db_consume(&c->h2_net_cache, take);
+        off += take;
+    }
+    return 0;
+}
+
+static int h2_read_frame(tls13_conn_t *c, uint8_t *type, uint8_t *flags, uint32_t *stream_id, uint8_t **payload, size_t *payload_len) {
+    uint8_t hdr[9];
+    if (h2_read_exact(c, hdr, sizeof(hdr)) != 0) {
+        return -1;
+    }
+    size_t len = ((size_t)hdr[0] << 16) | ((size_t)hdr[1] << 8) | (size_t)hdr[2];
+    if (len > 1024U * 1024U) {
+        return -1;
+    }
+
+    uint8_t *body = NULL;
+    if (len > 0) {
+        body = (uint8_t *)malloc(len);
+        if (body == NULL) {
+            return -1;
+        }
+        if (h2_read_exact(c, body, len) != 0) {
+            free(body);
+            return -1;
+        }
+    }
+
+    *type = hdr[3];
+    *flags = hdr[4];
+    *stream_id = (((uint32_t)hdr[5] << 24) | ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 8) | (uint32_t)hdr[8]) & 0x7FFFFFFFU;
+    *payload = body;
+    *payload_len = len;
+    return 0;
+}
+
+static int hpack_append_int(dynbuf_t *b, uint32_t value, uint8_t prefix_bits, uint8_t first) {
+    uint8_t max_first = (uint8_t)((1U << prefix_bits) - 1U);
+    if (value < max_first) {
+        uint8_t ch = first | (uint8_t)value;
+        return db_append(b, &ch, 1);
+    }
+
+    uint8_t ch = first | max_first;
+    if (db_append(b, &ch, 1) != 0) {
+        return -1;
+    }
+    value -= max_first;
+    while (value >= 128) {
+        ch = (uint8_t)((value & 0x7F) | 0x80);
+        if (db_append(b, &ch, 1) != 0) {
+            return -1;
+        }
+        value >>= 7;
+    }
+    ch = (uint8_t)value;
+    return db_append(b, &ch, 1);
+}
+
+static int hpack_append_string(dynbuf_t *b, const char *s) {
+    size_t len = strlen(s);
+    if (len > 0x7FFFFFFFU) {
+        return -1;
+    }
+    if (hpack_append_int(b, (uint32_t)len, 7, 0x00) != 0) {
+        return -1;
+    }
+    return db_append(b, s, len);
+}
+
+static int hpack_append_indexed(dynbuf_t *b, uint32_t index) {
+    return hpack_append_int(b, index, 7, 0x80);
+}
+
+static int hpack_append_literal_new_name(dynbuf_t *b, const char *name, const char *value) {
+    uint8_t literal = 0x00;
+    if (db_append(b, &literal, 1) != 0) {
+        return -1;
+    }
+    if (hpack_append_string(b, name) != 0 || hpack_append_string(b, value) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int h2_decode_int(const uint8_t *buf, size_t len, size_t *off, uint8_t prefix_bits, uint32_t *value) {
+    if (*off >= len) {
+        return -1;
+    }
+    uint8_t first = buf[*off];
+    (*off)++;
+    uint32_t mask = (1U << prefix_bits) - 1U;
+    uint32_t v = first & mask;
+    if (v != mask) {
+        *value = v;
+        return 0;
+    }
+
+    uint32_t m = 0;
+    for (;;) {
+        if (*off >= len || m > 28) {
+            return -1;
+        }
+        uint8_t b = buf[*off];
+        (*off)++;
+        v += (uint32_t)(b & 0x7F) << m;
+        if ((b & 0x80) == 0) {
+            *value = v;
+            return 0;
+        }
+        m += 7;
+    }
+}
+
+static int h2_skip_string(const uint8_t *buf, size_t len, size_t *off) {
+    if (*off >= len) {
+        return -1;
+    }
+    uint32_t slen = 0;
+    if (h2_decode_int(buf, len, off, 7, &slen) != 0) {
+        return -1;
+    }
+    if ((size_t)slen > len - *off) {
+        return -1;
+    }
+    *off += (size_t)slen;
+    return 0;
+}
+
+static int h2_read_string_plain(const uint8_t *buf, size_t len, size_t *off, char *out, size_t out_cap) {
+    if (*off >= len || out_cap == 0) {
+        return -1;
+    }
+    int huffman = (buf[*off] & 0x80) != 0;
+    uint32_t slen = 0;
+    if (h2_decode_int(buf, len, off, 7, &slen) != 0 || (size_t)slen > len - *off) {
+        return -1;
+    }
+    if (huffman) {
+        return -1;
+    }
+    size_t copy = (size_t)slen;
+    if (copy >= out_cap) {
+        copy = out_cap - 1;
+    }
+    memcpy(out, buf + *off, copy);
+    out[copy] = '\0';
+    *off += (size_t)slen;
+    return 0;
+}
+
+static int hpack_static_status(uint32_t index) {
+    switch (index) {
+    case 8:
+        return 200;
+    case 9:
+        return 204;
+    case 10:
+        return 206;
+    case 11:
+        return 304;
+    case 12:
+        return 400;
+    case 13:
+        return 404;
+    case 14:
+        return 500;
+    default:
+        return 0;
+    }
+}
+
+static int h2_decode_status_header(const uint8_t *block, size_t len) {
+    size_t off = 0;
+    int status = 0;
+    while (off < len) {
+        uint8_t first = block[off];
+        if ((first & 0x80) != 0) {
+            uint32_t index = 0;
+            if (h2_decode_int(block, len, &off, 7, &index) != 0) {
+                return status;
+            }
+            int s = hpack_static_status(index);
+            if (s != 0) {
+                return s;
+            }
+        } else if ((first & 0x40) != 0) {
+            uint32_t name_index = 0;
+            if (h2_decode_int(block, len, &off, 6, &name_index) != 0) {
+                return status;
+            }
+            if (name_index == 0) {
+                if (h2_skip_string(block, len, &off) != 0) {
+                    return status;
+                }
+            }
+            if (name_index == 8) {
+                char value[16];
+                value[0] = '\0';
+                if (h2_read_string_plain(block, len, &off, value, sizeof(value)) == 0) {
+                    return atoi(value);
+                }
+                return status;
+            }
+            if (h2_skip_string(block, len, &off) != 0) {
+                return status;
+            }
+        } else if ((first & 0x20) != 0) {
+            uint32_t ignored = 0;
+            if (h2_decode_int(block, len, &off, 5, &ignored) != 0) {
+                return status;
+            }
+        } else {
+            uint32_t name_index = 0;
+            if (h2_decode_int(block, len, &off, 4, &name_index) != 0) {
+                return status;
+            }
+            char value[16];
+            value[0] = '\0';
+            if (name_index == 0) {
+                char name[32];
+                name[0] = '\0';
+                size_t name_off = off;
+                if (h2_read_string_plain(block, len, &name_off, name, sizeof(name)) == 0) {
+                    off = name_off;
+                    if (h2_read_string_plain(block, len, &off, value, sizeof(value)) == 0 && strcmp(name, ":status") == 0) {
+                        status = atoi(value);
+                    }
+                } else {
+                    if (h2_skip_string(block, len, &off) != 0 || h2_skip_string(block, len, &off) != 0) {
+                        return status;
+                    }
+                }
+            } else {
+                if (name_index == 8) {
+                    if (h2_read_string_plain(block, len, &off, value, sizeof(value)) == 0) {
+                        return atoi(value);
+                    }
+                    return status;
+                }
+                if (h2_skip_string(block, len, &off) != 0) {
+                    return status;
+                }
+            }
+        }
+    }
+    return status;
+}
+
+static int h2_process_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id, const uint8_t *payload, size_t payload_len, char *err,
+                              size_t err_cap) {
+    if (stream_id != c->h2_stream_id) {
+        return 0;
+    }
+
+    size_t off = 0;
+    if ((flags & H2_FLAG_PADDED) != 0) {
+        if (payload_len == 0) {
+            set_err(err, err_cap, "invalid h2 padded headers");
+            return -1;
+        }
+        uint8_t pad = payload[off++];
+        if ((size_t)pad > payload_len - off) {
+            set_err(err, err_cap, "invalid h2 headers padding");
+            return -1;
+        }
+        payload_len -= (size_t)pad;
+    }
+    if ((flags & H2_FLAG_PRIORITY) != 0) {
+        if (payload_len - off < 5) {
+            set_err(err, err_cap, "invalid h2 priority headers");
+            return -1;
+        }
+        off += 5;
+    }
+    if (off > payload_len) {
+        set_err(err, err_cap, "invalid h2 headers");
+        return -1;
+    }
+
+    int status = h2_decode_status_header(payload + off, payload_len - off);
+    if (status != 0) {
+        if (status != 200) {
+            if (err != NULL && err_cap > 0) {
+                snprintf(err, err_cap, "xhttp h2 returned non-200: %d", status);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_id, const uint8_t *payload,
+                                    size_t payload_len, char *err, size_t err_cap) {
+    switch (type) {
+    case H2_FRAME_SETTINGS:
+        if ((flags & H2_FLAG_ACK) != 0) {
+            return 0;
+        }
+        if (payload_len % 6 != 0) {
+            set_err(err, err_cap, "invalid h2 settings");
+            return -1;
+        }
+        for (size_t off = 0; off + 6 <= payload_len; off += 6) {
+            uint16_t id = ((uint16_t)payload[off] << 8) | (uint16_t)payload[off + 1];
+            uint32_t val = ((uint32_t)payload[off + 2] << 24) | ((uint32_t)payload[off + 3] << 16) | ((uint32_t)payload[off + 4] << 8) |
+                           (uint32_t)payload[off + 5];
+            if (id == 4) {
+                int64_t delta = (int64_t)val - (int64_t)c->h2_peer_initial_window;
+                c->h2_peer_initial_window = val;
+                c->h2_peer_stream_window += delta;
+            } else if (id == 5 && val >= 16384 && val <= 16777215) {
+                c->h2_peer_max_frame_size = val;
+            }
+        }
+        return h2_send_frame(c, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, NULL, 0);
+    case H2_FRAME_WINDOW_UPDATE:
+        if (payload_len != 4) {
+            set_err(err, err_cap, "invalid h2 window update");
+            return -1;
+        }
+        {
+            uint32_t inc = (((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) | ((uint32_t)payload[2] << 8) | (uint32_t)payload[3]) &
+                           0x7FFFFFFFU;
+            if (inc == 0) {
+                set_err(err, err_cap, "invalid h2 window increment");
+                return -1;
+            }
+            if (stream_id == 0) {
+                c->h2_peer_conn_window += inc;
+            } else if (stream_id == c->h2_stream_id) {
+                c->h2_peer_stream_window += inc;
+            }
+        }
+        return 0;
+    case H2_FRAME_PING:
+        if ((flags & H2_FLAG_ACK) == 0 && payload_len == 8) {
+            return h2_send_frame(c, H2_FRAME_PING, H2_FLAG_ACK, 0, payload, payload_len);
+        }
+        return 0;
+    case H2_FRAME_HEADERS:
+        return h2_process_headers(c, flags, stream_id, payload, payload_len, err, err_cap);
+    case H2_FRAME_RST_STREAM:
+        set_err(err, err_cap, "h2 stream reset");
+        return -1;
+    case H2_FRAME_GOAWAY:
+        set_err(err, err_cap, "h2 goaway");
+        return -1;
+    default:
+        return 0;
+    }
+}
+
+static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
+    static const char preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    if (reality_write_app_records(c, (const uint8_t *)preface, sizeof(preface) - 1) != 0) {
+        set_err(err, err_cap, "failed to send h2 preface");
+        return -1;
+    }
+
+    uint8_t settings[6] = {0x00, 0x04, 0x00, 0x10, 0x00, 0x00};
+    if (h2_send_frame(c, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings)) != 0 ||
+        h2_send_window_update(c, 0, H2_CONNECTION_WINDOW_INC) != 0) {
+        set_err(err, err_cap, "failed to send h2 settings");
+        return -1;
+    }
+    return 0;
+}
+
+static int h2_send_stream_one_headers(tls13_conn_t *c, char *err, size_t err_cap) {
+    dynbuf_t block = {0};
+    char xpadding[1100];
+    char referer[2048];
+
+    if (random_xpadding(xpadding, sizeof(xpadding)) != 0) {
+        set_err(err, err_cap, "failed to generate x_padding");
+        return -1;
+    }
+    snprintf(referer, sizeof(referer), "https://%s%s?x_padding=%s", c->xhttp_host, c->xhttp_base_path, xpadding);
+
+    int rc = 0;
+    if (hpack_append_indexed(&block, 3) != 0 || hpack_append_indexed(&block, 7) != 0 ||
+        hpack_append_literal_new_name(&block, ":authority", c->xhttp_host) != 0 ||
+        (strcmp(c->xhttp_base_path, "/") == 0 ? hpack_append_indexed(&block, 4)
+                                               : hpack_append_literal_new_name(&block, ":path", c->xhttp_base_path)) != 0 ||
+        hpack_append_literal_new_name(&block, "dnt", "1") != 0 ||
+        hpack_append_literal_new_name(&block, "content-type", "application/grpc") != 0 ||
+        hpack_append_literal_new_name(&block, "user-agent",
+                                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                                      "Chrome/149.0.0.0 Safari/537.36") != 0 ||
+        hpack_append_literal_new_name(&block, "priority", "u=1, i") != 0 ||
+        hpack_append_literal_new_name(&block, "cache-control", "no-cache") != 0 ||
+        hpack_append_literal_new_name(&block, "sec-fetch-dest", "empty") != 0 ||
+        hpack_append_literal_new_name(&block, "accept-language", "en-US,en;q=0.9") != 0 ||
+        hpack_append_literal_new_name(&block, "sec-fetch-mode", "cors") != 0 ||
+        hpack_append_literal_new_name(&block, "referer", referer) != 0 ||
+        hpack_append_literal_new_name(&block, "accept", "*/*") != 0 ||
+        hpack_append_literal_new_name(&block, "sec-fetch-site", "same-origin") != 0 ||
+        hpack_append_literal_new_name(&block, "sec-ch-ua-mobile", "?0") != 0 ||
+        hpack_append_literal_new_name(&block, "accept-encoding", "gzip") != 0 ||
+        hpack_append_literal_new_name(&block, "sec-ch-ua-platform", "\"Windows\"") != 0 ||
+        hpack_append_literal_new_name(&block, "sec-ch-ua", "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"") != 0 ||
+        hpack_append_literal_new_name(&block, "pragma", "no-cache") != 0) {
+        rc = -1;
+    }
+
+    if (rc == 0 && h2_send_frame(c, H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, c->h2_stream_id, block.data, block.len) != 0) {
+        rc = -1;
+    }
+    db_free(&block);
+    if (rc != 0) {
+        set_err(err, err_cap, "failed to send h2 headers");
+        return -1;
+    }
+    return 0;
+}
+
+static int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        if (c->h2_peer_conn_window <= 0 || c->h2_peer_stream_window <= 0) {
+            fprintf(stderr, "[xhttp] h2 upload flow-control window exhausted\n");
+            return -1;
+        }
+        size_t chunk = len - off;
+        if (chunk > c->h2_peer_max_frame_size) {
+            chunk = c->h2_peer_max_frame_size;
+        }
+        if ((int64_t)chunk > c->h2_peer_conn_window) {
+            chunk = (size_t)c->h2_peer_conn_window;
+        }
+        if ((int64_t)chunk > c->h2_peer_stream_window) {
+            chunk = (size_t)c->h2_peer_stream_window;
+        }
+        if (chunk == 0 || h2_send_frame(c, H2_FRAME_DATA, 0, c->h2_stream_id, buf + off, chunk) != 0) {
+            return -1;
+        }
+        c->h2_peer_conn_window -= (int64_t)chunk;
+        c->h2_peer_stream_window -= (int64_t)chunk;
+        off += chunk;
+    }
+    return 0;
+}
+
+static int h2_fill_app_cache(tls13_conn_t *c) {
+    if (c->h2_stream_eof) {
+        return -1;
+    }
+
+    for (;;) {
+        uint8_t type = 0;
+        uint8_t flags = 0;
+        uint32_t stream_id = 0;
+        uint8_t *payload = NULL;
+        size_t payload_len = 0;
+        char err[160] = {0};
+
+        if (h2_read_frame(c, &type, &flags, &stream_id, &payload, &payload_len) != 0) {
+            free(payload);
+            return -1;
+        }
+
+        int rc = 0;
+        if (type == H2_FRAME_DATA && stream_id == c->h2_stream_id) {
+            size_t off = 0;
+            size_t data_len = payload_len;
+            if ((flags & H2_FLAG_PADDED) != 0) {
+                if (payload_len == 0) {
+                    rc = -1;
+                } else {
+                    uint8_t pad = payload[0];
+                    off = 1;
+                    if ((size_t)pad > payload_len - off) {
+                        rc = -1;
+                    } else {
+                        data_len = payload_len - off - (size_t)pad;
+                    }
+                }
+            }
+
+            if (rc == 0 && payload_len > 0) {
+                uint32_t inc = (payload_len > H2_CONNECTION_WINDOW_INC) ? H2_CONNECTION_WINDOW_INC : (uint32_t)payload_len;
+                if (h2_send_window_update(c, 0, inc) != 0 || h2_send_window_update(c, c->h2_stream_id, inc) != 0) {
+                    rc = -1;
+                }
+            }
+            if (rc == 0 && data_len > 0 && db_append(&c->app_cache, payload + off, data_len) != 0) {
+                rc = -1;
+            }
+            if ((flags & H2_FLAG_END_STREAM) != 0) {
+                c->h2_stream_eof = 1;
+            }
+        } else {
+            rc = h2_process_control_frame(c, type, flags, stream_id, payload, payload_len, err, sizeof(err));
+            if (rc != 0 && err[0] != '\0') {
+                fprintf(stderr, "[xhttp] %s\n", err);
+            }
+        }
+
+        free(payload);
+        if (rc != 0) {
+            return -1;
+        }
+        if (c->app_cache.len > 0) {
+            return 0;
+        }
+        if (c->h2_stream_eof) {
+            return -1;
+        }
+    }
+}
+
 static int xhttp_send_download_request(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
     char request_path[768];
     snprintf(request_path, sizeof(request_path), "%s%s", c->xhttp_base_path, c->xhttp_session_id);
@@ -1336,38 +1931,6 @@ static uint16_t random_grease_value(void) {
     return vals[b % (sizeof(vals) / sizeof(vals[0]))];
 }
 
-static uint16_t random_unique_grease_value(const uint16_t *used, size_t used_len) {
-    for (int attempts = 0; attempts < 64; attempts++) {
-        uint16_t v = random_grease_value();
-        int seen = 0;
-        for (size_t i = 0; i < used_len; i++) {
-            if (used[i] == v) {
-                seen = 1;
-                break;
-            }
-        }
-        if (!seen) {
-            return v;
-        }
-    }
-
-    static const uint16_t vals[] = {0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
-                                    0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa};
-    for (size_t j = 0; j < sizeof(vals) / sizeof(vals[0]); j++) {
-        int seen = 0;
-        for (size_t i = 0; i < used_len; i++) {
-            if (used[i] == vals[j]) {
-                seen = 1;
-                break;
-            }
-        }
-        if (!seen) {
-            return vals[j];
-        }
-    }
-    return vals[0];
-}
-
 static int add_ext(dynbuf_t *b, uint16_t etype, const uint8_t *edata, size_t elen) {
     uint8_t hdr[4] = {(uint8_t)(etype >> 8), (uint8_t)(etype & 0xFF), (uint8_t)(elen >> 8), (uint8_t)(elen & 0xFF)};
     if (db_append(b, hdr, 4) != 0) {
@@ -1647,30 +2210,24 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
     }
 
     uint16_t grease = random_grease_value();
-    uint16_t qq_used_grease[5];
-    size_t qq_used_grease_len = 0;
-    qq_used_grease[qq_used_grease_len++] = grease;
-    uint16_t qq_grease_ext1 = random_unique_grease_value(qq_used_grease, qq_used_grease_len);
-    qq_used_grease[qq_used_grease_len++] = qq_grease_ext1;
-    uint16_t qq_grease_group = random_unique_grease_value(qq_used_grease, qq_used_grease_len);
-    qq_used_grease[qq_used_grease_len++] = qq_grease_group;
-    uint16_t qq_grease_vers = random_unique_grease_value(qq_used_grease, qq_used_grease_len);
-    qq_used_grease[qq_used_grease_len++] = qq_grease_vers;
-    uint16_t qq_grease_ext2 = random_unique_grease_value(qq_used_grease, qq_used_grease_len);
+    uint16_t boring_grease_cipher = random_grease_value();
+    uint16_t boring_grease_group = random_grease_value();
+    uint16_t boring_grease_ext1 = random_grease_value();
+    uint16_t boring_grease_ext2 = random_grease_value();
+    uint16_t boring_grease_vers = random_grease_value();
+    if (boring_grease_ext1 == boring_grease_ext2) {
+        boring_grease_ext2 ^= 0x1010;
+    }
     uint8_t suites[64];
     size_t soff = 0;
-    if (cfg->fp_mode == FP_QQ) {
-        uint16_t qq_suites[] = {grease, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030,
-                                0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
-        for (size_t i = 0; i < sizeof(qq_suites) / sizeof(qq_suites[0]); i++) {
-            suites[soff++] = (uint8_t)(qq_suites[i] >> 8);
-            suites[soff++] = (uint8_t)(qq_suites[i] & 0xFF);
+    if (cfg->fp_mode == FP_QQ || cfg->fp_mode == FP_CHROME) {
+        uint16_t chrome_like_suites[] = {boring_grease_cipher, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030,
+                                         0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
+        for (size_t i = 0; i < sizeof(chrome_like_suites) / sizeof(chrome_like_suites[0]); i++) {
+            suites[soff++] = (uint8_t)(chrome_like_suites[i] >> 8);
+            suites[soff++] = (uint8_t)(chrome_like_suites[i] & 0xFF);
         }
     } else {
-        if (cfg->fp_mode == FP_CHROME) {
-            suites[soff++] = (uint8_t)(grease >> 8);
-            suites[soff++] = (uint8_t)(grease & 0xFF);
-        }
         suites[soff++] = 0x13;
         suites[soff++] = 0x01;
     }
@@ -1689,17 +2246,16 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
 
     dynbuf_t exts = {0};
 
-    int random_mode = (cfg->fp_mode == FP_RANDOM) ? 1 : 0;
     if (cfg->fp_mode == FP_QQ) {
         size_t header_len = hs.len - 4;
-        if (ext_grease(&exts, qq_grease_ext1) != 0 || ext_server_name(&exts, cfg->sni) != 0 ||
+        if (ext_grease(&exts, boring_grease_ext1) != 0 || ext_server_name(&exts, cfg->sni) != 0 ||
             ext_extended_master_secret(&exts) != 0 || ext_renegotiation_info(&exts) != 0 ||
-            ext_supported_groups(&exts, qq_grease_group, 0) != 0 || ext_ec_point_formats(&exts) != 0 ||
+            ext_supported_groups(&exts, boring_grease_group, 0) != 0 || ext_ec_point_formats(&exts) != 0 ||
             ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
-            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, qq_grease_group, client_pub, 0) != 0 ||
-            ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, qq_grease_vers) != 0 ||
+            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0) != 0 ||
+            ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, boring_grease_vers) != 0 ||
             ext_compress_cert_brotli(&exts) != 0 || ext_application_settings_h2(&exts) != 0 ||
-            ext_grease_1byte_zero(&exts, qq_grease_ext2) != 0) {
+            ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
             db_free(&exts);
             db_free(&hs);
             return -1;
@@ -1711,10 +2267,22 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
             db_free(&hs);
             return -1;
         }
-    } else if (!random_mode) {
-        if (ext_server_name(&exts, cfg->sni) != 0 || ext_supported_groups(&exts, grease, 0) != 0 || ext_ec_point_formats(&exts) != 0 ||
-            ext_sig_algs(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_supported_versions(&exts, grease, 0) != 0 ||
-            ext_psk_modes(&exts) != 0 || ext_key_share(&exts, grease, client_pub, 0) != 0 || ext_padding(&exts, 16) != 0) {
+    } else if (cfg->fp_mode == FP_CHROME) {
+        size_t header_len = hs.len - 4;
+        if (ext_grease(&exts, boring_grease_ext1) != 0 || ext_server_name(&exts, cfg->sni) != 0 ||
+            ext_extended_master_secret(&exts) != 0 || ext_renegotiation_info(&exts) != 0 ||
+            ext_supported_groups(&exts, boring_grease_group, 0) != 0 || ext_ec_point_formats(&exts) != 0 ||
+            ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
+            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0) != 0 ||
+            ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, boring_grease_vers) != 0 ||
+            ext_compress_cert_brotli(&exts) != 0 || ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
+            db_free(&exts);
+            db_free(&hs);
+            return -1;
+        }
+        size_t unpadded_len = header_len + 4 + exts.len + 2;
+        size_t pad_len = boring_padding_len(unpadded_len);
+        if (pad_len > 0 && ext_padding(&exts, pad_len) != 0) {
             db_free(&exts);
             db_free(&hs);
             return -1;
@@ -1801,7 +2369,7 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
     hs.data[3] = (uint8_t)(body_len & 0xFF);
 
     uint8_t sid_plain[16] = {0};
-    uint8_t vx = 25, vy = 10, vz = 15;
+    uint8_t vx = 26, vy = 3, vz = 27;
     const char *ver_env = getenv("V2IOS6_VER");
     if (ver_env != NULL) {
         unsigned int tx = 0, ty = 0, tz = 0;
@@ -2050,7 +2618,8 @@ static int verify_reality_cert(const uint8_t auth_key[32], const uint8_t *cert_d
     }
 
     EVP_PKEY *pk = X509_get_pubkey(x);
-    if (pk == NULL || EVP_PKEY_base_id(pk) != EVP_PKEY_ED25519) {
+    int pk_base = (pk != NULL) ? EVP_PKEY_base_id(pk) : 0;
+    if (pk == NULL || pk_base != EVP_PKEY_ED25519) {
         if (pk != NULL) {
             EVP_PKEY_free(pk);
         }
@@ -2352,12 +2921,25 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
         return -1;
     }
 
-    uint8_t rec_hdr[5] = {0x16, 0x03, 0x01, (uint8_t)(ch_len >> 8), (uint8_t)(ch_len & 0xFF)};
-    if (write_exact(c->fd, rec_hdr, sizeof(rec_hdr)) != 0 || write_exact(c->fd, ch, ch_len) != 0) {
+    uint8_t *ch_record = (uint8_t *)malloc(5 + ch_len);
+    if (ch_record == NULL) {
+        free(ch);
+        set_err(err, err_cap, "failed to allocate ClientHello record");
+        return -1;
+    }
+    ch_record[0] = 0x16;
+    ch_record[1] = 0x03;
+    ch_record[2] = 0x01;
+    ch_record[3] = (uint8_t)(ch_len >> 8);
+    ch_record[4] = (uint8_t)(ch_len & 0xFF);
+    memcpy(ch_record + 5, ch, ch_len);
+    if (write_exact(c->fd, ch_record, 5 + ch_len) != 0) {
+        free(ch_record);
         free(ch);
         set_err(err, err_cap, "failed to send ClientHello");
         return -1;
     }
+    free(ch_record);
 
     if (append_transcript(c, ch, ch_len) != 0) {
         free(ch);
@@ -2482,7 +3064,6 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
                 if (enc_hs.len < 4 + hlen) {
                     break;
                 }
-
                 if (htype == 0x14) {
                     uint8_t thash[64];
                     uint8_t expect[64];
@@ -2567,17 +3148,21 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
      * It is not included in the handshake transcript.
      */
     uint8_t ccs_rec[6] = {0x14, 0x03, 0x03, 0x00, 0x01, 0x01};
-    if (write_exact(c->fd, ccs_rec, sizeof(ccs_rec)) != 0) {
+    uint8_t *client_last_flight = (uint8_t *)malloc(sizeof(ccs_rec) + enc_fin_len);
+    if (client_last_flight == NULL) {
         free(enc_fin);
-        set_err(err, err_cap, "failed to send compatibility CCS");
+        set_err(err, err_cap, "failed to allocate client Finished flight");
         return -1;
     }
-
-    if (write_exact(c->fd, enc_fin, enc_fin_len) != 0) {
+    memcpy(client_last_flight, ccs_rec, sizeof(ccs_rec));
+    memcpy(client_last_flight + sizeof(ccs_rec), enc_fin, enc_fin_len);
+    if (write_exact(c->fd, client_last_flight, sizeof(ccs_rec) + enc_fin_len) != 0) {
+        free(client_last_flight);
         free(enc_fin);
         set_err(err, err_cap, "failed to send client Finished");
         return -1;
     }
+    free(client_last_flight);
     free(enc_fin);
 
     if (append_transcript(c, fin_msg, fin_msg_len) != 0) {
@@ -2588,7 +3173,49 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
 }
 
 static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
-    c->mode = CONN_MODE_XHTTP;
+    if (strcmp(cfg->security, "reality") == 0) {
+        c->mode = CONN_MODE_XHTTP_REALITY;
+        c->xhttp_seq = 0;
+        c->xhttp_chunk_rem = -1;
+        c->xhttp_content_rem = -1;
+
+        snprintf(c->remote_host, sizeof(c->remote_host), "%s", cfg->server_host);
+        c->remote_port = cfg->server_port;
+        snprintf(c->remote_sni, sizeof(c->remote_sni), "%s", cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host);
+
+        if (normalize_xhttp_path(cfg->xhttp_path, c->xhttp_base_path, sizeof(c->xhttp_base_path)) != 0) {
+            set_err(err, err_cap, "invalid xhttp path");
+            return -1;
+        }
+        const char *xhost = cfg->xhttp_host[0] != '\0' ? cfg->xhttp_host : c->remote_sni;
+        snprintf(c->xhttp_host, sizeof(c->xhttp_host), "%s", xhost);
+
+        int fd = tcp_connect_host(cfg->server_host, cfg->server_port);
+        if (fd < 0) {
+            set_err(err, err_cap, "tcp connect failed");
+            return -1;
+        }
+        c->fd = fd;
+
+        if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
+            return -1;
+        }
+
+        c->h2_stream_id = 1;
+        c->h2_peer_initial_window = H2_DEFAULT_WINDOW;
+        c->h2_peer_max_frame_size = H2_DEFAULT_MAX_FRAME;
+        c->h2_peer_conn_window = H2_DEFAULT_WINDOW;
+        c->h2_peer_stream_window = H2_DEFAULT_WINDOW;
+        c->h2_stream_eof = 0;
+
+        fprintf(stderr, "[xhttp] reality mode=stream-one http=2\n");
+        if (h2_send_client_preface(c, err, err_cap) != 0 || h2_send_stream_one_headers(c, err, err_cap) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    c->mode = CONN_MODE_XHTTP_TLS;
     c->xhttp_seq = 0;
     c->xhttp_chunk_rem = -1;
     c->xhttp_content_rem = -1;
@@ -2704,31 +3331,13 @@ void tls13_reality_close(tls13_conn_t *c) {
         close(c->fd);
     }
     db_free(&c->xhttp_net_cache);
+    db_free(&c->h2_net_cache);
     db_free(&c->transcript);
     db_free(&c->app_cache);
     free(c);
 }
 
-int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
-    if (c->mode == CONN_MODE_XHTTP) {
-        size_t off = 0;
-        while (off < len) {
-            size_t chunk = len - off;
-            if (chunk > 900000) {
-                chunk = 900000;
-            }
-            char err[128] = {0};
-            if (xhttp_post_packet(c, buf + off, chunk, err, sizeof(err)) != 0) {
-                if (err[0] != '\0') {
-                    fprintf(stderr, "[xhttp] upload failed: %s\n", err);
-                }
-                return -1;
-            }
-            off += chunk;
-        }
-        return 0;
-    }
-
+static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
         size_t chunk = len - off;
@@ -2761,7 +3370,33 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     return 0;
 }
 
-static int fill_reality_app_cache(tls13_conn_t *c) {
+int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    if (c->mode == CONN_MODE_XHTTP_TLS) {
+        size_t off = 0;
+        while (off < len) {
+            size_t chunk = len - off;
+            if (chunk > 900000) {
+                chunk = 900000;
+            }
+            char err[128] = {0};
+            if (xhttp_post_packet(c, buf + off, chunk, err, sizeof(err)) != 0) {
+                if (err[0] != '\0') {
+                    fprintf(stderr, "[xhttp] upload failed: %s\n", err);
+                }
+                return -1;
+            }
+            off += chunk;
+        }
+        return 0;
+    }
+
+    if (c->mode == CONN_MODE_XHTTP_REALITY) {
+        return h2_write_data(c, buf, len);
+    }
+    return reality_write_app_records(c, buf, len);
+}
+
+static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
     for (;;) {
         uint8_t rtype = 0;
         uint8_t *pl = NULL;
@@ -2783,9 +3418,9 @@ static int fill_reality_app_cache(tls13_conn_t *c) {
         if (decrypt_record(c, c->s_app_key, c->s_app_iv, &c->s_app_seq, rtype, pl, pl_len, &dec, &dec_len, &inner) != 0) {
             if (rtype == 0x17 && pl_len > 0 && pl_len <= 18432) {
                 uint8_t hdr[5] = {0x17, 0x03, 0x03, (uint8_t)(pl_len >> 8), (uint8_t)(pl_len & 0xFF)};
-                int rc = db_append(&c->app_cache, hdr, sizeof(hdr));
+                int rc = db_append(cache, hdr, sizeof(hdr));
                 if (rc == 0) {
-                    rc = db_append(&c->app_cache, pl, pl_len);
+                    rc = db_append(cache, pl, pl_len);
                 }
                 free(pl);
                 if (rc != 0) {
@@ -2802,12 +3437,12 @@ static int fill_reality_app_cache(tls13_conn_t *c) {
         free(pl);
 
         if (inner == 0x17) {
-            int rc = db_append(&c->app_cache, dec, dec_len);
+            int rc = db_append(cache, dec, dec_len);
             free(dec);
             if (rc != 0) {
                 return -1;
             }
-            if (c->app_cache.len > 0) {
+            if (cache->len > 0) {
                 return 0;
             }
         } else {
@@ -2828,6 +3463,10 @@ static int fill_reality_app_cache(tls13_conn_t *c) {
     }
 }
 
+static int fill_reality_app_cache(tls13_conn_t *c) {
+    return fill_reality_plain_cache(c, &c->app_cache);
+}
+
 int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
     *out_len = 0;
     if (cap == 0) {
@@ -2835,8 +3474,12 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
     }
 
     if (c->app_cache.len == 0) {
-        if (c->mode == CONN_MODE_XHTTP) {
+        if (c->mode == CONN_MODE_XHTTP_TLS) {
             if (xhttp_fill_app_cache(c) != 0) {
+                return -1;
+            }
+        } else if (c->mode == CONN_MODE_XHTTP_REALITY) {
+            if (h2_fill_app_cache(c) != 0) {
                 return -1;
             }
         } else if (fill_reality_app_cache(c) != 0) {
