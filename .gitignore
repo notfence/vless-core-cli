@@ -1,7 +1,7 @@
 # Build outputs
 build/
 vless-core-linux-amd64
-vless-core-darwin-amrv7
+vless-core-darwin-armv7
 
 # Generated third-party artifacts
 third_party/*

@@ -17,7 +17,7 @@ Compatibility with other iOS versions/devices is not guaranteed.
 Build outputs:
 
 - `vless-core-linux-amd64`
-- `vless-core-darwin-amrv7`
+- `vless-core-darwin-armv7`
 
 ## Build
 
@@ -44,14 +44,14 @@ make ios
 ```bash
 ./vless-core-linux-amd64 --uri '<vless://...>' --listen-port <port>
 or
-./vless-core-darwin-amrv7 --uri '<vless://...>' --listen-port <port>
+./vless-core-darwin-armv7 --uri '<vless://...>' --listen-port <port>
 ```
 
 Show CLI help/parameters:
 
 ```bash
 ./vless-core-linux-amd64 --help
-./vless-core-darwin-amrv7 --help
+./vless-core-darwin-armv7 --help
 ```
 
 Expected help output:
@@ -112,7 +112,7 @@ Then:
 
 ```bash
 make ios
-file ./vless-core-darwin-amrv7
+file ./vless-core-darwin-armv7
 ```
 
 ## Legacy curl on iOS 6

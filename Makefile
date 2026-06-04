@@ -8,7 +8,7 @@ OBJ_LINUX := $(patsubst src/%.c,build/linux/%.o,$(SRC))
 OBJ_IOS := $(patsubst src/%.c,build/ios/%.o,$(SRC))
 
 BIN_LINUX ?= vless-core-linux-amd64
-BIN_IOS ?= vless-core-darwin-amrv7
+BIN_IOS ?= vless-core-darwin-armv7
 
 LDFLAGS ?=
 LDLIBS ?= -lssl -lcrypto -lpthread
