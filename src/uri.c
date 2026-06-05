@@ -107,6 +107,10 @@ static void parse_query(vless_config_t *cfg, char *query) {
             copy_trunc(cfg->flow, sizeof(cfg->flow), decoded);
         } else if (strcmp(key, "security") == 0) {
             copy_trunc(cfg->security, sizeof(cfg->security), decoded);
+        } else if (strcmp(key, "alpn") == 0) {
+            copy_trunc(cfg->alpn, sizeof(cfg->alpn), decoded);
+        } else if (strcmp(key, "allowInsecure") == 0 || strcmp(key, "insecure") == 0) {
+            cfg->allow_insecure = (strcmp(decoded, "1") == 0 || strcmp(decoded, "true") == 0);
         } else if (strcmp(key, "type") == 0) {
             if (strcmp(decoded, "xhttp") == 0 || strcmp(decoded, "splithttp") == 0) {
                 cfg->transport_mode = TRANSPORT_XHTTP;
@@ -136,6 +140,8 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     cfg->transport_mode = TRANSPORT_VISION;
     snprintf(cfg->flow, sizeof(cfg->flow), "xtls-rprx-vision");
     snprintf(cfg->security, sizeof(cfg->security), "reality");
+    cfg->alpn[0] = '\0';
+    cfg->allow_insecure = 0;
     snprintf(cfg->spider_x, sizeof(cfg->spider_x), "/");
     snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
     cfg->xhttp_host[0] = '\0';
@@ -219,7 +225,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         if (cfg->xhttp_path[0] == '\0') {
             snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
         }
-    } else {
+    } else if (strcmp(cfg->security, "reality") == 0) {
         if (cfg->pbk_len != 32) {
             set_err(err, err_cap, "pbk is required and must decode to 32 bytes");
             return -1;
@@ -230,15 +236,21 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
             return -1;
         }
 
-        if (strcmp(cfg->security, "reality") != 0) {
-            set_err(err, err_cap, "only security=reality is supported");
-            return -1;
-        }
-
         if (strcmp(cfg->flow, "xtls-rprx-vision") != 0) {
             set_err(err, err_cap, "only flow=xtls-rprx-vision is supported");
             return -1;
         }
+    } else if (strcmp(cfg->security, "tls") == 0) {
+        if (strcmp(cfg->flow, "xtls-rprx-vision") != 0) {
+            set_err(err, err_cap, "only flow=xtls-rprx-vision is supported");
+            return -1;
+        }
+
+        cfg->pbk_len = 0;
+        cfg->short_id_len = 0;
+    } else {
+        set_err(err, err_cap, "tcp requires security=reality or security=tls");
+        return -1;
     }
 
     return 0;

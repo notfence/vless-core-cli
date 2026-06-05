@@ -10,6 +10,9 @@ typedef struct {
     int padding_active;
     int packets_left;
     int bootstrap_sent;
+    int client_hello_seen;
+    int client_tls_app_records;
+    int direct_sent;
 } vision_wrap_t;
 
 typedef struct {

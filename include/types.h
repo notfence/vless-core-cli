@@ -26,6 +26,8 @@ typedef struct {
     char sni[256];
     char flow[64];
     char security[32];
+    char alpn[128];
+    int allow_insecure;
 
     uint8_t pbk[32];
     size_t pbk_len;

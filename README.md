@@ -3,7 +3,11 @@
 Standalone C CLI client for:
 
 - `VLESS + TCP + Reality + xtls-rprx-vision`
+- `VLESS + TCP + TLS + xtls-rprx-vision`
 - `VLESS + TLS + XHTTP (mode=packet-up)`
+- `VLESS + Reality + XHTTP (mode=stream-one)`
+
+`fp=chrome/firefox/random/qq` (firefox fallback to chrome)
 
 Protocol semantics are aligned with `xray-core` for the supported transports and URI parameters.
 
@@ -60,7 +64,7 @@ Expected help output:
 Usage: vless-core-linux-amd64 --uri <vless://...> --listen-port <port>
 
 Options:
-  --uri <vless://...>      VLESS URI (Reality/Vision or TLS/XHTTP)
+  --uri <vless://...>      VLESS URI (Reality/Vision, TLS/Vision, TLS/XHTTP, or Reality/XHTTP)
   --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)
   -h, --help               Show help
   -v, --version            Show version
@@ -78,6 +82,8 @@ VLESS_XHTTP_TLS_MODE=auto|strict|insecure|tofu
 - `strict`: only verified TLS, no fallback.
 - `insecure`: always insecure TLS.
 - `tofu`: Trust-On-First-Use pinning (first cert is saved, next connections must match SHA-256 pin).
+
+`type=tcp&security=tls` uses the same pin storage and falls back to TOFU when strict cert verification fails.
 
 TOFU pin file path:
 

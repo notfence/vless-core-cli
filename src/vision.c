@@ -87,6 +87,51 @@ static uint16_t vision_padding_len(size_t content_len, int long_padding) {
     return rand_u16_mod(VISION_SHORT_PAD_RANDOM);
 }
 
+static int vision_scan_tls_records(const uint8_t *in, size_t len, int *has_client_hello, int *app_records) {
+    size_t pos = 0;
+    int found_client_hello = 0;
+    int found_app_records = 0;
+
+    if (has_client_hello != NULL) {
+        *has_client_hello = 0;
+    }
+    if (app_records != NULL) {
+        *app_records = 0;
+    }
+    if (in == NULL || len < 5) {
+        return 0;
+    }
+
+    while (pos < len) {
+        if (len - pos < 5) {
+            return 0;
+        }
+
+        uint8_t rtype = in[pos];
+        uint8_t vmajor = in[pos + 1];
+        size_t rlen = ((size_t)in[pos + 3] << 8) | in[pos + 4];
+        if ((rtype != 0x14 && rtype != 0x16 && rtype != 0x17) || vmajor != 0x03 || rlen > 18432 || pos + 5 + rlen > len) {
+            return 0;
+        }
+
+        if (rtype == 0x16 && rlen >= 4 && in[pos + 5] == 0x01) {
+            found_client_hello = 1;
+        } else if (rtype == 0x17) {
+            found_app_records++;
+        }
+
+        pos += 5 + rlen;
+    }
+
+    if (has_client_hello != NULL) {
+        *has_client_hello = found_client_hello;
+    }
+    if (app_records != NULL) {
+        *app_records = found_app_records;
+    }
+    return 1;
+}
+
 static int vision_build_block(vision_wrap_t *ctx, uint8_t command, const uint8_t *content, size_t content_len, int long_padding, uint8_t **out,
                               size_t *out_len) {
     if (content_len > 0xFFFF) {
@@ -177,7 +222,22 @@ int vision_wrap_payload(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, ui
         payload_len = 0xFFFF;
     }
 
+    int has_client_hello = 0;
+    int app_records = 0;
+    int tls_records = vision_scan_tls_records(in, payload_len, &has_client_hello, &app_records);
+    if (tls_records && has_client_hello) {
+        ctx->client_hello_seen = 1;
+    }
+
     uint8_t command = (ctx->packets_left <= 1) ? CMD_END : CMD_CONTINUE;
+    if (tls_records && ctx->client_hello_seen && app_records > 0) {
+        int previous_app_records = ctx->client_tls_app_records;
+        ctx->client_tls_app_records += app_records;
+        if (previous_app_records > 0 || app_records > 1) {
+            command = CMD_DIRECT;
+        }
+    }
+
     int long_padding = (payload_len < VISION_LONG_PAD_THRESHOLD) ? 1 : 0;
     if (vision_build_block(ctx, command, in, payload_len, long_padding, out, out_len) != 0) {
         return -1;
@@ -188,6 +248,9 @@ int vision_wrap_payload(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, ui
     }
     if (command != CMD_CONTINUE) {
         ctx->padding_active = 0;
+    }
+    if (command == CMD_DIRECT) {
+        ctx->direct_sent = 1;
     }
     return 0;
 }

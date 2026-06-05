@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <openssl/evp.h>
 #include <openssl/err.h>
@@ -13,12 +14,14 @@
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,7 +34,8 @@ typedef struct {
 typedef enum {
     CONN_MODE_REALITY = 0,
     CONN_MODE_XHTTP_TLS = 1,
-    CONN_MODE_XHTTP_REALITY = 2
+    CONN_MODE_XHTTP_REALITY = 2,
+    CONN_MODE_TLS = 3
 } conn_mode_t;
 
 typedef enum {
@@ -90,6 +94,7 @@ struct tls13_conn {
     int xhttp_eof;
     int xhttp_tls_insecure;
     char xhttp_pin_key[320];
+    char tls_verify_mode[16];
 
     dynbuf_t xhttp_net_cache;
     dynbuf_t h2_net_cache;
@@ -216,6 +221,65 @@ static int tcp_connect_host(const char *host, uint16_t port) {
     return fd;
 }
 
+static void set_socket_io_timeout(int fd, int timeout_ms) {
+    struct timeval tv;
+    memset(&tv, 0, sizeof(tv));
+    if (timeout_ms > 0) {
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        perror("[tls] setsockopt SO_RCVTIMEO");
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
+        perror("[tls] setsockopt SO_SNDTIMEO");
+    }
+}
+
+static int tcp_connect_addrinfo(const struct addrinfo *it) {
+    int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (fd < 0) {
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    int rc = connect(fd, it->ai_addr, it->ai_addrlen);
+    if (rc != 0 && errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 500000;
+        rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+        if (rc > 0 && FD_ISSET(fd, &wfds)) {
+            int so_error = 0;
+            socklen_t so_error_len = sizeof(so_error);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) == 0 && so_error == 0) {
+                rc = 0;
+            } else {
+                rc = -1;
+            }
+        } else {
+            rc = -1;
+        }
+    }
+
+    if (rc == 0) {
+        if (flags >= 0) {
+            (void)fcntl(fd, F_SETFL, flags);
+        }
+        return fd;
+    }
+
+    close(fd);
+    return -1;
+}
+
 static int ssl_write_all(SSL *ssl, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t off = 0;
@@ -296,7 +360,8 @@ static int is_cert_verify_error_msg(const char *err) {
         return 0;
     }
     return strstr(err, "certificate verify failed") != NULL || strstr(err, "unable to get local issuer") != NULL ||
-           strstr(err, "self signed certificate") != NULL || strstr(err, "hostname mismatch") != NULL;
+           strstr(err, "self signed certificate") != NULL || strstr(err, "self-signed certificate") != NULL ||
+           strstr(err, "hostname mismatch") != NULL || strstr(err, "no trusted CA bundle") != NULL;
 }
 
 static xhttp_tls_mode_t get_xhttp_tls_mode(void) {
@@ -513,6 +578,42 @@ static int xhttp_store_pin(const char *key, const char *pin_hex, char *err, size
     return -1;
 }
 
+static int sha256_hex(const uint8_t *data, size_t len, char out_hex[65]) {
+    uint8_t digest[SHA256_DIGEST_LENGTH];
+    if (SHA256(data, len, digest) == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
+    }
+    out_hex[64] = '\0';
+    return 0;
+}
+
+static int tofu_verify_or_store_pin(const char *log_prefix, const char *pin_key, const char *peer_pin, int log_ok, char *err, size_t err_cap) {
+    char known_pin[65];
+    if (xhttp_load_pin(pin_key, known_pin) == 0) {
+        if (strcmp(known_pin, peer_pin) != 0) {
+            if (err != NULL && err_cap > 0) {
+                snprintf(err, err_cap, "TOFU pin mismatch for %s", pin_key);
+            }
+            return -1;
+        }
+        if (log_ok) {
+            fprintf(stderr, "%s TOFU pin verified for %s\n", log_prefix, pin_key);
+        }
+        return 0;
+    }
+
+    if (xhttp_store_pin(pin_key, peer_pin, err, err_cap) != 0) {
+        return -1;
+    }
+    if (log_ok) {
+        fprintf(stderr, "%s TOFU pin learned for %s\n", log_prefix, pin_key);
+    }
+    return 0;
+}
+
 static int tls_peer_leaf_pin_hex(SSL *ssl, char pin_hex[65], char *err, size_t err_cap) {
     X509 *peer = SSL_get_peer_certificate(ssl);
     if (peer == NULL) {
@@ -528,18 +629,12 @@ static int tls_peer_leaf_pin_hex(SSL *ssl, char pin_hex[65], char *err, size_t e
         return -1;
     }
 
-    unsigned char digest[SHA256_DIGEST_LENGTH];
-    if (SHA256(der, (size_t)der_len, digest) == NULL) {
+    if (sha256_hex(der, (size_t)der_len, pin_hex) != 0) {
         OPENSSL_free(der);
         X509_free(peer);
         set_err(err, err_cap, "failed to hash peer certificate");
         return -1;
     }
-
-    for (size_t i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        snprintf(pin_hex + (i * 2), 3, "%02x", digest[i]);
-    }
-    pin_hex[64] = '\0';
 
     OPENSSL_free(der);
     X509_free(peer);
@@ -552,27 +647,7 @@ static int xhttp_tofu_verify_or_store(SSL *ssl, const char *pin_key, int log_ok,
         return -1;
     }
 
-    char known_pin[65];
-    if (xhttp_load_pin(pin_key, known_pin) == 0) {
-        if (strcmp(known_pin, peer_pin) != 0) {
-            if (err != NULL && err_cap > 0) {
-                snprintf(err, err_cap, "TOFU pin mismatch for %s", pin_key);
-            }
-            return -1;
-        }
-        if (log_ok) {
-            fprintf(stderr, "[xhttp] TOFU pin verified for %s\n", pin_key);
-        }
-        return 0;
-    }
-
-    if (xhttp_store_pin(pin_key, peer_pin, err, err_cap) != 0) {
-        return -1;
-    }
-    if (log_ok) {
-        fprintf(stderr, "[xhttp] TOFU pin learned for %s\n", pin_key);
-    }
-    return 0;
+    return tofu_verify_or_store_pin("[xhttp]", pin_key, peer_pin, log_ok, err, err_cap);
 }
 
 static int open_tls_socket(const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer, SSL_CTX **out_ctx, SSL **out_ssl,
@@ -2173,8 +2248,8 @@ static int shuffle_indices(size_t *idx, size_t n) {
     return 0;
 }
 
-static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32], uint8_t client_pub[32], uint8_t client_random[32],
-                              uint8_t auth_key[32], uint8_t **out, size_t *out_len, size_t *sid_pos) {
+static int build_client_hello(const vless_config_t *cfg, int use_reality, uint8_t client_priv[32], uint8_t client_pub[32],
+                              uint8_t client_random[32], uint8_t auth_key[32], uint8_t **out, size_t *out_len, size_t *sid_pos) {
     dynbuf_t hs = {0};
 
     if (x25519_generate(client_priv, client_pub) != 0) {
@@ -2203,8 +2278,12 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
     }
 
     *sid_pos = hs.len;
-    uint8_t sid_zero[32] = {0};
-    if (db_append(&hs, sid_zero, sizeof(sid_zero)) != 0) {
+    uint8_t session_id[32] = {0};
+    if (!use_reality && RAND_bytes(session_id, sizeof(session_id)) != 1) {
+        db_free(&hs);
+        return -1;
+    }
+    if (db_append(&hs, session_id, sizeof(session_id)) != 0) {
         db_free(&hs);
         return -1;
     }
@@ -2367,6 +2446,12 @@ static int build_client_hello(const vless_config_t *cfg, uint8_t client_priv[32]
     hs.data[1] = (uint8_t)((body_len >> 16) & 0xFF);
     hs.data[2] = (uint8_t)((body_len >> 8) & 0xFF);
     hs.data[3] = (uint8_t)(body_len & 0xFF);
+
+    if (!use_reality) {
+        *out = hs.data;
+        *out_len = hs.len;
+        return 0;
+    }
 
     uint8_t sid_plain[16] = {0};
     uint8_t vx = 26, vy = 3, vz = 27;
@@ -2610,6 +2695,46 @@ static int parse_first_cert_der(const uint8_t *cert_msg, size_t cert_msg_len, co
     return 0;
 }
 
+static int tls_cert_der_pin_hex(const uint8_t *der, size_t der_len, char pin_hex[65], char *err, size_t err_cap) {
+    if (der == NULL || der_len == 0) {
+        set_err(err, err_cap, "missing TLS leaf certificate");
+        return -1;
+    }
+
+    if (sha256_hex(der, der_len, pin_hex) != 0) {
+        set_err(err, err_cap, "failed to hash TLS leaf certificate");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int tls_cert_message_leaf_pin_hex(const uint8_t *cert_msg, size_t cert_msg_len, char pin_hex[65], char *err, size_t err_cap) {
+    const uint8_t *der = NULL;
+    size_t der_len = 0;
+    if (parse_first_cert_der(cert_msg, cert_msg_len, &der, &der_len) != 0) {
+        set_err(err, err_cap, "failed to parse TLS leaf certificate");
+        return -1;
+    }
+    return tls_cert_der_pin_hex(der, der_len, pin_hex, err, err_cap);
+}
+
+static int tcp_tls_tofu_verify_or_store(const vless_config_t *cfg, const uint8_t *cert_msg, size_t cert_msg_len, char *err, size_t err_cap) {
+    char pin_key[320];
+    const char *pin_host = cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host;
+    if (xhttp_make_pin_key(pin_host, cfg->server_port, pin_key, sizeof(pin_key)) != 0) {
+        set_err(err, err_cap, "failed to build TOFU pin key");
+        return -1;
+    }
+
+    char peer_pin[65];
+    if (tls_cert_message_leaf_pin_hex(cert_msg, cert_msg_len, peer_pin, err, err_cap) != 0) {
+        return -1;
+    }
+
+    return tofu_verify_or_store_pin("[tls]", pin_key, peer_pin, 1, err, err_cap);
+}
+
 static int verify_reality_cert(const uint8_t auth_key[32], const uint8_t *cert_der, size_t cert_der_len) {
     const unsigned char *p = cert_der;
     X509 *x = d2i_X509(NULL, &p, (long)cert_der_len);
@@ -2651,6 +2776,196 @@ static int verify_reality_cert(const uint8_t auth_key[32], const uint8_t *cert_d
     EVP_PKEY_free(pk);
     X509_free(x);
     return ok;
+}
+
+static int load_x509_store_paths(X509_STORE *store) {
+    int default_paths_ready = (X509_STORE_set_default_paths(store) == 1) ? 1 : 0;
+    int custom_ca_loaded = 0;
+    const char *debug = getenv("VLESS_TLS_DEBUG");
+
+    const char *env_ca = getenv("VLESS_CA_BUNDLE");
+    const char *ca_paths[] = {
+        env_ca,
+        "/usr/share/vless-core/cacert.pem",
+        "/Applications/vless-core.app/cacert.pem",
+        "third_party/cacert.pem",
+        NULL,
+    };
+    for (size_t i = 0; ca_paths[i] != NULL; i++) {
+        if (ca_paths[i] == NULL || ca_paths[i][0] == '\0') {
+            continue;
+        }
+        if (X509_STORE_load_locations(store, ca_paths[i], NULL) == 1) {
+            custom_ca_loaded = 1;
+            if (debug != NULL && debug[0] != '\0') {
+                fprintf(stderr, "[tls] loaded CA bundle: %s\n", ca_paths[i]);
+            }
+            break;
+        } else if (debug != NULL && debug[0] != '\0') {
+            fprintf(stderr, "[tls] failed to load CA bundle: %s\n", ca_paths[i]);
+        }
+    }
+
+    if (debug != NULL && debug[0] != '\0') {
+        fprintf(stderr, "[tls] default CA paths ready=%d custom_ca_loaded=%d\n", default_paths_ready, custom_ca_loaded);
+    }
+    return (custom_ca_loaded || default_paths_ready) ? 0 : -1;
+}
+
+static int verify_tls_cert_message(const char *servername, const uint8_t *cert_msg, size_t cert_msg_len, char *err, size_t err_cap) {
+    X509 *leaf = NULL;
+    STACK_OF(X509) *untrusted = NULL;
+    X509_STORE *store = NULL;
+    X509_STORE_CTX *ctx = NULL;
+    int rc = -1;
+    int cert_count = 0;
+    const char *debug = getenv("VLESS_TLS_DEBUG");
+
+    if (cert_msg_len < 4 || cert_msg[0] != 0x0b) {
+        set_err(err, err_cap, "invalid TLS certificate message");
+        return -1;
+    }
+    size_t body_len = ((size_t)cert_msg[1] << 16) | ((size_t)cert_msg[2] << 8) | cert_msg[3];
+    if (4 + body_len > cert_msg_len) {
+        set_err(err, err_cap, "truncated TLS certificate message");
+        return -1;
+    }
+
+    const uint8_t *p = cert_msg + 4;
+    const uint8_t *end_body = p + body_len;
+    if (p >= end_body) {
+        set_err(err, err_cap, "empty TLS certificate message");
+        return -1;
+    }
+
+    uint8_t req_ctx_len = *p++;
+    if ((size_t)(end_body - p) < (size_t)req_ctx_len + 3) {
+        set_err(err, err_cap, "invalid TLS certificate request context");
+        return -1;
+    }
+    p += req_ctx_len;
+
+    size_t list_len = ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2];
+    p += 3;
+    if ((size_t)(end_body - p) < list_len) {
+        set_err(err, err_cap, "truncated TLS certificate list");
+        return -1;
+    }
+
+    const uint8_t *end_list = p + list_len;
+    untrusted = sk_X509_new_null();
+    if (untrusted == NULL) {
+        set_err(err, err_cap, "failed to allocate TLS certificate stack");
+        goto out;
+    }
+
+    while (p < end_list) {
+        if ((size_t)(end_list - p) < 3) {
+            set_err(err, err_cap, "invalid TLS certificate entry");
+            goto out;
+        }
+        size_t der_len = ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2];
+        p += 3;
+        if (der_len == 0 || (size_t)(end_list - p) < der_len) {
+            set_err(err, err_cap, "truncated TLS certificate entry");
+            goto out;
+        }
+
+        const unsigned char *der = p;
+        X509 *cert = d2i_X509(NULL, &der, (long)der_len);
+        if (cert == NULL) {
+            set_err(err, err_cap, "failed to parse TLS certificate");
+            goto out;
+        }
+        if (leaf == NULL) {
+            leaf = cert;
+        } else if (sk_X509_push(untrusted, cert) == 0) {
+            X509_free(cert);
+            set_err(err, err_cap, "failed to store TLS certificate chain");
+            goto out;
+        }
+        cert_count++;
+        p += der_len;
+
+        if ((size_t)(end_list - p) < 2) {
+            set_err(err, err_cap, "invalid TLS certificate extensions");
+            goto out;
+        }
+        size_t ext_len = ((size_t)p[0] << 8) | p[1];
+        p += 2;
+        if ((size_t)(end_list - p) < ext_len) {
+            set_err(err, err_cap, "truncated TLS certificate extensions");
+            goto out;
+        }
+        p += ext_len;
+    }
+
+    if (leaf == NULL) {
+        set_err(err, err_cap, "missing TLS leaf certificate");
+        goto out;
+    }
+
+    if (debug != NULL && debug[0] != '\0') {
+        char subject[256];
+        char issuer[256];
+        X509_NAME_oneline(X509_get_subject_name(leaf), subject, sizeof(subject));
+        X509_NAME_oneline(X509_get_issuer_name(leaf), issuer, sizeof(issuer));
+        fprintf(stderr, "[tls] cert chain entries=%d untrusted=%d\n", cert_count, sk_X509_num(untrusted));
+        fprintf(stderr, "[tls] leaf subject=%s\n", subject);
+        fprintf(stderr, "[tls] leaf issuer=%s\n", issuer);
+    }
+
+    const char *host = (servername != NULL && servername[0] != '\0') ? servername : NULL;
+    if (host == NULL || X509_check_host(leaf, host, 0, 0, NULL) != 1) {
+        set_err(err, err_cap, "TLS certificate hostname mismatch");
+        goto out;
+    }
+
+    store = X509_STORE_new();
+    if (store == NULL) {
+        set_err(err, err_cap, "failed to allocate TLS certificate store");
+        goto out;
+    }
+    (void)X509_STORE_set_flags(store, X509_V_FLAG_TRUSTED_FIRST);
+    if (load_x509_store_paths(store) != 0) {
+        set_err(err, err_cap, "no trusted CA bundle found (set VLESS_CA_BUNDLE or install /usr/share/vless-core/cacert.pem)");
+        goto out;
+    }
+
+    ctx = X509_STORE_CTX_new();
+    if (ctx == NULL || X509_STORE_CTX_init(ctx, store, leaf, untrusted) != 1) {
+        set_err(err, err_cap, "failed to initialize TLS certificate verification");
+        goto out;
+    }
+
+    if (X509_verify_cert(ctx) != 1) {
+        int verify_rc = X509_STORE_CTX_get_error(ctx);
+        int verify_depth = X509_STORE_CTX_get_error_depth(ctx);
+        if (err != NULL && err_cap > 0) {
+            snprintf(err, err_cap, "TLS certificate verify failed: %s", X509_verify_cert_error_string(verify_rc));
+        }
+        if (debug != NULL && debug[0] != '\0') {
+            fprintf(stderr, "[tls] cert verify failed depth=%d: %s\n", verify_depth, X509_verify_cert_error_string(verify_rc));
+        }
+        goto out;
+    }
+
+    rc = 0;
+
+out:
+    if (ctx != NULL) {
+        X509_STORE_CTX_free(ctx);
+    }
+    if (store != NULL) {
+        X509_STORE_free(store);
+    }
+    if (leaf != NULL) {
+        X509_free(leaf);
+    }
+    if (untrusted != NULL) {
+        sk_X509_pop_free(untrusted, X509_free);
+    }
+    return rc;
 }
 
 static int calc_finished_verify(const tls13_conn_t *c, const uint8_t *traffic_secret, const uint8_t *transcript_hash_val, uint8_t *out) {
@@ -2904,11 +3219,24 @@ int tls13_reality_is_raw_direct(const tls13_conn_t *c) {
     return (c != NULL && c->reality_raw_direct);
 }
 
+int tls13_has_pending_app(const tls13_conn_t *c) {
+    return (c != NULL && c->app_cache.len > 0);
+}
+
+void tls13_mark_raw_direct(tls13_conn_t *c) {
+    if (c != NULL) {
+        c->reality_raw_direct = 1;
+    }
+}
+
 static int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len) {
     return db_append(&c->transcript, msg, msg_len);
 }
 
 static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    int use_reality = (strcmp(cfg->security, "reality") == 0);
+    snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "%s", use_reality ? "reality" : (cfg->allow_insecure ? "insecure" : "strict"));
+
     uint8_t client_priv[32];
     uint8_t client_pub[32];
     uint8_t client_random[32];
@@ -2916,7 +3244,7 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
     size_t ch_len = 0;
     size_t sid_pos = 0;
 
-    if (build_client_hello(cfg, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos) != 0) {
+    if (build_client_hello(cfg, use_reality, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos) != 0) {
         set_err(err, err_cap, "failed to build ClientHello");
         return -1;
     }
@@ -3022,7 +3350,7 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
 
     dynbuf_t enc_hs = {0};
     int got_finished = 0;
-    int cert_verified = 0;
+    int cert_verified = use_reality ? 0 : (cfg->allow_insecure ? 1 : 0);
 
     while (!got_finished) {
         uint8_t rtype = 0;
@@ -3087,12 +3415,33 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
                 }
 
                 if (htype == 0x0b) {
-                    const uint8_t *der = NULL;
-                    size_t der_len = 0;
-                    if (parse_first_cert_der(enc_hs.data, 4 + hlen, &der, &der_len) == 0) {
-                        if (verify_reality_cert(c->auth_key, der, der_len) == 0) {
-                            cert_verified = 1;
+                    if (use_reality) {
+                        const uint8_t *der = NULL;
+                        size_t der_len = 0;
+                        if (parse_first_cert_der(enc_hs.data, 4 + hlen, &der, &der_len) == 0) {
+                            if (verify_reality_cert(c->auth_key, der, der_len) == 0) {
+                                cert_verified = 1;
+                            }
                         }
+                    } else if (!cfg->allow_insecure) {
+                        char verify_err[256] = {0};
+                        if (verify_tls_cert_message(cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host, enc_hs.data, 4 + hlen, verify_err,
+                                                    sizeof(verify_err)) != 0) {
+                            if (!is_cert_verify_error_msg(verify_err)) {
+                                set_err(err, err_cap, verify_err[0] != '\0' ? verify_err : "TLS certificate verify failed");
+                                db_free(&enc_hs);
+                                return -1;
+                            }
+                            fprintf(stderr, "[tls] cert verify failed, using TOFU: %s\n", verify_err);
+                            if (tcp_tls_tofu_verify_or_store(cfg, enc_hs.data, 4 + hlen, err, err_cap) != 0) {
+                                db_free(&enc_hs);
+                                return -1;
+                            }
+                            snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "tofu");
+                        } else {
+                            snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "strict");
+                        }
+                        cert_verified = 1;
                     }
                 }
 
@@ -3110,7 +3459,7 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
     db_free(&enc_hs);
 
     if (!cert_verified) {
-        set_err(err, err_cap, "REALITY cert verify failed");
+        set_err(err, err_cap, use_reality ? "REALITY cert verify failed" : "TLS certificate verify failed");
         return -1;
     }
 
@@ -3169,6 +3518,70 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
         return -1;
     }
 
+    return 0;
+}
+
+static int tcp_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    c->mode = CONN_MODE_TLS;
+    snprintf(c->remote_host, sizeof(c->remote_host), "%s", cfg->server_host);
+    c->remote_port = cfg->server_port;
+    snprintf(c->remote_sni, sizeof(c->remote_sni), "%s", cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host);
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned int)cfg->server_port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(cfg->server_host, port_str, &hints, &res) != 0) {
+        set_err(err, err_cap, "tcp resolve failed");
+        return -1;
+    }
+
+    char last_err[256] = {0};
+    int connected = 0;
+    for (struct addrinfo *it = res; it != NULL; it = it->ai_next) {
+        int fd = tcp_connect_addrinfo(it);
+        if (fd < 0) {
+            continue;
+        }
+
+        c->fd = fd;
+        c->reality_raw_direct = 0;
+        db_free(&c->transcript);
+        memset(&c->transcript, 0, sizeof(c->transcript));
+        set_socket_io_timeout(fd, 3500);
+
+        char attempt_err[256] = {0};
+        if (run_tls_handshake(cfg, c, attempt_err, sizeof(attempt_err)) == 0) {
+            set_socket_io_timeout(fd, 0);
+            connected = 1;
+            break;
+        }
+
+        if (attempt_err[0] != '\0') {
+            snprintf(last_err, sizeof(last_err), "%s", attempt_err);
+        }
+        fprintf(stderr, "[tls] handshake attempt failed: %s\n", attempt_err[0] != '\0' ? attempt_err : "unknown error");
+        close(fd);
+        c->fd = -1;
+    }
+    freeaddrinfo(res);
+
+    if (!connected) {
+        if (last_err[0] != '\0') {
+            set_err(err, err_cap, last_err);
+        } else {
+            set_err(err, err_cap, "tcp connect failed");
+        }
+        return -1;
+    }
+
+    fprintf(stderr, "[tls] connected mode=vision alpn=%s verify=%s\n", cfg->alpn[0] != '\0' ? cfg->alpn : "default",
+            c->tls_verify_mode[0] != '\0' ? c->tls_verify_mode : (cfg->allow_insecure ? "insecure" : "strict"));
     return 0;
 }
 
@@ -3299,6 +3712,15 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
         return 0;
     }
 
+    if (strcmp(cfg->security, "tls") == 0) {
+        if (tcp_tls_connect(cfg, c, err, err_cap) != 0) {
+            tls13_reality_close(c);
+            return -1;
+        }
+        *out = c;
+        return 0;
+    }
+
     int fd = tcp_connect_host(cfg->server_host, cfg->server_port);
     if (fd < 0) {
         tls13_reality_close(c);
@@ -3321,7 +3743,9 @@ void tls13_reality_close(tls13_conn_t *c) {
         return;
     }
     if (c->ssl != NULL) {
-        SSL_shutdown(c->ssl);
+        if (!c->reality_raw_direct) {
+            SSL_shutdown(c->ssl);
+        }
         SSL_free(c->ssl);
     }
     if (c->ssl_ctx != NULL) {

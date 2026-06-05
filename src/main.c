@@ -275,18 +275,35 @@ static void *client_worker(void *arg) {
     int forwarded_client_payload = (first_payload_len > 0) ? 1 : 0;
 
     while (1) {
+        int client_ready = 0;
+        int upstream_ready = (!downstream_direct && tls13_has_pending_app(tls));
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(cfd, &rfds);
-        FD_SET(tfd, &rfds);
 
-        int maxfd = (cfd > tfd) ? cfd : tfd;
-        int s = select(maxfd + 1, &rfds, NULL, NULL, NULL);
-        if (s <= 0) {
-            break;
+        if (upstream_ready) {
+            FD_SET(cfd, &rfds);
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+            int s = select(cfd + 1, &rfds, NULL, NULL, &tv);
+            if (s < 0 && errno != EINTR) {
+                break;
+            }
+            client_ready = (s > 0 && FD_ISSET(cfd, &rfds));
+        } else {
+            FD_SET(cfd, &rfds);
+            FD_SET(tfd, &rfds);
+
+            int maxfd = (cfd > tfd) ? cfd : tfd;
+            int s = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+            if (s <= 0) {
+                break;
+            }
+            client_ready = FD_ISSET(cfd, &rfds);
+            upstream_ready = FD_ISSET(tfd, &rfds);
         }
 
-        if (FD_ISSET(cfd, &rfds)) {
+        if (client_ready) {
             ssize_t n = recv(cfd, cbuf, sizeof(cbuf), 0);
             if (n <= 0) {
                 break;
@@ -314,6 +331,9 @@ static void *client_worker(void *arg) {
                 if (wrapped_len > 0) {
                     forwarded_client_payload = 1;
                 }
+                if (vwrap.direct_sent) {
+                    upstream_direct = 1;
+                }
             } else {
                 if (tls13_write_app(tls, cbuf, (size_t)n) != 0) {
                     break;
@@ -322,7 +342,7 @@ static void *client_worker(void *arg) {
             }
         }
 
-        if (FD_ISSET(tfd, &rfds)) {
+        if (upstream_ready) {
             if (downstream_direct) {
                 ssize_t n = recv(tfd, tbuf, sizeof(tbuf), 0);
                 if (n <= 0) {
@@ -357,6 +377,7 @@ static void *client_worker(void *arg) {
                     }
                     if (!downstream_direct) {
                         downstream_direct = 1;
+                        upstream_direct = 1;
                         fprintf(stderr, "[conn] switched to Vision downstream direct mode by raw fallback for %s:%u\n", target_host,
                                 (unsigned)target_port);
                     }
@@ -378,6 +399,8 @@ static void *client_worker(void *arg) {
 
                 if (switch_to_direct) {
                     downstream_direct = 1;
+                    upstream_direct = 1;
+                    tls13_mark_raw_direct(tls);
                     fprintf(stderr, "[conn] switched to Vision downstream direct mode for %s:%u\n", target_host, (unsigned)target_port);
                 }
             } else {
@@ -399,7 +422,7 @@ static void *client_worker(void *arg) {
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s --uri <vless://...> --listen-port <port>\n", argv0);
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  --uri <vless://...>      VLESS URI (Reality/Vision, TLS/XHTTP, or Reality/XHTTP)\n");
+    fprintf(stderr, "  --uri <vless://...>      VLESS URI (Reality/Vision, TLS/Vision, TLS/XHTTP, or Reality/XHTTP)\n");
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
