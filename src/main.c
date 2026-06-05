@@ -511,6 +511,8 @@ int main(int argc, char **argv) {
     const char *fp_label = "chrome";
     if (cfg.fp_mode == FP_RANDOM) {
         fp_label = "random";
+    } else if (cfg.fp_mode == FP_RANDOMIZED) {
+        fp_label = "randomized";
     } else if (cfg.fp_mode == FP_QQ) {
         fp_label = "qq";
     }
