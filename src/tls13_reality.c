@@ -7,9 +7,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <openssl/ec.h>
 #include <openssl/evp.h>
 #include <openssl/err.h>
 #include <openssl/hmac.h>
+#include <openssl/obj_mac.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
@@ -1998,6 +2000,22 @@ static int x25519_shared(const uint8_t priv[32], const uint8_t peer_pub[32], uin
     return ok ? 0 : -1;
 }
 
+static int p256_generate_public(uint8_t pub[65]) {
+    EC_KEY *key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    if (key == NULL) {
+        return -1;
+    }
+    int ok = EC_KEY_generate_key(key) == 1;
+    if (ok) {
+        const EC_GROUP *group = EC_KEY_get0_group(key);
+        const EC_POINT *point = EC_KEY_get0_public_key(key);
+        ok = group != NULL && point != NULL &&
+             EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, pub, 65, NULL) == 65;
+    }
+    EC_KEY_free(key);
+    return ok ? 0 : -1;
+}
+
 static uint16_t random_grease_value(void) {
     static const uint16_t vals[] = {0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
                                     0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa};
@@ -2054,6 +2072,20 @@ static int ext_supported_groups(dynbuf_t *exts, uint16_t grease, int random_mode
     return add_ext(exts, 0x000a, data, off);
 }
 
+static int ext_supported_groups_firefox(dynbuf_t *exts) {
+    uint16_t groups[] = {0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101};
+    uint8_t data[32];
+    size_t off = 0;
+    size_t glen = sizeof(groups);
+    data[off++] = (uint8_t)(glen >> 8);
+    data[off++] = (uint8_t)(glen & 0xFF);
+    for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
+        data[off++] = (uint8_t)(groups[i] >> 8);
+        data[off++] = (uint8_t)(groups[i] & 0xFF);
+    }
+    return add_ext(exts, 0x000a, data, off);
+}
+
 static int ext_ec_point_formats(dynbuf_t *exts) {
     uint8_t data[] = {0x01, 0x00};
     return add_ext(exts, 0x000b, data, sizeof(data));
@@ -2076,6 +2108,20 @@ static int ext_sig_algs(dynbuf_t *exts) {
 static int ext_sig_algs_qq(dynbuf_t *exts) {
     /* Matches uTLS HelloQQ_11_1 signature algorithm ordering. */
     uint16_t sigs[] = {0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601};
+    uint8_t data[64];
+    size_t off = 0;
+    size_t slen = sizeof(sigs);
+    data[off++] = (uint8_t)(slen >> 8);
+    data[off++] = (uint8_t)(slen & 0xFF);
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        data[off++] = (uint8_t)(sigs[i] >> 8);
+        data[off++] = (uint8_t)(sigs[i] & 0xFF);
+    }
+    return add_ext(exts, 0x000d, data, off);
+}
+
+static int ext_sig_algs_firefox(dynbuf_t *exts) {
+    uint16_t sigs[] = {0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201};
     uint8_t data[64];
     size_t off = 0;
     size_t slen = sizeof(sigs);
@@ -2135,6 +2181,11 @@ static int ext_supported_versions_qq(dynbuf_t *exts, uint16_t grease) {
     return add_ext(exts, 0x002b, data, sizeof(data));
 }
 
+static int ext_supported_versions_firefox(dynbuf_t *exts) {
+    uint8_t data[] = {0x04, 0x03, 0x04, 0x03, 0x03};
+    return add_ext(exts, 0x002b, data, sizeof(data));
+}
+
 static int ext_psk_modes(dynbuf_t *exts) {
     uint8_t data[] = {0x01, 0x01};
     return add_ext(exts, 0x002d, data, sizeof(data));
@@ -2163,6 +2214,35 @@ static int ext_key_share(dynbuf_t *exts, uint16_t grease, const uint8_t pubkey[3
     data[0] = (uint8_t)(list_len >> 8);
     data[1] = (uint8_t)(list_len & 0xFF);
 
+    return add_ext(exts, 0x0033, data, off);
+}
+
+static int ext_key_share_firefox(dynbuf_t *exts, const uint8_t x25519_pub[32]) {
+    uint8_t p256_pub[65];
+    if (p256_generate_public(p256_pub) != 0) {
+        return -1;
+    }
+
+    uint8_t data[2 + 4 + 32 + 4 + 65];
+    size_t off = 2;
+
+    data[off++] = 0x00;
+    data[off++] = 0x1d;
+    data[off++] = 0x00;
+    data[off++] = 0x20;
+    memcpy(data + off, x25519_pub, 32);
+    off += 32;
+
+    data[off++] = 0x00;
+    data[off++] = 0x17;
+    data[off++] = 0x00;
+    data[off++] = 0x41;
+    memcpy(data + off, p256_pub, sizeof(p256_pub));
+    off += sizeof(p256_pub);
+
+    size_t list_len = off - 2;
+    data[0] = (uint8_t)(list_len >> 8);
+    data[1] = (uint8_t)(list_len & 0xFF);
     return add_ext(exts, 0x0033, data, off);
 }
 
@@ -2212,6 +2292,46 @@ static int ext_compress_cert_brotli(dynbuf_t *exts) {
     /* algorithm list length=2, brotli=0x0002 */
     uint8_t data[] = {0x02, 0x00, 0x02};
     return add_ext(exts, 0x001b, data, sizeof(data));
+}
+
+static int ext_delegated_credentials_firefox(dynbuf_t *exts) {
+    uint8_t data[] = {0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03};
+    return add_ext(exts, 0x0022, data, sizeof(data));
+}
+
+static int ext_record_size_limit_firefox(dynbuf_t *exts) {
+    uint8_t data[] = {0x40, 0x01};
+    return add_ext(exts, 0x001c, data, sizeof(data));
+}
+
+static int ext_ech_grease_firefox(dynbuf_t *exts) {
+    enum { ECH_PAYLOAD_LEN = 239 };
+    uint8_t data[1 + 2 + 2 + 1 + 2 + 32 + 2 + ECH_PAYLOAD_LEN];
+    size_t off = 0;
+
+    data[off++] = 0x00;
+    data[off++] = 0x00;
+    data[off++] = 0x01;
+    data[off++] = 0x00;
+    data[off++] = 0x01;
+    if (RAND_bytes(data + off, 1) != 1) {
+        return -1;
+    }
+    off += 1;
+    data[off++] = 0x00;
+    data[off++] = 0x20;
+    if (RAND_bytes(data + off, 32) != 1) {
+        return -1;
+    }
+    off += 32;
+    data[off++] = (uint8_t)(ECH_PAYLOAD_LEN >> 8);
+    data[off++] = (uint8_t)(ECH_PAYLOAD_LEN & 0xFF);
+    if (RAND_bytes(data + off, ECH_PAYLOAD_LEN) != 1) {
+        return -1;
+    }
+    off += ECH_PAYLOAD_LEN;
+
+    return add_ext(exts, 0xfe0d, data, off);
 }
 
 static int ext_application_settings_h2(dynbuf_t *exts) {
@@ -2306,6 +2426,13 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, uint8_
             suites[soff++] = (uint8_t)(chrome_like_suites[i] >> 8);
             suites[soff++] = (uint8_t)(chrome_like_suites[i] & 0xFF);
         }
+    } else if (cfg->fp_mode == FP_FIREFOX) {
+        uint16_t firefox_suites[] = {0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030,
+                                     0xc00a, 0xc009, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
+        for (size_t i = 0; i < sizeof(firefox_suites) / sizeof(firefox_suites[0]); i++) {
+            suites[soff++] = (uint8_t)(firefox_suites[i] >> 8);
+            suites[soff++] = (uint8_t)(firefox_suites[i] & 0xFF);
+        }
     } else {
         suites[soff++] = 0x13;
         suites[soff++] = 0x01;
@@ -2362,6 +2489,18 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, uint8_
         size_t unpadded_len = header_len + 4 + exts.len + 2;
         size_t pad_len = boring_padding_len(unpadded_len);
         if (pad_len > 0 && ext_padding(&exts, pad_len) != 0) {
+            db_free(&exts);
+            db_free(&hs);
+            return -1;
+        }
+    } else if (cfg->fp_mode == FP_FIREFOX) {
+        if (ext_server_name(&exts, cfg->sni) != 0 || ext_extended_master_secret(&exts) != 0 ||
+            ext_renegotiation_info(&exts) != 0 || ext_supported_groups_firefox(&exts) != 0 ||
+            ext_ec_point_formats(&exts) != 0 || ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 ||
+            ext_status_request(&exts) != 0 || ext_delegated_credentials_firefox(&exts) != 0 ||
+            ext_key_share_firefox(&exts, client_pub) != 0 || ext_supported_versions_firefox(&exts) != 0 ||
+            ext_sig_algs_firefox(&exts) != 0 || ext_psk_modes(&exts) != 0 || ext_record_size_limit_firefox(&exts) != 0 ||
+            ext_ech_grease_firefox(&exts) != 0) {
             db_free(&exts);
             db_free(&hs);
             return -1;

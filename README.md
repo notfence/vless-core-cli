@@ -7,7 +7,7 @@ Standalone C CLI client for:
 - `VLESS + TLS + XHTTP (mode=packet-up)`
 - `VLESS + Reality + XHTTP (mode=stream-one)`
 
-`fp=chrome/firefox/random/randomized/qq` (firefox fallback to chrome)
+`fp=chrome/firefox/random/randomized/qq`
 
 Protocol semantics are aligned with `xray-core` for the supported transports and URI parameters.
 

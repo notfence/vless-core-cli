@@ -17,7 +17,7 @@
 #include "vision.h"
 #include "vless.h"
 
-#define VLESS_CORE_VERSION "1.0.3"
+#define VLESS_CORE_VERSION "1.0.4"
 
 static ssize_t read_with_timeout(int fd, uint8_t *buf, size_t cap, int timeout_ms) {
     fd_set rfds;
@@ -515,6 +515,8 @@ int main(int argc, char **argv) {
         fp_label = "randomized";
     } else if (cfg.fp_mode == FP_QQ) {
         fp_label = "qq";
+    } else if (cfg.fp_mode == FP_FIREFOX) {
+        fp_label = "firefox";
     }
     fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
             cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security,
