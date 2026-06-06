@@ -2419,7 +2419,7 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, uint8_
     }
     uint8_t suites[64];
     size_t soff = 0;
-    if (cfg->fp_mode == FP_QQ || cfg->fp_mode == FP_CHROME) {
+    if (cfg->fp_mode == FP_QQ || cfg->fp_mode == FP_CHROME || cfg->fp_mode == FP_EDGE) {
         uint16_t chrome_like_suites[] = {boring_grease_cipher, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030,
                                          0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
         for (size_t i = 0; i < sizeof(chrome_like_suites) / sizeof(chrome_like_suites[0]); i++) {
@@ -2473,7 +2473,7 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, uint8_
             db_free(&hs);
             return -1;
         }
-    } else if (cfg->fp_mode == FP_CHROME) {
+    } else if (cfg->fp_mode == FP_CHROME || cfg->fp_mode == FP_EDGE) {
         size_t header_len = hs.len - 4;
         if (ext_grease(&exts, boring_grease_ext1) != 0 || ext_server_name(&exts, cfg->sni) != 0 ||
             ext_extended_master_secret(&exts) != 0 || ext_renegotiation_info(&exts) != 0 ||

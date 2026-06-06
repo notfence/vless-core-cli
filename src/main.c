@@ -517,6 +517,8 @@ int main(int argc, char **argv) {
         fp_label = "qq";
     } else if (cfg.fp_mode == FP_FIREFOX) {
         fp_label = "firefox";
+    } else if (cfg.fp_mode == FP_EDGE) {
+        fp_label = "edge";
     }
     fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
             cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security,

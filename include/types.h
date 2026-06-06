@@ -9,7 +9,8 @@ typedef enum {
     FP_RANDOM = 1,
     FP_QQ = 2,
     FP_RANDOMIZED = 3,
-    FP_FIREFOX = 4
+    FP_FIREFOX = 4,
+    FP_EDGE = 5
 } fingerprint_mode_t;
 
 typedef enum {

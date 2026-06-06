@@ -104,6 +104,8 @@ static void parse_query(vless_config_t *cfg, char *query) {
                 cfg->fp_mode = FP_QQ;
             } else if (strcmp(decoded, "firefox") == 0) {
                 cfg->fp_mode = FP_FIREFOX;
+            } else if (strcmp(decoded, "edge") == 0) {
+                cfg->fp_mode = FP_EDGE;
             } else {
                 cfg->fp_mode = FP_CHROME;
             }
