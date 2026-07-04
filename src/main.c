@@ -17,7 +17,7 @@
 #include "vision.h"
 #include "vless.h"
 
-#define VLESS_CORE_VERSION "1.0.4"
+#define VLESS_CORE_VERSION "1.0.5"
 
 static ssize_t read_with_timeout(int fd, uint8_t *buf, size_t cap, int timeout_ms) {
     fd_set rfds;
@@ -422,7 +422,7 @@ static void *client_worker(void *arg) {
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s --uri <vless://...> --listen-port <port>\n", argv0);
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  --uri <vless://...>      VLESS URI (Reality/Vision, TLS/Vision, TLS/XHTTP, or Reality/XHTTP)\n");
+    fprintf(stderr, "  --uri <vless://...>      VLESS URI (Reality/Vision, TLS/Vision, TLS/XHTTP, Reality/XHTTP, TLS/WS, or plain WS)\n");
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
@@ -520,9 +520,14 @@ int main(int argc, char **argv) {
     } else if (cfg.fp_mode == FP_EDGE) {
         fp_label = "edge";
     }
+    const char *transport_label = "vision";
+    if (cfg.transport_mode == TRANSPORT_XHTTP) {
+        transport_label = "xhttp";
+    } else if (cfg.transport_mode == TRANSPORT_WS) {
+        transport_label = "ws";
+    }
     fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
-            cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security,
-            cfg.transport_mode == TRANSPORT_XHTTP ? "xhttp" : "vision", fp_label);
+            cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security, transport_label, fp_label);
     if (cfg.transport_mode == TRANSPORT_XHTTP && strcmp(cfg.security, "tls") == 0) {
         fprintf(stderr, "[xhttp] tls_mode=%s\n", xhttp_tls_mode_startup_label());
     }

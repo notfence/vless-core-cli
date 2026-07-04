@@ -15,7 +15,8 @@ typedef enum {
 
 typedef enum {
     TRANSPORT_VISION = 0,
-    TRANSPORT_XHTTP = 1
+    TRANSPORT_XHTTP = 1,
+    TRANSPORT_WS = 2
 } transport_mode_t;
 
 typedef struct {

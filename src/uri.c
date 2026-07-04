@@ -117,9 +117,11 @@ static void parse_query(vless_config_t *cfg, char *query) {
             copy_trunc(cfg->alpn, sizeof(cfg->alpn), decoded);
         } else if (strcmp(key, "allowInsecure") == 0 || strcmp(key, "insecure") == 0) {
             cfg->allow_insecure = (strcmp(decoded, "1") == 0 || strcmp(decoded, "true") == 0);
-        } else if (strcmp(key, "type") == 0) {
+        } else if (strcmp(key, "type") == 0 || strcmp(key, "transport") == 0 || strcmp(key, "network") == 0 || strcmp(key, "net") == 0) {
             if (strcmp(decoded, "xhttp") == 0 || strcmp(decoded, "splithttp") == 0) {
                 cfg->transport_mode = TRANSPORT_XHTTP;
+            } else if (strcmp(decoded, "ws") == 0 || strcmp(decoded, "websocket") == 0) {
+                cfg->transport_mode = TRANSPORT_WS;
             } else if (decoded[0] == '\0' || strcmp(decoded, "tcp") == 0) {
                 cfg->transport_mode = TRANSPORT_VISION;
             }
@@ -228,6 +230,17 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
                 return -1;
             }
         }
+        if (cfg->xhttp_path[0] == '\0') {
+            snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
+        }
+    } else if (cfg->transport_mode == TRANSPORT_WS) {
+        if (strcmp(cfg->security, "tls") != 0 && strcmp(cfg->security, "none") != 0) {
+            set_err(err, err_cap, "ws requires security=tls or security=none");
+            return -1;
+        }
+        cfg->flow[0] = '\0';
+        cfg->pbk_len = 0;
+        cfg->short_id_len = 0;
         if (cfg->xhttp_path[0] == '\0') {
             snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
         }

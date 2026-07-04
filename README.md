@@ -6,6 +6,8 @@ Standalone C CLI client for:
 - `VLESS + TCP + TLS + xtls-rprx-vision`
 - `VLESS + TLS + XHTTP (mode=packet-up)`
 - `VLESS + Reality + XHTTP (mode=stream-one)`
+- `VLESS + TLS + WebSocket`
+- `VLESS + WebSocket`
 
 `fp=chrome/firefox/edge/random/randomized/qq`
 
@@ -64,7 +66,7 @@ Expected help output:
 Usage: vless-core-linux-amd64 --uri <vless://...> --listen-port <port>
 
 Options:
-  --uri <vless://...>      VLESS URI (Reality/Vision, TLS/Vision, TLS/XHTTP, or Reality/XHTTP)
+  --uri <vless://...>      VLESS URI (Reality/Vision, TLS/Vision, TLS/XHTTP, Reality/XHTTP, TLS/WS, or plain WS)
   --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)
   -h, --help               Show help
   -v, --version            Show version
