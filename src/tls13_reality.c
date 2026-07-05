@@ -39,7 +39,8 @@ typedef enum {
     CONN_MODE_XHTTP_TLS = 1,
     CONN_MODE_XHTTP_REALITY = 2,
     CONN_MODE_TLS = 3,
-    CONN_MODE_WS = 4
+    CONN_MODE_WS = 4,
+    CONN_MODE_XHTTP_TLS_H2 = 5
 } conn_mode_t;
 
 typedef enum {
@@ -91,11 +92,24 @@ struct tls13_conn {
     char xhttp_base_path[512];
     char xhttp_host[256];
     char xhttp_session_id[64];
+    char xhttp_session_placement[16];
+    char xhttp_session_key[64];
+    char xhttp_seq_placement[16];
+    char xhttp_seq_key[64];
+    char xhttp_uplink_method[8];
+    char xhttp_padding_placement[16];
+    char xhttp_padding_key[64];
+    char xhttp_padding_header[64];
+    char xhttp_padding_method[16];
+    int xhttp_padding_obfs;
+    int xhttp_padding_min;
+    int xhttp_padding_max;
     uint64_t xhttp_seq;
     int xhttp_chunked;
     int64_t xhttp_content_rem;
     int64_t xhttp_chunk_rem;
     int xhttp_eof;
+    int xhttp_headers_read;
     int xhttp_tls_insecure;
     char xhttp_pin_key[320];
     char tls_verify_mode[16];
@@ -110,6 +124,7 @@ struct tls13_conn {
     int reality_raw_direct;
 
     uint32_t h2_stream_id;
+    uint32_t h2_next_stream_id;
     uint32_t h2_peer_initial_window;
     uint32_t h2_peer_max_frame_size;
     int64_t h2_peer_conn_window;
@@ -348,15 +363,38 @@ static int random_session_id(char out[64]) {
     return 0;
 }
 
-static int random_xpadding(char *buf, size_t cap) {
-    if (cap < 1002) {
+static int random_range_int(int min, int max) {
+    if (min <= 0) {
+        min = 1;
+    }
+    if (max < min) {
+        max = min;
+    }
+    uint32_t r = 0;
+    if (RAND_bytes((uint8_t *)&r, sizeof(r)) != 1) {
+        return min;
+    }
+    return min + (int)(r % (uint32_t)(max - min + 1));
+}
+
+static int random_xpadding_value(int min_len, int max_len, const char *method, char *buf, size_t cap) {
+    if (buf == NULL || cap < 2) {
         return -1;
     }
-    uint8_t b = 0;
-    if (RAND_bytes(&b, 1) != 1) {
+    if (min_len <= 0) {
+        min_len = 100;
+    }
+    if (max_len < min_len) {
+        max_len = min_len;
+    }
+
+    int target = random_range_int(min_len, max_len);
+    int len = target;
+    (void)method;
+    if (len <= 0 || (size_t)len + 1 > cap) {
         return -1;
     }
-    int len = 100 + (b % 901); // [100,1000]
+
     memset(buf, 'X', (size_t)len);
     buf[len] = '\0';
     return 0;
@@ -655,6 +693,74 @@ static int xhttp_tofu_verify_or_store(SSL *ssl, const char *pin_key, int log_ok,
     }
 
     return tofu_verify_or_store_pin("[xhttp]", pin_key, peer_pin, log_ok, err, err_cap);
+}
+
+static int alpn_csv_has_token(const char *csv, const char *token) {
+    if (csv == NULL || token == NULL || token[0] == '\0') {
+        return 0;
+    }
+    size_t token_len = strlen(token);
+    const char *p = csv;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            p++;
+        }
+        const char *start = p;
+        while (*p != '\0' && *p != ',') {
+            p++;
+        }
+        const char *end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+            end--;
+        }
+        if ((size_t)(end - start) == token_len && strncmp(start, token, token_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int append_alpn_token(unsigned char *out, unsigned int cap, unsigned int *len, const char *token) {
+    size_t n = strlen(token);
+    if (n == 0 || n > 255 || *len + 1U + (unsigned int)n > cap) {
+        return -1;
+    }
+    out[(*len)++] = (unsigned char)n;
+    memcpy(out + *len, token, n);
+    *len += (unsigned int)n;
+    return 0;
+}
+
+static int build_xhttp_tls_alpn(const char *cfg_alpn, unsigned char *out, unsigned int cap, unsigned int *out_len) {
+    int want_h2 = 0;
+    int want_h1 = 0;
+    if (cfg_alpn == NULL || cfg_alpn[0] == '\0') {
+        want_h2 = 1;
+        want_h1 = 1;
+    } else {
+        want_h2 = alpn_csv_has_token(cfg_alpn, "h2");
+        want_h1 = alpn_csv_has_token(cfg_alpn, "http/1.1");
+        if (!want_h2 && !want_h1) {
+            want_h2 = 1;
+            want_h1 = 1;
+        }
+    }
+
+    *out_len = 0;
+    if (want_h2 && append_alpn_token(out, cap, out_len, "h2") != 0) {
+        return -1;
+    }
+    if (want_h1 && append_alpn_token(out, cap, out_len, "http/1.1") != 0) {
+        return -1;
+    }
+    return *out_len > 0 ? 0 : -1;
+}
+
+static int ssl_selected_alpn_is_h2(SSL *ssl) {
+    const unsigned char *selected = NULL;
+    unsigned int selected_len = 0;
+    SSL_get0_alpn_selected(ssl, &selected, &selected_len);
+    return selected != NULL && selected_len == 2 && memcmp(selected, "h2", 2) == 0;
 }
 
 static int open_tls_socket(const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer, const unsigned char *alpn_protos,
@@ -1266,6 +1372,27 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
         return -1;
     }
 
+    if (!c->xhttp_headers_read) {
+        int status = 0;
+        int chunked = 0;
+        int64_t content_len = -1;
+        char err[160] = {0};
+        if (parse_http_response_headers(c->ssl, &c->xhttp_net_cache, &status, &chunked, &content_len, err, sizeof(err)) != 0) {
+            if (err[0] != '\0') {
+                fprintf(stderr, "[xhttp] %s\n", err);
+            }
+            return -1;
+        }
+        if (status != 200) {
+            fprintf(stderr, "[xhttp] GET returned non-200: %d\n", status);
+            return -1;
+        }
+        c->xhttp_chunked = chunked;
+        c->xhttp_content_rem = content_len;
+        c->xhttp_chunk_rem = -1;
+        c->xhttp_headers_read = 1;
+    }
+
     if (!c->xhttp_chunked) {
         if (c->xhttp_content_rem == 0) {
             c->xhttp_eof = 1;
@@ -1386,6 +1513,16 @@ static int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t 
     hdr[7] = (uint8_t)(stream_id >> 8);
     hdr[8] = (uint8_t)stream_id;
 
+    if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
+        if (ssl_write_all(c->ssl, hdr, sizeof(hdr)) != 0) {
+            return -1;
+        }
+        if (len > 0 && ssl_write_all(c->ssl, payload, len) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
     if (reality_write_app_records(c, hdr, sizeof(hdr)) != 0) {
         return -1;
     }
@@ -1411,8 +1548,16 @@ static int h2_send_window_update(tls13_conn_t *c, uint32_t stream_id, uint32_t i
 static int h2_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
-        if (c->h2_net_cache.len == 0 && fill_reality_plain_cache(c, &c->h2_net_cache) != 0) {
-            return -1;
+        if (c->h2_net_cache.len == 0) {
+            if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
+                uint8_t tmp[8192];
+                size_t got = 0;
+                if (ssl_read_some(c->ssl, tmp, sizeof(tmp), &got) != 0 || got == 0 || db_append(&c->h2_net_cache, tmp, got) != 0) {
+                    return -1;
+                }
+            } else if (fill_reality_plain_cache(c, &c->h2_net_cache) != 0) {
+                return -1;
+            }
         }
         size_t take = c->h2_net_cache.len;
         if (take > len - off) {
@@ -1670,9 +1815,7 @@ static int h2_decode_status_header(const uint8_t *block, size_t len) {
 
 static int h2_process_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id, const uint8_t *payload, size_t payload_len, char *err,
                               size_t err_cap) {
-    if (stream_id != c->h2_stream_id) {
-        return 0;
-    }
+    (void)c;
 
     size_t off = 0;
     if ((flags & H2_FLAG_PADDED) != 0) {
@@ -1703,7 +1846,7 @@ static int h2_process_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id
     if (status != 0) {
         if (status != 200) {
             if (err != NULL && err_cap > 0) {
-                snprintf(err, err_cap, "xhttp h2 returned non-200: %d", status);
+                snprintf(err, err_cap, "xhttp h2 stream %u returned non-200: %d", (unsigned)stream_id, status);
             }
             return -1;
         }
@@ -1774,7 +1917,9 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
 
 static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
     static const char preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    if (reality_write_app_records(c, (const uint8_t *)preface, sizeof(preface) - 1) != 0) {
+    int preface_rc = (c->mode == CONN_MODE_XHTTP_TLS_H2) ? ssl_write_all(c->ssl, preface, sizeof(preface) - 1)
+                                                         : reality_write_app_records(c, (const uint8_t *)preface, sizeof(preface) - 1);
+    if (preface_rc != 0) {
         set_err(err, err_cap, "failed to send h2 preface");
         return -1;
     }
@@ -1793,7 +1938,7 @@ static int h2_send_stream_one_headers(tls13_conn_t *c, char *err, size_t err_cap
     char xpadding[1100];
     char referer[2048];
 
-    if (random_xpadding(xpadding, sizeof(xpadding)) != 0) {
+    if (random_xpadding_value(100, 1000, "repeat-x", xpadding, sizeof(xpadding)) != 0) {
         set_err(err, err_cap, "failed to generate x_padding");
         return -1;
     }
@@ -1931,24 +2076,375 @@ static int h2_fill_app_cache(tls13_conn_t *c) {
     }
 }
 
-static int xhttp_send_download_request(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
-    char request_path[768];
-    snprintf(request_path, sizeof(request_path), "%s%s", c->xhttp_base_path, c->xhttp_session_id);
+static int xhttp_append_path_segment(char *path, size_t cap, const char *segment) {
+    if (path == NULL || segment == NULL || segment[0] == '\0') {
+        return 0;
+    }
+    size_t len = strlen(path);
+    if (len == 0) {
+        if (cap < 2) {
+            return -1;
+        }
+        path[0] = '/';
+        path[1] = '\0';
+        len = 1;
+    }
+    size_t seg_len = strlen(segment);
+    int need_slash = (path[len - 1] != '/');
+    if (len + (need_slash ? 1U : 0U) + seg_len + 1U > cap) {
+        return -1;
+    }
+    if (need_slash) {
+        path[len++] = '/';
+    }
+    memcpy(path + len, segment, seg_len + 1);
+    return 0;
+}
 
-    char xpadding[1100];
-    if (random_xpadding(xpadding, sizeof(xpadding)) != 0) {
-        set_err(err, err_cap, "failed to generate x_padding");
+static int xhttp_append_query_param(char *path, size_t cap, const char *key, const char *value) {
+    if (path == NULL || key == NULL || key[0] == '\0' || value == NULL) {
+        return 0;
+    }
+    size_t len = strlen(path);
+    const char sep = strchr(path, '?') == NULL ? '?' : '&';
+    size_t avail = cap > len ? cap - len : 0;
+    if (avail == 0) {
+        return -1;
+    }
+    int n = snprintf(path + len, avail, "%c%s=%s", sep, key, value);
+    return (n > 0 && (size_t)n < avail) ? 0 : -1;
+}
+
+static int xhttp_append_header_line(char *headers, size_t cap, const char *key, const char *value) {
+    if (headers == NULL || key == NULL || key[0] == '\0' || value == NULL) {
+        return 0;
+    }
+    if (strchr(key, '\r') != NULL || strchr(key, '\n') != NULL || strchr(value, '\r') != NULL || strchr(value, '\n') != NULL) {
+        return -1;
+    }
+    size_t len = strlen(headers);
+    size_t avail = cap > len ? cap - len : 0;
+    if (avail == 0) {
+        return -1;
+    }
+    int n = snprintf(headers + len, avail, "%s: %s\r\n", key, value);
+    return (n > 0 && (size_t)n < avail) ? 0 : -1;
+}
+
+static int xhttp_append_cookie_pair(char *cookies, size_t cap, const char *key, const char *value) {
+    if (cookies == NULL || key == NULL || key[0] == '\0' || value == NULL) {
+        return 0;
+    }
+    if (strchr(key, '\r') != NULL || strchr(key, '\n') != NULL || strchr(value, '\r') != NULL || strchr(value, '\n') != NULL) {
+        return -1;
+    }
+    size_t len = strlen(cookies);
+    size_t avail = cap > len ? cap - len : 0;
+    if (avail == 0) {
+        return -1;
+    }
+    int n = snprintf(cookies + len, avail, "%s%s=%s", len > 0 ? "; " : "", key, value);
+    return (n > 0 && (size_t)n < avail) ? 0 : -1;
+}
+
+static const char *xhttp_meta_key(const char *placement, const char *configured, const char *header_default, const char *other_default) {
+    if (configured != NULL && configured[0] != '\0') {
+        return configured;
+    }
+    if (placement != NULL && strcmp(placement, "header") == 0) {
+        return header_default;
+    }
+    if (placement != NULL && (strcmp(placement, "query") == 0 || strcmp(placement, "cookie") == 0)) {
+        return other_default;
+    }
+    return "";
+}
+
+static int xhttp_apply_meta_one(char *path, size_t path_cap, char *headers, size_t headers_cap, char *cookies, size_t cookies_cap,
+                                const char *placement, const char *key, const char *value) {
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+    if (placement == NULL || placement[0] == '\0' || strcmp(placement, "path") == 0) {
+        return xhttp_append_path_segment(path, path_cap, value);
+    }
+    if (strcmp(placement, "query") == 0) {
+        return xhttp_append_query_param(path, path_cap, key, value);
+    }
+    if (strcmp(placement, "header") == 0) {
+        return xhttp_append_header_line(headers, headers_cap, key, value);
+    }
+    if (strcmp(placement, "cookie") == 0) {
+        return xhttp_append_cookie_pair(cookies, cookies_cap, key, value);
+    }
+    return -1;
+}
+
+static int xhttp_apply_padding(tls13_conn_t *c, char *path, size_t path_cap, char *headers, size_t headers_cap, char *cookies,
+                               size_t cookies_cap) {
+    char padding[9000];
+    if (random_xpadding_value(c->xhttp_padding_min, c->xhttp_padding_max, c->xhttp_padding_method, padding, sizeof(padding)) != 0) {
         return -1;
     }
 
-    char referer[2048];
-    snprintf(referer, sizeof(referer), "https://%s%s?x_padding=%s", c->xhttp_host, c->xhttp_base_path, xpadding);
+    const char *placement = c->xhttp_padding_obfs ? c->xhttp_padding_placement : "queryinheader";
+    const char *key = c->xhttp_padding_obfs && c->xhttp_padding_key[0] != '\0' ? c->xhttp_padding_key : "x_padding";
+    const char *header = c->xhttp_padding_obfs && c->xhttp_padding_header[0] != '\0' ? c->xhttp_padding_header : "Referer";
 
-    char req[4096];
+    if (strcmp(placement, "header") == 0) {
+        return xhttp_append_header_line(headers, headers_cap, header, padding);
+    }
+    if (strcmp(placement, "query") == 0) {
+        return xhttp_append_query_param(path, path_cap, key, padding);
+    }
+    if (strcmp(placement, "cookie") == 0) {
+        return xhttp_append_cookie_pair(cookies, cookies_cap, key, padding);
+    }
+
+    char bare_path[1024];
+    snprintf(bare_path, sizeof(bare_path), "%s", path);
+    char *q = strchr(bare_path, '?');
+    if (q != NULL) {
+        *q = '\0';
+    }
+
+    char referer[2048];
+    int n = snprintf(referer, sizeof(referer), "https://%s%s?%s=%s", c->xhttp_host, bare_path, key, padding);
+    if (n <= 0 || (size_t)n >= sizeof(referer)) {
+        return -1;
+    }
+    return xhttp_append_header_line(headers, headers_cap, header, referer);
+}
+
+static int xhttp_prepare_request(tls13_conn_t *c, const char *seq_str, char *path, size_t path_cap, char *headers, size_t headers_cap) {
+    char cookies[1024];
+    cookies[0] = '\0';
+    headers[0] = '\0';
+    snprintf(path, path_cap, "%s", c->xhttp_base_path);
+
+    if (xhttp_apply_padding(c, path, path_cap, headers, headers_cap, cookies, sizeof(cookies)) != 0) {
+        return -1;
+    }
+
+    const char *session_key = xhttp_meta_key(c->xhttp_session_placement, c->xhttp_session_key, "X-Session", "x_session");
+    if (xhttp_apply_meta_one(path, path_cap, headers, headers_cap, cookies, sizeof(cookies), c->xhttp_session_placement, session_key,
+                             c->xhttp_session_id) != 0) {
+        return -1;
+    }
+
+    if (seq_str != NULL && seq_str[0] != '\0') {
+        const char *seq_key = xhttp_meta_key(c->xhttp_seq_placement, c->xhttp_seq_key, "X-Seq", "x_seq");
+        if (xhttp_apply_meta_one(path, path_cap, headers, headers_cap, cookies, sizeof(cookies), c->xhttp_seq_placement, seq_key, seq_str) !=
+            0) {
+            return -1;
+        }
+    }
+
+    if (cookies[0] != '\0' && xhttp_append_header_line(headers, headers_cap, "Cookie", cookies) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int h2_append_regular_header(dynbuf_t *block, const char *name, size_t name_len, const char *value, size_t value_len) {
+    if (name == NULL || value == NULL || name_len == 0) {
+        return 0;
+    }
+    if (name_len >= 128 || value_len >= 4096) {
+        return -1;
+    }
+
+    char lname[128];
+    char vbuf[4096];
+    for (size_t i = 0; i < name_len; i++) {
+        unsigned char ch = (unsigned char)name[i];
+        if (ch == '\r' || ch == '\n' || ch == ':' || ch == '\0') {
+            return -1;
+        }
+        lname[i] = (char)tolower(ch);
+    }
+    lname[name_len] = '\0';
+
+    while (value_len > 0 && (*value == ' ' || *value == '\t')) {
+        value++;
+        value_len--;
+    }
+    while (value_len > 0 && (value[value_len - 1] == ' ' || value[value_len - 1] == '\t')) {
+        value_len--;
+    }
+    memcpy(vbuf, value, value_len);
+    vbuf[value_len] = '\0';
+
+    if (strcmp(lname, "connection") == 0 || strcmp(lname, "keep-alive") == 0 || strcmp(lname, "proxy-connection") == 0 ||
+        strcmp(lname, "transfer-encoding") == 0 || strcmp(lname, "upgrade") == 0) {
+        return 0;
+    }
+    return hpack_append_literal_new_name(block, lname, vbuf);
+}
+
+static int h2_append_http1_header_lines(dynbuf_t *block, const char *headers) {
+    const char *p = headers;
+    while (p != NULL && *p != '\0') {
+        const char *line_end = strstr(p, "\r\n");
+        size_t line_len = line_end != NULL ? (size_t)(line_end - p) : strlen(p);
+        if (line_len > 0) {
+            const char *colon = memchr(p, ':', line_len);
+            if (colon == NULL) {
+                return -1;
+            }
+            if (h2_append_regular_header(block, p, (size_t)(colon - p), colon + 1, line_len - (size_t)(colon - p) - 1) != 0) {
+                return -1;
+            }
+        }
+        if (line_end == NULL) {
+            break;
+        }
+        p = line_end + 2;
+    }
+    return 0;
+}
+
+static int h2_send_xhttp_request_headers(tls13_conn_t *c, uint32_t stream_id, const char *method, const char *path,
+                                         const char *extra_headers, size_t content_len, int has_body, char *err, size_t err_cap) {
+    dynbuf_t block = {0};
+    int rc = 0;
+
+    if (strcmp(method, "GET") == 0) {
+        rc = hpack_append_indexed(&block, 2);
+    } else if (strcmp(method, "POST") == 0) {
+        rc = hpack_append_indexed(&block, 3);
+    } else {
+        rc = hpack_append_literal_new_name(&block, ":method", method);
+    }
+
+    if (rc == 0) {
+        rc = hpack_append_indexed(&block, 7);
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, ":authority", c->xhttp_host);
+    }
+    if (rc == 0) {
+        rc = (strcmp(path, "/") == 0) ? hpack_append_indexed(&block, 4) : hpack_append_literal_new_name(&block, ":path", path);
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, "user-agent",
+                                           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                                           "Chrome/149.0.0.0 Safari/537.36");
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, "accept", "*/*");
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, "cache-control", "no-cache");
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, "pragma", "no-cache");
+    }
+    if (rc == 0 && extra_headers != NULL && extra_headers[0] != '\0') {
+        rc = h2_append_http1_header_lines(&block, extra_headers);
+    }
+    if (rc == 0 && has_body) {
+        char clen[32];
+        snprintf(clen, sizeof(clen), "%zu", content_len);
+        rc = hpack_append_literal_new_name(&block, "content-length", clen);
+    }
+
+    uint8_t flags = H2_FLAG_END_HEADERS;
+    if (!has_body) {
+        flags |= H2_FLAG_END_STREAM;
+    }
+    if (rc == 0 && h2_send_frame(c, H2_FRAME_HEADERS, flags, stream_id, block.data, block.len) != 0) {
+        rc = -1;
+    }
+
+    db_free(&block);
+    if (rc != 0) {
+        set_err(err, err_cap, "failed to send xhttp h2 headers");
+        return -1;
+    }
+    return 0;
+}
+
+static int h2_send_xhttp_body(tls13_conn_t *c, uint32_t stream_id, const uint8_t *buf, size_t len, char *err, size_t err_cap) {
+    size_t off = 0;
+    if (len == 0) {
+        if (h2_send_frame(c, H2_FRAME_DATA, H2_FLAG_END_STREAM, stream_id, NULL, 0) != 0) {
+            set_err(err, err_cap, "failed to send xhttp h2 body");
+            return -1;
+        }
+        return 0;
+    }
+
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > c->h2_peer_max_frame_size) {
+            chunk = c->h2_peer_max_frame_size;
+        }
+        uint8_t flags = (off + chunk == len) ? H2_FLAG_END_STREAM : 0;
+        if (h2_send_frame(c, H2_FRAME_DATA, flags, stream_id, buf + off, chunk) != 0) {
+            set_err(err, err_cap, "failed to send xhttp h2 body");
+            return -1;
+        }
+        off += chunk;
+    }
+    return 0;
+}
+
+static int xhttp_h2_send_download_request(tls13_conn_t *c, char *err, size_t err_cap) {
+    char request_path[2048];
+    char extra_headers[4096];
+    if (xhttp_prepare_request(c, "", request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
+        set_err(err, err_cap, "failed to build xhttp h2 GET");
+        return -1;
+    }
+
+    c->h2_stream_id = 1;
+    c->h2_next_stream_id = 3;
+    c->h2_peer_initial_window = H2_DEFAULT_WINDOW;
+    c->h2_peer_max_frame_size = H2_DEFAULT_MAX_FRAME;
+    c->h2_peer_conn_window = H2_DEFAULT_WINDOW;
+    c->h2_peer_stream_window = H2_DEFAULT_WINDOW;
+    c->h2_stream_eof = 0;
+
+    if (h2_send_client_preface(c, err, err_cap) != 0) {
+        return -1;
+    }
+    return h2_send_xhttp_request_headers(c, c->h2_stream_id, "GET", request_path, extra_headers, 0, 0, err, err_cap);
+}
+
+static int xhttp_h2_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, char *err, size_t err_cap) {
+    char seq[32];
+    snprintf(seq, sizeof(seq), "%llu", (unsigned long long)c->xhttp_seq++);
+
+    char request_path[2048];
+    char extra_headers[4096];
+    if (xhttp_prepare_request(c, seq, request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
+        set_err(err, err_cap, "failed to build xhttp h2 upload request");
+        return -1;
+    }
+
+    uint32_t stream_id = c->h2_next_stream_id;
+    c->h2_next_stream_id += 2;
+    const char *method = (strcmp(c->xhttp_uplink_method, "GET") == 0) ? "GET" : "POST";
+    if (h2_send_xhttp_request_headers(c, stream_id, method, request_path, extra_headers, len, 1, err, err_cap) != 0) {
+        return -1;
+    }
+    return h2_send_xhttp_body(c, stream_id, buf, len, err, err_cap);
+}
+
+static int xhttp_send_download_request(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    char request_path[2048];
+    char extra_headers[4096];
+    if (xhttp_prepare_request(c, "", request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
+        set_err(err, err_cap, "failed to build xhttp GET");
+        return -1;
+    }
+
+    char req[8192];
     int req_len =
         snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: vless-core/1.0\r\nAccept: */*\r\nCache-Control: no-cache\r\n"
-                                   "Referer: %s\r\nConnection: keep-alive\r\n\r\n",
-                 request_path, c->xhttp_host, referer);
+                                   "%sConnection: keep-alive\r\n\r\n",
+                 request_path, c->xhttp_host, extra_headers);
     if (req_len <= 0 || (size_t)req_len >= sizeof(req)) {
         set_err(err, err_cap, "xhttp GET request too large");
         return -1;
@@ -1959,21 +2455,11 @@ static int xhttp_send_download_request(const vless_config_t *cfg, tls13_conn_t *
         return -1;
     }
 
-    int status = 0;
-    int chunked = 0;
-    int64_t content_len = -1;
-    if (parse_http_response_headers(c->ssl, &c->xhttp_net_cache, &status, &chunked, &content_len, err, err_cap) != 0) {
-        return -1;
-    }
-    if (status != 200) {
-        set_err(err, err_cap, "xhttp GET returned non-200");
-        return -1;
-    }
-
-    c->xhttp_chunked = chunked;
-    c->xhttp_content_rem = content_len;
+    c->xhttp_chunked = 0;
+    c->xhttp_content_rem = -1;
     c->xhttp_chunk_rem = -1;
     c->xhttp_eof = 0;
+    c->xhttp_headers_read = 0;
     (void)cfg;
     return 0;
 }
@@ -2046,27 +2532,23 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, ch
     char seq[32];
     snprintf(seq, sizeof(seq), "%llu", (unsigned long long)c->xhttp_seq++);
 
-    char request_path[1024];
-    snprintf(request_path, sizeof(request_path), "%s%s/%s", c->xhttp_base_path, c->xhttp_session_id, seq);
-
-    char xpadding[1100];
-    if (random_xpadding(xpadding, sizeof(xpadding)) != 0) {
+    char request_path[2048];
+    char extra_headers[4096];
+    if (xhttp_prepare_request(c, seq, request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
         SSL_shutdown(ssl);
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(fd);
-        set_err(err, err_cap, "failed to generate x_padding");
+        set_err(err, err_cap, "failed to build xhttp upload request");
         return -1;
     }
 
-    char referer[2048];
-    snprintf(referer, sizeof(referer), "https://%s%s?x_padding=%s", c->xhttp_host, c->xhttp_base_path, xpadding);
-
-    char req[4096];
+    const char *method = (strcmp(c->xhttp_uplink_method, "GET") == 0) ? "GET" : "POST";
+    char req[8192];
     int req_len = snprintf(req, sizeof(req),
-                           "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: vless-core/1.0\r\nAccept: */*\r\nReferer: %s\r\n"
-                           "Content-Type: application/octet-stream\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-                           request_path, c->xhttp_host, referer, len);
+                           "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: vless-core/1.0\r\nAccept: */*\r\n"
+                           "%sContent-Type: application/octet-stream\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                           method, request_path, c->xhttp_host, extra_headers, len);
     if (req_len <= 0 || (size_t)req_len >= sizeof(req)) {
         SSL_shutdown(ssl);
         SSL_free(ssl);
@@ -2089,7 +2571,9 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, ch
             rc = -1;
         } else if (status != 200) {
             rc = -1;
-            set_err(err, err_cap, "xhttp POST returned non-200");
+            if (err != NULL && err_cap > 0) {
+                snprintf(err, err_cap, "xhttp %s returned non-200: %d", method, status);
+            }
         }
         db_free(&cache);
         (void)chunked;
@@ -4197,6 +4681,24 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
 
     const char *xhost = cfg->xhttp_host[0] != '\0' ? cfg->xhttp_host : c->remote_sni;
     snprintf(c->xhttp_host, sizeof(c->xhttp_host), "%s", xhost);
+    snprintf(c->xhttp_session_placement, sizeof(c->xhttp_session_placement), "%s",
+             cfg->xhttp_session_placement[0] != '\0' ? cfg->xhttp_session_placement : "path");
+    snprintf(c->xhttp_session_key, sizeof(c->xhttp_session_key), "%s", cfg->xhttp_session_key);
+    snprintf(c->xhttp_seq_placement, sizeof(c->xhttp_seq_placement), "%s",
+             cfg->xhttp_seq_placement[0] != '\0' ? cfg->xhttp_seq_placement : "path");
+    snprintf(c->xhttp_seq_key, sizeof(c->xhttp_seq_key), "%s", cfg->xhttp_seq_key);
+    snprintf(c->xhttp_uplink_method, sizeof(c->xhttp_uplink_method), "%s",
+             cfg->xhttp_uplink_method[0] != '\0' ? cfg->xhttp_uplink_method : "POST");
+    snprintf(c->xhttp_padding_placement, sizeof(c->xhttp_padding_placement), "%s",
+             cfg->xhttp_padding_placement[0] != '\0' ? cfg->xhttp_padding_placement : "queryinheader");
+    snprintf(c->xhttp_padding_key, sizeof(c->xhttp_padding_key), "%s", cfg->xhttp_padding_key[0] != '\0' ? cfg->xhttp_padding_key : "x_padding");
+    snprintf(c->xhttp_padding_header, sizeof(c->xhttp_padding_header), "%s",
+             cfg->xhttp_padding_header[0] != '\0' ? cfg->xhttp_padding_header : "X-Padding");
+    snprintf(c->xhttp_padding_method, sizeof(c->xhttp_padding_method), "%s",
+             cfg->xhttp_padding_method[0] != '\0' ? cfg->xhttp_padding_method : "repeat-x");
+    c->xhttp_padding_obfs = cfg->xhttp_padding_obfs;
+    c->xhttp_padding_min = cfg->xhttp_padding_min > 0 ? cfg->xhttp_padding_min : 100;
+    c->xhttp_padding_max = cfg->xhttp_padding_max >= c->xhttp_padding_min ? cfg->xhttp_padding_max : c->xhttp_padding_min;
     if (random_session_id(c->xhttp_session_id) != 0) {
         set_err(err, err_cap, "failed to create xhttp session id");
         return -1;
@@ -4208,10 +4710,18 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         return -1;
     }
 
+    unsigned char xhttp_alpn[32];
+    unsigned int xhttp_alpn_len = 0;
+    if (build_xhttp_tls_alpn(cfg->alpn, xhttp_alpn, sizeof(xhttp_alpn), &xhttp_alpn_len) != 0) {
+        set_err(err, err_cap, "failed to build xhttp TLS ALPN");
+        return -1;
+    }
+
     xhttp_tls_mode_t mode = get_xhttp_tls_mode();
     if (mode == XHTTP_TLS_MODE_TOFU) {
         xhttp_log_tls_mode_selected(mode, 0);
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &c->ssl_ctx, &c->ssl, &c->fd, err, err_cap) != 0) {
+        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd, err,
+                            err_cap) != 0) {
             return -1;
         }
         if (xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
@@ -4221,7 +4731,8 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
     } else {
         int verify_peer = xhttp_effective_verify_peer();
         xhttp_log_tls_mode_selected(mode, verify_peer);
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &c->ssl_ctx, &c->ssl, &c->fd, err, err_cap) != 0) {
+        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl,
+                            &c->fd, err, err_cap) != 0) {
             if (!(verify_peer == 1 && xhttp_auto_fallback_allowed() && is_cert_verify_error_msg(err))) {
                 return -1;
             }
@@ -4229,7 +4740,8 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
                 fprintf(stderr, "[xhttp] tls_mode=auto(selected=insecure+tofu): %s\n", err);
             }
             g_xhttp_auto_force_insecure = 1;
-            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &c->ssl_ctx, &c->ssl, &c->fd, err, err_cap) != 0) {
+            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
+                                err, err_cap) != 0) {
                 return -1;
             }
             if (mode == XHTTP_TLS_MODE_AUTO && xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
@@ -4240,6 +4752,17 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
             c->xhttp_tls_insecure = verify_peer ? 0 : 1;
         }
     }
+
+    if (ssl_selected_alpn_is_h2(c->ssl)) {
+        c->mode = CONN_MODE_XHTTP_TLS_H2;
+        fprintf(stderr, "[xhttp] tls mode=packet-up http=2\n");
+        if (xhttp_h2_send_download_request(c, err, err_cap) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    fprintf(stderr, "[xhttp] tls mode=packet-up http=1.1\n");
     if (xhttp_send_download_request(cfg, c, err, err_cap) != 0) {
         return -1;
     }
@@ -4381,6 +4904,25 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
         return 0;
     }
 
+    if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
+        size_t off = 0;
+        while (off < len) {
+            size_t chunk = len - off;
+            if (chunk > 60000) {
+                chunk = 60000;
+            }
+            char err[128] = {0};
+            if (xhttp_h2_post_packet(c, buf + off, chunk, err, sizeof(err)) != 0) {
+                if (err[0] != '\0') {
+                    fprintf(stderr, "[xhttp] h2 upload failed: %s\n", err);
+                }
+                return -1;
+            }
+            off += chunk;
+        }
+        return 0;
+    }
+
     if (c->mode == CONN_MODE_XHTTP_REALITY) {
         return h2_write_data(c, buf, len);
     }
@@ -4471,6 +5013,10 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
             }
         } else if (c->mode == CONN_MODE_XHTTP_TLS) {
             if (xhttp_fill_app_cache(c) != 0) {
+                return -1;
+            }
+        } else if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
+            if (h2_fill_app_cache(c) != 0) {
                 return -1;
             }
         } else if (c->mode == CONN_MODE_XHTTP_REALITY) {

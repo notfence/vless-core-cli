@@ -46,6 +46,19 @@ typedef struct {
     char xhttp_path[256];
     char xhttp_host[256];
     char xhttp_mode[32];
+    char xhttp_session_placement[16];
+    char xhttp_session_key[64];
+    char xhttp_seq_placement[16];
+    char xhttp_seq_key[64];
+    char xhttp_uplink_method[8];
+    char xhttp_uplink_data_placement[16];
+    char xhttp_padding_placement[16];
+    char xhttp_padding_key[64];
+    char xhttp_padding_header[64];
+    char xhttp_padding_method[16];
+    int xhttp_padding_obfs;
+    int xhttp_padding_min;
+    int xhttp_padding_max;
 } vless_config_t;
 
 typedef struct {

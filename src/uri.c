@@ -25,6 +25,224 @@ static void copy_trunc(char *dst, size_t dst_cap, const char *src) {
     dst[n] = '\0';
 }
 
+static void copy_lower_trunc(char *dst, size_t dst_cap, const char *src) {
+    if (dst_cap == 0) {
+        return;
+    }
+    size_t n = 0;
+    while (n + 1 < dst_cap && src[n] != '\0') {
+        char ch = src[n];
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = (char)(ch - 'A' + 'a');
+        }
+        dst[n] = ch;
+        n++;
+    }
+    dst[n] = '\0';
+}
+
+static void copy_upper_trunc(char *dst, size_t dst_cap, const char *src) {
+    if (dst_cap == 0) {
+        return;
+    }
+    size_t n = 0;
+    while (n + 1 < dst_cap && src[n] != '\0') {
+        char ch = src[n];
+        if (ch >= 'a' && ch <= 'z') {
+            ch = (char)(ch - 'a' + 'A');
+        }
+        dst[n] = ch;
+        n++;
+    }
+    dst[n] = '\0';
+}
+
+static void trim_in_place(char *s) {
+    if (s == NULL) {
+        return;
+    }
+    size_t n = strlen(s);
+    size_t start = 0;
+    while (start < n && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
+        start++;
+    }
+    size_t end = n;
+    while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r' || s[end - 1] == '\n')) {
+        end--;
+    }
+    if (start > 0) {
+        memmove(s, s + start, end - start);
+    }
+    s[end - start] = '\0';
+}
+
+static const char *skip_json_ws(const char *p) {
+    while (p != NULL && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
+        p++;
+    }
+    return p;
+}
+
+static const char *json_find_value(const char *json, const char *key) {
+    if (json == NULL || key == NULL || key[0] == '\0') {
+        return NULL;
+    }
+
+    char needle[96];
+    int n = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (n <= 0 || (size_t)n >= sizeof(needle)) {
+        return NULL;
+    }
+
+    const char *p = json;
+    while ((p = strstr(p, needle)) != NULL) {
+        const char *v = skip_json_ws(p + n);
+        if (v != NULL && *v == ':') {
+            return skip_json_ws(v + 1);
+        }
+        p += n;
+    }
+    return NULL;
+}
+
+static int json_get_scalar(const char *json, const char *key, char *out, size_t out_cap) {
+    if (out == NULL || out_cap == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+
+    const char *p = json_find_value(json, key);
+    if (p == NULL || *p == '\0') {
+        return -1;
+    }
+
+    size_t oi = 0;
+    if (*p == '"') {
+        p++;
+        while (*p != '\0' && *p != '"') {
+            if (oi + 1 >= out_cap) {
+                return -1;
+            }
+            if (*p == '\\' && p[1] != '\0') {
+                p++;
+                switch (*p) {
+                case 'n':
+                    out[oi++] = '\n';
+                    break;
+                case 'r':
+                    out[oi++] = '\r';
+                    break;
+                case 't':
+                    out[oi++] = '\t';
+                    break;
+                default:
+                    out[oi++] = *p;
+                    break;
+                }
+                p++;
+                continue;
+            }
+            out[oi++] = *p++;
+        }
+        out[oi] = '\0';
+        return (*p == '"') ? 0 : -1;
+    }
+
+    while (*p != '\0' && *p != ',' && *p != '}') {
+        if (oi + 1 >= out_cap) {
+            return -1;
+        }
+        out[oi++] = *p++;
+    }
+    out[oi] = '\0';
+    trim_in_place(out);
+    return out[0] != '\0' ? 0 : -1;
+}
+
+static void parse_range_value(const char *value, int *min_out, int *max_out) {
+    if (value == NULL || min_out == NULL || max_out == NULL) {
+        return;
+    }
+    char tmp[64];
+    copy_trunc(tmp, sizeof(tmp), value);
+    trim_in_place(tmp);
+    if (tmp[0] == '\0') {
+        return;
+    }
+
+    char *dash = strchr(tmp, '-');
+    long a = 0;
+    long b = 0;
+    if (dash != NULL) {
+        *dash = '\0';
+        a = strtol(tmp, NULL, 10);
+        b = strtol(dash + 1, NULL, 10);
+    } else {
+        a = strtol(tmp, NULL, 10);
+        b = a;
+    }
+    if (a <= 0 || b <= 0) {
+        return;
+    }
+    if (a > b) {
+        long t = a;
+        a = b;
+        b = t;
+    }
+    if (a > 8192) {
+        a = 8192;
+    }
+    if (b > 8192) {
+        b = 8192;
+    }
+    *min_out = (int)a;
+    *max_out = (int)b;
+}
+
+static void parse_xhttp_extra(vless_config_t *cfg, const char *json) {
+    char val[256];
+
+    if (json_get_scalar(json, "sessionPlacement", val, sizeof(val)) == 0 ||
+        json_get_scalar(json, "sessionIDPlacement", val, sizeof(val)) == 0) {
+        copy_lower_trunc(cfg->xhttp_session_placement, sizeof(cfg->xhttp_session_placement), val);
+    }
+    if (json_get_scalar(json, "sessionKey", val, sizeof(val)) == 0 ||
+        json_get_scalar(json, "sessionIDKey", val, sizeof(val)) == 0) {
+        copy_trunc(cfg->xhttp_session_key, sizeof(cfg->xhttp_session_key), val);
+    }
+    if (json_get_scalar(json, "seqPlacement", val, sizeof(val)) == 0) {
+        copy_lower_trunc(cfg->xhttp_seq_placement, sizeof(cfg->xhttp_seq_placement), val);
+    }
+    if (json_get_scalar(json, "seqKey", val, sizeof(val)) == 0) {
+        copy_trunc(cfg->xhttp_seq_key, sizeof(cfg->xhttp_seq_key), val);
+    }
+    if (json_get_scalar(json, "uplinkHTTPMethod", val, sizeof(val)) == 0) {
+        copy_upper_trunc(cfg->xhttp_uplink_method, sizeof(cfg->xhttp_uplink_method), val);
+    }
+    if (json_get_scalar(json, "uplinkDataPlacement", val, sizeof(val)) == 0) {
+        copy_lower_trunc(cfg->xhttp_uplink_data_placement, sizeof(cfg->xhttp_uplink_data_placement), val);
+    }
+    if (json_get_scalar(json, "xPaddingPlacement", val, sizeof(val)) == 0) {
+        copy_lower_trunc(cfg->xhttp_padding_placement, sizeof(cfg->xhttp_padding_placement), val);
+    }
+    if (json_get_scalar(json, "xPaddingKey", val, sizeof(val)) == 0) {
+        copy_trunc(cfg->xhttp_padding_key, sizeof(cfg->xhttp_padding_key), val);
+    }
+    if (json_get_scalar(json, "xPaddingHeader", val, sizeof(val)) == 0) {
+        copy_trunc(cfg->xhttp_padding_header, sizeof(cfg->xhttp_padding_header), val);
+    }
+    if (json_get_scalar(json, "xPaddingMethod", val, sizeof(val)) == 0) {
+        copy_lower_trunc(cfg->xhttp_padding_method, sizeof(cfg->xhttp_padding_method), val);
+    }
+    if (json_get_scalar(json, "xPaddingObfsMode", val, sizeof(val)) == 0) {
+        copy_lower_trunc(val, sizeof(val), val);
+        cfg->xhttp_padding_obfs = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    }
+    if (json_get_scalar(json, "xPaddingBytes", val, sizeof(val)) == 0) {
+        parse_range_value(val, &cfg->xhttp_padding_min, &cfg->xhttp_padding_max);
+    }
+}
+
 static int parse_host_port(const char *s, char *host, size_t host_cap, uint16_t *port) {
     if (s == NULL || host == NULL || port == NULL) {
         return -1;
@@ -78,7 +296,7 @@ static void parse_query(vless_config_t *cfg, char *query) {
         const char *key = tok;
         const char *val = eq + 1;
 
-        char decoded[512];
+        char decoded[1536];
         if (percent_decode(val, decoded, sizeof(decoded)) != 0) {
             continue;
         }
@@ -131,6 +349,10 @@ static void parse_query(vless_config_t *cfg, char *query) {
             copy_trunc(cfg->xhttp_host, sizeof(cfg->xhttp_host), decoded);
         } else if (strcmp(key, "mode") == 0) {
             copy_trunc(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), decoded);
+        } else if (strcmp(key, "extra") == 0) {
+            parse_xhttp_extra(cfg, decoded);
+        } else if (strcmp(key, "xPaddingBytes") == 0 || strcmp(key, "x_padding_bytes") == 0) {
+            parse_range_value(decoded, &cfg->xhttp_padding_min, &cfg->xhttp_padding_max);
         } else if (strcmp(key, "spx") == 0) {
             copy_trunc(cfg->spider_x, sizeof(cfg->spider_x), decoded);
         }
@@ -154,6 +376,19 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
     cfg->xhttp_host[0] = '\0';
     snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "auto");
+    snprintf(cfg->xhttp_session_placement, sizeof(cfg->xhttp_session_placement), "path");
+    cfg->xhttp_session_key[0] = '\0';
+    snprintf(cfg->xhttp_seq_placement, sizeof(cfg->xhttp_seq_placement), "path");
+    cfg->xhttp_seq_key[0] = '\0';
+    snprintf(cfg->xhttp_uplink_method, sizeof(cfg->xhttp_uplink_method), "POST");
+    snprintf(cfg->xhttp_uplink_data_placement, sizeof(cfg->xhttp_uplink_data_placement), "body");
+    snprintf(cfg->xhttp_padding_placement, sizeof(cfg->xhttp_padding_placement), "queryinheader");
+    snprintf(cfg->xhttp_padding_key, sizeof(cfg->xhttp_padding_key), "x_padding");
+    snprintf(cfg->xhttp_padding_header, sizeof(cfg->xhttp_padding_header), "X-Padding");
+    snprintf(cfg->xhttp_padding_method, sizeof(cfg->xhttp_padding_method), "repeat-x");
+    cfg->xhttp_padding_obfs = 0;
+    cfg->xhttp_padding_min = 100;
+    cfg->xhttp_padding_max = 1000;
     snprintf(cfg->original_uri, sizeof(cfg->original_uri), "%s", uri);
 
     if (strncmp(uri, "vless://", 8) != 0) {
@@ -210,6 +445,14 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         }
         if (xhttp_tls && strcmp(cfg->xhttp_mode, "packet-up") != 0) {
             set_err(err, err_cap, "only xhttp/tls mode=packet-up is supported");
+            return -1;
+        }
+        if (xhttp_tls && strcmp(cfg->xhttp_uplink_method, "GET") != 0 && strcmp(cfg->xhttp_uplink_method, "POST") != 0) {
+            set_err(err, err_cap, "xhttp/tls uplinkHTTPMethod must be GET or POST");
+            return -1;
+        }
+        if (xhttp_tls && strcmp(cfg->xhttp_uplink_data_placement, "body") != 0 && strcmp(cfg->xhttp_uplink_data_placement, "auto") != 0) {
+            set_err(err, err_cap, "only xhttp/tls uplinkDataPlacement=body is supported");
             return -1;
         }
         if (xhttp_reality && strcmp(cfg->xhttp_mode, "stream-one") != 0) {
