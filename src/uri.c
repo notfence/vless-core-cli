@@ -1,6 +1,7 @@
 #include "uri.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,6 +75,52 @@ static void trim_in_place(char *s) {
         memmove(s, s + start, end - start);
     }
     s[end - start] = '\0';
+}
+
+static int starts_with_ci(const char *s, const char *prefix) {
+    if (s == NULL || prefix == NULL) {
+        return 0;
+    }
+    while (*prefix != '\0') {
+        if (*s == '\0') {
+            return 0;
+        }
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) {
+            return 0;
+        }
+        s++;
+        prefix++;
+    }
+    return 1;
+}
+
+static void init_config_defaults(vless_config_t *cfg, const char *uri) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->protocol = CORE_PROTOCOL_VLESS;
+    cfg->fp_mode = FP_CHROME;
+    cfg->transport_mode = TRANSPORT_VISION;
+    snprintf(cfg->flow, sizeof(cfg->flow), "xtls-rprx-vision");
+    snprintf(cfg->security, sizeof(cfg->security), "reality");
+    cfg->alpn[0] = '\0';
+    cfg->allow_insecure = 0;
+    snprintf(cfg->spider_x, sizeof(cfg->spider_x), "/");
+    snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
+    cfg->xhttp_host[0] = '\0';
+    snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "auto");
+    snprintf(cfg->xhttp_session_placement, sizeof(cfg->xhttp_session_placement), "path");
+    cfg->xhttp_session_key[0] = '\0';
+    snprintf(cfg->xhttp_seq_placement, sizeof(cfg->xhttp_seq_placement), "path");
+    cfg->xhttp_seq_key[0] = '\0';
+    snprintf(cfg->xhttp_uplink_method, sizeof(cfg->xhttp_uplink_method), "POST");
+    snprintf(cfg->xhttp_uplink_data_placement, sizeof(cfg->xhttp_uplink_data_placement), "body");
+    snprintf(cfg->xhttp_padding_placement, sizeof(cfg->xhttp_padding_placement), "queryinheader");
+    snprintf(cfg->xhttp_padding_key, sizeof(cfg->xhttp_padding_key), "x_padding");
+    snprintf(cfg->xhttp_padding_header, sizeof(cfg->xhttp_padding_header), "X-Padding");
+    snprintf(cfg->xhttp_padding_method, sizeof(cfg->xhttp_padding_method), "repeat-x");
+    cfg->xhttp_padding_obfs = 0;
+    cfg->xhttp_padding_min = 100;
+    cfg->xhttp_padding_max = 1000;
+    snprintf(cfg->original_uri, sizeof(cfg->original_uri), "%s", uri ? uri : "");
 }
 
 static const char *skip_json_ws(const char *p) {
@@ -286,6 +333,42 @@ static int parse_host_port(const char *s, char *host, size_t host_cap, uint16_t 
     return 0;
 }
 
+static int parse_host_optional_port(const char *s, uint16_t default_port, char *host, size_t host_cap, uint16_t *port) {
+    if (s == NULL || host == NULL || port == NULL) {
+        return -1;
+    }
+    if (parse_host_port(s, host, host_cap, port) == 0) {
+        return 0;
+    }
+
+    if (s[0] == '[') {
+        const char *end = strchr(s, ']');
+        if (end == NULL || end[1] != '\0') {
+            return -1;
+        }
+        size_t hlen = (size_t)(end - (s + 1));
+        if (hlen == 0 || hlen + 1 > host_cap) {
+            return -1;
+        }
+        memcpy(host, s + 1, hlen);
+        host[hlen] = '\0';
+        *port = default_port;
+        return 0;
+    }
+
+    if (strchr(s, ':') != NULL) {
+        return -1;
+    }
+    size_t hlen = strlen(s);
+    if (hlen == 0 || hlen + 1 > host_cap) {
+        return -1;
+    }
+    memcpy(host, s, hlen);
+    host[hlen] = '\0';
+    *port = default_port;
+    return 0;
+}
+
 static void parse_query(vless_config_t *cfg, char *query) {
     for (char *tok = strtok(query, "&"); tok != NULL; tok = strtok(NULL, "&")) {
         char *eq = strchr(tok, '=');
@@ -359,39 +442,76 @@ static void parse_query(vless_config_t *cfg, char *query) {
     }
 }
 
+static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {
+    if (uri == NULL || cfg == NULL) {
+        set_err(err, err_cap, "null input");
+        return -1;
+    }
+
+    init_config_defaults(cfg, uri);
+    cfg->protocol = CORE_PROTOCOL_SOCKS5;
+    cfg->flow[0] = '\0';
+    snprintf(cfg->security, sizeof(cfg->security), "none");
+    cfg->pbk_len = 0;
+    cfg->short_id_len = 0;
+
+    if (!starts_with_ci(uri, "socks5://")) {
+        set_err(err, err_cap, "URI must start with socks5://");
+        return -1;
+    }
+
+    char work[4096];
+    snprintf(work, sizeof(work), "%s", uri + 9);
+
+    char *end = strpbrk(work, "/?#");
+    if (end != NULL) {
+        *end = '\0';
+    }
+    trim_in_place(work);
+    if (work[0] == '\0') {
+        set_err(err, err_cap, "missing SOCKS5 host");
+        return -1;
+    }
+
+    char *host_port = work;
+    char *at = strrchr(work, '@');
+    if (at != NULL) {
+        *at = '\0';
+        host_port = at + 1;
+
+        char *pass = strchr(work, ':');
+        if (pass != NULL) {
+            *pass = '\0';
+            pass++;
+        }
+        if (percent_decode(work, cfg->socks5_user, sizeof(cfg->socks5_user)) != 0) {
+            set_err(err, err_cap, "invalid SOCKS5 username");
+            return -1;
+        }
+        if (pass != NULL && percent_decode(pass, cfg->socks5_pass, sizeof(cfg->socks5_pass)) != 0) {
+            set_err(err, err_cap, "invalid SOCKS5 password");
+            return -1;
+        }
+    }
+
+    trim_in_place(host_port);
+    if (parse_host_optional_port(host_port, 1080, cfg->server_host, sizeof(cfg->server_host), &cfg->server_port) != 0) {
+        set_err(err, err_cap, "invalid SOCKS5 host:port");
+        return -1;
+    }
+    snprintf(cfg->sni, sizeof(cfg->sni), "%s", cfg->server_host);
+    return 0;
+}
+
 int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {
     if (uri == NULL || cfg == NULL) {
         set_err(err, err_cap, "null input");
         return -1;
     }
 
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->fp_mode = FP_CHROME;
-    cfg->transport_mode = TRANSPORT_VISION;
-    snprintf(cfg->flow, sizeof(cfg->flow), "xtls-rprx-vision");
-    snprintf(cfg->security, sizeof(cfg->security), "reality");
-    cfg->alpn[0] = '\0';
-    cfg->allow_insecure = 0;
-    snprintf(cfg->spider_x, sizeof(cfg->spider_x), "/");
-    snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
-    cfg->xhttp_host[0] = '\0';
-    snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "auto");
-    snprintf(cfg->xhttp_session_placement, sizeof(cfg->xhttp_session_placement), "path");
-    cfg->xhttp_session_key[0] = '\0';
-    snprintf(cfg->xhttp_seq_placement, sizeof(cfg->xhttp_seq_placement), "path");
-    cfg->xhttp_seq_key[0] = '\0';
-    snprintf(cfg->xhttp_uplink_method, sizeof(cfg->xhttp_uplink_method), "POST");
-    snprintf(cfg->xhttp_uplink_data_placement, sizeof(cfg->xhttp_uplink_data_placement), "body");
-    snprintf(cfg->xhttp_padding_placement, sizeof(cfg->xhttp_padding_placement), "queryinheader");
-    snprintf(cfg->xhttp_padding_key, sizeof(cfg->xhttp_padding_key), "x_padding");
-    snprintf(cfg->xhttp_padding_header, sizeof(cfg->xhttp_padding_header), "X-Padding");
-    snprintf(cfg->xhttp_padding_method, sizeof(cfg->xhttp_padding_method), "repeat-x");
-    cfg->xhttp_padding_obfs = 0;
-    cfg->xhttp_padding_min = 100;
-    cfg->xhttp_padding_max = 1000;
-    snprintf(cfg->original_uri, sizeof(cfg->original_uri), "%s", uri);
+    init_config_defaults(cfg, uri);
 
-    if (strncmp(uri, "vless://", 8) != 0) {
+    if (!starts_with_ci(uri, "vless://")) {
         set_err(err, err_cap, "URI must start with vless://");
         return -1;
     }
@@ -516,4 +636,19 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     }
 
     return 0;
+}
+
+int parse_core_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {
+    if (uri == NULL) {
+        set_err(err, err_cap, "null input");
+        return -1;
+    }
+    if (starts_with_ci(uri, "socks5://")) {
+        return parse_socks5_uri(uri, cfg, err, err_cap);
+    }
+    if (starts_with_ci(uri, "vless://")) {
+        return parse_vless_uri(uri, cfg, err, err_cap);
+    }
+    set_err(err, err_cap, "URI must start with vless:// or socks5://");
+    return -1;
 }

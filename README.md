@@ -8,6 +8,7 @@ Standalone C CLI client for:
 - `VLESS + Reality + XHTTP (mode=stream-one)`
 - `VLESS + TLS + WebSocket`
 - `VLESS + WebSocket`
+- `SOCKS5`
 
 `fp=chrome/firefox/edge/random/randomized/qq`
 
@@ -48,9 +49,9 @@ make ios
 ## Run
 
 ```bash
-./vless-core-linux-amd64 --uri '<vless://...>' --listen-port <port>
+./vless-core-linux-amd64 --uri '<vless://...|socks5://...>' --listen-port <port>
 or
-./vless-core-darwin-armv7 --uri '<vless://...>' --listen-port <port>
+./vless-core-darwin-armv7 --uri '<vless://...|socks5://...>' --listen-port <port>
 ```
 
 Show CLI help/parameters:
@@ -63,10 +64,10 @@ Show CLI help/parameters:
 Expected help output:
 
 ```text
-Usage: vless-core-linux-amd64 --uri <vless://...> --listen-port <port>
+Usage: vless-core-linux-amd64 --uri <vless://...|socks5://...> --listen-port <port>
 
 Options:
-  --uri <vless://...>      VLESS URI (Reality/Vision, TLS/Vision, TLS/XHTTP, Reality/XHTTP, TLS/WS, or plain WS)
+  --uri <uri>              VLESS URI or SOCKS5 upstream URI
   --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)
   -h, --help               Show help
   -v, --version            Show version

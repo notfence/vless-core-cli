@@ -19,13 +19,23 @@ typedef enum {
     TRANSPORT_WS = 2
 } transport_mode_t;
 
+typedef enum {
+    CORE_PROTOCOL_VLESS = 0,
+    CORE_PROTOCOL_SOCKS5 = 1
+} core_protocol_t;
+
 typedef struct {
     char original_uri[2048];
+
+    core_protocol_t protocol;
 
     uint8_t uuid[16];
 
     char server_host[256];
     uint16_t server_port;
+
+    char socks5_user[256];
+    char socks5_pass[256];
 
     char sni[256];
     char flow[64];

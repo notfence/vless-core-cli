@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "socks5.h"
+#include "socks5_upstream.h"
 #include "tls13_reality.h"
 #include "types.h"
 #include "uri.h"
@@ -136,6 +137,39 @@ static int write_all(int fd, const uint8_t *buf, size_t len) {
     return 0;
 }
 
+static void relay_tcp_pair(int fd_a, int fd_b) {
+    uint8_t buf[8192];
+
+    while (1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd_a, &rfds);
+        FD_SET(fd_b, &rfds);
+
+        int maxfd = (fd_a > fd_b) ? fd_a : fd_b;
+        int s = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (s <= 0) {
+            if (s < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        if (FD_ISSET(fd_a, &rfds)) {
+            ssize_t n = recv(fd_a, buf, sizeof(buf), 0);
+            if (n <= 0 || write_all(fd_b, buf, (size_t)n) != 0) {
+                break;
+            }
+        }
+        if (FD_ISSET(fd_b, &rfds)) {
+            ssize_t n = recv(fd_b, buf, sizeof(buf), 0);
+            if (n <= 0 || write_all(fd_a, buf, (size_t)n) != 0) {
+                break;
+            }
+        }
+    }
+}
+
 static void *client_worker(void *arg) {
     client_ctx_t *ctx = (client_ctx_t *)arg;
     int cfd = ctx->client_fd;
@@ -146,6 +180,35 @@ static void *client_worker(void *arg) {
     uint16_t target_port = 0;
     if (socks5_negotiate_and_get_target(cfd, target_host, sizeof(target_host), &target_port) != 0) {
         socks5_send_failure(cfd, 0x01);
+        close(cfd);
+        return NULL;
+    }
+
+    if (cfg.protocol == CORE_PROTOCOL_SOCKS5) {
+        char err[256] = {0};
+        int upstream_fd = socks5_upstream_connect(&cfg, target_host, target_port, err, sizeof(err));
+        if (upstream_fd < 0) {
+            fprintf(stderr, "[socks5] upstream connect failed for %s:%u via %s:%u: %s\n",
+                    target_host, (unsigned)target_port, cfg.server_host, (unsigned)cfg.server_port, err);
+            socks5_send_failure(cfd, 0x05);
+            close(cfd);
+            return NULL;
+        }
+
+        if (socks5_send_success(cfd) != 0) {
+            close(upstream_fd);
+            close(cfd);
+            return NULL;
+        }
+
+        fprintf(stderr, "[socks5] connected target=%s:%u via=%s:%u auth=%s\n",
+                target_host,
+                (unsigned)target_port,
+                cfg.server_host,
+                (unsigned)cfg.server_port,
+                (cfg.socks5_user[0] != '\0' ? "userpass" : "none"));
+        relay_tcp_pair(cfd, upstream_fd);
+        close(upstream_fd);
         close(cfd);
         return NULL;
     }
@@ -420,9 +483,9 @@ static void *client_worker(void *arg) {
 }
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s --uri <vless://...> --listen-port <port>\n", argv0);
+    fprintf(stderr, "Usage: %s --uri <vless://...|socks5://...> --listen-port <port>\n", argv0);
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  --uri <vless://...>      VLESS URI (Reality/Vision, TLS/Vision, TLS/XHTTP, Reality/XHTTP, TLS/WS, or plain WS)\n");
+    fprintf(stderr, "  --uri <uri>              VLESS URI or SOCKS5 upstream URI\n");
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
@@ -476,7 +539,7 @@ int main(int argc, char **argv) {
 
     vless_config_t cfg;
     char err[256] = {0};
-    if (parse_vless_uri(uri, &cfg, err, sizeof(err)) != 0) {
+    if (parse_core_uri(uri, &cfg, err, sizeof(err)) != 0) {
         fprintf(stderr, "Invalid URI: %s\n", err);
         return 1;
     }
@@ -508,28 +571,37 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const char *fp_label = "chrome";
-    if (cfg.fp_mode == FP_RANDOM) {
-        fp_label = "random";
-    } else if (cfg.fp_mode == FP_RANDOMIZED) {
-        fp_label = "randomized";
-    } else if (cfg.fp_mode == FP_QQ) {
-        fp_label = "qq";
-    } else if (cfg.fp_mode == FP_FIREFOX) {
-        fp_label = "firefox";
-    } else if (cfg.fp_mode == FP_EDGE) {
-        fp_label = "edge";
-    }
-    const char *transport_label = "vision";
-    if (cfg.transport_mode == TRANSPORT_XHTTP) {
-        transport_label = "xhttp";
-    } else if (cfg.transport_mode == TRANSPORT_WS) {
-        transport_label = "ws";
-    }
-    fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
-            cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security, transport_label, fp_label);
-    if (cfg.transport_mode == TRANSPORT_XHTTP && strcmp(cfg.security, "tls") == 0) {
-        fprintf(stderr, "[xhttp] tls_mode=%s\n", xhttp_tls_mode_startup_label());
+    if (cfg.protocol == CORE_PROTOCOL_SOCKS5) {
+        fprintf(stderr, "%s listening on 127.0.0.1:%d (upstream=socks5://%s:%u, auth=%s)\n",
+                prog,
+                listen_port,
+                cfg.server_host,
+                (unsigned)cfg.server_port,
+                (cfg.socks5_user[0] != '\0' ? "userpass" : "none"));
+    } else {
+        const char *fp_label = "chrome";
+        if (cfg.fp_mode == FP_RANDOM) {
+            fp_label = "random";
+        } else if (cfg.fp_mode == FP_RANDOMIZED) {
+            fp_label = "randomized";
+        } else if (cfg.fp_mode == FP_QQ) {
+            fp_label = "qq";
+        } else if (cfg.fp_mode == FP_FIREFOX) {
+            fp_label = "firefox";
+        } else if (cfg.fp_mode == FP_EDGE) {
+            fp_label = "edge";
+        }
+        const char *transport_label = "vision";
+        if (cfg.transport_mode == TRANSPORT_XHTTP) {
+            transport_label = "xhttp";
+        } else if (cfg.transport_mode == TRANSPORT_WS) {
+            transport_label = "ws";
+        }
+        fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
+                cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security, transport_label, fp_label);
+        if (cfg.transport_mode == TRANSPORT_XHTTP && strcmp(cfg.security, "tls") == 0) {
+            fprintf(stderr, "[xhttp] tls_mode=%s\n", xhttp_tls_mode_startup_label());
+        }
     }
 
     while (1) {
