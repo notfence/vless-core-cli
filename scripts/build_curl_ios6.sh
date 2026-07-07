@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 THIRD_PARTY_DIR="${ROOT_DIR}/third_party"
-CURL_VER="${CURL_VER:-7.88.1}"
+CURL_VER="${CURL_VER:-8.21.0}"
 CURL_TAR="${THIRD_PARTY_DIR}/curl-${CURL_VER}.tar.xz"
 CURL_SRC_DIR="${THIRD_PARTY_DIR}/curl-${CURL_VER}"
 CURL_INSTALL_DIR="${THIRD_PARTY_DIR}/curl-ios6-armv7"
@@ -11,6 +11,7 @@ CURL_INSTALL_DIR="${THIRD_PARTY_DIR}/curl-ios6-armv7"
 IOS_TOOLCHAIN="${IOS_TOOLCHAIN:-${HOME}/toolchains/ios6}"
 IOS_SDK="${IOS_SDK:-${IOS_TOOLCHAIN}/SDK/iPhoneOS6.1.sdk}"
 OPENSSL_PREFIX="${OPENSSL_PREFIX:-${THIRD_PARTY_DIR}/openssl-ios6-armv7}"
+ZLIB_PREFIX="${ZLIB_PREFIX:-${THIRD_PARTY_DIR}/zlib-ios6-armv7}"
 
 require_file() {
   local path="$1"
@@ -89,9 +90,18 @@ prepend_ld_library_if_needed
 
 mkdir -p "${THIRD_PARTY_DIR}"
 
-if [[ ! -f "${OPENSSL_PREFIX}/lib/libcrypto.a" ]]; then
-  echo "Missing ${OPENSSL_PREFIX}/lib/libcrypto.a"
-  echo "Run: make openssl-ios6"
+for openssl_lib in libssl.a libcrypto.a; do
+  if [[ ! -f "${OPENSSL_PREFIX}/lib/${openssl_lib}" ]]; then
+    echo "Missing ${OPENSSL_PREFIX}/lib/${openssl_lib}"
+    echo "Run: make openssl-ios6"
+    echo "If the private asm patch lives elsewhere, set OPENSSL_IOS6_ASM_PATCH=/path/to/openssl-ios6-armv7-asm.patch"
+    exit 1
+  fi
+done
+
+if [[ ! -f "${ZLIB_PREFIX}/lib/libz.a" ]]; then
+  echo "Missing ${ZLIB_PREFIX}/lib/libz.a"
+  echo "Run: make zlib-ios6"
   exit 1
 fi
 
@@ -107,25 +117,66 @@ export CC=arm-apple-darwin11-clang
 export AR=arm-apple-darwin11-ar
 export RANLIB=arm-apple-darwin11-ranlib
 export STRIP=arm-apple-darwin11-strip
-export CPPFLAGS="-I${OPENSSL_PREFIX}/include"
-export CFLAGS="-arch armv7 -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -O2"
-export LDFLAGS="-arch armv7 -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -L${OPENSSL_PREFIX}/lib"
+export CPPFLAGS="-I${OPENSSL_PREFIX}/include -I${ZLIB_PREFIX}/include"
+export CFLAGS="-arch armv7 -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -O2 -DNDEBUG"
+export LDFLAGS="-arch armv7 -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -L${OPENSSL_PREFIX}/lib -L${ZLIB_PREFIX}/lib"
 
 pushd "${CURL_SRC_DIR}" >/dev/null
 ./configure \
   --host=arm-apple-darwin11 \
   --prefix="${CURL_INSTALL_DIR}" \
   --with-openssl="${OPENSSL_PREFIX}" \
+  --with-zlib="${ZLIB_PREFIX}" \
   --enable-static \
   --disable-shared \
+  --disable-docs \
+  --disable-manual \
+  --disable-alt-svc \
+  --disable-aws \
+  --disable-bearer-auth \
+  --disable-dateparse \
+  --disable-dict \
+  --disable-digest-auth \
+  --disable-doh \
+  --disable-ech \
+  --disable-file \
+  --disable-form-api \
+  --disable-ftp \
+  --disable-get-easy-options \
+  --disable-gopher \
+  --disable-headers-api \
+  --disable-hsts \
+  --disable-imap \
+  --disable-ipfs \
+  --disable-kerberos-auth \
   --disable-ldap \
   --disable-ldaps \
+  --disable-libcurl-option \
+  --disable-mime \
+  --disable-mqtt \
+  --disable-negotiate-auth \
+  --disable-netrc \
+  --disable-ntlm \
+  --disable-openssl-auto-load-config \
+  --disable-pop3 \
+  --disable-progress-meter \
+  --disable-proxy-http3 \
+  --disable-rtsp \
+  --disable-smb \
+  --disable-smtp \
+  --disable-socketpair \
+  --disable-ssls-export \
+  --disable-telnet \
+  --disable-tftp \
+  --disable-tls-srp \
+  --disable-unix-sockets \
+  --disable-websockets \
+  --disable-httpsrr \
   --without-libidn2 \
   --without-brotli \
   --without-zstd \
   --without-nghttp2 \
   --without-libpsl \
-  --without-librtmp \
   --without-ca-bundle \
   --without-ca-path
 make -j"$(nproc)"

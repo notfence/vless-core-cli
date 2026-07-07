@@ -6,6 +6,10 @@ vless-core-darwin-armv7
 # Generated third-party artifacts
 third_party/*
 
+# Private rebuild inputs
+patches/openssl-ios6-armv7-asm.patch
+patches/private/
+
 # Local clutter
 .DS_Store
 *.swp

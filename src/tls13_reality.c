@@ -9,10 +9,12 @@
 #include <limits.h>
 #include <netdb.h>
 #include <openssl/ec.h>
+#include <openssl/core_names.h>
 #include <openssl/evp.h>
 #include <openssl/err.h>
 #include <openssl/hmac.h>
 #include <openssl/obj_mac.h>
+#include <openssl/params.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
@@ -51,6 +53,7 @@ typedef enum {
 
 #define CORE_CONNECT_TIMEOUT_MS 12000
 #define CORE_TLS_HANDSHAKE_TIMEOUT_MS 12000
+#define CORE_OPENSSL_GROUPS "X25519:P-256:P-384"
 
 static int g_xhttp_auto_force_insecure = 0;
 
@@ -738,6 +741,12 @@ static int open_tls_socket(const char *connect_host, uint16_t connect_port, cons
     if (ctx == NULL) {
         close(fd);
         set_err(err, err_cap, "SSL_CTX_new failed");
+        return -1;
+    }
+    if (SSL_CTX_set1_groups_list(ctx, CORE_OPENSSL_GROUPS) != 1) {
+        SSL_CTX_free(ctx);
+        close(fd);
+        set_err(err, err_cap, "failed to set TLS groups");
         return -1;
     }
 
@@ -2578,23 +2587,72 @@ static int digest_hash(const EVP_MD *md, const uint8_t *in, size_t in_len, uint8
     return ok ? 0 : -1;
 }
 
-static int hmac_digest(const EVP_MD *md, const uint8_t *key, size_t key_len, const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len) {
+static int hmac_digest_segments(const EVP_MD *md, const uint8_t *key, size_t key_len, const uint8_t *seg1, size_t seg1_len,
+                                const uint8_t *seg2, size_t seg2_len, const uint8_t *seg3, size_t seg3_len, uint8_t *out,
+                                size_t out_len) {
     if (md == NULL || out == NULL) {
         return -1;
     }
-    unsigned int want = (unsigned int)EVP_MD_size(md);
-    if (want == 0 || out_len != want) {
+    int md_size = EVP_MD_size(md);
+    if (md_size <= 0 || out_len != (size_t)md_size) {
         return -1;
     }
+#if defined(OPENSSL_VERSION_MAJOR) && OPENSSL_VERSION_MAJOR >= 3
+    const char *digest_name = EVP_MD_get0_name(md);
+    if (digest_name == NULL) {
+        return -1;
+    }
+
+    EVP_MAC *mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    if (mac == NULL) {
+        return -1;
+    }
+    EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(mac);
+    EVP_MAC_free(mac);
+    if (ctx == NULL) {
+        return -1;
+    }
+
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, (char *)digest_name, 0);
+    params[1] = OSSL_PARAM_construct_end();
+
+    int ok = EVP_MAC_init(ctx, key, key_len, params) == 1;
+    if (ok && seg1_len > 0) ok = EVP_MAC_update(ctx, seg1, seg1_len) == 1;
+    if (ok && seg2_len > 0) ok = EVP_MAC_update(ctx, seg2, seg2_len) == 1;
+    if (ok && seg3_len > 0) ok = EVP_MAC_update(ctx, seg3, seg3_len) == 1;
+
+    size_t got_len = 0;
+    if (ok) {
+        ok = EVP_MAC_final(ctx, out, &got_len, out_len) == 1 && got_len == out_len;
+    }
+    EVP_MAC_CTX_free(ctx);
+    return ok ? 0 : -1;
+#else
+    HMAC_CTX *ctx = HMAC_CTX_new();
+    if (ctx == NULL) {
+        return -1;
+    }
+    int ok = HMAC_Init_ex(ctx, key, (int)key_len, md, NULL) == 1;
+    if (ok && seg1_len > 0) ok = HMAC_Update(ctx, seg1, seg1_len) == 1;
+    if (ok && seg2_len > 0) ok = HMAC_Update(ctx, seg2, seg2_len) == 1;
+    if (ok && seg3_len > 0) ok = HMAC_Update(ctx, seg3, seg3_len) == 1;
+
     unsigned int got_len = 0;
-    unsigned char *ret = HMAC(md, key, (int)key_len, in, in_len, out, &got_len);
-    return (ret != NULL && got_len == want) ? 0 : -1;
+    if (ok) {
+        ok = HMAC_Final(ctx, out, &got_len) == 1 && got_len == (unsigned int)out_len;
+    }
+    HMAC_CTX_free(ctx);
+    return ok ? 0 : -1;
+#endif
+}
+
+static int hmac_digest(const EVP_MD *md, const uint8_t *key, size_t key_len, const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len) {
+    return hmac_digest_segments(md, key, key_len, in, in_len, NULL, 0, NULL, 0, out, out_len);
 }
 
 static int hmac_sha512(const uint8_t *key, size_t key_len, const uint8_t *in, size_t in_len, uint8_t out[64]) {
-    unsigned int out_len = 0;
-    unsigned char *ret = HMAC(EVP_sha512(), key, (int)key_len, in, in_len, out, &out_len);
-    return (ret != NULL && out_len == 64) ? 0 : -1;
+    return hmac_digest(EVP_sha512(), key, key_len, in, in_len, out, 64);
 }
 
 static int hkdf_extract_md(const EVP_MD *md, const uint8_t *salt, size_t salt_len, const uint8_t *ikm, size_t ikm_len, uint8_t *prk,
@@ -2618,32 +2676,9 @@ static int hkdf_expand_md(const EVP_MD *md, const uint8_t *prk, size_t prk_len, 
     size_t t_len = 0;
 
     while (pos < out_len) {
-        HMAC_CTX *ctx = HMAC_CTX_new();
-        if (ctx == NULL) {
+        if (hmac_digest_segments(md, prk, prk_len, t_len > 0 ? t : NULL, t_len, info, info_len, &counter, 1, t, hash_len) != 0) {
             return -1;
         }
-        if (HMAC_Init_ex(ctx, prk, (int)prk_len, md, NULL) != 1) {
-            HMAC_CTX_free(ctx);
-            return -1;
-        }
-        if (t_len > 0 && HMAC_Update(ctx, t, t_len) != 1) {
-            HMAC_CTX_free(ctx);
-            return -1;
-        }
-        if (info_len > 0 && HMAC_Update(ctx, info, info_len) != 1) {
-            HMAC_CTX_free(ctx);
-            return -1;
-        }
-        if (HMAC_Update(ctx, &counter, 1) != 1) {
-            HMAC_CTX_free(ctx);
-            return -1;
-        }
-        unsigned int got = 0;
-        if (HMAC_Final(ctx, t, &got) != 1 || got != hash_len) {
-            HMAC_CTX_free(ctx);
-            return -1;
-        }
-        HMAC_CTX_free(ctx);
 
         size_t take = out_len - pos;
         if (take > hash_len) {
@@ -2756,7 +2791,8 @@ static int x25519_shared(const uint8_t priv[32], const uint8_t peer_pub[32], uin
     return ok ? 0 : -1;
 }
 
-static int p256_generate_public(uint8_t pub[65]) {
+#if !defined(OPENSSL_VERSION_MAJOR) || OPENSSL_VERSION_MAJOR < 3
+static int p256_generate_public_legacy(uint8_t pub[65]) {
     EC_KEY *key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
     if (key == NULL) {
         return -1;
@@ -2770,6 +2806,36 @@ static int p256_generate_public(uint8_t pub[65]) {
     }
     EC_KEY_free(key);
     return ok ? 0 : -1;
+}
+#endif
+
+static int p256_generate_public(uint8_t pub[65]) {
+#if defined(OPENSSL_VERSION_MAJOR) && OPENSSL_VERSION_MAJOR >= 3
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+    EVP_PKEY *key = NULL;
+    OSSL_PARAM params[2];
+    int ok = 0;
+
+    if (ctx == NULL) {
+        return -1;
+    }
+
+    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, "prime256v1", 0);
+    params[1] = OSSL_PARAM_construct_end();
+
+    if (EVP_PKEY_keygen_init(ctx) == 1 &&
+        EVP_PKEY_CTX_set_params(ctx, params) == 1 &&
+        EVP_PKEY_generate(ctx, &key) == 1 &&
+        EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_PUB_KEY, pub, 65, NULL) == 1) {
+        ok = 1;
+    }
+
+    EVP_PKEY_free(key);
+    EVP_PKEY_CTX_free(ctx);
+    return ok ? 0 : -1;
+#else
+    return p256_generate_public_legacy(pub);
+#endif
 }
 
 static uint16_t random_grease_value(void) {

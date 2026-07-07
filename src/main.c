@@ -20,6 +20,9 @@
 #include "vless.h"
 
 #define VLESS_CORE_VERSION "1.0.5"
+#ifndef VLESS_OPENSSL_PATCH_STATUS
+#define VLESS_OPENSSL_PATCH_STATUS "unpatched"
+#endif
 
 static ssize_t read_with_timeout(int fd, uint8_t *buf, size_t cap, int timeout_ms) {
     fd_set rfds;
@@ -642,6 +645,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
+    fprintf(stderr, "  --openssl-patch-status   Show OpenSSL patch status\n");
 }
 
 static const char *xhttp_tls_mode_startup_label(void) {
@@ -678,6 +682,9 @@ int main(int argc, char **argv) {
             listen_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
             printf("vless-core %s\n", VLESS_CORE_VERSION);
+            return 0;
+        } else if (strcmp(argv[i], "--openssl-patch-status") == 0) {
+            printf("%s\n", VLESS_OPENSSL_PATCH_STATUS);
             return 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(prog);

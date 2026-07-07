@@ -107,14 +107,22 @@ Override if needed:
 make ios IOS_TOOLCHAIN=/path/to/ios6/toolchain
 ```
 
-OpenSSL armv7 must exist at:
+OpenSSL armv7 is generated at:
 
+- `third_party/openssl-ios6-armv7/lib/libssl.a`
 - `third_party/openssl-ios6-armv7/lib/libcrypto.a`
 
 If missing:
 
 ```bash
 make openssl-ios6
+```
+
+The script downloads OpenSSL 3.5.7 and builds it locally. By default it applies the ignored private asm patch from `patches/openssl-ios6-armv7-asm.patch`; set `OPENSSL_IOS6_ASM_PATCH=/path/to/openssl-ios6-armv7-asm.patch` if the patch lives elsewhere. 
+
+Public rebuilds can use:
+```bash
+OPENSSL_NO_ASM=1 make openssl-ios6
 ```
 
 Then:
@@ -126,9 +134,11 @@ file ./vless-core-darwin-armv7
 
 ## Legacy curl on iOS 6
 
-Old stock iOS 6 curl/OpenSSL may fail modern TLS. Build replacement curl (armv7 + OpenSSL 1.1.1w):
+Old stock iOS 6 curl/OpenSSL may fail modern TLS. Build replacement curl (armv7 + OpenSSL 3.5.7 + zlib 1.3.1):
 
 ```bash
+make zlib-ios6
+make openssl-ios6
 make curl-ios6
 make curl-ios6-package
 ```
