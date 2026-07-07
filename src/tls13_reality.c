@@ -1,11 +1,11 @@
 #define _POSIX_C_SOURCE 200112L
 
+#include "socket_util.h"
 #include "tls13_reality.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
 #include <openssl/ec.h>
@@ -24,7 +24,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -49,6 +48,9 @@ typedef enum {
     XHTTP_TLS_MODE_INSECURE = 2,
     XHTTP_TLS_MODE_TOFU = 3
 } xhttp_tls_mode_t;
+
+#define CORE_CONNECT_TIMEOUT_MS 12000
+#define CORE_TLS_HANDSHAKE_TIMEOUT_MS 12000
 
 static int g_xhttp_auto_force_insecure = 0;
 
@@ -232,7 +234,8 @@ static int tcp_connect_host(const char *host, uint16_t port) {
         if (fd < 0) {
             continue;
         }
-        if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
+        core_tune_tcp_socket(fd);
+        if (core_connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen, CORE_CONNECT_TIMEOUT_MS) == 0) {
             break;
         }
         close(fd);
@@ -243,58 +246,14 @@ static int tcp_connect_host(const char *host, uint16_t port) {
     return fd;
 }
 
-static void set_socket_io_timeout(int fd, int timeout_ms) {
-    struct timeval tv;
-    memset(&tv, 0, sizeof(tv));
-    if (timeout_ms > 0) {
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-    }
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
-        perror("[tls] setsockopt SO_RCVTIMEO");
-    }
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
-        perror("[tls] setsockopt SO_SNDTIMEO");
-    }
-}
-
 static int tcp_connect_addrinfo(const struct addrinfo *it) {
     int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
     if (fd < 0) {
         return -1;
     }
+    core_tune_tcp_socket(fd);
 
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) {
-        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
-
-    int rc = connect(fd, it->ai_addr, it->ai_addrlen);
-    if (rc != 0 && errno == EINPROGRESS) {
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(fd, &wfds);
-        struct timeval tv;
-        tv.tv_sec = 2;
-        tv.tv_usec = 500000;
-        rc = select(fd + 1, NULL, &wfds, NULL, &tv);
-        if (rc > 0 && FD_ISSET(fd, &wfds)) {
-            int so_error = 0;
-            socklen_t so_error_len = sizeof(so_error);
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) == 0 && so_error == 0) {
-                rc = 0;
-            } else {
-                rc = -1;
-            }
-        } else {
-            rc = -1;
-        }
-    }
-
-    if (rc == 0) {
-        if (flags >= 0) {
-            (void)fcntl(fd, F_SETFL, flags);
-        }
+    if (core_connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen, CORE_CONNECT_TIMEOUT_MS) == 0) {
         return fd;
     }
 
@@ -851,6 +810,7 @@ static int open_tls_socket(const char *connect_host, uint16_t connect_port, cons
         set_err(err, err_cap, "failed to set TLS ALPN");
         return -1;
     }
+    core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
     if (SSL_connect(ssl) != 1) {
         unsigned long e = ERR_get_error();
         long verify_rc = X509_V_OK;
@@ -879,6 +839,7 @@ static int open_tls_socket(const char *connect_host, uint16_t connect_port, cons
         }
         return -1;
     }
+    core_set_socket_io_timeout(fd, 0);
 
     if (verify_peer) {
         long verify_rc = SSL_get_verify_result(ssl);
@@ -4496,11 +4457,11 @@ static int tcp_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err
         c->reality_raw_direct = 0;
         db_free(&c->transcript);
         memset(&c->transcript, 0, sizeof(c->transcript));
-        set_socket_io_timeout(fd, 3500);
+        core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
 
         char attempt_err[256] = {0};
         if (run_tls_handshake(cfg, c, attempt_err, sizeof(attempt_err)) == 0) {
-            set_socket_io_timeout(fd, 0);
+            core_set_socket_io_timeout(fd, 0);
             connected = 1;
             break;
         }
@@ -4647,9 +4608,11 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         }
         c->fd = fd;
 
+        core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
         if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
             return -1;
         }
+        core_set_socket_io_timeout(fd, 0);
 
         c->h2_stream_id = 1;
         c->h2_peer_initial_window = H2_DEFAULT_WINDOW;
@@ -4814,10 +4777,12 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
     }
     c->fd = fd;
 
+    core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
     if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
         tls13_reality_close(c);
         return -1;
     }
+    core_set_socket_io_timeout(fd, 0);
 
     *out = c;
     return 0;

@@ -1,18 +1,19 @@
 #define _POSIX_C_SOURCE 200112L
 
+#include "socket_util.h"
 #include "socks5_upstream.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <netdb.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
+
+#define SOCKS5_UPSTREAM_TIMEOUT_MS 12000
+#define DNS_CACHE_PATH "/var/run/vlesscore-dns-cache.txt"
 
 static void set_errf(char *err, size_t cap, const char *fmt, ...) {
     if (err == NULL || cap == 0) {
@@ -50,53 +51,6 @@ static int write_exact(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-static int connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t addr_len, int timeout_ms) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) {
-        return connect(fd, addr, addr_len);
-    }
-
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-        return connect(fd, addr, addr_len);
-    }
-
-    int rc = connect(fd, addr, addr_len);
-    if (rc == 0) {
-        (void)fcntl(fd, F_SETFL, flags);
-        return 0;
-    }
-    if (errno != EINPROGRESS) {
-        (void)fcntl(fd, F_SETFL, flags);
-        return -1;
-    }
-
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
-
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-    rc = select(fd + 1, NULL, &wfds, NULL, &tv);
-    if (rc <= 0) {
-        (void)fcntl(fd, F_SETFL, flags);
-        errno = (rc == 0) ? ETIMEDOUT : errno;
-        return -1;
-    }
-
-    int soerr = 0;
-    socklen_t soerr_len = sizeof(soerr);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerr_len) != 0 || soerr != 0) {
-        (void)fcntl(fd, F_SETFL, flags);
-        errno = (soerr != 0) ? soerr : errno;
-        return -1;
-    }
-
-    (void)fcntl(fd, F_SETFL, flags);
-    return 0;
-}
-
 static int connect_tcp_host(const char *host, uint16_t port, char *err, size_t err_cap) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
@@ -121,14 +75,10 @@ static int connect_tcp_host(const char *host, uint16_t port, char *err, size_t e
             saved_errno = errno;
             continue;
         }
+        core_tune_tcp_socket(fd);
+        core_set_socket_io_timeout(fd, SOCKS5_UPSTREAM_TIMEOUT_MS);
 
-        struct timeval tv;
-        tv.tv_sec = 12;
-        tv.tv_usec = 0;
-        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-        if (connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen, 12000) == 0) {
+        if (core_connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen, SOCKS5_UPSTREAM_TIMEOUT_MS) == 0) {
             freeaddrinfo(res);
             return fd;
         }
@@ -235,12 +185,64 @@ static int socks5_authenticate(int fd, const vless_config_t *cfg, char *err, siz
     return 0;
 }
 
+static int dns_cache_lookup_name(const char *ip, char *out, size_t out_cap) {
+    if (ip == NULL || ip[0] == '\0' || out == NULL || out_cap == 0) {
+        return -1;
+    }
+
+    struct in_addr in4;
+    struct in6_addr in6;
+    if (inet_pton(AF_INET, ip, &in4) != 1 && inet_pton(AF_INET6, ip, &in6) != 1) {
+        return -1;
+    }
+
+    FILE *fp = fopen(DNS_CACHE_PATH, "r");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    char line[512];
+    int found = -1;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *tab = strchr(line, '\t');
+        if (tab == NULL) {
+            continue;
+        }
+        *tab = '\0';
+        if (strcmp(line, ip) != 0) {
+            continue;
+        }
+
+        char *name = tab + 1;
+        char *end = name;
+        while (*end != '\0' && *end != '\r' && *end != '\n' && *end != '\t') {
+            end++;
+        }
+        *end = '\0';
+
+        size_t name_len = strlen(name);
+        if (name_len == 0 || name_len > 255 || name_len >= out_cap) {
+            continue;
+        }
+        snprintf(out, out_cap, "%s", name);
+        found = 0;
+    }
+
+    fclose(fp);
+    return found;
+}
+
 static int socks5_send_connect(int fd, const char *target_host, uint16_t target_port, char *err, size_t err_cap) {
     uint8_t req[300];
     size_t n = 0;
     req[n++] = 0x05;
     req[n++] = 0x01;
     req[n++] = 0x00;
+
+    char mapped_host[256];
+    if (dns_cache_lookup_name(target_host, mapped_host, sizeof(mapped_host)) == 0) {
+        target_host = mapped_host;
+    }
 
     struct in_addr in4;
     struct in6_addr in6;
@@ -299,11 +301,38 @@ int socks5_upstream_connect(const vless_config_t *cfg, const char *target_host, 
         return -1;
     }
 
-    if (socks5_authenticate(fd, cfg, err, err_cap) != 0 ||
-        socks5_send_connect(fd, target_host, target_port, err, err_cap) != 0) {
+    if (socks5_authenticate(fd, cfg, err, err_cap) != 0) {
         close(fd);
         return -1;
     }
 
+    if (socks5_send_connect(fd, target_host, target_port, err, err_cap) == 0) {
+        return fd;
+    }
+
+    char first_err[256];
+    snprintf(first_err, sizeof(first_err), "%s", (err != NULL && err[0] != '\0') ? err : "SOCKS5 CONNECT failed");
+    close(fd);
+
+    char mapped_host[256];
+    if (dns_cache_lookup_name(target_host, mapped_host, sizeof(mapped_host)) != 0 || strcmp(mapped_host, target_host) == 0) {
+        set_errf(err, err_cap, "%s", first_err);
+        return -1;
+    }
+
+    fd = connect_tcp_host(cfg->server_host, cfg->server_port, err, err_cap);
+    if (fd < 0) {
+        return -1;
+    }
+    if (socks5_authenticate(fd, cfg, err, err_cap) != 0 ||
+        socks5_send_connect(fd, mapped_host, target_port, err, err_cap) != 0) {
+        close(fd);
+        if (err != NULL && err[0] == '\0') {
+            set_errf(err, err_cap, "%s", first_err);
+        }
+        return -1;
+    }
+
+    fprintf(stderr, "[socks5] retried target=%s:%u as domain=%s via DNS cache\n", target_host, (unsigned)target_port, mapped_host);
     return fd;
 }

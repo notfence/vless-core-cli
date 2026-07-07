@@ -12,6 +12,7 @@
 
 #include "socks5.h"
 #include "socks5_upstream.h"
+#include "socket_util.h"
 #include "tls13_reality.h"
 #include "types.h"
 #include "uri.h"
@@ -125,6 +126,121 @@ static ssize_t read_initial_payload(int fd, uint8_t *buf, size_t cap) {
     return (ssize_t)len;
 }
 
+static int is_ip_literal(const char *host) {
+    struct in_addr in4;
+    struct in6_addr in6;
+    return host != NULL && (inet_pton(AF_INET, host, &in4) == 1 || inet_pton(AF_INET6, host, &in6) == 1);
+}
+
+static int valid_sni_host(const uint8_t *name, size_t len) {
+    if (name == NULL || len == 0 || len > 255) {
+        return 0;
+    }
+    for (size_t i = 0; i < len; i++) {
+        uint8_t ch = name[i];
+        if (ch <= 0x20 || ch >= 0x7f || ch == '\t' || ch == '/') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int parse_tls_sni(const uint8_t *buf, size_t len, char *out, size_t out_cap) {
+    if (buf == NULL || len < 9 || out == NULL || out_cap == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+
+    size_t pos = 0;
+    while (pos + 9 <= len) {
+        if (buf[pos] != 0x16 || buf[pos + 1] != 0x03) {
+            return -1;
+        }
+
+        size_t rec_len = ((size_t)buf[pos + 3] << 8) | (size_t)buf[pos + 4];
+        size_t rec_start = pos + 5;
+        size_t rec_end = rec_start + rec_len;
+        if (rec_len == 0 || rec_len > 18432 || rec_end > len) {
+            return -1;
+        }
+
+        if (buf[rec_start] != 0x01) {
+            pos = rec_end;
+            continue;
+        }
+
+        size_t hs_len = ((size_t)buf[rec_start + 1] << 16) |
+                        ((size_t)buf[rec_start + 2] << 8) |
+                        (size_t)buf[rec_start + 3];
+        size_t hs_start = rec_start + 4;
+        size_t hs_end = hs_start + hs_len;
+        if (hs_len < 42 || hs_end > rec_end) {
+            return -1;
+        }
+
+        size_t p = hs_start;
+        p += 2;  /* legacy_version */
+        p += 32; /* random */
+
+        if (p + 1 > hs_end) return -1;
+        size_t session_len = buf[p++];
+        if (p + session_len + 2 > hs_end) return -1;
+        p += session_len;
+
+        size_t cipher_len = ((size_t)buf[p] << 8) | (size_t)buf[p + 1];
+        p += 2;
+        if (p + cipher_len + 1 > hs_end) return -1;
+        p += cipher_len;
+
+        size_t compression_len = buf[p++];
+        if (p + compression_len > hs_end) return -1;
+        p += compression_len;
+
+        if (p == hs_end) return -1;
+        if (p + 2 > hs_end) return -1;
+        size_t extensions_len = ((size_t)buf[p] << 8) | (size_t)buf[p + 1];
+        p += 2;
+        if (p + extensions_len > hs_end) return -1;
+
+        size_t ext_end = p + extensions_len;
+        while (p + 4 <= ext_end) {
+            uint16_t ext_type = ((uint16_t)buf[p] << 8) | (uint16_t)buf[p + 1];
+            size_t ext_len = ((size_t)buf[p + 2] << 8) | (size_t)buf[p + 3];
+            p += 4;
+            if (p + ext_len > ext_end) return -1;
+
+            if (ext_type == 0x0000) {
+                size_t sni_pos = p;
+                if (sni_pos + 2 > p + ext_len) return -1;
+                size_t list_len = ((size_t)buf[sni_pos] << 8) | (size_t)buf[sni_pos + 1];
+                sni_pos += 2;
+                if (sni_pos + list_len > p + ext_len) return -1;
+                size_t list_end = sni_pos + list_len;
+
+                while (sni_pos + 3 <= list_end) {
+                    uint8_t name_type = buf[sni_pos++];
+                    size_t name_len = ((size_t)buf[sni_pos] << 8) | (size_t)buf[sni_pos + 1];
+                    sni_pos += 2;
+                    if (sni_pos + name_len > list_end) return -1;
+                    if (name_type == 0x00 && valid_sni_host(buf + sni_pos, name_len) && name_len < out_cap) {
+                        memcpy(out, buf + sni_pos, name_len);
+                        out[name_len] = '\0';
+                        return 0;
+                    }
+                    sni_pos += name_len;
+                }
+                return -1;
+            }
+
+            p += ext_len;
+        }
+
+        return -1;
+    }
+
+    return -1;
+}
+
 static int write_all(int fd, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -186,23 +302,60 @@ static void *client_worker(void *arg) {
 
     if (cfg.protocol == CORE_PROTOCOL_SOCKS5) {
         char err[256] = {0};
-        int upstream_fd = socks5_upstream_connect(&cfg, target_host, target_port, err, sizeof(err));
+        char upstream_target[512];
+        snprintf(upstream_target, sizeof(upstream_target), "%s", target_host);
+
+        uint8_t first_payload[8192];
+        ssize_t first_payload_len = 0;
+        int delayed_connect = (target_port == 443 && is_ip_literal(target_host));
+
+        if (delayed_connect) {
+            if (socks5_send_success(cfd) != 0) {
+                close(cfd);
+                return NULL;
+            }
+
+            first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
+            if (first_payload_len < 0) {
+                fprintf(stderr, "[socks5] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
+                close(cfd);
+                return NULL;
+            }
+
+            char sni[256];
+            if (first_payload_len > 0 && parse_tls_sni(first_payload, (size_t)first_payload_len, sni, sizeof(sni)) == 0) {
+                snprintf(upstream_target, sizeof(upstream_target), "%s", sni);
+                fprintf(stderr, "[socks5] remapped transparent TLS target=%s:%u to sni=%s\n",
+                        target_host, (unsigned)target_port, upstream_target);
+            }
+        }
+
+        int upstream_fd = socks5_upstream_connect(&cfg, upstream_target, target_port, err, sizeof(err));
         if (upstream_fd < 0) {
             fprintf(stderr, "[socks5] upstream connect failed for %s:%u via %s:%u: %s\n",
-                    target_host, (unsigned)target_port, cfg.server_host, (unsigned)cfg.server_port, err);
-            socks5_send_failure(cfd, 0x05);
+                    upstream_target, (unsigned)target_port, cfg.server_host, (unsigned)cfg.server_port, err);
+            if (!delayed_connect) {
+                socks5_send_failure(cfd, 0x05);
+            }
             close(cfd);
             return NULL;
         }
 
-        if (socks5_send_success(cfd) != 0) {
+        if (!delayed_connect && socks5_send_success(cfd) != 0) {
+            close(upstream_fd);
+            close(cfd);
+            return NULL;
+        }
+        if (first_payload_len > 0 && write_all(upstream_fd, first_payload, (size_t)first_payload_len) != 0) {
             close(upstream_fd);
             close(cfd);
             return NULL;
         }
 
-        fprintf(stderr, "[socks5] connected target=%s:%u via=%s:%u auth=%s\n",
+        fprintf(stderr, "[socks5] connected target=%s:%u upstream_target=%s:%u via=%s:%u auth=%s\n",
                 target_host,
+                (unsigned)target_port,
+                upstream_target,
                 (unsigned)target_port,
                 cfg.server_host,
                 (unsigned)cfg.server_port,
@@ -613,6 +766,7 @@ int main(int argc, char **argv) {
             perror("accept");
             break;
         }
+        core_tune_tcp_socket(cfd);
 
         client_ctx_t *ctx = (client_ctx_t *)calloc(1, sizeof(*ctx));
         if (ctx == NULL) {
