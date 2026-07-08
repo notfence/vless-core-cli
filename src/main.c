@@ -466,6 +466,56 @@ static void *client_worker(void *arg) {
         }
         free(first_packet);
 
+    } else if (cfg.transport_mode == TRANSPORT_WS) {
+        uint8_t vless_req[2048];
+        size_t vless_req_len = 0;
+        uint8_t *first_packet = NULL;
+        size_t first_packet_len = 0;
+
+        if (socks5_send_success(cfd) != 0) {
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+        socks_success_sent = 1;
+
+        first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
+        if (first_payload_len < 0) {
+            fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+
+        if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
+            fprintf(stderr, "[conn] VLESS/WS request build failed for %s:%u\n", target_host, (unsigned)target_port);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+
+        first_packet_len = vless_req_len + ((first_payload_len > 0) ? (size_t)first_payload_len : 0);
+        first_packet = (uint8_t *)malloc(first_packet_len);
+        if (first_packet == NULL) {
+            fprintf(stderr, "[conn] VLESS/WS request alloc failed for %s:%u\n", target_host, (unsigned)target_port);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+
+        memcpy(first_packet, vless_req, vless_req_len);
+        if (first_payload_len > 0) {
+            memcpy(first_packet + vless_req_len, first_payload, (size_t)first_payload_len);
+        }
+
+        if (tls13_write_app(tls, first_packet, first_packet_len) != 0) {
+            free(first_packet);
+            fprintf(stderr, "[conn] VLESS/WS request send failed for %s:%u\n", target_host, (unsigned)target_port);
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+        free(first_packet);
     } else {
         if (vless_send_request(tls, &cfg, target_host, target_port) != 0) {
             fprintf(stderr, "[conn] VLESS request send failed for %s:%u\n", target_host, (unsigned)target_port);
