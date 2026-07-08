@@ -134,6 +134,8 @@ struct tls13_conn {
     uint32_t h2_peer_max_frame_size;
     int64_t h2_peer_conn_window;
     int64_t h2_peer_stream_window;
+    uint32_t h2_recv_conn_pending;
+    uint32_t h2_recv_stream_pending;
     int h2_stream_eof;
 };
 
@@ -1465,6 +1467,8 @@ enum {
 
 #define H2_DEFAULT_WINDOW 65535
 #define H2_CONNECTION_WINDOW_INC (16U * 1024U * 1024U)
+#define H2_CLIENT_INITIAL_WINDOW (16U * 1024U * 1024U)
+#define H2_WINDOW_UPDATE_THRESHOLD (1024U * 1024U)
 #define H2_DEFAULT_MAX_FRAME 16384U
 
 static int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_id, const uint8_t *payload, size_t len) {
@@ -1515,27 +1519,59 @@ static int h2_send_window_update(tls13_conn_t *c, uint32_t stream_id, uint32_t i
     return h2_send_frame(c, H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload, sizeof(payload));
 }
 
+static int h2_note_recv_data(tls13_conn_t *c, size_t payload_len) {
+    if (payload_len == 0) {
+        return 0;
+    }
+    if (payload_len > 0x7FFFFFFFU || c->h2_recv_conn_pending > 0x7FFFFFFFU - payload_len ||
+        c->h2_recv_stream_pending > 0x7FFFFFFFU - payload_len) {
+        return -1;
+    }
+
+    c->h2_recv_conn_pending += (uint32_t)payload_len;
+    c->h2_recv_stream_pending += (uint32_t)payload_len;
+    if (c->h2_recv_conn_pending < H2_WINDOW_UPDATE_THRESHOLD && c->h2_recv_stream_pending < H2_WINDOW_UPDATE_THRESHOLD) {
+        return 0;
+    }
+
+    uint32_t conn_inc = c->h2_recv_conn_pending;
+    uint32_t stream_inc = c->h2_recv_stream_pending;
+    c->h2_recv_conn_pending = 0;
+    c->h2_recv_stream_pending = 0;
+    if (h2_send_window_update(c, 0, conn_inc) != 0 || h2_send_window_update(c, c->h2_stream_id, stream_inc) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int h2_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
-        if (c->h2_net_cache.len == 0) {
-            if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
-                uint8_t tmp[8192];
-                size_t got = 0;
-                if (ssl_read_some(c->ssl, tmp, sizeof(tmp), &got) != 0 || got == 0 || db_append(&c->h2_net_cache, tmp, got) != 0) {
-                    return -1;
-                }
-            } else if (fill_reality_plain_cache(c, &c->h2_net_cache) != 0) {
+        if (c->h2_net_cache.len > 0) {
+            size_t take = c->h2_net_cache.len;
+            if (take > len - off) {
+                take = len - off;
+            }
+            memcpy(buf + off, c->h2_net_cache.data, take);
+            db_consume(&c->h2_net_cache, take);
+            off += take;
+            continue;
+        }
+
+        if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
+            size_t got = 0;
+            if (ssl_read_some(c->ssl, buf + off, len - off, &got) != 0 || got == 0) {
+                return -1;
+            }
+            off += got;
+        } else {
+            if (fill_reality_plain_cache(c, &c->h2_net_cache) != 0) {
+                return -1;
+            }
+            if (c->h2_net_cache.len == 0) {
                 return -1;
             }
         }
-        size_t take = c->h2_net_cache.len;
-        if (take > len - off) {
-            take = len - off;
-        }
-        memcpy(buf + off, c->h2_net_cache.data, take);
-        db_consume(&c->h2_net_cache, take);
-        off += take;
     }
     return 0;
 }
@@ -1894,7 +1930,14 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
         return -1;
     }
 
-    uint8_t settings[6] = {0x00, 0x04, 0x00, 0x10, 0x00, 0x00};
+    uint8_t settings[6] = {
+        0x00,
+        0x04,
+        (uint8_t)(H2_CLIENT_INITIAL_WINDOW >> 24),
+        (uint8_t)(H2_CLIENT_INITIAL_WINDOW >> 16),
+        (uint8_t)(H2_CLIENT_INITIAL_WINDOW >> 8),
+        (uint8_t)H2_CLIENT_INITIAL_WINDOW,
+    };
     if (h2_send_frame(c, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings)) != 0 ||
         h2_send_window_update(c, 0, H2_CONNECTION_WINDOW_INC) != 0) {
         set_err(err, err_cap, "failed to send h2 settings");
@@ -2014,11 +2057,8 @@ static int h2_fill_app_cache(tls13_conn_t *c) {
                 }
             }
 
-            if (rc == 0 && payload_len > 0) {
-                uint32_t inc = (payload_len > H2_CONNECTION_WINDOW_INC) ? H2_CONNECTION_WINDOW_INC : (uint32_t)payload_len;
-                if (h2_send_window_update(c, 0, inc) != 0 || h2_send_window_update(c, c->h2_stream_id, inc) != 0) {
-                    rc = -1;
-                }
+            if (rc == 0 && h2_note_recv_data(c, payload_len) != 0) {
+                rc = -1;
             }
             if (rc == 0 && data_len > 0 && db_append(&c->app_cache, payload + off, data_len) != 0) {
                 rc = -1;
@@ -2374,6 +2414,8 @@ static int xhttp_h2_send_download_request(tls13_conn_t *c, char *err, size_t err
     c->h2_peer_max_frame_size = H2_DEFAULT_MAX_FRAME;
     c->h2_peer_conn_window = H2_DEFAULT_WINDOW;
     c->h2_peer_stream_window = H2_DEFAULT_WINDOW;
+    c->h2_recv_conn_pending = 0;
+    c->h2_recv_stream_pending = 0;
     c->h2_stream_eof = 0;
 
     if (h2_send_client_preface(c, err, err_cap) != 0) {
@@ -4187,6 +4229,15 @@ int tls13_has_pending_app(const tls13_conn_t *c) {
     if (c->app_cache.len > 0) {
         return 1;
     }
+    if (c->mode == CONN_MODE_XHTTP_TLS && (c->xhttp_net_cache.len > 0 || (c->ssl != NULL && SSL_pending(c->ssl) > 0))) {
+        return 1;
+    }
+    if (c->mode == CONN_MODE_XHTTP_TLS_H2 && (c->h2_net_cache.len > 0 || (c->ssl != NULL && SSL_pending(c->ssl) > 0))) {
+        return 1;
+    }
+    if (c->mode == CONN_MODE_XHTTP_REALITY && c->h2_net_cache.len > 0) {
+        return 1;
+    }
     if (c->mode == CONN_MODE_WS && (c->ws_net_cache.len > 0 || (c->ssl != NULL && SSL_pending(c->ssl) > 0))) {
         return 1;
     }
@@ -4685,6 +4736,8 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         c->h2_peer_max_frame_size = H2_DEFAULT_MAX_FRAME;
         c->h2_peer_conn_window = H2_DEFAULT_WINDOW;
         c->h2_peer_stream_window = H2_DEFAULT_WINDOW;
+        c->h2_recv_conn_pending = 0;
+        c->h2_recv_stream_pending = 0;
         c->h2_stream_eof = 0;
 
         fprintf(stderr, "[xhttp] reality mode=stream-one http=2\n");
