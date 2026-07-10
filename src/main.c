@@ -19,7 +19,7 @@
 #include "vision.h"
 #include "vless.h"
 
-#define VLESS_CORE_VERSION "1.0.5"
+#define VLESS_CORE_VERSION "1.0.6"
 #ifndef VLESS_OPENSSL_PATCH_STATUS
 #define VLESS_OPENSSL_PATCH_STATUS "unpatched"
 #endif
@@ -378,7 +378,7 @@ static void *client_worker(void *arg) {
         return NULL;
     }
 
-    int use_vision = (cfg.transport_mode == TRANSPORT_VISION);
+    int use_vision = (cfg.transport_mode == TRANSPORT_VISION && strcmp(cfg.flow, "xtls-rprx-vision") == 0);
     vision_wrap_t vwrap;
     vision_unpad_t vunpad;
     if (use_vision) {
@@ -801,7 +801,7 @@ int main(int argc, char **argv) {
         } else if (cfg.fp_mode == FP_EDGE) {
             fp_label = "edge";
         }
-        const char *transport_label = "vision";
+        const char *transport_label = strcmp(cfg.flow, "xtls-rprx-vision") == 0 ? "vision" : "tcp";
         if (cfg.transport_mode == TRANSPORT_XHTTP) {
             transport_label = "xhttp";
         } else if (cfg.transport_mode == TRANSPORT_WS) {

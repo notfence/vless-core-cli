@@ -2,8 +2,8 @@
 
 Standalone C CLI client for:
 
-- `VLESS + TCP + Reality + xtls-rprx-vision`
-- `VLESS + TCP + TLS + xtls-rprx-vision`
+- `VLESS + TCP + Reality (+ xtls-rprx-vision)`
+- `VLESS + TCP + TLS (+ xtls-rprx-vision)`
 - `VLESS + TLS + XHTTP (mode=packet-up)`
 - `VLESS + Reality + XHTTP (mode=stream-one)`
 - `VLESS + TLS + WebSocket`

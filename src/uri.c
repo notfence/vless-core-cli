@@ -99,7 +99,7 @@ static void init_config_defaults(vless_config_t *cfg, const char *uri) {
     cfg->protocol = CORE_PROTOCOL_VLESS;
     cfg->fp_mode = FP_CHROME;
     cfg->transport_mode = TRANSPORT_VISION;
-    snprintf(cfg->flow, sizeof(cfg->flow), "xtls-rprx-vision");
+    cfg->flow[0] = '\0';
     snprintf(cfg->security, sizeof(cfg->security), "reality");
     cfg->alpn[0] = '\0';
     cfg->allow_insecure = 0;
@@ -618,13 +618,13 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
             return -1;
         }
 
-        if (strcmp(cfg->flow, "xtls-rprx-vision") != 0) {
-            set_err(err, err_cap, "only flow=xtls-rprx-vision is supported");
+        if (cfg->flow[0] != '\0' && strcmp(cfg->flow, "xtls-rprx-vision") != 0) {
+            set_err(err, err_cap, "only omitted flow or flow=xtls-rprx-vision is supported");
             return -1;
         }
     } else if (strcmp(cfg->security, "tls") == 0) {
-        if (strcmp(cfg->flow, "xtls-rprx-vision") != 0) {
-            set_err(err, err_cap, "only flow=xtls-rprx-vision is supported");
+        if (cfg->flow[0] != '\0' && strcmp(cfg->flow, "xtls-rprx-vision") != 0) {
+            set_err(err, err_cap, "only omitted flow or flow=xtls-rprx-vision is supported");
             return -1;
         }
 
