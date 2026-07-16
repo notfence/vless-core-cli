@@ -19,7 +19,7 @@
 #include "vision.h"
 #include "vless.h"
 
-#define VLESS_CORE_VERSION "1.0.6"
+#define VLESS_CORE_VERSION "1.0.7"
 #ifndef VLESS_OPENSSL_PATCH_STATUS
 #define VLESS_OPENSSL_PATCH_STATUS "unpatched"
 #endif
@@ -41,6 +41,35 @@ static ssize_t read_with_timeout(int fd, uint8_t *buf, size_t cap, int timeout_m
         return 0;
     }
     return recv(fd, buf, cap, 0);
+}
+
+static ssize_t recv_coalesced(int fd, uint8_t *buf, size_t cap, int wait_us) {
+    ssize_t first = recv(fd, buf, cap, 0);
+    if (first <= 0 || wait_us <= 0) {
+        return first;
+    }
+
+    size_t total = (size_t)first;
+    while (total < cap) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = wait_us;
+        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (rc <= 0 || !FD_ISSET(fd, &rfds)) {
+            break;
+        }
+
+        ssize_t n = recv(fd, buf + total, cap - total, 0);
+        if (n <= 0) {
+            break;
+        }
+        total += (size_t)n;
+    }
+    return (ssize_t)total;
 }
 
 static int tls_records_needed(const uint8_t *buf, size_t len, size_t *needed) {
@@ -536,7 +565,19 @@ static void *client_worker(void *arg) {
     }
 
     int tfd = tls13_get_fd(tls);
-    uint8_t cbuf[8192];
+    size_t cbuf_cap = tls13_write_batch_size(tls);
+    if (cbuf_cap < 8192) {
+        cbuf_cap = 8192;
+    }
+    uint8_t *cbuf = (uint8_t *)malloc(cbuf_cap);
+    if (cbuf == NULL) {
+        if (use_vision) {
+            vision_unpad_free(&vunpad);
+        }
+        tls13_reality_close(tls);
+        close(cfd);
+        return NULL;
+    }
     uint8_t tbuf[8192];
     int got_vless_response = 0;
     int upstream_direct = 0;
@@ -573,7 +614,7 @@ static void *client_worker(void *arg) {
         }
 
         if (client_ready) {
-            ssize_t n = recv(cfd, cbuf, sizeof(cbuf), 0);
+            ssize_t n = recv_coalesced(cfd, cbuf, cbuf_cap, cbuf_cap > 8192 ? 2000 : 0);
             if (n <= 0) {
                 break;
             }
@@ -635,8 +676,12 @@ static void *client_worker(void *arg) {
             }
 
             size_t got = 0;
-            if (tls13_read_app(tls, tbuf, sizeof(tbuf), &got) != 0 || got == 0) {
+            int read_rc = tls13_read_app(tls, tbuf, sizeof(tbuf), &got);
+            if (read_rc < 0 || (read_rc == 0 && got == 0)) {
                 break;
+            }
+            if (read_rc > 0) {
+                continue;
             }
 
             if (use_vision) {
@@ -683,6 +728,7 @@ static void *client_worker(void *arg) {
     if (use_vision) {
         vision_unpad_free(&vunpad);
     }
+    free(cbuf);
     tls13_reality_close(tls);
     close(cfd);
     return NULL;

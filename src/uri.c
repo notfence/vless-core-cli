@@ -120,6 +120,8 @@ static void init_config_defaults(vless_config_t *cfg, const char *uri) {
     cfg->xhttp_padding_obfs = 0;
     cfg->xhttp_padding_min = 100;
     cfg->xhttp_padding_max = 1000;
+    cfg->xhttp_max_each_post_min = 1000000;
+    cfg->xhttp_max_each_post_max = 1000000;
     snprintf(cfg->original_uri, sizeof(cfg->original_uri), "%s", uri ? uri : "");
 }
 
@@ -206,7 +208,7 @@ static int json_get_scalar(const char *json, const char *key, char *out, size_t 
     return out[0] != '\0' ? 0 : -1;
 }
 
-static void parse_range_value(const char *value, int *min_out, int *max_out) {
+static void parse_range_value_limited(const char *value, int *min_out, int *max_out, long limit) {
     if (value == NULL || min_out == NULL || max_out == NULL) {
         return;
     }
@@ -236,14 +238,18 @@ static void parse_range_value(const char *value, int *min_out, int *max_out) {
         a = b;
         b = t;
     }
-    if (a > 8192) {
-        a = 8192;
+    if (a > limit) {
+        a = limit;
     }
-    if (b > 8192) {
-        b = 8192;
+    if (b > limit) {
+        b = limit;
     }
     *min_out = (int)a;
     *max_out = (int)b;
+}
+
+static void parse_range_value(const char *value, int *min_out, int *max_out) {
+    parse_range_value_limited(value, min_out, max_out, 8192);
 }
 
 static void parse_xhttp_extra(vless_config_t *cfg, const char *json) {
@@ -287,6 +293,9 @@ static void parse_xhttp_extra(vless_config_t *cfg, const char *json) {
     }
     if (json_get_scalar(json, "xPaddingBytes", val, sizeof(val)) == 0) {
         parse_range_value(val, &cfg->xhttp_padding_min, &cfg->xhttp_padding_max);
+    }
+    if (json_get_scalar(json, "scMaxEachPostBytes", val, sizeof(val)) == 0) {
+        parse_range_value_limited(val, &cfg->xhttp_max_each_post_min, &cfg->xhttp_max_each_post_max, 16L * 1024L * 1024L);
     }
 }
 
@@ -436,6 +445,8 @@ static void parse_query(vless_config_t *cfg, char *query) {
             parse_xhttp_extra(cfg, decoded);
         } else if (strcmp(key, "xPaddingBytes") == 0 || strcmp(key, "x_padding_bytes") == 0) {
             parse_range_value(decoded, &cfg->xhttp_padding_min, &cfg->xhttp_padding_max);
+        } else if (strcmp(key, "scMaxEachPostBytes") == 0 || strcmp(key, "sc_max_each_post_bytes") == 0) {
+            parse_range_value_limited(decoded, &cfg->xhttp_max_each_post_min, &cfg->xhttp_max_each_post_max, 16L * 1024L * 1024L);
         } else if (strcmp(key, "spx") == 0) {
             copy_trunc(cfg->spider_x, sizeof(cfg->spider_x), decoded);
         }

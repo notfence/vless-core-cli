@@ -69,6 +69,8 @@ typedef struct {
     int xhttp_padding_obfs;
     int xhttp_padding_min;
     int xhttp_padding_max;
+    int xhttp_max_each_post_min;
+    int xhttp_max_each_post_max;
 } vless_config_t;
 
 typedef struct {
