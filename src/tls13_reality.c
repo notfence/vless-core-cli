@@ -20,10 +20,12 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -41,7 +43,9 @@ typedef enum {
     CONN_MODE_XHTTP_REALITY = 2,
     CONN_MODE_TLS = 3,
     CONN_MODE_WS = 4,
-    CONN_MODE_XHTTP_TLS_H2 = 5
+    CONN_MODE_XHTTP_TLS_H2 = 5,
+    CONN_MODE_PLAIN = 6,
+    CONN_MODE_XHTTP_PLAIN = 7
 } conn_mode_t;
 
 typedef enum {
@@ -60,6 +64,9 @@ static int g_xhttp_auto_force_insecure = 0;
 struct tls13_conn {
     int fd;
     conn_mode_t mode;
+    int xhttp_upload_fd;
+    pthread_t xhttp_upload_reader;
+    int xhttp_upload_reader_started;
 
     uint8_t auth_key[32];
 
@@ -290,6 +297,19 @@ static int ssl_read_some(SSL *ssl, uint8_t *buf, size_t cap, size_t *out_len) {
         return 0;
     }
     int n = SSL_read(ssl, buf, (int)cap);
+    if (n <= 0) {
+        return -1;
+    }
+    *out_len = (size_t)n;
+    return 0;
+}
+
+static int fd_read_some(int fd, uint8_t *buf, size_t cap, size_t *out_len) {
+    *out_len = 0;
+    if (cap == 0) {
+        return 0;
+    }
+    ssize_t n = recv(fd, buf, cap, 0);
     if (n <= 0) {
         return -1;
     }
@@ -922,7 +942,7 @@ static int contains_case_insensitive(const char *haystack, const char *needle) {
     return 0;
 }
 
-static int parse_http_response_headers(SSL *ssl, dynbuf_t *cache, int *status_code, int *chunked, int64_t *content_len, char *err,
+static int parse_http_response_headers(SSL *ssl, int fd, dynbuf_t *cache, int *status_code, int *chunked, int64_t *content_len, char *err,
                                        size_t err_cap) {
     *status_code = 0;
     *chunked = 0;
@@ -973,7 +993,8 @@ static int parse_http_response_headers(SSL *ssl, dynbuf_t *cache, int *status_co
 
         uint8_t tmp[4096];
         size_t got = 0;
-        if (ssl_read_some(ssl, tmp, sizeof(tmp), &got) != 0 || got == 0) {
+        int read_rc = ssl != NULL ? ssl_read_some(ssl, tmp, sizeof(tmp), &got) : fd_read_some(fd, tmp, sizeof(tmp), &got);
+        if (read_rc != 0 || got == 0) {
             set_err(err, err_cap, "failed to read HTTP headers");
             return -1;
         }
@@ -1304,7 +1325,7 @@ static int xhttp_stream_read_some(tls13_conn_t *c, uint8_t *buf, size_t cap, siz
         *out_len = take;
         return 0;
     }
-    return ssl_read_some(c->ssl, buf, cap, out_len);
+    return c->ssl != NULL ? ssl_read_some(c->ssl, buf, cap, out_len) : fd_read_some(c->fd, buf, cap, out_len);
 }
 
 static int xhttp_stream_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
@@ -1344,6 +1365,42 @@ static int xhttp_stream_read_line(tls13_conn_t *c, char *line, size_t cap) {
     return 0;
 }
 
+static int xhttp_plain_buffer_available(tls13_conn_t *c) {
+    if (c->mode != CONN_MODE_XHTTP_PLAIN) {
+        return 0;
+    }
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(c->fd, &rfds);
+    struct timeval tv = {0, 0};
+    int ready = select(c->fd + 1, &rfds, NULL, NULL, &tv);
+    if (ready <= 0) {
+        return ready < 0 && errno != EINTR ? -1 : 0;
+    }
+    uint8_t tmp[4096];
+    ssize_t n = recv(c->fd, tmp, sizeof(tmp), 0);
+    if (n > 0) {
+        return db_append(&c->xhttp_net_cache, tmp, (size_t)n);
+    }
+    if (n == 0) {
+        return -1;
+    }
+    return errno == EINTR ? 0 : -1;
+}
+
+static int xhttp_plain_line_ready(tls13_conn_t *c, size_t skip) {
+    if (c->mode != CONN_MODE_XHTTP_PLAIN) {
+        return 1;
+    }
+    if (xhttp_plain_buffer_available(c) != 0) {
+        return -1;
+    }
+    if (c->xhttp_net_cache.len <= skip) {
+        return 0;
+    }
+    return memchr(c->xhttp_net_cache.data + skip, '\n', c->xhttp_net_cache.len - skip) != NULL;
+}
+
 static int xhttp_fill_app_cache(tls13_conn_t *c) {
     if (c->xhttp_eof) {
         return -1;
@@ -1354,7 +1411,7 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
         int chunked = 0;
         int64_t content_len = -1;
         char err[160] = {0};
-        if (parse_http_response_headers(c->ssl, &c->xhttp_net_cache, &status, &chunked, &content_len, err, sizeof(err)) != 0) {
+        if (parse_http_response_headers(c->ssl, c->fd, &c->xhttp_net_cache, &status, &chunked, &content_len, err, sizeof(err)) != 0) {
             if (err[0] != '\0') {
                 fprintf(stderr, "[xhttp] %s\n", err);
             }
@@ -1396,6 +1453,13 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
 
     for (;;) {
         if (c->xhttp_chunk_rem < 0) {
+            int line_ready = xhttp_plain_line_ready(c, 0);
+            if (line_ready < 0) {
+                return -1;
+            }
+            if (!line_ready) {
+                return 1;
+            }
             char line[128];
             if (xhttp_stream_read_line(c, line, sizeof(line)) != 0) {
                 return -1;
@@ -1425,6 +1489,13 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
         }
 
         if (c->xhttp_chunk_rem == 0) {
+            int line_ready = xhttp_plain_line_ready(c, 2);
+            if (line_ready < 0) {
+                return -1;
+            }
+            if (!line_ready) {
+                return 1;
+            }
             uint8_t crlf[2];
             if (xhttp_stream_read_exact(c, crlf, sizeof(crlf)) != 0) {
                 return -1;
@@ -1439,6 +1510,14 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
             ask = (size_t)c->xhttp_chunk_rem;
         }
         size_t got = 0;
+        if (c->mode == CONN_MODE_XHTTP_PLAIN && c->xhttp_net_cache.len == 0) {
+            if (xhttp_plain_buffer_available(c) != 0) {
+                return -1;
+            }
+            if (c->xhttp_net_cache.len == 0) {
+                return 1;
+            }
+        }
         if (xhttp_stream_read_some(c, tmp, ask, &got) != 0 || got == 0) {
             return -1;
         }
@@ -2213,7 +2292,8 @@ static int xhttp_apply_padding(tls13_conn_t *c, char *path, size_t path_cap, cha
     }
 
     char referer[2048];
-    int n = snprintf(referer, sizeof(referer), "https://%s%s?%s=%s", c->xhttp_host, bare_path, key, padding);
+    const char *scheme = c->mode == CONN_MODE_XHTTP_PLAIN ? "http" : "https";
+    int n = snprintf(referer, sizeof(referer), "%s://%s%s?%s=%s", scheme, c->xhttp_host, bare_path, key, padding);
     if (n <= 0 || (size_t)n >= sizeof(referer)) {
         return -1;
     }
@@ -2518,6 +2598,79 @@ static int xhttp_h2_start_mode(tls13_conn_t *c, char *err, size_t err_cap) {
     return 0;
 }
 
+static int xhttp_conn_write_all(tls13_conn_t *c, const void *buf, size_t len) {
+    return c->ssl != NULL ? ssl_write_all(c->ssl, buf, len) : write_exact(c->fd, buf, len);
+}
+
+static void *xhttp_plain_upload_reader(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    uint8_t buf[4096];
+    while (recv(fd, buf, sizeof(buf), 0) > 0) {
+    }
+    return NULL;
+}
+
+static int xhttp_start_plain_upload_reader(tls13_conn_t *c) {
+    if (pthread_create(&c->xhttp_upload_reader, NULL, xhttp_plain_upload_reader, (void *)(intptr_t)c->xhttp_upload_fd) != 0) {
+        return -1;
+    }
+    c->xhttp_upload_reader_started = 1;
+    return 0;
+}
+
+static int xhttp_send_plain_stream_request(tls13_conn_t *c, int fd, char *err, size_t err_cap) {
+    char request_path[2048];
+    char extra_headers[4096];
+    if (xhttp_prepare_request(c, "", request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
+        set_err(err, err_cap, "failed to build xhttp stream request");
+        return -1;
+    }
+
+    char req[8192];
+    int req_len = snprintf(req, sizeof(req),
+                           "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: vless-core/1.0\r\nAccept: */*\r\n"
+                           "%sContent-Type: application/grpc\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                           request_path, c->xhttp_host, extra_headers);
+    if (req_len <= 0 || (size_t)req_len >= sizeof(req)) {
+        set_err(err, err_cap, "xhttp stream request too large");
+        return -1;
+    }
+    if (write_exact(fd, req, (size_t)req_len) != 0) {
+        set_err(err, err_cap, "failed to send xhttp stream request");
+        return -1;
+    }
+
+    c->xhttp_chunked = 0;
+    c->xhttp_content_rem = -1;
+    c->xhttp_chunk_rem = -1;
+    c->xhttp_eof = 0;
+    c->xhttp_headers_read = 0;
+    return 0;
+}
+
+static int xhttp_write_plain_stream(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    int fd = strcmp(c->xhttp_transport_mode, "stream-one") == 0 ? c->fd : c->xhttp_upload_fd;
+    if (fd < 0) {
+        return -1;
+    }
+
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > 16384) {
+            chunk = 16384;
+        }
+        char header[32];
+        int header_len = snprintf(header, sizeof(header), "%zx\r\n", chunk);
+        if (header_len <= 0 || (size_t)header_len >= sizeof(header) || write_exact(fd, header, (size_t)header_len) != 0 ||
+            write_exact(fd, buf + off, chunk) != 0 || write_exact(fd, "\r\n", 2) != 0) {
+            return -1;
+        }
+        off += chunk;
+    }
+    return 0;
+}
+
 static int xhttp_send_download_request(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
     char request_path[2048];
     char extra_headers[4096];
@@ -2536,7 +2689,7 @@ static int xhttp_send_download_request(const vless_config_t *cfg, tls13_conn_t *
         return -1;
     }
 
-    if (ssl_write_all(c->ssl, req, (size_t)req_len) != 0) {
+    if (xhttp_conn_write_all(c, req, (size_t)req_len) != 0) {
         set_err(err, err_cap, "failed to send xhttp GET");
         return -1;
     }
@@ -2550,7 +2703,65 @@ static int xhttp_send_download_request(const vless_config_t *cfg, tls13_conn_t *
     return 0;
 }
 
+static int xhttp_post_packet_plain(tls13_conn_t *c, const uint8_t *buf, size_t len, char *err, size_t err_cap) {
+    int fd = tcp_connect_host(c->remote_host, c->remote_port);
+    if (fd < 0) {
+        set_err(err, err_cap, "tcp connect failed");
+        return -1;
+    }
+
+    char seq[32];
+    snprintf(seq, sizeof(seq), "%llu", (unsigned long long)c->xhttp_seq++);
+
+    char request_path[2048];
+    char extra_headers[4096];
+    if (xhttp_prepare_request(c, seq, request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
+        close(fd);
+        set_err(err, err_cap, "failed to build xhttp upload request");
+        return -1;
+    }
+
+    const char *method = (strcmp(c->xhttp_uplink_method, "GET") == 0) ? "GET" : "POST";
+    char req[8192];
+    int req_len = snprintf(req, sizeof(req),
+                           "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: vless-core/1.0\r\nAccept: */*\r\n"
+                           "%sContent-Type: application/octet-stream\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                           method, request_path, c->xhttp_host, extra_headers, len);
+    if (req_len <= 0 || (size_t)req_len >= sizeof(req)) {
+        close(fd);
+        set_err(err, err_cap, "xhttp POST request too large");
+        return -1;
+    }
+
+    int rc = 0;
+    if (write_exact(fd, req, (size_t)req_len) != 0 || (len > 0 && write_exact(fd, buf, len) != 0)) {
+        rc = -1;
+        set_err(err, err_cap, "failed to send xhttp POST");
+    } else {
+        dynbuf_t cache = {0};
+        int status = 0;
+        int chunked = 0;
+        int64_t content_len = -1;
+        if (parse_http_response_headers(NULL, fd, &cache, &status, &chunked, &content_len, err, err_cap) != 0) {
+            rc = -1;
+        } else if (status != 200) {
+            rc = -1;
+            if (err != NULL && err_cap > 0) {
+                snprintf(err, err_cap, "xhttp %s returned non-200: %d", method, status);
+            }
+        }
+        db_free(&cache);
+    }
+
+    close(fd);
+    return rc;
+}
+
 static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, char *err, size_t err_cap) {
+    if (c->mode == CONN_MODE_XHTTP_PLAIN) {
+        return xhttp_post_packet_plain(c, buf, len, err, err_cap);
+    }
+
     SSL_CTX *ctx = NULL;
     SSL *ssl = NULL;
     int fd = -1;
@@ -2653,7 +2864,7 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, ch
         int status = 0;
         int chunked = 0;
         int64_t content_len = -1;
-        if (parse_http_response_headers(ssl, &cache, &status, &chunked, &content_len, err, err_cap) != 0) {
+        if (parse_http_response_headers(ssl, fd, &cache, &status, &chunked, &content_len, err, err_cap) != 0) {
             rc = -1;
         } else if (status != 200) {
             rc = -1;
@@ -4303,8 +4514,16 @@ int tls13_has_pending_app(const tls13_conn_t *c) {
     if (c->app_cache.len > 0) {
         return 1;
     }
-    if (c->mode == CONN_MODE_XHTTP_TLS && (c->xhttp_net_cache.len > 0 || (c->ssl != NULL && SSL_pending(c->ssl) > 0))) {
-        return 1;
+    if (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_PLAIN) {
+        int cache_ready = c->xhttp_net_cache.len > 0;
+        if (c->mode == CONN_MODE_XHTTP_PLAIN && c->xhttp_headers_read && c->xhttp_chunked && c->xhttp_chunk_rem <= 0) {
+            size_t skip = c->xhttp_chunk_rem == 0 ? 2 : 0;
+            cache_ready = c->xhttp_net_cache.len > skip &&
+                          memchr(c->xhttp_net_cache.data + skip, '\n', c->xhttp_net_cache.len - skip) != NULL;
+        }
+        if (cache_ready || (c->ssl != NULL && SSL_pending(c->ssl) > 0)) {
+            return 1;
+        }
     }
     if (c->mode == CONN_MODE_XHTTP_TLS_H2 && (c->h2_net_cache.len > 0 || (c->ssl != NULL && SSL_pending(c->ssl) > 0))) {
         return 1;
@@ -4320,7 +4539,8 @@ int tls13_has_pending_app(const tls13_conn_t *c) {
 
 size_t tls13_write_batch_size(const tls13_conn_t *c) {
     if (c != NULL && strcmp(c->xhttp_transport_mode, "packet-up") == 0 &&
-        (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_TLS_H2 || c->mode == CONN_MODE_XHTTP_REALITY) &&
+        (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_TLS_H2 || c->mode == CONN_MODE_XHTTP_REALITY ||
+         c->mode == CONN_MODE_XHTTP_PLAIN) &&
         c->xhttp_max_each_post_bytes > 0) {
         size_t size = (size_t)c->xhttp_max_each_post_bytes;
         return size > 1024U * 1024U ? 1024U * 1024U : size;
@@ -4837,6 +5057,37 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         return -1;
     }
 
+    if (strcmp(cfg->security, "none") == 0) {
+        c->mode = CONN_MODE_XHTTP_PLAIN;
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port);
+        if (c->fd < 0) {
+            set_err(err, err_cap, "tcp connect failed");
+            return -1;
+        }
+        fprintf(stderr, "[xhttp] plain mode=%s http=1.1 max_each_post=%d\n", c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
+        if (strcmp(c->xhttp_transport_mode, "stream-one") == 0) {
+            return xhttp_send_plain_stream_request(c, c->fd, err, err_cap);
+        }
+        if (xhttp_send_download_request(cfg, c, err, err_cap) != 0) {
+            return -1;
+        }
+        if (strcmp(c->xhttp_transport_mode, "stream-up") == 0) {
+            c->xhttp_upload_fd = tcp_connect_host(c->remote_host, c->remote_port);
+            if (c->xhttp_upload_fd < 0) {
+                set_err(err, err_cap, "xhttp upload tcp connect failed");
+                return -1;
+            }
+            if (xhttp_send_plain_stream_request(c, c->xhttp_upload_fd, err, err_cap) != 0) {
+                return -1;
+            }
+            if (xhttp_start_plain_upload_reader(c) != 0) {
+                set_err(err, err_cap, "failed to start xhttp upload stream");
+                return -1;
+            }
+        }
+        return 0;
+    }
+
     if (strcmp(cfg->security, "reality") == 0) {
         c->mode = CONN_MODE_XHTTP_REALITY;
 
@@ -4939,6 +5190,7 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
         return -1;
     }
     c->fd = -1;
+    c->xhttp_upload_fd = -1;
     c->mode = CONN_MODE_REALITY;
 
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
@@ -4955,6 +5207,19 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
             tls13_reality_close(c);
             return -1;
         }
+        *out = c;
+        return 0;
+    }
+
+    if (strcmp(cfg->security, "none") == 0) {
+        c->mode = CONN_MODE_PLAIN;
+        c->fd = tcp_connect_host(cfg->server_host, cfg->server_port);
+        if (c->fd < 0) {
+            tls13_reality_close(c);
+            set_err(err, err_cap, "tcp connect failed");
+            return -1;
+        }
+        fprintf(stderr, "[tcp] connected security=none\n");
         *out = c;
         return 0;
     }
@@ -4990,6 +5255,20 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
 void tls13_reality_close(tls13_conn_t *c) {
     if (c == NULL) {
         return;
+    }
+    if (c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
+        int upload_fd = strcmp(c->xhttp_transport_mode, "stream-one") == 0 ? c->fd : c->xhttp_upload_fd;
+        if (upload_fd >= 0) {
+            (void)write_exact(upload_fd, "0\r\n\r\n", 5);
+        }
+    }
+    if (c->xhttp_upload_fd >= 0) {
+        shutdown(c->xhttp_upload_fd, SHUT_RDWR);
+        if (c->xhttp_upload_reader_started) {
+            pthread_join(c->xhttp_upload_reader, NULL);
+        }
+        close(c->xhttp_upload_fd);
+        c->xhttp_upload_fd = -1;
     }
     if (c->ssl != NULL) {
         if (!c->reality_raw_direct) {
@@ -5045,11 +5324,19 @@ static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t
 }
 
 int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    if (c->mode == CONN_MODE_PLAIN) {
+        return write_exact(c->fd, buf, len);
+    }
+
     if (c->mode == CONN_MODE_WS) {
         return ws_write_frame(c, 0x2, buf, len);
     }
 
-    if (c->mode == CONN_MODE_XHTTP_TLS) {
+    if (c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
+        return xhttp_write_plain_stream(c, buf, len);
+    }
+
+    if (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_PLAIN) {
         size_t max_post = c->xhttp_max_each_post_bytes > 0 ? (size_t)c->xhttp_max_each_post_bytes : 1000000U;
         size_t off = 0;
         while (off < len) {
@@ -5194,14 +5481,22 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
         return 0;
     }
 
+    if (c->mode == CONN_MODE_PLAIN) {
+        return fd_read_some(c->fd, buf, cap, out_len);
+    }
+
     if (c->app_cache.len == 0) {
         if (c->mode == CONN_MODE_WS) {
             if (ws_fill_app_cache(c) != 0) {
                 return -1;
             }
-        } else if (c->mode == CONN_MODE_XHTTP_TLS) {
-            if (xhttp_fill_app_cache(c) != 0) {
+        } else if (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_PLAIN) {
+            int rc = xhttp_fill_app_cache(c);
+            if (rc < 0) {
                 return -1;
+            }
+            if (rc > 0) {
+                return 1;
             }
         } else if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
             int rc = h2_fill_app_cache(c);

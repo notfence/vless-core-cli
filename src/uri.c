@@ -567,8 +567,9 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
         int xhttp_tls = (strcmp(cfg->security, "tls") == 0);
         int xhttp_reality = (strcmp(cfg->security, "reality") == 0);
-        if (!xhttp_tls && !xhttp_reality) {
-            set_err(err, err_cap, "xhttp requires security=tls or security=reality");
+        int xhttp_plain = (strcmp(cfg->security, "none") == 0);
+        if (!xhttp_tls && !xhttp_reality && !xhttp_plain) {
+            set_err(err, err_cap, "xhttp requires security=none, security=tls, or security=reality");
             return -1;
         }
         if (strcmp(cfg->xhttp_mode, "auto") == 0 || cfg->xhttp_mode[0] == '\0') {
@@ -583,12 +584,16 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
             set_err(err, err_cap, "xhttp uplinkHTTPMethod must be GET or POST");
             return -1;
         }
+        if (strcmp(cfg->xhttp_uplink_method, "GET") == 0 && strcmp(cfg->xhttp_mode, "packet-up") != 0) {
+            set_err(err, err_cap, "xhttp uplinkHTTPMethod=GET requires mode=packet-up");
+            return -1;
+        }
         if (strcmp(cfg->xhttp_uplink_data_placement, "body") != 0 && strcmp(cfg->xhttp_uplink_data_placement, "auto") != 0) {
             set_err(err, err_cap, "only xhttp uplinkDataPlacement=body is supported");
             return -1;
         }
         cfg->flow[0] = '\0';
-        if (xhttp_tls) {
+        if (!xhttp_reality) {
             cfg->pbk_len = 0;
             cfg->short_id_len = 0;
         } else {
@@ -638,8 +643,15 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
 
         cfg->pbk_len = 0;
         cfg->short_id_len = 0;
+    } else if (strcmp(cfg->security, "none") == 0) {
+        if (cfg->flow[0] != '\0') {
+            set_err(err, err_cap, "tcp without security does not support flow");
+            return -1;
+        }
+        cfg->pbk_len = 0;
+        cfg->short_id_len = 0;
     } else {
-        set_err(err, err_cap, "tcp requires security=reality or security=tls");
+        set_err(err, err_cap, "tcp requires security=none, security=reality, or security=tls");
         return -1;
     }
 

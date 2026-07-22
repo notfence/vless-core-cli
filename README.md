@@ -4,8 +4,10 @@ Standalone C CLI client for:
 
 - `VLESS + TCP + Reality (+ xtls-rprx-vision)`
 - `VLESS + TCP + TLS (+ xtls-rprx-vision)`
+- `VLESS + TCP` (no security)
 - `VLESS + XHTTP + Reality`
 - `VLESS + XHTTP + TLS`
+- `VLESS + XHTTP` (no security)
 - `VLESS + WebSocket + TLS`
 - `VLESS + WebSocket`
 - `SOCKS5`
@@ -14,7 +16,7 @@ Standalone C CLI client for:
 
 Protocol semantics are aligned with `xray-core` for the supported transports and URI parameters.
 
-For XHTTP, `mode=auto` follows xray's defaults: `packet-up` with TLS and `stream-one` with Reality.
+For XHTTP, `mode=auto` follows xray's defaults: `packet-up` without security or with TLS, and `stream-one` with Reality.
 
 ## Tested Device/OS
 
