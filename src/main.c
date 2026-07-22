@@ -19,7 +19,7 @@
 #include "vision.h"
 #include "vless.h"
 
-#define VLESS_CORE_VERSION "1.0.7"
+#define VLESS_CORE_VERSION "1.0.8"
 #ifndef VLESS_OPENSSL_PATCH_STATUS
 #define VLESS_OPENSSL_PATCH_STATUS "unpatched"
 #endif

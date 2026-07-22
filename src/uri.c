@@ -440,7 +440,7 @@ static void parse_query(vless_config_t *cfg, char *query) {
         } else if (strcmp(key, "host") == 0) {
             copy_trunc(cfg->xhttp_host, sizeof(cfg->xhttp_host), decoded);
         } else if (strcmp(key, "mode") == 0) {
-            copy_trunc(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), decoded);
+            copy_lower_trunc(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), decoded);
         } else if (strcmp(key, "extra") == 0) {
             parse_xhttp_extra(cfg, decoded);
         } else if (strcmp(key, "xPaddingBytes") == 0 || strcmp(key, "x_padding_bytes") == 0) {
@@ -574,20 +574,17 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         if (strcmp(cfg->xhttp_mode, "auto") == 0 || cfg->xhttp_mode[0] == '\0') {
             snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "%s", xhttp_reality ? "stream-one" : "packet-up");
         }
-        if (xhttp_tls && strcmp(cfg->xhttp_mode, "packet-up") != 0) {
-            set_err(err, err_cap, "only xhttp/tls mode=packet-up is supported");
+        if (strcmp(cfg->xhttp_mode, "packet-up") != 0 && strcmp(cfg->xhttp_mode, "stream-one") != 0 &&
+            strcmp(cfg->xhttp_mode, "stream-up") != 0) {
+            set_err(err, err_cap, "xhttp mode must be auto, packet-up, stream-one, or stream-up");
             return -1;
         }
-        if (xhttp_tls && strcmp(cfg->xhttp_uplink_method, "GET") != 0 && strcmp(cfg->xhttp_uplink_method, "POST") != 0) {
-            set_err(err, err_cap, "xhttp/tls uplinkHTTPMethod must be GET or POST");
+        if (strcmp(cfg->xhttp_uplink_method, "GET") != 0 && strcmp(cfg->xhttp_uplink_method, "POST") != 0) {
+            set_err(err, err_cap, "xhttp uplinkHTTPMethod must be GET or POST");
             return -1;
         }
-        if (xhttp_tls && strcmp(cfg->xhttp_uplink_data_placement, "body") != 0 && strcmp(cfg->xhttp_uplink_data_placement, "auto") != 0) {
-            set_err(err, err_cap, "only xhttp/tls uplinkDataPlacement=body is supported");
-            return -1;
-        }
-        if (xhttp_reality && strcmp(cfg->xhttp_mode, "stream-one") != 0) {
-            set_err(err, err_cap, "only xhttp/reality mode=auto or mode=stream-one is supported");
+        if (strcmp(cfg->xhttp_uplink_data_placement, "body") != 0 && strcmp(cfg->xhttp_uplink_data_placement, "auto") != 0) {
+            set_err(err, err_cap, "only xhttp uplinkDataPlacement=body is supported");
             return -1;
         }
         cfg->flow[0] = '\0';

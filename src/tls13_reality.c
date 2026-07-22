@@ -96,6 +96,7 @@ struct tls13_conn {
 
     char xhttp_base_path[512];
     char xhttp_host[256];
+    char xhttp_transport_mode[32];
     char xhttp_session_id[64];
     char xhttp_session_placement[16];
     char xhttp_session_key[64];
@@ -144,6 +145,7 @@ struct tls13_conn {
 
 static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len);
 static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache);
+static int h2_pump_one_frame(tls13_conn_t *c);
 
 static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
@@ -1975,60 +1977,21 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
     return 0;
 }
 
-static int h2_send_stream_one_headers(tls13_conn_t *c, char *err, size_t err_cap) {
-    dynbuf_t block = {0};
-    char xpadding[1100];
-    char referer[2048];
-
-    if (random_xpadding_value(100, 1000, "repeat-x", xpadding, sizeof(xpadding)) != 0) {
-        set_err(err, err_cap, "failed to generate x_padding");
-        return -1;
-    }
-    snprintf(referer, sizeof(referer), "https://%s%s?x_padding=%s", c->xhttp_host, c->xhttp_base_path, xpadding);
-
-    int rc = 0;
-    if (hpack_append_indexed(&block, 3) != 0 || hpack_append_indexed(&block, 7) != 0 ||
-        hpack_append_literal_new_name(&block, ":authority", c->xhttp_host) != 0 ||
-        (strcmp(c->xhttp_base_path, "/") == 0 ? hpack_append_indexed(&block, 4)
-                                               : hpack_append_literal_new_name(&block, ":path", c->xhttp_base_path)) != 0 ||
-        hpack_append_literal_new_name(&block, "dnt", "1") != 0 ||
-        hpack_append_literal_new_name(&block, "content-type", "application/grpc") != 0 ||
-        hpack_append_literal_new_name(&block, "user-agent",
-                                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                                      "Chrome/149.0.0.0 Safari/537.36") != 0 ||
-        hpack_append_literal_new_name(&block, "priority", "u=1, i") != 0 ||
-        hpack_append_literal_new_name(&block, "cache-control", "no-cache") != 0 ||
-        hpack_append_literal_new_name(&block, "sec-fetch-dest", "empty") != 0 ||
-        hpack_append_literal_new_name(&block, "accept-language", "en-US,en;q=0.9") != 0 ||
-        hpack_append_literal_new_name(&block, "sec-fetch-mode", "cors") != 0 ||
-        hpack_append_literal_new_name(&block, "referer", referer) != 0 ||
-        hpack_append_literal_new_name(&block, "accept", "*/*") != 0 ||
-        hpack_append_literal_new_name(&block, "sec-fetch-site", "same-origin") != 0 ||
-        hpack_append_literal_new_name(&block, "sec-ch-ua-mobile", "?0") != 0 ||
-        hpack_append_literal_new_name(&block, "accept-encoding", "gzip") != 0 ||
-        hpack_append_literal_new_name(&block, "sec-ch-ua-platform", "\"Windows\"") != 0 ||
-        hpack_append_literal_new_name(&block, "sec-ch-ua", "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"") != 0 ||
-        hpack_append_literal_new_name(&block, "pragma", "no-cache") != 0) {
-        rc = -1;
-    }
-
-    if (rc == 0 && h2_send_frame(c, H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, c->h2_stream_id, block.data, block.len) != 0) {
-        rc = -1;
-    }
-    db_free(&block);
-    if (rc != 0) {
-        set_err(err, err_cap, "failed to send h2 headers");
-        return -1;
-    }
-    return 0;
-}
-
 static int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    int stream_up = strcmp(c->xhttp_transport_mode, "stream-up") == 0;
+    uint32_t stream_id = stream_up ? c->h2_upload_stream_id : c->h2_stream_id;
+    int64_t *stream_window = stream_up ? &c->h2_upload_stream_window : &c->h2_peer_stream_window;
+    if (stream_id == 0) {
+        return -1;
+    }
+
     size_t off = 0;
     while (off < len) {
-        if (c->h2_peer_conn_window <= 0 || c->h2_peer_stream_window <= 0) {
-            fprintf(stderr, "[xhttp] h2 upload flow-control window exhausted\n");
-            return -1;
+        while (c->h2_peer_conn_window <= 0 || *stream_window <= 0) {
+            if (h2_pump_one_frame(c) != 0) {
+                fprintf(stderr, "[xhttp] failed while waiting for h2 upload window\n");
+                return -1;
+            }
         }
         size_t chunk = len - off;
         if (chunk > c->h2_peer_max_frame_size) {
@@ -2037,14 +2000,14 @@ static int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
         if ((int64_t)chunk > c->h2_peer_conn_window) {
             chunk = (size_t)c->h2_peer_conn_window;
         }
-        if ((int64_t)chunk > c->h2_peer_stream_window) {
-            chunk = (size_t)c->h2_peer_stream_window;
+        if ((int64_t)chunk > *stream_window) {
+            chunk = (size_t)*stream_window;
         }
-        if (chunk == 0 || h2_send_frame(c, H2_FRAME_DATA, 0, c->h2_stream_id, buf + off, chunk) != 0) {
+        if (chunk == 0 || h2_send_frame(c, H2_FRAME_DATA, 0, stream_id, buf + off, chunk) != 0) {
             return -1;
         }
         c->h2_peer_conn_window -= (int64_t)chunk;
-        c->h2_peer_stream_window -= (int64_t)chunk;
+        *stream_window -= (int64_t)chunk;
         off += chunk;
     }
     return 0;
@@ -2346,7 +2309,8 @@ static int h2_append_http1_header_lines(dynbuf_t *block, const char *headers) {
 }
 
 static int h2_send_xhttp_request_headers(tls13_conn_t *c, uint32_t stream_id, const char *method, const char *path,
-                                         const char *extra_headers, size_t content_len, int has_body, char *err, size_t err_cap) {
+                                         const char *extra_headers, size_t content_len, int has_body, int streaming_body, char *err,
+                                         size_t err_cap) {
     dynbuf_t block = {0};
     int rc = 0;
 
@@ -2384,7 +2348,10 @@ static int h2_send_xhttp_request_headers(tls13_conn_t *c, uint32_t stream_id, co
     if (rc == 0 && extra_headers != NULL && extra_headers[0] != '\0') {
         rc = h2_append_http1_header_lines(&block, extra_headers);
     }
-    if (rc == 0 && has_body) {
+    if (rc == 0 && has_body && streaming_body) {
+        rc = hpack_append_literal_new_name(&block, "content-type", "application/grpc");
+    }
+    if (rc == 0 && has_body && !streaming_body) {
         char clen[32];
         snprintf(clen, sizeof(clen), "%zu", content_len);
         rc = hpack_append_literal_new_name(&block, "content-length", clen);
@@ -2454,14 +2421,7 @@ static int h2_send_xhttp_body(tls13_conn_t *c, uint32_t stream_id, const uint8_t
     return 0;
 }
 
-static int xhttp_h2_send_download_request(tls13_conn_t *c, char *err, size_t err_cap) {
-    char request_path[2048];
-    char extra_headers[4096];
-    if (xhttp_prepare_request(c, "", request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
-        set_err(err, err_cap, "failed to build xhttp h2 GET");
-        return -1;
-    }
-
+static int xhttp_h2_begin(tls13_conn_t *c, char *err, size_t err_cap) {
     c->h2_stream_id = 1;
     c->h2_next_stream_id = 3;
     c->h2_peer_initial_window = H2_DEFAULT_WINDOW;
@@ -2477,7 +2437,52 @@ static int xhttp_h2_send_download_request(tls13_conn_t *c, char *err, size_t err
     if (h2_send_client_preface(c, err, err_cap) != 0) {
         return -1;
     }
-    return h2_send_xhttp_request_headers(c, c->h2_stream_id, "GET", request_path, extra_headers, 0, 0, err, err_cap);
+    return 0;
+}
+
+static int xhttp_h2_send_download_request(tls13_conn_t *c, char *err, size_t err_cap) {
+    char request_path[2048];
+    char extra_headers[4096];
+    if (xhttp_prepare_request(c, "", request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
+        set_err(err, err_cap, "failed to build xhttp h2 GET");
+        return -1;
+    }
+
+    if (xhttp_h2_begin(c, err, err_cap) != 0) {
+        return -1;
+    }
+    return h2_send_xhttp_request_headers(c, c->h2_stream_id, "GET", request_path, extra_headers, 0, 0, 0, err, err_cap);
+}
+
+static int xhttp_h2_send_stream_one_request(tls13_conn_t *c, char *err, size_t err_cap) {
+    char request_path[2048];
+    char extra_headers[4096];
+    if (xhttp_prepare_request(c, "", request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
+        set_err(err, err_cap, "failed to build xhttp h2 stream-one request");
+        return -1;
+    }
+
+    if (xhttp_h2_begin(c, err, err_cap) != 0) {
+        return -1;
+    }
+    const char *method = strcmp(c->xhttp_uplink_method, "GET") == 0 ? "GET" : "POST";
+    return h2_send_xhttp_request_headers(c, c->h2_stream_id, method, request_path, extra_headers, 0, 1, 1, err, err_cap);
+}
+
+static int xhttp_h2_send_stream_up_request(tls13_conn_t *c, char *err, size_t err_cap) {
+    char request_path[2048];
+    char extra_headers[4096];
+    if (xhttp_prepare_request(c, "", request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
+        set_err(err, err_cap, "failed to build xhttp h2 stream-up request");
+        return -1;
+    }
+
+    uint32_t stream_id = c->h2_next_stream_id;
+    c->h2_next_stream_id += 2;
+    c->h2_upload_stream_id = stream_id;
+    c->h2_upload_stream_window = c->h2_peer_initial_window;
+    const char *method = strcmp(c->xhttp_uplink_method, "GET") == 0 ? "GET" : "POST";
+    return h2_send_xhttp_request_headers(c, stream_id, method, request_path, extra_headers, 0, 1, 1, err, err_cap);
 }
 
 static int xhttp_h2_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, char *err, size_t err_cap) {
@@ -2494,10 +2499,23 @@ static int xhttp_h2_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len,
     uint32_t stream_id = c->h2_next_stream_id;
     c->h2_next_stream_id += 2;
     const char *method = (strcmp(c->xhttp_uplink_method, "GET") == 0) ? "GET" : "POST";
-    if (h2_send_xhttp_request_headers(c, stream_id, method, request_path, extra_headers, len, 1, err, err_cap) != 0) {
+    if (h2_send_xhttp_request_headers(c, stream_id, method, request_path, extra_headers, len, 1, 0, err, err_cap) != 0) {
         return -1;
     }
     return h2_send_xhttp_body(c, stream_id, buf, len, err, err_cap);
+}
+
+static int xhttp_h2_start_mode(tls13_conn_t *c, char *err, size_t err_cap) {
+    if (strcmp(c->xhttp_transport_mode, "stream-one") == 0) {
+        return xhttp_h2_send_stream_one_request(c, err, err_cap);
+    }
+    if (xhttp_h2_send_download_request(c, err, err_cap) != 0) {
+        return -1;
+    }
+    if (strcmp(c->xhttp_transport_mode, "stream-up") == 0) {
+        return xhttp_h2_send_stream_up_request(c, err, err_cap);
+    }
+    return 0;
 }
 
 static int xhttp_send_download_request(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
@@ -4301,7 +4319,9 @@ int tls13_has_pending_app(const tls13_conn_t *c) {
 }
 
 size_t tls13_write_batch_size(const tls13_conn_t *c) {
-    if (c != NULL && (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_TLS_H2) && c->xhttp_max_each_post_bytes > 0) {
+    if (c != NULL && strcmp(c->xhttp_transport_mode, "packet-up") == 0 &&
+        (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_TLS_H2 || c->mode == CONN_MODE_XHTTP_REALITY) &&
+        c->xhttp_max_each_post_bytes > 0) {
         size_t size = (size_t)c->xhttp_max_each_post_bytes;
         return size > 1024U * 1024U ? 1024U * 1024U : size;
     }
@@ -4764,54 +4784,7 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
     return 0;
 }
 
-static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
-    if (strcmp(cfg->security, "reality") == 0) {
-        c->mode = CONN_MODE_XHTTP_REALITY;
-        c->xhttp_seq = 0;
-        c->xhttp_chunk_rem = -1;
-        c->xhttp_content_rem = -1;
-
-        snprintf(c->remote_host, sizeof(c->remote_host), "%s", cfg->server_host);
-        c->remote_port = cfg->server_port;
-        snprintf(c->remote_sni, sizeof(c->remote_sni), "%s", cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host);
-
-        if (normalize_xhttp_path(cfg->xhttp_path, c->xhttp_base_path, sizeof(c->xhttp_base_path)) != 0) {
-            set_err(err, err_cap, "invalid xhttp path");
-            return -1;
-        }
-        const char *xhost = cfg->xhttp_host[0] != '\0' ? cfg->xhttp_host : c->remote_sni;
-        snprintf(c->xhttp_host, sizeof(c->xhttp_host), "%s", xhost);
-
-        int fd = tcp_connect_host(cfg->server_host, cfg->server_port);
-        if (fd < 0) {
-            set_err(err, err_cap, "tcp connect failed");
-            return -1;
-        }
-        c->fd = fd;
-
-        core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
-        if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
-            return -1;
-        }
-        core_set_socket_io_timeout(fd, 0);
-
-        c->h2_stream_id = 1;
-        c->h2_peer_initial_window = H2_DEFAULT_WINDOW;
-        c->h2_peer_max_frame_size = H2_DEFAULT_MAX_FRAME;
-        c->h2_peer_conn_window = H2_DEFAULT_WINDOW;
-        c->h2_peer_stream_window = H2_DEFAULT_WINDOW;
-        c->h2_recv_conn_pending = 0;
-        c->h2_recv_stream_pending = 0;
-        c->h2_stream_eof = 0;
-
-        fprintf(stderr, "[xhttp] reality mode=stream-one http=2\n");
-        if (h2_send_client_preface(c, err, err_cap) != 0 || h2_send_stream_one_headers(c, err, err_cap) != 0) {
-            return -1;
-        }
-        return 0;
-    }
-
-    c->mode = CONN_MODE_XHTTP_TLS;
+static int xhttp_configure(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
     c->xhttp_seq = 0;
     c->xhttp_chunk_rem = -1;
     c->xhttp_content_rem = -1;
@@ -4827,6 +4800,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
 
     const char *xhost = cfg->xhttp_host[0] != '\0' ? cfg->xhttp_host : c->remote_sni;
     snprintf(c->xhttp_host, sizeof(c->xhttp_host), "%s", xhost);
+    snprintf(c->xhttp_transport_mode, sizeof(c->xhttp_transport_mode), "%s", cfg->xhttp_mode);
     snprintf(c->xhttp_session_placement, sizeof(c->xhttp_session_placement), "%s",
              cfg->xhttp_session_placement[0] != '\0' ? cfg->xhttp_session_placement : "path");
     snprintf(c->xhttp_session_key, sizeof(c->xhttp_session_key), "%s", cfg->xhttp_session_key);
@@ -4837,7 +4811,8 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
              cfg->xhttp_uplink_method[0] != '\0' ? cfg->xhttp_uplink_method : "POST");
     snprintf(c->xhttp_padding_placement, sizeof(c->xhttp_padding_placement), "%s",
              cfg->xhttp_padding_placement[0] != '\0' ? cfg->xhttp_padding_placement : "queryinheader");
-    snprintf(c->xhttp_padding_key, sizeof(c->xhttp_padding_key), "%s", cfg->xhttp_padding_key[0] != '\0' ? cfg->xhttp_padding_key : "x_padding");
+    snprintf(c->xhttp_padding_key, sizeof(c->xhttp_padding_key), "%s",
+             cfg->xhttp_padding_key[0] != '\0' ? cfg->xhttp_padding_key : "x_padding");
     snprintf(c->xhttp_padding_header, sizeof(c->xhttp_padding_header), "%s",
              cfg->xhttp_padding_header[0] != '\0' ? cfg->xhttp_padding_header : "X-Padding");
     snprintf(c->xhttp_padding_method, sizeof(c->xhttp_padding_method), "%s",
@@ -4848,10 +4823,44 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
     int max_post_min = cfg->xhttp_max_each_post_min > 0 ? cfg->xhttp_max_each_post_min : 1000000;
     int max_post_max = cfg->xhttp_max_each_post_max >= max_post_min ? cfg->xhttp_max_each_post_max : max_post_min;
     c->xhttp_max_each_post_bytes = random_range_int(max_post_min, max_post_max);
-    if (random_session_id(c->xhttp_session_id) != 0) {
+
+    c->xhttp_session_id[0] = '\0';
+    if (strcmp(c->xhttp_transport_mode, "stream-one") != 0 && random_session_id(c->xhttp_session_id) != 0) {
         set_err(err, err_cap, "failed to create xhttp session id");
         return -1;
     }
+    return 0;
+}
+
+static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    if (xhttp_configure(cfg, c, err, err_cap) != 0) {
+        return -1;
+    }
+
+    if (strcmp(cfg->security, "reality") == 0) {
+        c->mode = CONN_MODE_XHTTP_REALITY;
+
+        int fd = tcp_connect_host(cfg->server_host, cfg->server_port);
+        if (fd < 0) {
+            set_err(err, err_cap, "tcp connect failed");
+            return -1;
+        }
+        c->fd = fd;
+
+        core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
+        if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
+            return -1;
+        }
+        core_set_socket_io_timeout(fd, 0);
+
+        fprintf(stderr, "[xhttp] reality mode=%s http=2\n", c->xhttp_transport_mode);
+        if (xhttp_h2_start_mode(c, err, err_cap) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    c->mode = CONN_MODE_XHTTP_TLS;
 
     if (xhttp_make_pin_key(c->remote_sni[0] != '\0' ? c->remote_sni : c->remote_host, c->remote_port, c->xhttp_pin_key,
                            sizeof(c->xhttp_pin_key)) != 0) {
@@ -4904,14 +4913,18 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
 
     if (ssl_selected_alpn_is_h2(c->ssl)) {
         c->mode = CONN_MODE_XHTTP_TLS_H2;
-        fprintf(stderr, "[xhttp] tls mode=packet-up http=2 max_each_post=%d\n", c->xhttp_max_each_post_bytes);
-        if (xhttp_h2_send_download_request(c, err, err_cap) != 0) {
+        fprintf(stderr, "[xhttp] tls mode=%s http=2 max_each_post=%d\n", c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
+        if (xhttp_h2_start_mode(c, err, err_cap) != 0) {
             return -1;
         }
         return 0;
     }
 
-    fprintf(stderr, "[xhttp] tls mode=packet-up http=1.1 max_each_post=%d\n", c->xhttp_max_each_post_bytes);
+    if (strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
+        set_err(err, err_cap, "xhttp stream-one and stream-up require HTTP/2");
+        return -1;
+    }
+    fprintf(stderr, "[xhttp] tls mode=%s http=1.1 max_each_post=%d\n", c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
     if (xhttp_send_download_request(cfg, c, err, err_cap) != 0) {
         return -1;
     }
@@ -5057,6 +5070,9 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     }
 
     if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
+        if (strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
+            return h2_write_data(c, buf, len);
+        }
         size_t max_post = c->xhttp_max_each_post_bytes > 0 ? (size_t)c->xhttp_max_each_post_bytes : 1000000U;
         size_t off = 0;
         while (off < len) {
@@ -5077,6 +5093,25 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     }
 
     if (c->mode == CONN_MODE_XHTTP_REALITY) {
+        if (strcmp(c->xhttp_transport_mode, "packet-up") == 0) {
+            size_t max_post = c->xhttp_max_each_post_bytes > 0 ? (size_t)c->xhttp_max_each_post_bytes : 1000000U;
+            size_t off = 0;
+            while (off < len) {
+                size_t chunk = len - off;
+                if (chunk > max_post) {
+                    chunk = max_post;
+                }
+                char err[128] = {0};
+                if (xhttp_h2_post_packet(c, buf + off, chunk, err, sizeof(err)) != 0) {
+                    if (err[0] != '\0') {
+                        fprintf(stderr, "[xhttp] h2 upload failed: %s\n", err);
+                    }
+                    return -1;
+                }
+                off += chunk;
+            }
+            return 0;
+        }
         return h2_write_data(c, buf, len);
     }
     return reality_write_app_records(c, buf, len);
