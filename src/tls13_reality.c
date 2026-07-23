@@ -133,6 +133,7 @@ struct tls13_conn {
     dynbuf_t xhttp_net_cache;
     dynbuf_t ws_net_cache;
     dynbuf_t h2_net_cache;
+    dynbuf_t h2_send_buf;
     dynbuf_t transcript;
     dynbuf_t app_cache;
     int reality_raw_direct;
@@ -143,8 +144,11 @@ struct tls13_conn {
     uint32_t h2_peer_max_frame_size;
     int64_t h2_peer_conn_window;
     int64_t h2_peer_stream_window;
+    int64_t h2_peer_conn_refill_target;
+    int64_t h2_peer_stream_refill_target;
     uint32_t h2_upload_stream_id;
     int64_t h2_upload_stream_window;
+    int64_t h2_upload_stream_refill_target;
     uint32_t h2_recv_conn_pending;
     uint32_t h2_recv_stream_pending;
     int h2_stream_eof;
@@ -1554,12 +1558,19 @@ enum {
 #define H2_CLIENT_INITIAL_WINDOW (16U * 1024U * 1024U)
 #define H2_WINDOW_UPDATE_THRESHOLD (1024U * 1024U)
 #define H2_DEFAULT_MAX_FRAME 16384U
+#define H2_MAX_INBOUND_FRAME (1024U * 1024U)
+#define H2_INPUT_DRAIN_LIMIT 4
+#define H2_WRITE_BATCH_SIZE (64U * 1024U)
 
 static int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_id, const uint8_t *payload, size_t len) {
     if (len > 0xFFFFFFU) {
         return -1;
     }
-    uint8_t hdr[9];
+    c->h2_send_buf.len = 0;
+    if (db_reserve(&c->h2_send_buf, 9 + len) != 0) {
+        return -1;
+    }
+    uint8_t *hdr = c->h2_send_buf.data;
     hdr[0] = (uint8_t)(len >> 16);
     hdr[1] = (uint8_t)(len >> 8);
     hdr[2] = (uint8_t)len;
@@ -1570,22 +1581,19 @@ static int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t 
     hdr[6] = (uint8_t)(stream_id >> 16);
     hdr[7] = (uint8_t)(stream_id >> 8);
     hdr[8] = (uint8_t)stream_id;
+    if (len > 0) {
+        memcpy(hdr + 9, payload, len);
+    }
+    c->h2_send_buf.len = 9 + len;
 
     if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
-        if (ssl_write_all(c->ssl, hdr, sizeof(hdr)) != 0) {
+        if (ssl_write_all(c->ssl, c->h2_send_buf.data, c->h2_send_buf.len) != 0) {
             return -1;
         }
-        if (len > 0 && ssl_write_all(c->ssl, payload, len) != 0) {
+    } else {
+        if (reality_write_app_records(c, c->h2_send_buf.data, c->h2_send_buf.len) != 0) {
             return -1;
         }
-        return 0;
-    }
-
-    if (reality_write_app_records(c, hdr, sizeof(hdr)) != 0) {
-        return -1;
-    }
-    if (len > 0 && reality_write_app_records(c, payload, len) != 0) {
-        return -1;
     }
     return 0;
 }
@@ -1666,7 +1674,7 @@ static int h2_read_frame(tls13_conn_t *c, uint8_t *type, uint8_t *flags, uint32_
         return -1;
     }
     size_t len = ((size_t)hdr[0] << 16) | ((size_t)hdr[1] << 8) | (size_t)hdr[2];
-    if (len > 1024U * 1024U) {
+    if (len > H2_MAX_INBOUND_FRAME) {
         return -1;
     }
 
@@ -1975,8 +1983,14 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
                 int64_t delta = (int64_t)val - (int64_t)c->h2_peer_initial_window;
                 c->h2_peer_initial_window = val;
                 c->h2_peer_stream_window += delta;
+                if (c->h2_peer_stream_window > c->h2_peer_stream_refill_target) {
+                    c->h2_peer_stream_refill_target = c->h2_peer_stream_window;
+                }
                 if (c->h2_upload_stream_id != 0) {
                     c->h2_upload_stream_window += delta;
+                    if (c->h2_upload_stream_window > c->h2_upload_stream_refill_target) {
+                        c->h2_upload_stream_refill_target = c->h2_upload_stream_window;
+                    }
                 }
             } else if (id == 5 && val >= 16384 && val <= 16777215) {
                 c->h2_peer_max_frame_size = val;
@@ -2000,15 +2014,24 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
                     set_err(err, err_cap, "h2 connection window overflow");
                     return -1;
                 }
+                if (c->h2_peer_conn_window > c->h2_peer_conn_refill_target) {
+                    c->h2_peer_conn_refill_target = c->h2_peer_conn_window;
+                }
             } else if (stream_id == c->h2_stream_id) {
                 if (h2_add_send_window(&c->h2_peer_stream_window, inc) != 0) {
                     set_err(err, err_cap, "h2 stream window overflow");
                     return -1;
                 }
+                if (c->h2_peer_stream_window > c->h2_peer_stream_refill_target) {
+                    c->h2_peer_stream_refill_target = c->h2_peer_stream_window;
+                }
             } else if (stream_id == c->h2_upload_stream_id) {
                 if (h2_add_send_window(&c->h2_upload_stream_window, inc) != 0) {
                     set_err(err, err_cap, "h2 upload window overflow");
                     return -1;
+                }
+                if (c->h2_upload_stream_window > c->h2_upload_stream_refill_target) {
+                    c->h2_upload_stream_refill_target = c->h2_upload_stream_window;
                 }
             }
         }
@@ -2063,13 +2086,22 @@ static int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     if (stream_id == 0) {
         return -1;
     }
-
     size_t off = 0;
     while (off < len) {
-        while (c->h2_peer_conn_window <= 0 || *stream_window <= 0) {
-            if (h2_pump_one_frame(c) != 0) {
-                fprintf(stderr, "[xhttp] failed while waiting for h2 upload window\n");
-                return -1;
+        int64_t *stream_refill_target =
+            stream_up ? &c->h2_upload_stream_refill_target : &c->h2_peer_stream_refill_target;
+        int64_t conn_low = c->h2_peer_conn_refill_target / 4;
+        int64_t stream_low = *stream_refill_target / 4;
+        if (c->h2_peer_conn_window <= conn_low || *stream_window <= stream_low) {
+            int64_t conn_high = c->h2_peer_conn_refill_target / 2;
+            int64_t stream_high = *stream_refill_target / 2;
+            while (c->h2_peer_conn_window < conn_high || *stream_window < stream_high) {
+                if (h2_pump_one_frame(c) != 0) {
+                    fprintf(stderr, "[xhttp] failed while waiting for h2 upload window\n");
+                    return -1;
+                }
+                conn_high = c->h2_peer_conn_refill_target / 2;
+                stream_high = *stream_refill_target / 2;
             }
         }
         size_t chunk = len - off;
@@ -2508,6 +2540,9 @@ static int xhttp_h2_begin(tls13_conn_t *c, char *err, size_t err_cap) {
     c->h2_peer_max_frame_size = H2_DEFAULT_MAX_FRAME;
     c->h2_peer_conn_window = H2_DEFAULT_WINDOW;
     c->h2_peer_stream_window = H2_DEFAULT_WINDOW;
+    c->h2_peer_conn_refill_target = H2_DEFAULT_WINDOW;
+    c->h2_peer_stream_refill_target = H2_DEFAULT_WINDOW;
+    c->h2_upload_stream_refill_target = H2_DEFAULT_WINDOW;
     c->h2_upload_stream_id = 0;
     c->h2_upload_stream_window = 0;
     c->h2_recv_conn_pending = 0;
@@ -2561,6 +2596,7 @@ static int xhttp_h2_send_stream_up_request(tls13_conn_t *c, char *err, size_t er
     c->h2_next_stream_id += 2;
     c->h2_upload_stream_id = stream_id;
     c->h2_upload_stream_window = c->h2_peer_initial_window;
+    c->h2_upload_stream_refill_target = c->h2_peer_initial_window;
     const char *method = strcmp(c->xhttp_uplink_method, "GET") == 0 ? "GET" : "POST";
     return h2_send_xhttp_request_headers(c, stream_id, method, request_path, extra_headers, 0, 1, 1, err, err_cap);
 }
@@ -4537,6 +4573,44 @@ int tls13_has_pending_app(const tls13_conn_t *c) {
     return 0;
 }
 
+static int h2_input_ready(const tls13_conn_t *c) {
+    if (c->h2_net_cache.len >= 9) {
+        size_t frame_len = ((size_t)c->h2_net_cache.data[0] << 16) | ((size_t)c->h2_net_cache.data[1] << 8) |
+                           (size_t)c->h2_net_cache.data[2];
+        if (frame_len <= H2_MAX_INBOUND_FRAME && c->h2_net_cache.len >= 9 + frame_len) {
+            return 1;
+        }
+    }
+    if (c->ssl != NULL && SSL_pending(c->ssl) > 0) {
+        return 1;
+    }
+    if (c->fd < 0) {
+        return 0;
+    }
+
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(c->fd, &rfds);
+    struct timeval tv = {0, 0};
+    int rc = select(c->fd + 1, &rfds, NULL, NULL, &tv);
+    return rc > 0 && FD_ISSET(c->fd, &rfds);
+}
+
+int tls13_drain_h2_input(tls13_conn_t *c) {
+    if (c == NULL || (c->mode != CONN_MODE_XHTTP_TLS_H2 && c->mode != CONN_MODE_XHTTP_REALITY)) {
+        return 0;
+    }
+
+    int drained = 0;
+    while (drained < H2_INPUT_DRAIN_LIMIT && c->app_cache.len == 0 && h2_input_ready(c)) {
+        if (h2_pump_one_frame(c) != 0) {
+            return -1;
+        }
+        drained++;
+    }
+    return drained;
+}
+
 size_t tls13_write_batch_size(const tls13_conn_t *c) {
     if (c != NULL && strcmp(c->xhttp_transport_mode, "packet-up") == 0 &&
         (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_TLS_H2 || c->mode == CONN_MODE_XHTTP_REALITY ||
@@ -4544,6 +4618,10 @@ size_t tls13_write_batch_size(const tls13_conn_t *c) {
         c->xhttp_max_each_post_bytes > 0) {
         size_t size = (size_t)c->xhttp_max_each_post_bytes;
         return size > 1024U * 1024U ? 1024U * 1024U : size;
+    }
+    if (c != NULL && strcmp(c->xhttp_transport_mode, "packet-up") != 0 &&
+        (c->mode == CONN_MODE_XHTTP_TLS_H2 || c->mode == CONN_MODE_XHTTP_REALITY)) {
+        return H2_WRITE_BATCH_SIZE;
     }
     return 8192;
 }
@@ -5285,6 +5363,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     db_free(&c->xhttp_net_cache);
     db_free(&c->ws_net_cache);
     db_free(&c->h2_net_cache);
+    db_free(&c->h2_send_buf);
     db_free(&c->transcript);
     db_free(&c->app_cache);
     free(c);

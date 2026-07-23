@@ -653,6 +653,16 @@ static void *client_worker(void *arg) {
         }
 
         if (upstream_ready) {
+            int drained = tls13_drain_h2_input(tls);
+            if (drained < 0) {
+                break;
+            }
+            if (drained > 0) {
+                upstream_ready = tls13_has_pending_app(tls);
+            }
+        }
+
+        if (upstream_ready) {
             if (downstream_direct) {
                 ssize_t n = recv(tfd, tbuf, sizeof(tbuf), 0);
                 if (n <= 0) {
