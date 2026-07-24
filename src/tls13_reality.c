@@ -45,7 +45,8 @@ typedef enum {
     CONN_MODE_WS = 4,
     CONN_MODE_XHTTP_TLS_H2 = 5,
     CONN_MODE_PLAIN = 6,
-    CONN_MODE_XHTTP_PLAIN = 7
+    CONN_MODE_XHTTP_PLAIN = 7,
+    CONN_MODE_GRPC_PLAIN = 8
 } conn_mode_t;
 
 typedef enum {
@@ -129,11 +130,16 @@ struct tls13_conn {
     char tls_verify_mode[16];
     char ws_path[512];
     char ws_host[320];
+    char grpc_service_name[256];
+    char grpc_authority[320];
+    int grpc_transport;
+    int grpc_multi_mode;
 
     dynbuf_t xhttp_net_cache;
     dynbuf_t ws_net_cache;
     dynbuf_t h2_net_cache;
     dynbuf_t h2_send_buf;
+    dynbuf_t grpc_recv_cache;
     dynbuf_t transcript;
     dynbuf_t app_cache;
     int reality_raw_direct;
@@ -1590,6 +1596,10 @@ static int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t 
         if (ssl_write_all(c->ssl, c->h2_send_buf.data, c->h2_send_buf.len) != 0) {
             return -1;
         }
+    } else if (c->mode == CONN_MODE_GRPC_PLAIN) {
+        if (write_exact(c->fd, c->h2_send_buf.data, c->h2_send_buf.len) != 0) {
+            return -1;
+        }
     } else {
         if (reality_write_app_records(c, c->h2_send_buf.data, c->h2_send_buf.len) != 0) {
             return -1;
@@ -1656,6 +1666,11 @@ static int h2_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
                 return -1;
             }
             off += got;
+        } else if (c->mode == CONN_MODE_GRPC_PLAIN) {
+            if (read_exact(c->fd, buf + off, len - off) != 0) {
+                return -1;
+            }
+            off = len;
         } else {
             if (fill_reality_plain_cache(c, &c->h2_net_cache) != 0) {
                 return -1;
@@ -1944,7 +1959,8 @@ static int h2_process_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id
     if (status != 0) {
         if (status != 200) {
             if (err != NULL && err_cap > 0) {
-                snprintf(err, err_cap, "xhttp h2 stream %u returned non-200: %d", (unsigned)stream_id, status);
+                snprintf(err, err_cap, "%s h2 stream %u returned non-200: %d", c->grpc_transport ? "grpc" : "xhttp",
+                         (unsigned)stream_id, status);
             }
             return -1;
         }
@@ -2056,8 +2072,14 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
 
 static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
     static const char preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    int preface_rc = (c->mode == CONN_MODE_XHTTP_TLS_H2) ? ssl_write_all(c->ssl, preface, sizeof(preface) - 1)
-                                                         : reality_write_app_records(c, (const uint8_t *)preface, sizeof(preface) - 1);
+    int preface_rc = 0;
+    if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
+        preface_rc = ssl_write_all(c->ssl, preface, sizeof(preface) - 1);
+    } else if (c->mode == CONN_MODE_GRPC_PLAIN) {
+        preface_rc = write_exact(c->fd, preface, sizeof(preface) - 1);
+    } else {
+        preface_rc = reality_write_app_records(c, (const uint8_t *)preface, sizeof(preface) - 1);
+    }
     if (preface_rc != 0) {
         set_err(err, err_cap, "failed to send h2 preface");
         return -1;
@@ -2124,6 +2146,137 @@ static int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     return 0;
 }
 
+static size_t protobuf_varint_size(size_t value) {
+    size_t n = 1;
+    while (value >= 0x80) {
+        value >>= 7;
+        n++;
+    }
+    return n;
+}
+
+static size_t protobuf_write_varint(uint8_t *out, size_t value) {
+    size_t n = 0;
+    do {
+        uint8_t ch = (uint8_t)(value & 0x7f);
+        value >>= 7;
+        if (value != 0) {
+            ch |= 0x80;
+        }
+        out[n++] = ch;
+    } while (value != 0);
+    return n;
+}
+
+static int protobuf_read_varint(const uint8_t *buf, size_t len, size_t *off, uint64_t *value) {
+    uint64_t v = 0;
+    unsigned int shift = 0;
+    while (*off < len && shift < 64) {
+        uint8_t ch = buf[(*off)++];
+        v |= (uint64_t)(ch & 0x7f) << shift;
+        if ((ch & 0x80) == 0) {
+            *value = v;
+            return 0;
+        }
+        shift += 7;
+    }
+    return -1;
+}
+
+static int grpc_append_hunk_payload(tls13_conn_t *c, const uint8_t *msg, size_t msg_len) {
+    size_t off = 0;
+    int found = 0;
+
+    while (off < msg_len) {
+        uint64_t key = 0;
+        if (protobuf_read_varint(msg, msg_len, &off, &key) != 0 || key == 0) {
+            return -1;
+        }
+        uint32_t field = (uint32_t)(key >> 3);
+        uint32_t wire = (uint32_t)(key & 7);
+
+        if (wire == 0) {
+            uint64_t ignored = 0;
+            if (protobuf_read_varint(msg, msg_len, &off, &ignored) != 0) {
+                return -1;
+            }
+        } else if (wire == 1) {
+            if (msg_len - off < 8) {
+                return -1;
+            }
+            off += 8;
+        } else if (wire == 2) {
+            uint64_t field_len = 0;
+            if (protobuf_read_varint(msg, msg_len, &off, &field_len) != 0 || field_len > msg_len - off) {
+                return -1;
+            }
+            if (field == 1) {
+                if (db_append(&c->app_cache, msg + off, (size_t)field_len) != 0) {
+                    return -1;
+                }
+                found = 1;
+            }
+            off += (size_t)field_len;
+        } else if (wire == 5) {
+            if (msg_len - off < 4) {
+                return -1;
+            }
+            off += 4;
+        } else {
+            return -1;
+        }
+    }
+    return found || msg_len == 0 ? 0 : -1;
+}
+
+static int grpc_feed_data(tls13_conn_t *c, const uint8_t *data, size_t len) {
+    if (db_append(&c->grpc_recv_cache, data, len) != 0) {
+        return -1;
+    }
+
+    while (c->grpc_recv_cache.len >= 5) {
+        const uint8_t *frame = c->grpc_recv_cache.data;
+        uint32_t msg_len = ((uint32_t)frame[1] << 24) | ((uint32_t)frame[2] << 16) | ((uint32_t)frame[3] << 8) | (uint32_t)frame[4];
+        if (frame[0] != 0 || msg_len > 16U * 1024U * 1024U) {
+            return -1;
+        }
+        if (c->grpc_recv_cache.len < 5U + (size_t)msg_len) {
+            break;
+        }
+        if (grpc_append_hunk_payload(c, frame + 5, msg_len) != 0) {
+            return -1;
+        }
+        db_consume(&c->grpc_recv_cache, 5U + (size_t)msg_len);
+    }
+    return 0;
+}
+
+static int grpc_write_hunk(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    size_t varint_len = protobuf_varint_size(len);
+    if (len > UINT32_MAX - 1U - varint_len) {
+        return -1;
+    }
+    size_t msg_len = 1U + varint_len + len;
+    size_t frame_len = 5U + msg_len;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    if (frame == NULL) {
+        return -1;
+    }
+
+    frame[0] = 0;
+    frame[1] = (uint8_t)(msg_len >> 24);
+    frame[2] = (uint8_t)(msg_len >> 16);
+    frame[3] = (uint8_t)(msg_len >> 8);
+    frame[4] = (uint8_t)msg_len;
+    frame[5] = 0x0a;
+    size_t written = protobuf_write_varint(frame + 6, len);
+    memcpy(frame + 6 + written, buf, len);
+
+    int rc = h2_write_data(c, frame, frame_len);
+    free(frame);
+    return rc;
+}
+
 static int h2_pump_one_frame(tls13_conn_t *c) {
     uint8_t type = 0;
     uint8_t flags = 0;
@@ -2158,8 +2311,12 @@ static int h2_pump_one_frame(tls13_conn_t *c) {
         if (rc == 0 && h2_note_recv_data(c, payload_len) != 0) {
             rc = -1;
         }
-        if (rc == 0 && data_len > 0 && db_append(&c->app_cache, payload + off, data_len) != 0) {
-            rc = -1;
+        if (rc == 0 && data_len > 0) {
+            if (c->grpc_transport) {
+                rc = grpc_feed_data(c, payload + off, data_len);
+            } else if (db_append(&c->app_cache, payload + off, data_len) != 0) {
+                rc = -1;
+            }
         }
         if ((flags & H2_FLAG_END_STREAM) != 0) {
             c->h2_stream_eof = 1;
@@ -2167,7 +2324,10 @@ static int h2_pump_one_frame(tls13_conn_t *c) {
     } else {
         rc = h2_process_control_frame(c, type, flags, stream_id, payload, payload_len, err, sizeof(err));
         if (rc != 0 && err[0] != '\0') {
-            fprintf(stderr, "[xhttp] %s\n", err);
+            fprintf(stderr, "[%s] %s\n", c->grpc_transport ? "grpc" : "xhttp", err);
+        }
+        if (rc == 0 && type == H2_FRAME_HEADERS && stream_id == c->h2_stream_id && (flags & H2_FLAG_END_STREAM) != 0) {
+            c->h2_stream_eof = 1;
         }
     }
 
@@ -2632,6 +2792,136 @@ static int xhttp_h2_start_mode(tls13_conn_t *c, char *err, size_t err_cap) {
         return xhttp_h2_send_stream_up_request(c, err, err_cap);
     }
     return 0;
+}
+
+static int grpc_path_escape(const char *src, char *dst, size_t cap, int keep_slash) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t out = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p != '\0'; p++) {
+        unsigned char ch = *p;
+        int safe = (ch >= 'a' && ch <= 'z') ||
+                   (ch >= 'A' && ch <= 'Z') ||
+                   (ch >= '0' && ch <= '9') ||
+                   ch == '-' || ch == '_' || ch == '.' || ch == '~' ||
+                   ch == '$' || ch == '&' || ch == '+' || ch == ':' ||
+                   ch == '=' || ch == '@' || (keep_slash && ch == '/');
+        if (safe) {
+            if (out + 1 >= cap) {
+                return -1;
+            }
+            dst[out++] = (char)ch;
+        } else {
+            if (out + 3 >= cap) {
+                return -1;
+            }
+            dst[out++] = '%';
+            dst[out++] = hex[ch >> 4];
+            dst[out++] = hex[ch & 0x0f];
+        }
+    }
+    if (out >= cap) {
+        return -1;
+    }
+    dst[out] = '\0';
+    return 0;
+}
+
+static int grpc_build_request_path(const char *service_name, int multi_mode, char *path, size_t cap) {
+    char service[512];
+    char stream[256];
+
+    if (service_name[0] != '/') {
+        if (grpc_path_escape(service_name, service, sizeof(service), 0) != 0) {
+            return -1;
+        }
+        snprintf(stream, sizeof(stream), "%s", multi_mode ? "TunMulti" : "Tun");
+    } else {
+        const char *last = strrchr(service_name, '/');
+        if (last == NULL || last == service_name) {
+            service[0] = '\0';
+        } else {
+            char raw_service[512];
+            size_t n = (size_t)(last - service_name - 1);
+            if (n >= sizeof(raw_service)) {
+                return -1;
+            }
+            memcpy(raw_service, service_name + 1, n);
+            raw_service[n] = '\0';
+            if (grpc_path_escape(raw_service, service, sizeof(service), 1) != 0) {
+                return -1;
+            }
+        }
+
+        const char *raw_stream = last != NULL ? last + 1 : "";
+        char stream_part[256];
+        const char *separator = strchr(raw_stream, '|');
+        if (multi_mode && separator != NULL) {
+            raw_stream = separator + 1;
+        }
+        size_t n = strcspn(raw_stream, "|");
+        if (n >= sizeof(stream_part)) {
+            return -1;
+        }
+        memcpy(stream_part, raw_stream, n);
+        stream_part[n] = '\0';
+        if (grpc_path_escape(stream_part, stream, sizeof(stream), 0) != 0) {
+            return -1;
+        }
+    }
+
+    int n = snprintf(path, cap, "/%s/%s", service, stream);
+    return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static int h2_send_grpc_request_headers(tls13_conn_t *c, char *err, size_t err_cap) {
+    char path[1024];
+    if (grpc_build_request_path(c->grpc_service_name, c->grpc_multi_mode, path, sizeof(path)) != 0) {
+        set_err(err, err_cap, "invalid grpc serviceName");
+        return -1;
+    }
+
+    dynbuf_t block = {0};
+    int rc = hpack_append_indexed(&block, 3);
+    if (rc == 0) {
+        rc = hpack_append_indexed(&block, c->mode == CONN_MODE_GRPC_PLAIN ? 6 : 7);
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, ":authority", c->grpc_authority);
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, ":path", path);
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, "content-type", "application/grpc");
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, "user-agent",
+                                           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                                           "Chrome/149.0.0.0 Safari/537.36");
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, "te", "trailers");
+    }
+    if (rc == 0) {
+        rc = hpack_append_literal_new_name(&block, "grpc-accept-encoding", "identity");
+    }
+    if (rc == 0 && h2_send_frame(c, H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, c->h2_stream_id, block.data, block.len) != 0) {
+        rc = -1;
+    }
+    db_free(&block);
+
+    if (rc != 0) {
+        set_err(err, err_cap, "failed to send grpc h2 headers");
+        return -1;
+    }
+    return 0;
+}
+
+static int grpc_h2_start(tls13_conn_t *c, char *err, size_t err_cap) {
+    if (xhttp_h2_begin(c, err, err_cap) != 0) {
+        return -1;
+    }
+    return h2_send_grpc_request_headers(c, err, err_cap);
 }
 
 static int xhttp_conn_write_all(tls13_conn_t *c, const void *buf, size_t len) {
@@ -4567,6 +4857,9 @@ int tls13_has_pending_app(const tls13_conn_t *c) {
     if (c->mode == CONN_MODE_XHTTP_REALITY && c->h2_net_cache.len > 0) {
         return 1;
     }
+    if (c->mode == CONN_MODE_GRPC_PLAIN && c->h2_net_cache.len > 0) {
+        return 1;
+    }
     if (c->mode == CONN_MODE_WS && (c->ws_net_cache.len > 0 || (c->ssl != NULL && SSL_pending(c->ssl) > 0))) {
         return 1;
     }
@@ -4597,7 +4890,8 @@ static int h2_input_ready(const tls13_conn_t *c) {
 }
 
 int tls13_drain_h2_input(tls13_conn_t *c) {
-    if (c == NULL || (c->mode != CONN_MODE_XHTTP_TLS_H2 && c->mode != CONN_MODE_XHTTP_REALITY)) {
+    if (c == NULL ||
+        (c->mode != CONN_MODE_XHTTP_TLS_H2 && c->mode != CONN_MODE_XHTTP_REALITY && c->mode != CONN_MODE_GRPC_PLAIN)) {
         return 0;
     }
 
@@ -4612,6 +4906,9 @@ int tls13_drain_h2_input(tls13_conn_t *c) {
 }
 
 size_t tls13_write_batch_size(const tls13_conn_t *c) {
+    if (c != NULL && c->grpc_transport) {
+        return H2_WRITE_BATCH_SIZE;
+    }
     if (c != NULL && strcmp(c->xhttp_transport_mode, "packet-up") == 0 &&
         (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_TLS_H2 || c->mode == CONN_MODE_XHTTP_REALITY ||
          c->mode == CONN_MODE_XHTTP_PLAIN) &&
@@ -5260,6 +5557,109 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
     return 0;
 }
 
+static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    if (xhttp_make_pin_key(c->remote_sni[0] != '\0' ? c->remote_sni : c->remote_host, c->remote_port, c->xhttp_pin_key,
+                           sizeof(c->xhttp_pin_key)) != 0) {
+        set_err(err, err_cap, "failed to build grpc pin key");
+        return -1;
+    }
+
+    unsigned char alpn[32];
+    unsigned int alpn_len = 0;
+    if (build_xhttp_tls_alpn(cfg->alpn, alpn, sizeof(alpn), &alpn_len) != 0) {
+        set_err(err, err_cap, "failed to build grpc TLS ALPN");
+        return -1;
+    }
+
+    xhttp_tls_mode_t mode = get_xhttp_tls_mode();
+    if (cfg->allow_insecure) {
+        mode = XHTTP_TLS_MODE_INSECURE;
+    }
+    if (mode == XHTTP_TLS_MODE_TOFU) {
+        fprintf(stderr, "[grpc] tls_mode=tofu\n");
+        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd, err,
+                            err_cap) != 0 ||
+            xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
+            return -1;
+        }
+        c->xhttp_tls_insecure = 1;
+    } else {
+        int verify_peer = mode == XHTTP_TLS_MODE_INSECURE ? 0 : xhttp_effective_verify_peer();
+        fprintf(stderr, "[grpc] tls_mode=%s\n", xhttp_tls_mode_name(mode));
+        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd, err,
+                            err_cap) != 0) {
+            if (!(verify_peer == 1 && mode == XHTTP_TLS_MODE_AUTO && is_cert_verify_error_msg(err))) {
+                return -1;
+            }
+            fprintf(stderr, "[grpc] tls_mode=auto(selected=insecure+tofu): %s\n", err);
+            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd, err,
+                                err_cap) != 0 ||
+                xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
+                return -1;
+            }
+            c->xhttp_tls_insecure = 1;
+        } else {
+            c->xhttp_tls_insecure = verify_peer ? 0 : 1;
+        }
+    }
+
+    if (!ssl_selected_alpn_is_h2(c->ssl)) {
+        set_err(err, err_cap, "grpc requires HTTP/2 ALPN");
+        return -1;
+    }
+    c->mode = CONN_MODE_XHTTP_TLS_H2;
+    return 0;
+}
+
+static int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    c->grpc_transport = 1;
+    snprintf(c->remote_host, sizeof(c->remote_host), "%s", cfg->server_host);
+    c->remote_port = cfg->server_port;
+    snprintf(c->remote_sni, sizeof(c->remote_sni), "%s", cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host);
+    snprintf(c->grpc_service_name, sizeof(c->grpc_service_name), "%s", cfg->grpc_service_name);
+    c->grpc_multi_mode = strcmp(cfg->xhttp_mode, "multi") == 0;
+
+    if (cfg->grpc_authority[0] != '\0') {
+        snprintf(c->grpc_authority, sizeof(c->grpc_authority), "%s", cfg->grpc_authority);
+    } else if (strcmp(cfg->security, "none") != 0 && c->remote_sni[0] != '\0') {
+        snprintf(c->grpc_authority, sizeof(c->grpc_authority), "%s", c->remote_sni);
+    } else if (strchr(c->remote_host, ':') != NULL) {
+        snprintf(c->grpc_authority, sizeof(c->grpc_authority), "[%s]:%u", c->remote_host, (unsigned)c->remote_port);
+    } else {
+        snprintf(c->grpc_authority, sizeof(c->grpc_authority), "%s:%u", c->remote_host, (unsigned)c->remote_port);
+    }
+
+    if (strcmp(cfg->security, "none") == 0) {
+        c->mode = CONN_MODE_GRPC_PLAIN;
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port);
+        if (c->fd < 0) {
+            set_err(err, err_cap, "tcp connect failed");
+            return -1;
+        }
+    } else if (strcmp(cfg->security, "reality") == 0) {
+        c->mode = CONN_MODE_XHTTP_REALITY;
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port);
+        if (c->fd < 0) {
+            set_err(err, err_cap, "tcp connect failed");
+            return -1;
+        }
+        core_set_socket_io_timeout(c->fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
+        if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
+            return -1;
+        }
+        core_set_socket_io_timeout(c->fd, 0);
+    } else if (grpc_tls_connect(cfg, c, err, err_cap) != 0) {
+        return -1;
+    }
+
+    if (grpc_h2_start(c, err, err_cap) != 0) {
+        return -1;
+    }
+    fprintf(stderr, "[grpc] connected service=%s authority=%s security=%s mode=%s\n", c->grpc_service_name, c->grpc_authority,
+            cfg->security, c->grpc_multi_mode ? "multi" : "single");
+    return 0;
+}
+
 int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *err, size_t err_cap) {
     *out = NULL;
     tls13_conn_t *c = (tls13_conn_t *)calloc(1, sizeof(*c));
@@ -5273,6 +5673,15 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
 
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
         if (xhttp_connect(cfg, c, err, err_cap) != 0) {
+            tls13_reality_close(c);
+            return -1;
+        }
+        *out = c;
+        return 0;
+    }
+
+    if (cfg->transport_mode == TRANSPORT_GRPC) {
+        if (grpc_connect(cfg, c, err, err_cap) != 0) {
             tls13_reality_close(c);
             return -1;
         }
@@ -5340,6 +5749,9 @@ void tls13_reality_close(tls13_conn_t *c) {
             (void)write_exact(upload_fd, "0\r\n\r\n", 5);
         }
     }
+    if (c->grpc_transport && c->h2_stream_id != 0 && c->fd >= 0) {
+        (void)h2_send_frame(c, H2_FRAME_DATA, H2_FLAG_END_STREAM, c->h2_stream_id, NULL, 0);
+    }
     if (c->xhttp_upload_fd >= 0) {
         shutdown(c->xhttp_upload_fd, SHUT_RDWR);
         if (c->xhttp_upload_reader_started) {
@@ -5364,6 +5776,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     db_free(&c->ws_net_cache);
     db_free(&c->h2_net_cache);
     db_free(&c->h2_send_buf);
+    db_free(&c->grpc_recv_cache);
     db_free(&c->transcript);
     db_free(&c->app_cache);
     free(c);
@@ -5403,6 +5816,10 @@ static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t
 }
 
 int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    if (c->grpc_transport) {
+        return grpc_write_hunk(c, buf, len);
+    }
+
     if (c->mode == CONN_MODE_PLAIN) {
         return write_exact(c->fd, buf, len);
     }
@@ -5577,7 +5994,7 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
             if (rc > 0) {
                 return 1;
             }
-        } else if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
+        } else if (c->mode == CONN_MODE_XHTTP_TLS_H2 || c->mode == CONN_MODE_GRPC_PLAIN) {
             int rc = h2_fill_app_cache(c);
             if (rc < 0) {
                 return -1;

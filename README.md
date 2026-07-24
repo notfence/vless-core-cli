@@ -8,6 +8,9 @@ Standalone C CLI client for:
 - `VLESS + XHTTP + Reality`
 - `VLESS + XHTTP + TLS`
 - `VLESS + XHTTP` (no security)
+- `VLESS + gRPC + Reality`
+- `VLESS + gRPC + TLS`
+- `VLESS + gRPC` (no security)
 - `VLESS + WebSocket + TLS`
 - `VLESS + WebSocket`
 - `SOCKS5`
@@ -18,10 +21,12 @@ Protocol semantics are aligned with `xray-core` for the supported transports and
 
 For XHTTP, `mode=auto` follows xray's defaults: `packet-up` without security or with TLS, and `stream-one` with Reality.
 
-## Tested Device/OS
+## Platform Support
 
-Tested only on **iOS 6.1.3** on **iPhone 4s**.
-Compatibility with other iOS versions/devices is not guaranteed.
+- Linux on x86-64 (`vless-core-linux-amd64`)
+- iOS 6.x through iOS 10.x on all compatible 32-bit devices (`vless-core-darwin-armv7`)
+
+The iOS binary is built for ARMv7 with iOS 6.0 as the minimum deployment target. 64-bit ARM devices are not supported.
 
 ## Binaries
 

@@ -107,6 +107,8 @@ static void init_config_defaults(vless_config_t *cfg, const char *uri) {
     snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
     cfg->xhttp_host[0] = '\0';
     snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "auto");
+    cfg->grpc_service_name[0] = '\0';
+    cfg->grpc_authority[0] = '\0';
     snprintf(cfg->xhttp_session_placement, sizeof(cfg->xhttp_session_placement), "path");
     cfg->xhttp_session_key[0] = '\0';
     snprintf(cfg->xhttp_seq_placement, sizeof(cfg->xhttp_seq_placement), "path");
@@ -432,6 +434,8 @@ static void parse_query(vless_config_t *cfg, char *query) {
                 cfg->transport_mode = TRANSPORT_XHTTP;
             } else if (strcmp(decoded, "ws") == 0 || strcmp(decoded, "websocket") == 0) {
                 cfg->transport_mode = TRANSPORT_WS;
+            } else if (strcmp(decoded, "grpc") == 0) {
+                cfg->transport_mode = TRANSPORT_GRPC;
             } else if (decoded[0] == '\0' || strcmp(decoded, "tcp") == 0) {
                 cfg->transport_mode = TRANSPORT_VISION;
             }
@@ -439,6 +443,10 @@ static void parse_query(vless_config_t *cfg, char *query) {
             copy_trunc(cfg->xhttp_path, sizeof(cfg->xhttp_path), decoded);
         } else if (strcmp(key, "host") == 0) {
             copy_trunc(cfg->xhttp_host, sizeof(cfg->xhttp_host), decoded);
+        } else if (strcmp(key, "serviceName") == 0 || strcmp(key, "service_name") == 0) {
+            copy_trunc(cfg->grpc_service_name, sizeof(cfg->grpc_service_name), decoded);
+        } else if (strcmp(key, "authority") == 0) {
+            copy_trunc(cfg->grpc_authority, sizeof(cfg->grpc_authority), decoded);
         } else if (strcmp(key, "mode") == 0) {
             copy_lower_trunc(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), decoded);
         } else if (strcmp(key, "extra") == 0) {
@@ -608,6 +616,33 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         }
         if (cfg->xhttp_path[0] == '\0') {
             snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
+        }
+    } else if (cfg->transport_mode == TRANSPORT_GRPC) {
+        int grpc_tls = (strcmp(cfg->security, "tls") == 0);
+        int grpc_reality = (strcmp(cfg->security, "reality") == 0);
+        int grpc_plain = (strcmp(cfg->security, "none") == 0);
+        if (!grpc_tls && !grpc_reality && !grpc_plain) {
+            set_err(err, err_cap, "grpc requires security=none, security=tls, or security=reality");
+            return -1;
+        }
+        if (strcmp(cfg->xhttp_mode, "auto") != 0 && cfg->xhttp_mode[0] != '\0' &&
+            strcmp(cfg->xhttp_mode, "gun") != 0 && strcmp(cfg->xhttp_mode, "multi") != 0) {
+            set_err(err, err_cap, "unsupported grpc mode");
+            return -1;
+        }
+        cfg->flow[0] = '\0';
+        if (!grpc_reality) {
+            cfg->pbk_len = 0;
+            cfg->short_id_len = 0;
+        } else {
+            if (cfg->pbk_len != 32) {
+                set_err(err, err_cap, "pbk is required and must decode to 32 bytes");
+                return -1;
+            }
+            if (cfg->short_id_len > 16) {
+                set_err(err, err_cap, "sid must be <= 16 bytes");
+                return -1;
+            }
         }
     } else if (cfg->transport_mode == TRANSPORT_WS) {
         if (strcmp(cfg->security, "tls") != 0 && strcmp(cfg->security, "none") != 0) {

@@ -16,7 +16,8 @@ typedef enum {
 typedef enum {
     TRANSPORT_VISION = 0,
     TRANSPORT_XHTTP = 1,
-    TRANSPORT_WS = 2
+    TRANSPORT_WS = 2,
+    TRANSPORT_GRPC = 3
 } transport_mode_t;
 
 typedef enum {
@@ -56,6 +57,8 @@ typedef struct {
     char xhttp_path[256];
     char xhttp_host[256];
     char xhttp_mode[32];
+    char grpc_service_name[256];
+    char grpc_authority[256];
     char xhttp_session_placement[16];
     char xhttp_session_key[64];
     char xhttp_seq_placement[16];

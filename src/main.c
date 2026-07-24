@@ -862,11 +862,13 @@ int main(int argc, char **argv) {
             transport_label = "xhttp";
         } else if (cfg.transport_mode == TRANSPORT_WS) {
             transport_label = "ws";
+        } else if (cfg.transport_mode == TRANSPORT_GRPC) {
+            transport_label = "grpc";
         }
         fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
                 cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security, transport_label, fp_label);
-        if (cfg.transport_mode == TRANSPORT_XHTTP && strcmp(cfg.security, "tls") == 0) {
-            fprintf(stderr, "[xhttp] tls_mode=%s\n", xhttp_tls_mode_startup_label());
+        if ((cfg.transport_mode == TRANSPORT_XHTTP || cfg.transport_mode == TRANSPORT_GRPC) && strcmp(cfg.security, "tls") == 0) {
+            fprintf(stderr, "[%s] tls_mode=%s\n", transport_label, xhttp_tls_mode_startup_label());
         }
     }
 
