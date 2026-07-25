@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -12,6 +13,7 @@
 
 #include "socks5.h"
 #include "socks5_upstream.h"
+#include "routing.h"
 #include "socket_util.h"
 #include "tls13_reality.h"
 #include "types.h"
@@ -23,6 +25,9 @@
 #ifndef VLESS_OPENSSL_PATCH_STATUS
 #define VLESS_OPENSSL_PATCH_STATUS "unpatched"
 #endif
+
+static routing_config_t g_routing;
+static int g_route_control_port = 0;
 
 static ssize_t read_with_timeout(int fd, uint8_t *buf, size_t cap, int timeout_ms) {
     fd_set rfds;
@@ -158,6 +163,29 @@ static ssize_t read_initial_payload(int fd, uint8_t *buf, size_t cap) {
     return (ssize_t)len;
 }
 
+static ssize_t read_sniff_payload(int fd, uint8_t *buf, size_t cap) {
+    ssize_t n = read_with_timeout(fd, buf, cap, 200);
+    if (n <= 0) {
+        return n;
+    }
+
+    size_t len = (size_t)n;
+    for (int attempt = 0; attempt < 3 && len < cap; attempt++) {
+        size_t needed = len;
+        int tls_like = tls_records_needed(buf, len, &needed);
+        int timeout_ms = (tls_like && needed > len) ? 50 : 10;
+        ssize_t more = read_with_timeout(fd, buf + len, cap - len, timeout_ms);
+        if (more < 0) {
+            return -1;
+        }
+        if (more == 0) {
+            break;
+        }
+        len += (size_t)more;
+    }
+    return (ssize_t)len;
+}
+
 static int is_ip_literal(const char *host) {
     struct in_addr in4;
     struct in6_addr in6;
@@ -273,6 +301,116 @@ static int parse_tls_sni(const uint8_t *buf, size_t len, char *out, size_t out_c
     return -1;
 }
 
+static int ascii_equal_ci(const uint8_t *value, size_t len, const char *expected) {
+    size_t expected_len = strlen(expected);
+    if (len != expected_len) {
+        return 0;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (tolower((unsigned char)value[i]) != tolower((unsigned char)expected[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int valid_http_host(const uint8_t *host, size_t len) {
+    if (host == NULL || len == 0 || len > 253 || host[0] == '.' || host[len - 1] == '.') {
+        return 0;
+    }
+    for (size_t i = 0; i < len; i++) {
+        uint8_t ch = host[i];
+        if (!(isalnum((unsigned char)ch) || ch == '-' || ch == '_' || ch == '.')) {
+            return 0;
+        }
+        if (ch == '.' && i > 0 && host[i - 1] == '.') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int parse_http_host(const uint8_t *buf, size_t len, char *out, size_t out_cap) {
+    if (buf == NULL || len < 8 || out == NULL || out_cap == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+
+    size_t pos = 0;
+    while (pos < len && buf[pos] != '\n') {
+        pos++;
+    }
+    if (pos == len || memchr(buf, ' ', pos) == NULL) {
+        return -1;
+    }
+    pos++;
+
+    while (pos < len) {
+        size_t line_start = pos;
+        while (pos < len && buf[pos] != '\n') {
+            pos++;
+        }
+        size_t line_end = pos;
+        if (line_end > line_start && buf[line_end - 1] == '\r') {
+            line_end--;
+        }
+        if (line_end == line_start) {
+            return -1;
+        }
+
+        size_t colon = line_start;
+        while (colon < line_end && buf[colon] != ':') {
+            colon++;
+        }
+        if (colon < line_end && ascii_equal_ci(buf + line_start, colon - line_start, "host")) {
+            size_t value_start = colon + 1;
+            while (value_start < line_end &&
+                   (buf[value_start] == ' ' || buf[value_start] == '\t')) {
+                value_start++;
+            }
+            while (line_end > value_start &&
+                   (buf[line_end - 1] == ' ' || buf[line_end - 1] == '\t')) {
+                line_end--;
+            }
+            if (value_start == line_end || buf[value_start] == '[') {
+                return -1;
+            }
+
+            size_t host_end = line_end;
+            for (size_t i = value_start; i < line_end; i++) {
+                if (buf[i] != ':') continue;
+                if (i + 1 == line_end) return -1;
+                for (size_t j = i + 1; j < line_end; j++) {
+                    if (!isdigit((unsigned char)buf[j])) return -1;
+                }
+                host_end = i;
+                break;
+            }
+            if (host_end > value_start && buf[host_end - 1] == '.') {
+                host_end--;
+            }
+            size_t host_len = host_end - value_start;
+            if (host_len >= out_cap || !valid_http_host(buf + value_start, host_len)) {
+                return -1;
+            }
+            memcpy(out, buf + value_start, host_len);
+            out[host_len] = '\0';
+            return 0;
+        }
+        if (pos < len) {
+            pos++;
+        }
+    }
+    return -1;
+}
+
+static int sniff_domain(const uint8_t *buf, size_t len, char *out, size_t out_cap) {
+    if (parse_tls_sni(buf, len, out, out_cap) == 0) {
+        return 0;
+    }
+    return parse_http_host(buf, len, out, out_cap);
+}
+
 static int write_all(int fd, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -332,20 +470,116 @@ static void *client_worker(void *arg) {
         return NULL;
     }
 
+    int socks_success_sent = 0;
+    uint8_t first_payload[8192];
+    ssize_t first_payload_len = 0;
+    char sniffed_domain[256];
+    sniffed_domain[0] = '\0';
+
+    if (is_ip_literal(target_host) && routing_has_domain_rules(&g_routing)) {
+        if (socks5_send_success(cfd) != 0) {
+            close(cfd);
+            return NULL;
+        }
+        socks_success_sent = 1;
+        first_payload_len = read_sniff_payload(cfd, first_payload, sizeof(first_payload));
+        if (first_payload_len < 0) {
+            fprintf(stderr, "[routing] initial payload read failed for %s:%u\n",
+                    target_host, (unsigned)target_port);
+            close(cfd);
+            return NULL;
+        }
+        if (first_payload_len > 0 &&
+            sniff_domain(first_payload,
+                         (size_t)first_payload_len,
+                         sniffed_domain,
+                         sizeof(sniffed_domain)) == 0) {
+            fprintf(stderr,
+                    "[routing] sniffed target=%s:%u domain=%s\n",
+                    target_host,
+                    (unsigned)target_port,
+                    sniffed_domain);
+        }
+    }
+
+    char routed_host[256];
+    int matched_rule = -1;
+    route_action_t route = routing_decide(&g_routing,
+                                          target_host,
+                                          target_port,
+                                          sniffed_domain[0] != '\0' ? sniffed_domain : NULL,
+                                          routed_host,
+                                          sizeof(routed_host),
+                                          &matched_rule);
+    if (g_routing.enabled) {
+        const char *route_source = "default";
+        if (matched_rule >= 0) route_source = "rule";
+        else if (matched_rule == -2) route_source = "lan";
+        else if (matched_rule == -3) route_source = "dns";
+        fprintf(stderr,
+                "[routing] target=%s:%u%s%s action=%s source=%s\n",
+                target_host,
+                (unsigned)target_port,
+                routed_host[0] != '\0' ? " domain=" : "",
+                routed_host[0] != '\0' ? routed_host : "",
+                routing_action_name(route),
+                route_source);
+    }
+
+    if (route == ROUTE_ACTION_BLOCK) {
+        if (!socks_success_sent) {
+            socks5_send_failure(cfd, 0x02);
+        }
+        close(cfd);
+        return NULL;
+    }
+
+    if (route == ROUTE_ACTION_DIRECT) {
+        char direct_err[256] = {0};
+        int direct_fd = routing_open_direct(target_host,
+                                            target_port,
+                                            g_route_control_port,
+                                            direct_err,
+                                            sizeof(direct_err));
+        if (direct_fd < 0) {
+            fprintf(stderr, "[routing] direct connect failed for %s:%u: %s\n",
+                    target_host, (unsigned)target_port, direct_err);
+            if (!socks_success_sent) {
+                socks5_send_failure(cfd, 0x05);
+            }
+            close(cfd);
+            return NULL;
+        }
+        if (!socks_success_sent && socks5_send_success(cfd) != 0) {
+            close(direct_fd);
+            close(cfd);
+            return NULL;
+        }
+        if (first_payload_len > 0 &&
+            write_all(direct_fd, first_payload, (size_t)first_payload_len) != 0) {
+            close(direct_fd);
+            close(cfd);
+            return NULL;
+        }
+        relay_tcp_pair(cfd, direct_fd);
+        close(direct_fd);
+        close(cfd);
+        return NULL;
+    }
+
     if (cfg.protocol == CORE_PROTOCOL_SOCKS5) {
         char err[256] = {0};
         char upstream_target[512];
         snprintf(upstream_target, sizeof(upstream_target), "%s", target_host);
 
-        uint8_t first_payload[8192];
-        ssize_t first_payload_len = 0;
         int delayed_connect = (target_port == 443 && is_ip_literal(target_host));
 
-        if (delayed_connect) {
-            if (socks5_send_success(cfd) != 0) {
+        if (delayed_connect && first_payload_len == 0) {
+            if (!socks_success_sent && socks5_send_success(cfd) != 0) {
                 close(cfd);
                 return NULL;
             }
+            socks_success_sent = 1;
 
             first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
             if (first_payload_len < 0) {
@@ -353,27 +587,28 @@ static void *client_worker(void *arg) {
                 close(cfd);
                 return NULL;
             }
+        }
 
-            char sni[256];
-            if (first_payload_len > 0 && parse_tls_sni(first_payload, (size_t)first_payload_len, sni, sizeof(sni)) == 0) {
-                snprintf(upstream_target, sizeof(upstream_target), "%s", sni);
-                fprintf(stderr, "[socks5] remapped transparent TLS target=%s:%u to sni=%s\n",
-                        target_host, (unsigned)target_port, upstream_target);
-            }
+        char sni[256];
+        if (first_payload_len > 0 &&
+            parse_tls_sni(first_payload, (size_t)first_payload_len, sni, sizeof(sni)) == 0) {
+            snprintf(upstream_target, sizeof(upstream_target), "%s", sni);
+            fprintf(stderr, "[socks5] remapped transparent TLS target=%s:%u to sni=%s\n",
+                    target_host, (unsigned)target_port, upstream_target);
         }
 
         int upstream_fd = socks5_upstream_connect(&cfg, upstream_target, target_port, err, sizeof(err));
         if (upstream_fd < 0) {
             fprintf(stderr, "[socks5] upstream connect failed for %s:%u via %s:%u: %s\n",
                     upstream_target, (unsigned)target_port, cfg.server_host, (unsigned)cfg.server_port, err);
-            if (!delayed_connect) {
+            if (!socks_success_sent) {
                 socks5_send_failure(cfd, 0x05);
             }
             close(cfd);
             return NULL;
         }
 
-        if (!delayed_connect && socks5_send_success(cfd) != 0) {
+        if (!socks_success_sent && socks5_send_success(cfd) != 0) {
             close(upstream_fd);
             close(cfd);
             return NULL;
@@ -402,7 +637,9 @@ static void *client_worker(void *arg) {
     tls13_conn_t *tls = NULL;
     if (tls13_reality_connect(&cfg, &tls, err, sizeof(err)) != 0) {
         fprintf(stderr, "[conn] upstream connect failed: %s\n", err);
-        socks5_send_failure(cfd, 0x05);
+        if (!socks_success_sent) {
+            socks5_send_failure(cfd, 0x05);
+        }
         close(cfd);
         return NULL;
     }
@@ -415,10 +652,6 @@ static void *client_worker(void *arg) {
         vision_unpad_init(&vunpad, cfg.uuid);
     }
 
-    int socks_success_sent = 0;
-    uint8_t first_payload[8192];
-    ssize_t first_payload_len = 0;
-
     if (use_vision) {
         uint8_t vless_req[2048];
         size_t vless_req_len = 0;
@@ -427,7 +660,7 @@ static void *client_worker(void *arg) {
         uint8_t *first_packet = NULL;
         size_t first_packet_len = 0;
 
-        if (socks5_send_success(cfd) != 0) {
+        if (!socks_success_sent && socks5_send_success(cfd) != 0) {
             vision_unpad_free(&vunpad);
             tls13_reality_close(tls);
             close(cfd);
@@ -435,13 +668,15 @@ static void *client_worker(void *arg) {
         }
         socks_success_sent = 1;
 
-        first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
-        if (first_payload_len < 0) {
-            fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
-            vision_unpad_free(&vunpad);
-            tls13_reality_close(tls);
-            close(cfd);
-            return NULL;
+        if (first_payload_len == 0) {
+            first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
+            if (first_payload_len < 0) {
+                fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
+                vision_unpad_free(&vunpad);
+                tls13_reality_close(tls);
+                close(cfd);
+                return NULL;
+            }
         }
 
         if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
@@ -501,19 +736,21 @@ static void *client_worker(void *arg) {
         uint8_t *first_packet = NULL;
         size_t first_packet_len = 0;
 
-        if (socks5_send_success(cfd) != 0) {
+        if (!socks_success_sent && socks5_send_success(cfd) != 0) {
             tls13_reality_close(tls);
             close(cfd);
             return NULL;
         }
         socks_success_sent = 1;
 
-        first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
-        if (first_payload_len < 0) {
-            fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
-            tls13_reality_close(tls);
-            close(cfd);
-            return NULL;
+        if (first_payload_len == 0) {
+            first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
+            if (first_payload_len < 0) {
+                fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
+                tls13_reality_close(tls);
+                close(cfd);
+                return NULL;
+            }
         }
 
         if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
@@ -548,7 +785,17 @@ static void *client_worker(void *arg) {
     } else {
         if (vless_send_request(tls, &cfg, target_host, target_port) != 0) {
             fprintf(stderr, "[conn] VLESS request send failed for %s:%u\n", target_host, (unsigned)target_port);
-            socks5_send_failure(cfd, 0x01);
+            if (!socks_success_sent) {
+                socks5_send_failure(cfd, 0x01);
+            }
+            tls13_reality_close(tls);
+            close(cfd);
+            return NULL;
+        }
+        if (first_payload_len > 0 &&
+            tls13_write_app(tls, first_payload, (size_t)first_payload_len) != 0) {
+            fprintf(stderr, "[conn] initial payload send failed for %s:%u\n",
+                    target_host, (unsigned)target_port);
             tls13_reality_close(tls);
             close(cfd);
             return NULL;
@@ -749,6 +996,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  --uri <uri>              VLESS URI or SOCKS5 upstream URI\n");
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
+    fprintf(stderr, "  --routing <rules>        Optional Proxy, Direct and Block rules\n");
+    fprintf(stderr, "  --route-control-port <p> Direct-route controller port\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
     fprintf(stderr, "  --openssl-patch-status   Show OpenSSL patch status\n");
@@ -779,13 +1028,19 @@ int main(int argc, char **argv) {
     prog = (prog != NULL) ? (prog + 1) : argv[0];
 
     const char *uri = NULL;
+    const char *routing_text = NULL;
     int listen_port = 0;
 
+    routing_config_init(&g_routing);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--uri") == 0 && i + 1 < argc) {
             uri = argv[++i];
         } else if (strcmp(argv[i], "--listen-port") == 0 && i + 1 < argc) {
             listen_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--routing") == 0 && i + 1 < argc) {
+            routing_text = argv[++i];
+        } else if (strcmp(argv[i], "--route-control-port") == 0 && i + 1 < argc) {
+            g_route_control_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
             printf("vless-core %s\n", VLESS_CORE_VERSION);
             return 0;
@@ -800,6 +1055,16 @@ int main(int argc, char **argv) {
 
     if (uri == NULL || listen_port <= 0 || listen_port > 65535) {
         usage(prog);
+        return 1;
+    }
+    if (g_route_control_port < 0 || g_route_control_port > 65535) {
+        fprintf(stderr, "Invalid route control port\n");
+        return 1;
+    }
+
+    char routing_err[256] = {0};
+    if (routing_config_parse(routing_text, &g_routing, routing_err, sizeof(routing_err)) != 0) {
+        fprintf(stderr, "Invalid routing policy: %s\n", routing_err);
         return 1;
     }
 
@@ -870,6 +1135,12 @@ int main(int argc, char **argv) {
         if ((cfg.transport_mode == TRANSPORT_XHTTP || cfg.transport_mode == TRANSPORT_GRPC) && strcmp(cfg.security, "tls") == 0) {
             fprintf(stderr, "[%s] tls_mode=%s\n", transport_label, xhttp_tls_mode_startup_label());
         }
+    }
+    if (g_routing.enabled) {
+        fprintf(stderr, "[routing] enabled default=%s bypass_lan=%s rules=%lu\n",
+                routing_action_name(g_routing.default_action),
+                g_routing.bypass_lan ? "yes" : "no",
+                (unsigned long)g_routing.rule_count);
     }
 
     while (1) {

@@ -13,7 +13,6 @@
 #include <unistd.h>
 
 #define SOCKS5_UPSTREAM_TIMEOUT_MS 12000
-#define DNS_CACHE_PATH "/var/run/vlesscore-dns-cache.txt"
 
 static void set_errf(char *err, size_t cap, const char *fmt, ...) {
     if (err == NULL || cap == 0) {
@@ -185,64 +184,12 @@ static int socks5_authenticate(int fd, const vless_config_t *cfg, char *err, siz
     return 0;
 }
 
-static int dns_cache_lookup_name(const char *ip, char *out, size_t out_cap) {
-    if (ip == NULL || ip[0] == '\0' || out == NULL || out_cap == 0) {
-        return -1;
-    }
-
-    struct in_addr in4;
-    struct in6_addr in6;
-    if (inet_pton(AF_INET, ip, &in4) != 1 && inet_pton(AF_INET6, ip, &in6) != 1) {
-        return -1;
-    }
-
-    FILE *fp = fopen(DNS_CACHE_PATH, "r");
-    if (fp == NULL) {
-        return -1;
-    }
-
-    char line[512];
-    int found = -1;
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        char *tab = strchr(line, '\t');
-        if (tab == NULL) {
-            continue;
-        }
-        *tab = '\0';
-        if (strcmp(line, ip) != 0) {
-            continue;
-        }
-
-        char *name = tab + 1;
-        char *end = name;
-        while (*end != '\0' && *end != '\r' && *end != '\n' && *end != '\t') {
-            end++;
-        }
-        *end = '\0';
-
-        size_t name_len = strlen(name);
-        if (name_len == 0 || name_len > 255 || name_len >= out_cap) {
-            continue;
-        }
-        snprintf(out, out_cap, "%s", name);
-        found = 0;
-    }
-
-    fclose(fp);
-    return found;
-}
-
 static int socks5_send_connect(int fd, const char *target_host, uint16_t target_port, char *err, size_t err_cap) {
     uint8_t req[300];
     size_t n = 0;
     req[n++] = 0x05;
     req[n++] = 0x01;
     req[n++] = 0x00;
-
-    char mapped_host[256];
-    if (dns_cache_lookup_name(target_host, mapped_host, sizeof(mapped_host)) == 0) {
-        target_host = mapped_host;
-    }
 
     struct in_addr in4;
     struct in6_addr in6;
@@ -306,33 +253,9 @@ int socks5_upstream_connect(const vless_config_t *cfg, const char *target_host, 
         return -1;
     }
 
-    if (socks5_send_connect(fd, target_host, target_port, err, err_cap) == 0) {
-        return fd;
-    }
-
-    char first_err[256];
-    snprintf(first_err, sizeof(first_err), "%s", (err != NULL && err[0] != '\0') ? err : "SOCKS5 CONNECT failed");
-    close(fd);
-
-    char mapped_host[256];
-    if (dns_cache_lookup_name(target_host, mapped_host, sizeof(mapped_host)) != 0 || strcmp(mapped_host, target_host) == 0) {
-        set_errf(err, err_cap, "%s", first_err);
-        return -1;
-    }
-
-    fd = connect_tcp_host(cfg->server_host, cfg->server_port, err, err_cap);
-    if (fd < 0) {
-        return -1;
-    }
-    if (socks5_authenticate(fd, cfg, err, err_cap) != 0 ||
-        socks5_send_connect(fd, mapped_host, target_port, err, err_cap) != 0) {
+    if (socks5_send_connect(fd, target_host, target_port, err, err_cap) != 0) {
         close(fd);
-        if (err != NULL && err[0] == '\0') {
-            set_errf(err, err_cap, "%s", first_err);
-        }
         return -1;
     }
-
-    fprintf(stderr, "[socks5] retried target=%s:%u as domain=%s via DNS cache\n", target_host, (unsigned)target_port, mapped_host);
     return fd;
 }

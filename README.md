@@ -78,9 +78,15 @@ Usage: vless-core-linux-amd64 --uri <vless://...|socks5://...> --listen-port <po
 Options:
   --uri <uri>              VLESS URI or SOCKS5 upstream URI
   --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)
+  --routing <rules>        Optional Proxy, Direct and Block rules
+  --route-control-port <p> Direct-route controller port
   -h, --help               Show help
   -v, --version            Show version
 ```
+
+## Routing
+
+Routing is optional and is disabled by default. When enabled, ordered rules can send new connections through the selected proxy, connect directly, or block them. Rules can match domains, domain suffixes, IP/CIDR ranges, and ports.
 
 ## XHTTP TLS modes
 
