@@ -25,6 +25,13 @@ typedef enum {
     CORE_PROTOCOL_SOCKS5 = 1
 } core_protocol_t;
 
+#define VLESS_ENCRYPTION_MAX_RELAYS 4
+
+typedef struct {
+    uint8_t key[1184];
+    size_t key_len;
+} vless_encryption_relay_t;
+
 typedef struct {
     char original_uri[2048];
 
@@ -40,6 +47,7 @@ typedef struct {
 
     char sni[256];
     char flow[64];
+    char encryption[1536];
     char security[32];
     char alpn[128];
     int allow_insecure;
@@ -74,6 +82,11 @@ typedef struct {
     int xhttp_padding_max;
     int xhttp_max_each_post_min;
     int xhttp_max_each_post_max;
+
+    int encryption_enabled;
+    int encryption_xor_mode;
+    vless_encryption_relay_t encryption_relays[VLESS_ENCRYPTION_MAX_RELAYS];
+    size_t encryption_relay_count;
 } vless_config_t;
 
 typedef struct {

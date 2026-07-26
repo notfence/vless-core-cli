@@ -77,7 +77,9 @@ int vless_build_request(uint8_t *packet, size_t cap, size_t *out_len, const vles
     return 0;
 }
 
-int vless_send_request(tls13_conn_t *tls, const vless_config_t *cfg, const char *target_host, uint16_t target_port) {
+int vless_send_request(tls13_conn_t *tls, vless_encryption_conn_t *encryption,
+                       const vless_config_t *cfg, const char *target_host,
+                       uint16_t target_port) {
     uint8_t packet[2048];
     size_t packet_len = 0;
 
@@ -85,12 +87,19 @@ int vless_send_request(tls13_conn_t *tls, const vless_config_t *cfg, const char 
         return -1;
     }
 
+    if (encryption != NULL) {
+        return vless_encryption_write(encryption, packet, packet_len);
+    }
     return tls13_write_app(tls, packet, packet_len);
 }
 
-int vless_read_response(tls13_conn_t *tls) {
+int vless_read_response(tls13_conn_t *tls,
+                        vless_encryption_conn_t *encryption) {
     uint8_t hdr[2];
-    if (tls13_read_exact_app(tls, hdr, sizeof(hdr)) != 0) {
+    int rc = encryption != NULL
+                 ? vless_encryption_read_exact(encryption, hdr, sizeof(hdr))
+                 : tls13_read_exact_app(tls, hdr, sizeof(hdr));
+    if (rc != 0) {
         return -1;
     }
     if (hdr[0] != 0x00) {
@@ -100,7 +109,10 @@ int vless_read_response(tls13_conn_t *tls) {
     uint8_t addon_len = hdr[1];
     if (addon_len > 0) {
         uint8_t tmp[256];
-        if (tls13_read_exact_app(tls, tmp, addon_len) != 0) {
+        rc = encryption != NULL
+                 ? vless_encryption_read_exact(encryption, tmp, addon_len)
+                 : tls13_read_exact_app(tls, tmp, addon_len);
+        if (rc != 0) {
             return -1;
         }
     }

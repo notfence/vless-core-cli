@@ -100,6 +100,7 @@ static void init_config_defaults(vless_config_t *cfg, const char *uri) {
     cfg->fp_mode = FP_CHROME;
     cfg->transport_mode = TRANSPORT_VISION;
     cfg->flow[0] = '\0';
+    snprintf(cfg->encryption, sizeof(cfg->encryption), "none");
     snprintf(cfg->security, sizeof(cfg->security), "reality");
     cfg->alpn[0] = '\0';
     cfg->allow_insecure = 0;
@@ -423,6 +424,8 @@ static void parse_query(vless_config_t *cfg, char *query) {
             }
         } else if (strcmp(key, "flow") == 0) {
             copy_trunc(cfg->flow, sizeof(cfg->flow), decoded);
+        } else if (strcmp(key, "encryption") == 0) {
+            copy_trunc(cfg->encryption, sizeof(cfg->encryption), decoded);
         } else if (strcmp(key, "security") == 0) {
             copy_trunc(cfg->security, sizeof(cfg->security), decoded);
         } else if (strcmp(key, "alpn") == 0) {
@@ -459,6 +462,81 @@ static void parse_query(vless_config_t *cfg, char *query) {
             copy_trunc(cfg->spider_x, sizeof(cfg->spider_x), decoded);
         }
     }
+}
+
+static int parse_vless_encryption(vless_config_t *cfg, char *err, size_t err_cap) {
+    cfg->encryption_enabled = 0;
+    cfg->encryption_xor_mode = 0;
+    cfg->encryption_relay_count = 0;
+
+    if (cfg->encryption[0] == '\0' || strcmp(cfg->encryption, "none") == 0) {
+        return 0;
+    }
+
+    char value[sizeof(cfg->encryption)];
+    copy_trunc(value, sizeof(value), cfg->encryption);
+
+    char *parts[32];
+    size_t count = 0;
+    char *cursor = value;
+    while (cursor != NULL && count < sizeof(parts) / sizeof(parts[0])) {
+        parts[count++] = cursor;
+        char *dot = strchr(cursor, '.');
+        if (dot == NULL) {
+            cursor = NULL;
+        } else {
+            *dot = '\0';
+            cursor = dot + 1;
+        }
+    }
+    if (cursor != NULL || count < 4 || strcmp(parts[0], "mlkem768x25519plus") != 0) {
+        set_err(err, err_cap, "unsupported VLESS encryption");
+        return -1;
+    }
+
+    if (strcmp(parts[1], "native") == 0) {
+        cfg->encryption_xor_mode = 0;
+    } else if (strcmp(parts[1], "xorpub") == 0) {
+        cfg->encryption_xor_mode = 1;
+    } else if (strcmp(parts[1], "random") == 0) {
+        cfg->encryption_xor_mode = 2;
+    } else {
+        set_err(err, err_cap, "unsupported VLESS encryption mode");
+        return -1;
+    }
+
+    if (strcmp(parts[2], "0rtt") != 0 &&
+        strcmp(parts[2], "1rtt") != 0) {
+        set_err(err, err_cap, "unsupported VLESS encryption handshake");
+        return -1;
+    }
+
+    for (size_t i = 3; i < count; i++) {
+        if (strlen(parts[i]) < 20) {
+            continue;
+        }
+
+        if (cfg->encryption_relay_count >= VLESS_ENCRYPTION_MAX_RELAYS) {
+            set_err(err, err_cap, "too many VLESS encryption relay keys");
+            return -1;
+        }
+        vless_encryption_relay_t *relay =
+            &cfg->encryption_relays[cfg->encryption_relay_count];
+        if (base64url_decode(parts[i], relay->key, sizeof(relay->key),
+                             &relay->key_len) != 0 ||
+            (relay->key_len != 32 && relay->key_len != 1184)) {
+            set_err(err, err_cap, "invalid VLESS encryption relay key");
+            return -1;
+        }
+        cfg->encryption_relay_count++;
+    }
+
+    if (cfg->encryption_relay_count == 0) {
+        set_err(err, err_cap, "missing VLESS encryption relay key");
+        return -1;
+    }
+    cfg->encryption_enabled = 1;
+    return 0;
 }
 
 static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {
@@ -572,6 +650,10 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         parse_query(cfg, query);
     }
 
+    if (parse_vless_encryption(cfg, err, err_cap) != 0) {
+        return -1;
+    }
+
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
         int xhttp_tls = (strcmp(cfg->security, "tls") == 0);
         int xhttp_reality = (strcmp(cfg->security, "reality") == 0);
@@ -600,7 +682,13 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
             set_err(err, err_cap, "only xhttp uplinkDataPlacement=body is supported");
             return -1;
         }
-        cfg->flow[0] = '\0';
+        if (!cfg->encryption_enabled) {
+            cfg->flow[0] = '\0';
+        } else if (cfg->flow[0] != '\0' &&
+                   strcmp(cfg->flow, "xtls-rprx-vision") != 0) {
+            set_err(err, err_cap, "encrypted xhttp supports only omitted flow or flow=xtls-rprx-vision");
+            return -1;
+        }
         if (!xhttp_reality) {
             cfg->pbk_len = 0;
             cfg->short_id_len = 0;

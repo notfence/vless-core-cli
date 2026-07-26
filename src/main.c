@@ -20,6 +20,7 @@
 #include "uri.h"
 #include "vision.h"
 #include "vless.h"
+#include "vless_encryption.h"
 
 #define VLESS_CORE_VERSION "1.0.8"
 #ifndef VLESS_OPENSSL_PATCH_STATUS
@@ -28,6 +29,28 @@
 
 static routing_config_t g_routing;
 static int g_route_control_port = 0;
+
+static int upstream_write(tls13_conn_t *tls,
+                          vless_encryption_conn_t *encryption,
+                          const uint8_t *buf, size_t len) {
+    return encryption != NULL
+               ? vless_encryption_write(encryption, buf, len)
+               : tls13_write_app(tls, buf, len);
+}
+
+static int upstream_read(tls13_conn_t *tls,
+                         vless_encryption_conn_t *encryption,
+                         uint8_t *buf, size_t cap, size_t *out_len) {
+    return encryption != NULL
+               ? vless_encryption_read(encryption, buf, cap, out_len)
+               : tls13_read_app(tls, buf, cap, out_len);
+}
+
+static void upstream_close(tls13_conn_t *tls,
+                           vless_encryption_conn_t *encryption) {
+    vless_encryption_close(encryption);
+    tls13_reality_close(tls);
+}
 
 static ssize_t read_with_timeout(int fd, uint8_t *buf, size_t cap, int timeout_ms) {
     fd_set rfds;
@@ -644,7 +667,22 @@ static void *client_worker(void *arg) {
         return NULL;
     }
 
-    int use_vision = (cfg.transport_mode == TRANSPORT_VISION && strcmp(cfg.flow, "xtls-rprx-vision") == 0);
+    vless_encryption_conn_t *encryption = NULL;
+    if (cfg.encryption_enabled &&
+        vless_encryption_connect(&cfg, tls, &encryption, err,
+                                 sizeof(err)) != 0) {
+        fprintf(stderr, "[conn] VLESS encryption handshake failed: %s\n", err);
+        if (!socks_success_sent) {
+            socks5_send_failure(cfd, 0x05);
+        }
+        upstream_close(tls, encryption);
+        close(cfd);
+        return NULL;
+    }
+
+    int use_vision = (strcmp(cfg.flow, "xtls-rprx-vision") == 0);
+    int allow_raw_vision =
+        (cfg.transport_mode == TRANSPORT_VISION && encryption == NULL);
     vision_wrap_t vwrap;
     vision_unpad_t vunpad;
     if (use_vision) {
@@ -662,7 +700,7 @@ static void *client_worker(void *arg) {
 
         if (!socks_success_sent && socks5_send_success(cfd) != 0) {
             vision_unpad_free(&vunpad);
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
@@ -673,7 +711,7 @@ static void *client_worker(void *arg) {
             if (first_payload_len < 0) {
                 fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
                 vision_unpad_free(&vunpad);
-                tls13_reality_close(tls);
+                upstream_close(tls, encryption);
                 close(cfd);
                 return NULL;
             }
@@ -682,7 +720,7 @@ static void *client_worker(void *arg) {
         if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
             fprintf(stderr, "[conn] VLESS/Vision request build failed for %s:%u\n", target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
@@ -691,14 +729,14 @@ static void *client_worker(void *arg) {
             if (vision_wrap_payload(&vwrap, first_payload, (size_t)first_payload_len, &vision_first, &vision_first_len) != 0) {
                 fprintf(stderr, "[conn] first Vision payload wrap failed for %s:%u\n", target_host, (unsigned)target_port);
                 vision_unpad_free(&vunpad);
-                tls13_reality_close(tls);
+                upstream_close(tls, encryption);
                 close(cfd);
                 return NULL;
             }
         } else if (vision_wrap_bootstrap(&vwrap, &vision_first, &vision_first_len) != 0) {
             fprintf(stderr, "[conn] Vision bootstrap build failed for %s:%u\n", target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
@@ -709,7 +747,7 @@ static void *client_worker(void *arg) {
             free(vision_first);
             fprintf(stderr, "[conn] VLESS/Vision request alloc failed for %s:%u\n", target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
@@ -720,11 +758,12 @@ static void *client_worker(void *arg) {
         }
         free(vision_first);
 
-        if (tls13_write_app(tls, first_packet, first_packet_len) != 0) {
+        if (upstream_write(tls, encryption, first_packet,
+                           first_packet_len) != 0) {
             free(first_packet);
             fprintf(stderr, "[conn] VLESS/Vision request send failed for %s:%u\n", target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
@@ -737,7 +776,7 @@ static void *client_worker(void *arg) {
         size_t first_packet_len = 0;
 
         if (!socks_success_sent && socks5_send_success(cfd) != 0) {
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
@@ -747,7 +786,7 @@ static void *client_worker(void *arg) {
             first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
             if (first_payload_len < 0) {
                 fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
-                tls13_reality_close(tls);
+                upstream_close(tls, encryption);
                 close(cfd);
                 return NULL;
             }
@@ -755,7 +794,7 @@ static void *client_worker(void *arg) {
 
         if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
             fprintf(stderr, "[conn] VLESS/WS request build failed for %s:%u\n", target_host, (unsigned)target_port);
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
@@ -764,7 +803,7 @@ static void *client_worker(void *arg) {
         first_packet = (uint8_t *)malloc(first_packet_len);
         if (first_packet == NULL) {
             fprintf(stderr, "[conn] VLESS/WS request alloc failed for %s:%u\n", target_host, (unsigned)target_port);
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
@@ -774,29 +813,32 @@ static void *client_worker(void *arg) {
             memcpy(first_packet + vless_req_len, first_payload, (size_t)first_payload_len);
         }
 
-        if (tls13_write_app(tls, first_packet, first_packet_len) != 0) {
+        if (upstream_write(tls, encryption, first_packet,
+                           first_packet_len) != 0) {
             free(first_packet);
             fprintf(stderr, "[conn] VLESS/WS request send failed for %s:%u\n", target_host, (unsigned)target_port);
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
         free(first_packet);
     } else {
-        if (vless_send_request(tls, &cfg, target_host, target_port) != 0) {
+        if (vless_send_request(tls, encryption, &cfg, target_host,
+                               target_port) != 0) {
             fprintf(stderr, "[conn] VLESS request send failed for %s:%u\n", target_host, (unsigned)target_port);
             if (!socks_success_sent) {
                 socks5_send_failure(cfd, 0x01);
             }
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
         if (first_payload_len > 0 &&
-            tls13_write_app(tls, first_payload, (size_t)first_payload_len) != 0) {
+            upstream_write(tls, encryption, first_payload,
+                           (size_t)first_payload_len) != 0) {
             fprintf(stderr, "[conn] initial payload send failed for %s:%u\n",
                     target_host, (unsigned)target_port);
-            tls13_reality_close(tls);
+            upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
@@ -806,7 +848,7 @@ static void *client_worker(void *arg) {
         if (use_vision) {
             vision_unpad_free(&vunpad);
         }
-        tls13_reality_close(tls);
+        upstream_close(tls, encryption);
         close(cfd);
         return NULL;
     }
@@ -821,7 +863,7 @@ static void *client_worker(void *arg) {
         if (use_vision) {
             vision_unpad_free(&vunpad);
         }
-        tls13_reality_close(tls);
+        upstream_close(tls, encryption);
         close(cfd);
         return NULL;
     }
@@ -829,6 +871,8 @@ static void *client_worker(void *arg) {
     int got_vless_response = 0;
     int upstream_direct = 0;
     int downstream_direct = 0;
+    int upstream_encryption_direct = 0;
+    int downstream_encryption_direct = 0;
     int forwarded_client_payload = (first_payload_len > 0) ? 1 : 0;
 
     while (1) {
@@ -880,7 +924,11 @@ static void *client_worker(void *arg) {
                     break;
                 }
 
-                if (wrapped_len > 0 && tls13_write_app(tls, wrapped, wrapped_len) != 0) {
+                if (wrapped_len > 0 &&
+                    upstream_write(tls,
+                                   upstream_encryption_direct ? NULL : encryption,
+                                   wrapped,
+                                   wrapped_len) != 0) {
                     free(wrapped);
                     break;
                 }
@@ -889,10 +937,16 @@ static void *client_worker(void *arg) {
                     forwarded_client_payload = 1;
                 }
                 if (vwrap.direct_sent) {
-                    upstream_direct = 1;
+                    if (encryption != NULL) {
+                        upstream_encryption_direct = 1;
+                    } else if (allow_raw_vision) {
+                        upstream_direct = 1;
+                    }
                 }
             } else {
-                if (tls13_write_app(tls, cbuf, (size_t)n) != 0) {
+                if (upstream_write(tls,
+                                   upstream_encryption_direct ? NULL : encryption,
+                                   cbuf, (size_t)n) != 0) {
                     break;
                 }
                 forwarded_client_payload = 1;
@@ -925,7 +979,7 @@ static void *client_worker(void *arg) {
                 if (!forwarded_client_payload) {
                     continue;
                 }
-                if (vless_read_response(tls) != 0) {
+                if (vless_read_response(tls, encryption) != 0) {
                     fprintf(stderr, "[conn] VLESS response read failed for %s:%u\n", target_host, (unsigned)target_port);
                     break;
                 }
@@ -933,7 +987,10 @@ static void *client_worker(void *arg) {
             }
 
             size_t got = 0;
-            int read_rc = tls13_read_app(tls, tbuf, sizeof(tbuf), &got);
+            int read_rc =
+                upstream_read(tls,
+                              downstream_encryption_direct ? NULL : encryption,
+                              tbuf, sizeof(tbuf), &got);
             if (read_rc < 0 || (read_rc == 0 && got == 0)) {
                 break;
             }
@@ -942,7 +999,7 @@ static void *client_worker(void *arg) {
             }
 
             if (use_vision) {
-                if (tls13_reality_is_raw_direct(tls)) {
+                if (allow_raw_vision && tls13_reality_is_raw_direct(tls)) {
                     if (write_all(cfd, tbuf, got) != 0) {
                         break;
                     }
@@ -969,10 +1026,13 @@ static void *client_worker(void *arg) {
                 free(plain);
 
                 if (switch_to_direct) {
-                    downstream_direct = 1;
-                    upstream_direct = 1;
-                    tls13_mark_raw_direct(tls);
-                    fprintf(stderr, "[conn] switched to Vision downstream direct mode for %s:%u\n", target_host, (unsigned)target_port);
+                    if (encryption != NULL) {
+                        downstream_encryption_direct = 1;
+                    } else if (allow_raw_vision) {
+                        downstream_direct = 1;
+                        upstream_direct = 1;
+                        tls13_mark_raw_direct(tls);
+                    }
                 }
             } else {
                 if (write_all(cfd, tbuf, got) != 0) {
@@ -986,7 +1046,7 @@ static void *client_worker(void *arg) {
         vision_unpad_free(&vunpad);
     }
     free(cbuf);
-    tls13_reality_close(tls);
+    upstream_close(tls, encryption);
     close(cfd);
     return NULL;
 }

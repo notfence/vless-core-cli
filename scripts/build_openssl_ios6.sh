@@ -143,7 +143,6 @@ openssl_options=(
   no-ec2m
   no-legacy
   no-ml-dsa
-  no-ml-kem
   no-slh-dsa
   no-multiblock
   no-nextprotoneg
