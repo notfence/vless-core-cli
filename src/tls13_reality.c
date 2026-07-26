@@ -3992,14 +3992,14 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, uint8_
     uint8_t suites[64];
     size_t soff = 0;
     if (cfg->fp_mode == FP_QQ || cfg->fp_mode == FP_CHROME || cfg->fp_mode == FP_EDGE) {
-        uint16_t chrome_like_suites[] = {boring_grease_cipher, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030,
+        uint16_t chrome_like_suites[] = {boring_grease_cipher, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030,
                                          0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
         for (size_t i = 0; i < sizeof(chrome_like_suites) / sizeof(chrome_like_suites[0]); i++) {
             suites[soff++] = (uint8_t)(chrome_like_suites[i] >> 8);
             suites[soff++] = (uint8_t)(chrome_like_suites[i] & 0xFF);
         }
     } else if (cfg->fp_mode == FP_FIREFOX) {
-        uint16_t firefox_suites[] = {0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030,
+        uint16_t firefox_suites[] = {0x1303, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030,
                                      0xc00a, 0xc009, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
         for (size_t i = 0; i < sizeof(firefox_suites) / sizeof(firefox_suites[0]); i++) {
             suites[soff++] = (uint8_t)(firefox_suites[i] >> 8);
@@ -4007,7 +4007,7 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, uint8_
         }
     } else {
         suites[soff++] = 0x13;
-        suites[soff++] = 0x01;
+        suites[soff++] = 0x03;
     }
 
     uint8_t slen[2] = {(uint8_t)(soff >> 8), (uint8_t)(soff & 0xFF)};
@@ -4278,6 +4278,12 @@ static int configure_tls_cipher(tls13_conn_t *c, uint16_t suite) {
         c->tls_key_len = 32;
         return 0;
     }
+    if (suite == 0x1303) {
+        c->tls_md = EVP_sha256();
+        c->tls_hash_len = 32;
+        c->tls_key_len = 32;
+        return 0;
+    }
     return -1;
 }
 
@@ -4313,7 +4319,7 @@ static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, u
     p += 2;
     n -= 2;
 
-    if (cipher != 0x1301 && cipher != 0x1302) {
+    if (cipher != 0x1301 && cipher != 0x1302 && cipher != 0x1303) {
         return -1;
     }
     if (cipher_out != NULL) {
@@ -4772,6 +4778,9 @@ static const EVP_CIPHER *record_cipher_for_conn(const tls13_conn_t *c) {
     if (c->tls_cipher_suite == 0x1302 && c->tls_key_len == 32) {
         return EVP_aes_256_gcm();
     }
+    if (c->tls_cipher_suite == 0x1303 && c->tls_key_len == 32) {
+        return EVP_chacha20_poly1305();
+    }
     return NULL;
 }
 
@@ -4817,7 +4826,7 @@ static int encrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8
 
     int len1 = 0;
     int ok = EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL) == 1 &&
-             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) == 1 &&
              EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
              EVP_EncryptUpdate(ctx, NULL, &len1, record, 5) == 1 &&
              EVP_EncryptUpdate(ctx, record + 5, &len1, inner, (int)inner_len) == 1;
@@ -4827,7 +4836,7 @@ static int encrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8
         ok = EVP_EncryptFinal_ex(ctx, record + 5 + len1, &len2) == 1;
     }
     if (ok) {
-        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, record + 5 + inner_len) == 1;
+        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, record + 5 + inner_len) == 1;
     }
 
     EVP_CIPHER_CTX_free(ctx);
@@ -4878,10 +4887,10 @@ static int decrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8
 
     int len1 = 0;
     int ok = EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL) == 1 &&
-             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) == 1 &&
              EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
              EVP_DecryptUpdate(ctx, NULL, &len1, hdr, 5) == 1 && EVP_DecryptUpdate(ctx, buf, &len1, ct, (int)ct_len) == 1 &&
-             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void *)tag) == 1;
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, (void *)tag) == 1;
 
     int len2 = 0;
     if (ok) {

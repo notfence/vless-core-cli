@@ -89,8 +89,8 @@ static int aead_seal(vless_aead_t *aead, const uint8_t *nonce_override,
     }
     int n = 0;
     int total = 0;
-    int ok = EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
-             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, sizeof(nonce), NULL) == 1 &&
+    int ok = EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, sizeof(nonce), NULL) == 1 &&
              EVP_EncryptInit_ex(ctx, NULL, NULL, aead->key, nonce) == 1;
     if (ok && aad_len > 0) {
         ok = EVP_EncryptUpdate(ctx, NULL, &n, aad, (int)aad_len) == 1;
@@ -104,7 +104,7 @@ static int aead_seal(vless_aead_t *aead, const uint8_t *nonce_override,
         total += n;
     }
     if (ok) {
-        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16,
+        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16,
                                  out + total) == 1;
         total += 16;
     }
@@ -138,8 +138,8 @@ static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
     }
     int n = 0;
     int total = 0;
-    int ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
-             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, sizeof(nonce), NULL) == 1 &&
+    int ok = EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, sizeof(nonce), NULL) == 1 &&
              EVP_DecryptInit_ex(ctx, NULL, NULL, aead->key, nonce) == 1;
     if (ok && aad_len > 0) {
         ok = EVP_DecryptUpdate(ctx, NULL, &n, aad, (int)aad_len) == 1;
@@ -149,7 +149,7 @@ static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
         total = n;
     }
     if (ok) {
-        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16,
+        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16,
                                  (void *)(ciphertext + data_len)) == 1;
     }
     if (ok) {
