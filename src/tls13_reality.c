@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
 #include <openssl/ec.h>
@@ -163,6 +164,7 @@ struct tls13_conn {
 static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len);
 static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache);
 static int h2_pump_one_frame(tls13_conn_t *c);
+static int h2_cached_frame_ready(const tls13_conn_t *c);
 
 static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
@@ -1566,6 +1568,7 @@ enum {
 #define H2_DEFAULT_MAX_FRAME 16384U
 #define H2_MAX_INBOUND_FRAME (1024U * 1024U)
 #define H2_INPUT_DRAIN_LIMIT 4
+#define H2_GRPC_INPUT_DRAIN_LIMIT 64
 #define H2_WRITE_BATCH_SIZE (64U * 1024U)
 
 static int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_id, const uint8_t *payload, size_t len) {
@@ -1646,6 +1649,84 @@ static int h2_note_recv_data(tls13_conn_t *c, size_t payload_len) {
     return 0;
 }
 
+static int h2_collect_tls_available(tls13_conn_t *c, int *want_write) {
+    if (c == NULL || c->ssl == NULL) {
+        return -1;
+    }
+    if (want_write != NULL) {
+        *want_write = 0;
+    }
+
+    int fd = SSL_get_fd(c->ssl);
+    if (fd < 0) {
+        return -1;
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return -1;
+    }
+
+    int result = 0;
+    uint8_t buf[16384];
+    for (int reads = 0; reads < 64; reads++) {
+        int n = SSL_read(c->ssl, buf, sizeof(buf));
+        if (n > 0) {
+            if (db_append(&c->h2_net_cache, buf, (size_t)n) != 0) {
+                result = -1;
+                break;
+            }
+            result = 1;
+            if (h2_cached_frame_ready(c)) {
+                break;
+            }
+            continue;
+        }
+
+        int ssl_error = SSL_get_error(c->ssl, n);
+        if (ssl_error == SSL_ERROR_WANT_READ) {
+            break;
+        }
+        if (ssl_error == SSL_ERROR_WANT_WRITE) {
+            if (want_write != NULL) {
+                *want_write = 1;
+            }
+            break;
+        }
+        if (result > 0 &&
+            (ssl_error == SSL_ERROR_ZERO_RETURN ||
+             (ssl_error == SSL_ERROR_SYSCALL && n == 0))) {
+            break;
+        }
+        result = -1;
+        break;
+    }
+
+    int saved_errno = errno;
+    if (fcntl(fd, F_SETFL, flags) != 0) {
+        result = -1;
+    }
+    errno = saved_errno;
+    return result;
+}
+
+static int h2_wait_tls_input(tls13_conn_t *c, int want_write) {
+    fd_set rfds;
+    fd_set wfds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    if (want_write) {
+        FD_SET(c->fd, &wfds);
+    } else {
+        FD_SET(c->fd, &rfds);
+    }
+
+    int rc;
+    do {
+        rc = select(c->fd + 1, &rfds, &wfds, NULL, NULL);
+    } while (rc < 0 && errno == EINTR);
+    return rc > 0 ? 0 : -1;
+}
+
 static int h2_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -1661,11 +1742,15 @@ static int h2_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
         }
 
         if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
-            size_t got = 0;
-            if (ssl_read_some(c->ssl, buf + off, len - off, &got) != 0 || got == 0) {
+            int want_write = 0;
+            int collected = h2_collect_tls_available(c, &want_write);
+            if (collected < 0) {
                 return -1;
             }
-            off += got;
+            if (c->h2_net_cache.len == 0 &&
+                h2_wait_tls_input(c, want_write) != 0) {
+                return -1;
+            }
         } else if (c->mode == CONN_MODE_GRPC_PLAIN) {
             if (read_exact(c->fd, buf + off, len - off) != 0) {
                 return -1;
@@ -2110,20 +2195,32 @@ static int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     }
     size_t off = 0;
     while (off < len) {
-        int64_t *stream_refill_target =
-            stream_up ? &c->h2_upload_stream_refill_target : &c->h2_peer_stream_refill_target;
-        int64_t conn_low = c->h2_peer_conn_refill_target / 4;
-        int64_t stream_low = *stream_refill_target / 4;
-        if (c->h2_peer_conn_window <= conn_low || *stream_window <= stream_low) {
-            int64_t conn_high = c->h2_peer_conn_refill_target / 2;
-            int64_t stream_high = *stream_refill_target / 2;
-            while (c->h2_peer_conn_window < conn_high || *stream_window < stream_high) {
+        if (c->grpc_transport) {
+            if (tls13_drain_h2_input(c) < 0) {
+                return -1;
+            }
+            while (c->h2_peer_conn_window <= 0 || *stream_window <= 0) {
                 if (h2_pump_one_frame(c) != 0) {
-                    fprintf(stderr, "[xhttp] failed while waiting for h2 upload window\n");
+                    fprintf(stderr, "[grpc] failed while waiting for h2 upload window\n");
                     return -1;
                 }
-                conn_high = c->h2_peer_conn_refill_target / 2;
-                stream_high = *stream_refill_target / 2;
+            }
+        } else {
+            int64_t *stream_refill_target =
+                stream_up ? &c->h2_upload_stream_refill_target : &c->h2_peer_stream_refill_target;
+            int64_t conn_low = c->h2_peer_conn_refill_target / 4;
+            int64_t stream_low = *stream_refill_target / 4;
+            if (c->h2_peer_conn_window <= conn_low || *stream_window <= stream_low) {
+                int64_t conn_high = c->h2_peer_conn_refill_target / 2;
+                int64_t stream_high = *stream_refill_target / 2;
+                while (c->h2_peer_conn_window < conn_high || *stream_window < stream_high) {
+                    if (h2_pump_one_frame(c) != 0) {
+                        fprintf(stderr, "[xhttp] failed while waiting for h2 upload window\n");
+                        return -1;
+                    }
+                    conn_high = c->h2_peer_conn_refill_target / 2;
+                    stream_high = *stream_refill_target / 2;
+                }
             }
         }
         size_t chunk = len - off;
@@ -4851,7 +4948,7 @@ int tls13_has_pending_app(const tls13_conn_t *c) {
             return 1;
         }
     }
-    if (c->mode == CONN_MODE_XHTTP_TLS_H2 && (c->h2_net_cache.len > 0 || (c->ssl != NULL && SSL_pending(c->ssl) > 0))) {
+    if (c->mode == CONN_MODE_XHTTP_TLS_H2 && h2_cached_frame_ready(c)) {
         return 1;
     }
     if (c->mode == CONN_MODE_XHTTP_REALITY && c->h2_net_cache.len > 0) {
@@ -4866,13 +4963,20 @@ int tls13_has_pending_app(const tls13_conn_t *c) {
     return 0;
 }
 
-static int h2_input_ready(const tls13_conn_t *c) {
+static int h2_cached_frame_ready(const tls13_conn_t *c) {
     if (c->h2_net_cache.len >= 9) {
         size_t frame_len = ((size_t)c->h2_net_cache.data[0] << 16) | ((size_t)c->h2_net_cache.data[1] << 8) |
                            (size_t)c->h2_net_cache.data[2];
         if (frame_len <= H2_MAX_INBOUND_FRAME && c->h2_net_cache.len >= 9 + frame_len) {
             return 1;
         }
+    }
+    return 0;
+}
+
+static int h2_input_ready(const tls13_conn_t *c) {
+    if (h2_cached_frame_ready(c)) {
+        return 1;
     }
     if (c->ssl != NULL && SSL_pending(c->ssl) > 0) {
         return 1;
@@ -4895,14 +4999,33 @@ int tls13_drain_h2_input(tls13_conn_t *c) {
         return 0;
     }
 
+    if (c->mode == CONN_MODE_XHTTP_TLS_H2 &&
+        c->app_cache.len == 0 &&
+        !h2_cached_frame_ready(c)) {
+        if (h2_collect_tls_available(c, NULL) < 0) {
+            return -1;
+        }
+    }
+
+    int drain_limit = c->grpc_transport ? H2_GRPC_INPUT_DRAIN_LIMIT : H2_INPUT_DRAIN_LIMIT;
     int drained = 0;
-    while (drained < H2_INPUT_DRAIN_LIMIT && c->app_cache.len == 0 && h2_input_ready(c)) {
+    while (drained < drain_limit && c->app_cache.len == 0 &&
+           (c->mode == CONN_MODE_XHTTP_TLS_H2 ?
+                h2_cached_frame_ready(c) :
+                h2_input_ready(c))) {
         if (h2_pump_one_frame(c) != 0) {
             return -1;
         }
         drained++;
     }
     return drained;
+}
+
+int tls13_uses_h2(const tls13_conn_t *c) {
+    return c != NULL &&
+           (c->mode == CONN_MODE_XHTTP_TLS_H2 ||
+            c->mode == CONN_MODE_XHTTP_REALITY ||
+            c->mode == CONN_MODE_GRPC_PLAIN);
 }
 
 size_t tls13_write_batch_size(const tls13_conn_t *c) {

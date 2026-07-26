@@ -14,6 +14,7 @@ void tls13_reality_close(tls13_conn_t *c);
 int tls13_get_fd(const tls13_conn_t *c);
 int tls13_reality_is_raw_direct(const tls13_conn_t *c);
 int tls13_has_pending_app(const tls13_conn_t *c);
+int tls13_uses_h2(const tls13_conn_t *c);
 int tls13_drain_h2_input(tls13_conn_t *c);
 size_t tls13_write_batch_size(const tls13_conn_t *c);
 void tls13_mark_raw_direct(tls13_conn_t *c);

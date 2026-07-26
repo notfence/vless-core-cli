@@ -959,7 +959,7 @@ static void *client_worker(void *arg) {
             if (drained < 0) {
                 break;
             }
-            if (drained > 0) {
+            if (tls13_uses_h2(tls)) {
                 upstream_ready = tls13_has_pending_app(tls);
             }
         }
