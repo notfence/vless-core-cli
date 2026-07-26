@@ -391,7 +391,7 @@ static void parse_query(vless_config_t *cfg, char *query) {
         const char *key = tok;
         const char *val = eq + 1;
 
-        char decoded[1536];
+        char decoded[4096];
         if (percent_decode(val, decoded, sizeof(decoded)) != 0) {
             continue;
         }

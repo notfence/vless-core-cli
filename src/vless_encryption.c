@@ -21,6 +21,14 @@ struct vless_encryption_conn {
     size_t united_key_len;
     vless_aead_t outgoing;
     vless_aead_t incoming;
+    EVP_CIPHER_CTX *outgoing_header_ctr;
+    EVP_CIPHER_CTX *incoming_header_ctr;
+    uint8_t outgoing_raw_header[5];
+    size_t outgoing_raw_header_len;
+    size_t outgoing_raw_skip;
+    uint8_t incoming_raw_header[5];
+    size_t incoming_raw_header_len;
+    size_t incoming_raw_skip;
     uint8_t *input;
     size_t input_len;
     size_t input_off;
@@ -264,6 +272,55 @@ static int aes_ctr_xor(EVP_CIPHER_CTX *ctx, uint8_t *data, size_t len) {
                : -1;
 }
 
+static size_t raw_record_length(const uint8_t header[5]) {
+    size_t len = ((size_t)header[3] << 8) | header[4];
+    if (header[0] != 23 || header[1] != 3 || header[2] != 3 ||
+        len < 17 || len > 16640) {
+        return 0;
+    }
+    return len;
+}
+
+static int xor_raw_headers(EVP_CIPHER_CTX *ctr, uint8_t *data, size_t len,
+                           uint8_t header[5], size_t *header_len,
+                           size_t *skip, int incoming) {
+    size_t off = 0;
+    while (off < len) {
+        if (*skip > 0) {
+            size_t take = len - off;
+            if (take > *skip) {
+                take = *skip;
+            }
+            *skip -= take;
+            off += take;
+            continue;
+        }
+
+        size_t take = 5 - *header_len;
+        if (take > len - off) {
+            take = len - off;
+        }
+        if (incoming) {
+            if (aes_ctr_xor(ctr, data + off, take) != 0) {
+                return -1;
+            }
+            memcpy(header + *header_len, data + off, take);
+        } else {
+            memcpy(header + *header_len, data + off, take);
+            if (aes_ctr_xor(ctr, data + off, take) != 0) {
+                return -1;
+            }
+        }
+        *header_len += take;
+        off += take;
+        if (*header_len == 5) {
+            *skip = raw_record_length(header);
+            *header_len = 0;
+        }
+    }
+    return 0;
+}
+
 static int build_relays(const vless_config_t *cfg, const uint8_t iv[16],
                         uint8_t *out, uint8_t nfs_key[32]) {
     EVP_CIPHER_CTX *previous_ctr = NULL;
@@ -342,11 +399,6 @@ int vless_encryption_connect(const vless_config_t *cfg, tls13_conn_t *transport,
         set_err(err, err_cap, "VLESS encryption is not configured");
         return -1;
     }
-    if (cfg->encryption_xor_mode == 2) {
-        set_err(err, err_cap, "VLESS encryption random mode is not supported");
-        return -1;
-    }
-
     size_t relays_len = 0;
     for (size_t i = 0; i < cfg->encryption_relay_count; i++) {
         relays_len += cfg->encryption_relays[i].key_len == 32 ? 32 : 1088;
@@ -368,6 +420,8 @@ int vless_encryption_connect(const vless_config_t *cfg, tls13_conn_t *transport,
         set_err(err, err_cap, "failed to allocate VLESS encryption hello");
         return -1;
     }
+    uint8_t client_iv[16];
+    memcpy(client_iv, hello, sizeof(client_iv));
 
     uint8_t nfs_key[32];
     if (build_relays(cfg, hello, hello + 16, nfs_key) != 0) {
@@ -524,6 +578,16 @@ int vless_encryption_connect(const vless_config_t *cfg, tls13_conn_t *transport,
     free(peer_padding);
     free(decoded_padding);
 
+    if (cfg->encryption_xor_mode == 2 &&
+        (aes_ctr_init(&conn->outgoing_header_ctr, conn->united_key,
+                      conn->united_key_len, client_iv) != 0 ||
+         aes_ctr_init(&conn->incoming_header_ctr, conn->united_key,
+                      conn->united_key_len, ticket) != 0)) {
+        vless_encryption_close(conn);
+        set_err(err, err_cap, "failed to initialize VLESS random mode");
+        goto cleanup_keys;
+    }
+
     EVP_PKEY_free(mlkem_key);
     EVP_PKEY_free(x25519_key);
     *out = conn;
@@ -543,6 +607,8 @@ void vless_encryption_close(vless_encryption_conn_t *conn) {
         return;
     }
     free(conn->input);
+    EVP_CIPHER_CTX_free(conn->outgoing_header_ctr);
+    EVP_CIPHER_CTX_free(conn->incoming_header_ctr);
     OPENSSL_cleanse(conn->united_key, sizeof(conn->united_key));
     OPENSSL_cleanse(&conn->outgoing, sizeof(conn->outgoing));
     OPENSSL_cleanse(&conn->incoming, sizeof(conn->incoming));
@@ -571,9 +637,13 @@ int vless_encryption_write(vless_encryption_conn_t *conn,
         size_t written = 0;
         int ok = aead_seal(&conn->outgoing, NULL, buf + off, chunk,
                            record, 5, record + 5, &written) == 0 &&
-                 written == encrypted_len &&
-                 tls13_write_app(conn->transport, record,
-                                 record_len) == 0;
+                 written == encrypted_len;
+        if (ok && conn->outgoing_header_ctr != NULL) {
+            ok = aes_ctr_xor(conn->outgoing_header_ctr, record, 5) == 0;
+        }
+        if (ok) {
+            ok = tls13_write_app(conn->transport, record, record_len) == 0;
+        }
         free(record);
         if (!ok) {
             return -1;
@@ -583,10 +653,40 @@ int vless_encryption_write(vless_encryption_conn_t *conn,
     return 0;
 }
 
+int vless_encryption_write_raw(vless_encryption_conn_t *conn,
+                               const uint8_t *buf, size_t len) {
+    if (len == 0) {
+        return 0;
+    }
+    if (conn->outgoing_header_ctr == NULL) {
+        return tls13_write_app(conn->transport, buf, len);
+    }
+    uint8_t *encoded = (uint8_t *)malloc(len);
+    if (encoded == NULL) {
+        return -1;
+    }
+    memcpy(encoded, buf, len);
+    int rc = xor_raw_headers(
+        conn->outgoing_header_ctr, encoded, len,
+        conn->outgoing_raw_header, &conn->outgoing_raw_header_len,
+        &conn->outgoing_raw_skip, 0);
+    if (rc == 0) {
+        rc = tls13_write_app(conn->transport, encoded, len);
+    }
+    free(encoded);
+    return rc;
+}
+
 static int read_record(vless_encryption_conn_t *conn) {
     uint8_t header[5];
-    if (transport_read_exact(conn->transport, header, sizeof(header)) != 0 ||
-        header[0] != 23 || header[1] != 3 || header[2] != 3) {
+    if (transport_read_exact(conn->transport, header, sizeof(header)) != 0) {
+        return -1;
+    }
+    if (conn->incoming_header_ctr != NULL &&
+        aes_ctr_xor(conn->incoming_header_ctr, header, sizeof(header)) != 0) {
+        return -1;
+    }
+    if (header[0] != 23 || header[1] != 3 || header[2] != 3) {
         return -1;
     }
     size_t encrypted_len = ((size_t)header[3] << 8) | header[4];
@@ -632,6 +732,19 @@ int vless_encryption_read(vless_encryption_conn_t *conn,
     conn->input_off += take;
     *out_len = take;
     return 0;
+}
+
+int vless_encryption_read_raw(vless_encryption_conn_t *conn,
+                              uint8_t *buf, size_t cap, size_t *out_len) {
+    int rc = tls13_read_app(conn->transport, buf, cap, out_len);
+    if (rc == 0 && *out_len > 0 && conn->incoming_header_ctr != NULL &&
+        xor_raw_headers(conn->incoming_header_ctr, buf, *out_len,
+                        conn->incoming_raw_header,
+                        &conn->incoming_raw_header_len,
+                        &conn->incoming_raw_skip, 1) != 0) {
+        return -1;
+    }
+    return rc;
 }
 
 int vless_encryption_read_exact(vless_encryption_conn_t *conn,

@@ -47,7 +47,7 @@ typedef struct {
 
     char sni[256];
     char flow[64];
-    char encryption[1536];
+    char encryption[4096];
     char security[32];
     char alpn[128];
     int allow_insecure;

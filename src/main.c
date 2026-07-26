@@ -924,13 +924,16 @@ static void *client_worker(void *arg) {
                     break;
                 }
 
-                if (wrapped_len > 0 &&
-                    upstream_write(tls,
-                                   upstream_encryption_direct ? NULL : encryption,
-                                   wrapped,
-                                   wrapped_len) != 0) {
-                    free(wrapped);
-                    break;
+                if (wrapped_len > 0) {
+                    int write_rc = upstream_encryption_direct
+                                       ? vless_encryption_write_raw(
+                                             encryption, wrapped, wrapped_len)
+                                       : upstream_write(tls, encryption,
+                                                        wrapped, wrapped_len);
+                    if (write_rc != 0) {
+                        free(wrapped);
+                        break;
+                    }
                 }
                 free(wrapped);
                 if (wrapped_len > 0) {
@@ -944,9 +947,7 @@ static void *client_worker(void *arg) {
                     }
                 }
             } else {
-                if (upstream_write(tls,
-                                   upstream_encryption_direct ? NULL : encryption,
-                                   cbuf, (size_t)n) != 0) {
+                if (upstream_write(tls, encryption, cbuf, (size_t)n) != 0) {
                     break;
                 }
                 forwarded_client_payload = 1;
@@ -987,10 +988,11 @@ static void *client_worker(void *arg) {
             }
 
             size_t got = 0;
-            int read_rc =
-                upstream_read(tls,
-                              downstream_encryption_direct ? NULL : encryption,
-                              tbuf, sizeof(tbuf), &got);
+            int read_rc = downstream_encryption_direct
+                              ? vless_encryption_read_raw(
+                                    encryption, tbuf, sizeof(tbuf), &got)
+                              : upstream_read(tls, encryption, tbuf,
+                                              sizeof(tbuf), &got);
             if (read_rc < 0 || (read_rc == 0 && got == 0)) {
                 break;
             }
