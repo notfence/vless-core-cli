@@ -12,7 +12,7 @@ Standalone C CLI client for:
 - `VLESS + gRPC + TLS`
 - `VLESS + gRPC` (no security)
 - `VLESS + WebSocket + TLS`
-- `VLESS + WebSocket`
+- `VLESS + WebSocket` (no security)
 - `SOCKS5`
 
 `fp=chrome/firefox/edge/random/randomized/qq`
