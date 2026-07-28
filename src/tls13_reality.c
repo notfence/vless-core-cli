@@ -57,11 +57,28 @@ typedef enum {
     XHTTP_TLS_MODE_TOFU = 3
 } xhttp_tls_mode_t;
 
+typedef enum {
+    TLS_CIPHER_OFFER_CHACHA = 0,
+    TLS_CIPHER_OFFER_AES = 1
+} tls_cipher_offer_t;
+
 #define CORE_CONNECT_TIMEOUT_MS 12000
 #define CORE_TLS_HANDSHAKE_TIMEOUT_MS 12000
 #define CORE_OPENSSL_GROUPS "X25519:P-256:P-384"
+#define TLS_AES_FALLBACK_CACHE_SIZE 16
 
 static int g_xhttp_auto_force_insecure = 0;
+
+typedef struct {
+    char host[256];
+    uint16_t port;
+    char sni[256];
+} tls_aes_fallback_entry_t;
+
+static tls_aes_fallback_entry_t g_tls_aes_fallback_cache[TLS_AES_FALLBACK_CACHE_SIZE];
+static size_t g_tls_aes_fallback_count = 0;
+static pthread_mutex_t g_tls_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_tls_cipher_logged = 0;
 
 struct tls13_conn {
     int fd;
@@ -129,6 +146,7 @@ struct tls13_conn {
     int xhttp_tls_insecure;
     char xhttp_pin_key[320];
     char tls_verify_mode[16];
+    int tls_use_aes_fallback;
     char ws_path[512];
     char ws_host[320];
     char grpc_service_name[256];
@@ -170,6 +188,49 @@ static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
         snprintf(err, cap, "%s", msg);
     }
+}
+
+static int tls_aes_fallback_entry_matches(const tls_aes_fallback_entry_t *entry, const char *host, uint16_t port, const char *sni) {
+    return entry->port == port && strcmp(entry->host, host) == 0 && strcmp(entry->sni, sni != NULL ? sni : "") == 0;
+}
+
+static int tls_aes_fallback_cached(const char *host, uint16_t port, const char *sni) {
+    int found = 0;
+    pthread_mutex_lock(&g_tls_state_lock);
+    for (size_t i = 0; i < g_tls_aes_fallback_count; i++) {
+        if (tls_aes_fallback_entry_matches(&g_tls_aes_fallback_cache[i], host, port, sni)) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_tls_state_lock);
+    return found;
+}
+
+static void cache_tls_aes_fallback(const char *host, uint16_t port, const char *sni) {
+    pthread_mutex_lock(&g_tls_state_lock);
+    for (size_t i = 0; i < g_tls_aes_fallback_count; i++) {
+        if (tls_aes_fallback_entry_matches(&g_tls_aes_fallback_cache[i], host, port, sni)) {
+            pthread_mutex_unlock(&g_tls_state_lock);
+            return;
+        }
+    }
+    if (g_tls_aes_fallback_count < TLS_AES_FALLBACK_CACHE_SIZE) {
+        tls_aes_fallback_entry_t *entry = &g_tls_aes_fallback_cache[g_tls_aes_fallback_count++];
+        snprintf(entry->host, sizeof(entry->host), "%s", host);
+        entry->port = port;
+        snprintf(entry->sni, sizeof(entry->sni), "%s", sni != NULL ? sni : "");
+    }
+    pthread_mutex_unlock(&g_tls_state_lock);
+}
+
+static void log_tls_cipher_once(const char *cipher) {
+    pthread_mutex_lock(&g_tls_state_lock);
+    if (!g_tls_cipher_logged) {
+        fprintf(stderr, "[tls] selected cipher=%s\n", cipher != NULL ? cipher : "unknown");
+        g_tls_cipher_logged = 1;
+    }
+    pthread_mutex_unlock(&g_tls_state_lock);
 }
 
 static int db_reserve(dynbuf_t *b, size_t n) {
@@ -273,21 +334,6 @@ static int tcp_connect_host(const char *host, uint16_t port) {
 
     freeaddrinfo(res);
     return fd;
-}
-
-static int tcp_connect_addrinfo(const struct addrinfo *it) {
-    int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-    if (fd < 0) {
-        return -1;
-    }
-    core_tune_tcp_socket(fd);
-
-    if (core_connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen, CORE_CONNECT_TIMEOUT_MS) == 0) {
-        return fd;
-    }
-
-    close(fd);
-    return -1;
 }
 
 static int ssl_write_all(SSL *ssl, const void *buf, size_t len) {
@@ -764,11 +810,13 @@ static int ssl_selected_alpn_is_h2(SSL *ssl) {
     return selected != NULL && selected_len == 2 && memcmp(selected, "h2", 2) == 0;
 }
 
-static int open_tls_socket(const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer, const unsigned char *alpn_protos,
-                           unsigned int alpn_protos_len, SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd, char *err, size_t err_cap) {
+static int open_tls_socket_once(const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
+                                const unsigned char *alpn_protos, unsigned int alpn_protos_len, tls_cipher_offer_t cipher_offer,
+                                SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd, int *retry_with_aes, char *err, size_t err_cap) {
     *out_ctx = NULL;
     *out_ssl = NULL;
     *out_fd = -1;
+    *retry_with_aes = 0;
 
     int fd = tcp_connect_host(connect_host, connect_port);
     if (fd < 0) {
@@ -786,6 +834,16 @@ static int open_tls_socket(const char *connect_host, uint16_t connect_port, cons
         SSL_CTX_free(ctx);
         close(fd);
         set_err(err, err_cap, "failed to set TLS groups");
+        return -1;
+    }
+    const char *cipher_suites = cipher_offer == TLS_CIPHER_OFFER_CHACHA
+                                    ? "TLS_CHACHA20_POLY1305_SHA256"
+                                    : "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384";
+    if (SSL_CTX_set_ciphersuites(ctx, cipher_suites) != 1 ||
+        (cipher_offer == TLS_CIPHER_OFFER_CHACHA && SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1)) {
+        SSL_CTX_free(ctx);
+        close(fd);
+        set_err(err, err_cap, "failed to set TLS cipher suites");
         return -1;
     }
 
@@ -861,6 +919,7 @@ static int open_tls_socket(const char *connect_host, uint16_t connect_port, cons
     core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
     if (SSL_connect(ssl) != 1) {
         unsigned long e = ERR_get_error();
+        *retry_with_aes = SSL_get_current_cipher(ssl) == NULL;
         long verify_rc = X509_V_OK;
         if (verify_peer) {
             verify_rc = SSL_get_verify_result(ssl);
@@ -906,6 +965,34 @@ static int open_tls_socket(const char *connect_host, uint16_t connect_port, cons
     *out_ctx = ctx;
     *out_ssl = ssl;
     *out_fd = fd;
+    return 0;
+}
+
+static int open_tls_socket(const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
+                           const unsigned char *alpn_protos, unsigned int alpn_protos_len, SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd,
+                           int *use_aes_fallback, char *err, size_t err_cap) {
+    if (!*use_aes_fallback && tls_aes_fallback_cached(connect_host, connect_port, sni)) {
+        *use_aes_fallback = 1;
+    }
+    tls_cipher_offer_t offer = *use_aes_fallback ? TLS_CIPHER_OFFER_AES : TLS_CIPHER_OFFER_CHACHA;
+    int retry_with_aes = 0;
+    if (open_tls_socket_once(connect_host, connect_port, sni, verify_peer, alpn_protos, alpn_protos_len, offer, out_ctx, out_ssl, out_fd,
+                             &retry_with_aes, err, err_cap) != 0) {
+        if (offer != TLS_CIPHER_OFFER_CHACHA || !retry_with_aes) {
+            return -1;
+        }
+        *use_aes_fallback = 1;
+        if (open_tls_socket_once(connect_host, connect_port, sni, verify_peer, alpn_protos, alpn_protos_len, TLS_CIPHER_OFFER_AES, out_ctx,
+                                 out_ssl, out_fd, &retry_with_aes, err, err_cap) != 0) {
+            return -1;
+        }
+        offer = TLS_CIPHER_OFFER_AES;
+    }
+    if (offer == TLS_CIPHER_OFFER_AES) {
+        cache_tls_aes_fallback(connect_host, connect_port, sni);
+    }
+
+    log_tls_cipher_once(SSL_get_cipher_name(*out_ssl));
     return 0;
 }
 
@@ -3196,7 +3283,8 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, ch
             set_err(err, err_cap, "failed to build TOFU pin key");
             return -1;
         }
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd, err, err_cap) != 0) {
+        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd, &c->tls_use_aes_fallback, err,
+                            err_cap) != 0) {
             return -1;
         }
         if (xhttp_tofu_verify_or_store(ssl, c->xhttp_pin_key, 0, err, err_cap) != 0) {
@@ -3210,7 +3298,8 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, ch
     } else {
         int need_auto_pin_check = 0;
         int verify_peer = c->xhttp_tls_insecure ? 0 : xhttp_effective_verify_peer();
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &ctx, &ssl, &fd, err, err_cap) != 0) {
+        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &ctx, &ssl, &fd,
+                            &c->tls_use_aes_fallback, err, err_cap) != 0) {
             if (!(verify_peer == 1 && xhttp_auto_fallback_allowed() && is_cert_verify_error_msg(err))) {
                 return -1;
             }
@@ -3218,7 +3307,8 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, ch
                 fprintf(stderr, "[xhttp] tls_mode=auto(selected=insecure+tofu): %s\n", err);
             }
             g_xhttp_auto_force_insecure = 1;
-            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd, err, err_cap) != 0) {
+            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd,
+                                &c->tls_use_aes_fallback, err, err_cap) != 0) {
                 return -1;
             }
             c->xhttp_tls_insecure = 1;
@@ -3940,8 +4030,9 @@ static int shuffle_indices(size_t *idx, size_t n) {
     return 0;
 }
 
-static int build_client_hello(const vless_config_t *cfg, int use_reality, uint8_t client_priv[32], uint8_t client_pub[32],
-                              uint8_t client_random[32], uint8_t auth_key[32], uint8_t **out, size_t *out_len, size_t *sid_pos) {
+static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_offer_t cipher_offer, uint8_t client_priv[32],
+                              uint8_t client_pub[32], uint8_t client_random[32], uint8_t auth_key[32], uint8_t **out, size_t *out_len,
+                              size_t *sid_pos) {
     dynbuf_t hs = {0};
 
     if (x25519_generate(client_priv, client_pub) != 0) {
@@ -3992,22 +4083,17 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, uint8_
     uint8_t suites[64];
     size_t soff = 0;
     if (cfg->fp_mode == FP_QQ || cfg->fp_mode == FP_CHROME || cfg->fp_mode == FP_EDGE) {
-        uint16_t chrome_like_suites[] = {boring_grease_cipher, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030,
-                                         0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
-        for (size_t i = 0; i < sizeof(chrome_like_suites) / sizeof(chrome_like_suites[0]); i++) {
-            suites[soff++] = (uint8_t)(chrome_like_suites[i] >> 8);
-            suites[soff++] = (uint8_t)(chrome_like_suites[i] & 0xFF);
-        }
-    } else if (cfg->fp_mode == FP_FIREFOX) {
-        uint16_t firefox_suites[] = {0x1303, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030,
-                                     0xc00a, 0xc009, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035};
-        for (size_t i = 0; i < sizeof(firefox_suites) / sizeof(firefox_suites[0]); i++) {
-            suites[soff++] = (uint8_t)(firefox_suites[i] >> 8);
-            suites[soff++] = (uint8_t)(firefox_suites[i] & 0xFF);
-        }
-    } else {
+        suites[soff++] = (uint8_t)(boring_grease_cipher >> 8);
+        suites[soff++] = (uint8_t)(boring_grease_cipher & 0xFF);
+    }
+    if (cipher_offer == TLS_CIPHER_OFFER_CHACHA) {
         suites[soff++] = 0x13;
         suites[soff++] = 0x03;
+    } else {
+        suites[soff++] = 0x13;
+        suites[soff++] = 0x01;
+        suites[soff++] = 0x13;
+        suites[soff++] = 0x02;
     }
 
     uint8_t slen[2] = {(uint8_t)(soff >> 8), (uint8_t)(soff & 0xFF)};
@@ -5065,7 +5151,7 @@ static int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len
     return db_append(&c->transcript, msg, msg_len);
 }
 
-static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, char *err, size_t err_cap) {
     int use_reality = (strcmp(cfg->security, "reality") == 0);
     snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "%s", use_reality ? "reality" : (cfg->allow_insecure ? "insecure" : "strict"));
 
@@ -5076,7 +5162,8 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
     size_t ch_len = 0;
     size_t sid_pos = 0;
 
-    if (build_client_hello(cfg, use_reality, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos) != 0) {
+    if (build_client_hello(cfg, use_reality, cipher_offer, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos) !=
+        0) {
         set_err(err, err_cap, "failed to build ClientHello");
         return -1;
     }
@@ -5353,62 +5440,103 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, char *e
     return 0;
 }
 
+static const char *tls_cipher_suite_name(uint16_t suite) {
+    if (suite == 0x1301) {
+        return "TLS_AES_128_GCM_SHA256";
+    }
+    if (suite == 0x1302) {
+        return "TLS_AES_256_GCM_SHA384";
+    }
+    if (suite == 0x1303) {
+        return "TLS_CHACHA20_POLY1305_SHA256";
+    }
+    return "unknown";
+}
+
+static void reset_manual_tls_handshake(tls13_conn_t *c) {
+    c->tls_cipher_suite = 0;
+    c->tls_md = NULL;
+    c->tls_hash_len = 0;
+    c->tls_key_len = 0;
+    memset(c->auth_key, 0, sizeof(c->auth_key));
+    memset(c->hs_secret, 0, sizeof(c->hs_secret));
+    memset(c->c_hs_traffic, 0, sizeof(c->c_hs_traffic));
+    memset(c->s_hs_traffic, 0, sizeof(c->s_hs_traffic));
+    memset(c->c_app_traffic, 0, sizeof(c->c_app_traffic));
+    memset(c->s_app_traffic, 0, sizeof(c->s_app_traffic));
+    memset(c->c_hs_key, 0, sizeof(c->c_hs_key));
+    memset(c->c_hs_iv, 0, sizeof(c->c_hs_iv));
+    memset(c->s_hs_key, 0, sizeof(c->s_hs_key));
+    memset(c->s_hs_iv, 0, sizeof(c->s_hs_iv));
+    memset(c->c_app_key, 0, sizeof(c->c_app_key));
+    memset(c->c_app_iv, 0, sizeof(c->c_app_iv));
+    memset(c->s_app_key, 0, sizeof(c->s_app_key));
+    memset(c->s_app_iv, 0, sizeof(c->s_app_iv));
+    c->c_hs_seq = 0;
+    c->s_hs_seq = 0;
+    c->c_app_seq = 0;
+    c->s_app_seq = 0;
+    c->c_app_record_bytes = 0;
+    c->reality_raw_direct = 0;
+    db_free(&c->transcript);
+    memset(&c->transcript, 0, sizeof(c->transcript));
+}
+
+static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    const char *sni = cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host;
+    if (!c->tls_use_aes_fallback && tls_aes_fallback_cached(cfg->server_host, cfg->server_port, sni)) {
+        c->tls_use_aes_fallback = 1;
+    }
+    tls_cipher_offer_t offer = c->tls_use_aes_fallback ? TLS_CIPHER_OFFER_AES : TLS_CIPHER_OFFER_CHACHA;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        reset_manual_tls_handshake(c);
+        c->fd = tcp_connect_host(cfg->server_host, cfg->server_port);
+        if (c->fd < 0) {
+            set_err(err, err_cap, "tcp connect failed");
+            return -1;
+        }
+
+        core_set_socket_io_timeout(c->fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
+        char attempt_err[256] = {0};
+        if (run_tls_handshake(cfg, c, offer, attempt_err, sizeof(attempt_err)) == 0) {
+            core_set_socket_io_timeout(c->fd, 0);
+            if (offer == TLS_CIPHER_OFFER_AES) {
+                cache_tls_aes_fallback(cfg->server_host, cfg->server_port, sni);
+            }
+            log_tls_cipher_once(tls_cipher_suite_name(c->tls_cipher_suite));
+            return 0;
+        }
+
+        int cipher_selected = c->tls_cipher_suite != 0;
+        close(c->fd);
+        c->fd = -1;
+
+        if (offer == TLS_CIPHER_OFFER_CHACHA && !cipher_selected) {
+            c->tls_use_aes_fallback = 1;
+            offer = TLS_CIPHER_OFFER_AES;
+            continue;
+        }
+
+        fprintf(stderr, "[tls] handshake failed cipher=%s: %s\n",
+                cipher_selected ? tls_cipher_suite_name(c->tls_cipher_suite)
+                                : (offer == TLS_CIPHER_OFFER_CHACHA ? "TLS_CHACHA20_POLY1305_SHA256" : "AES-GCM"),
+                attempt_err[0] != '\0' ? attempt_err : "unknown error");
+        set_err(err, err_cap, attempt_err[0] != '\0' ? attempt_err : "TLS handshake failed");
+        return -1;
+    }
+
+    set_err(err, err_cap, "TLS cipher negotiation failed");
+    return -1;
+}
+
 static int tcp_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
     c->mode = CONN_MODE_TLS;
     snprintf(c->remote_host, sizeof(c->remote_host), "%s", cfg->server_host);
     c->remote_port = cfg->server_port;
     snprintf(c->remote_sni, sizeof(c->remote_sni), "%s", cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host);
 
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned int)cfg->server_port);
-
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(cfg->server_host, port_str, &hints, &res) != 0) {
-        set_err(err, err_cap, "tcp resolve failed");
-        return -1;
-    }
-
-    char last_err[256] = {0};
-    int connected = 0;
-    for (struct addrinfo *it = res; it != NULL; it = it->ai_next) {
-        int fd = tcp_connect_addrinfo(it);
-        if (fd < 0) {
-            continue;
-        }
-
-        c->fd = fd;
-        c->reality_raw_direct = 0;
-        db_free(&c->transcript);
-        memset(&c->transcript, 0, sizeof(c->transcript));
-        core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
-
-        char attempt_err[256] = {0};
-        if (run_tls_handshake(cfg, c, attempt_err, sizeof(attempt_err)) == 0) {
-            core_set_socket_io_timeout(fd, 0);
-            connected = 1;
-            break;
-        }
-
-        if (attempt_err[0] != '\0') {
-            snprintf(last_err, sizeof(last_err), "%s", attempt_err);
-        }
-        fprintf(stderr, "[tls] handshake attempt failed: %s\n", attempt_err[0] != '\0' ? attempt_err : "unknown error");
-        close(fd);
-        c->fd = -1;
-    }
-    freeaddrinfo(res);
-
-    if (!connected) {
-        if (last_err[0] != '\0') {
-            set_err(err, err_cap, last_err);
-        } else {
-            set_err(err, err_cap, "tcp connect failed");
-        }
+    if (connect_manual_tls(cfg, c, err, err_cap) != 0) {
         return -1;
     }
 
@@ -5437,7 +5565,7 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
         static const unsigned char h1_alpn[] = {0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'};
         verify_peer = cfg->allow_insecure ? 0 : 1;
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, h1_alpn, sizeof(h1_alpn), &c->ssl_ctx, &c->ssl,
-                            &c->fd, err, err_cap) != 0) {
+                            &c->fd, &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
         }
     } else {
@@ -5597,19 +5725,9 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
 
     if (strcmp(cfg->security, "reality") == 0) {
         c->mode = CONN_MODE_XHTTP_REALITY;
-
-        int fd = tcp_connect_host(cfg->server_host, cfg->server_port);
-        if (fd < 0) {
-            set_err(err, err_cap, "tcp connect failed");
+        if (connect_manual_tls(cfg, c, err, err_cap) != 0) {
             return -1;
         }
-        c->fd = fd;
-
-        core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
-        if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
-            return -1;
-        }
-        core_set_socket_io_timeout(fd, 0);
 
         fprintf(stderr, "[xhttp] reality mode=%s http=2\n", c->xhttp_transport_mode);
         if (xhttp_h2_start_mode(c, err, err_cap) != 0) {
@@ -5636,8 +5754,8 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
     xhttp_tls_mode_t mode = get_xhttp_tls_mode();
     if (mode == XHTTP_TLS_MODE_TOFU) {
         xhttp_log_tls_mode_selected(mode, 0);
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd, err,
-                            err_cap) != 0) {
+        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
+                            &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
         }
         if (xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
@@ -5648,7 +5766,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         int verify_peer = xhttp_effective_verify_peer();
         xhttp_log_tls_mode_selected(mode, verify_peer);
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl,
-                            &c->fd, err, err_cap) != 0) {
+                            &c->fd, &c->tls_use_aes_fallback, err, err_cap) != 0) {
             if (!(verify_peer == 1 && xhttp_auto_fallback_allowed() && is_cert_verify_error_msg(err))) {
                 return -1;
             }
@@ -5657,7 +5775,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
             }
             g_xhttp_auto_force_insecure = 1;
             if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
-                                err, err_cap) != 0) {
+                                &c->tls_use_aes_fallback, err, err_cap) != 0) {
                 return -1;
             }
             if (mode == XHTTP_TLS_MODE_AUTO && xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
@@ -5709,8 +5827,8 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
     }
     if (mode == XHTTP_TLS_MODE_TOFU) {
         fprintf(stderr, "[grpc] tls_mode=tofu\n");
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd, err,
-                            err_cap) != 0 ||
+        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
+                            &c->tls_use_aes_fallback, err, err_cap) != 0 ||
             xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
             return -1;
         }
@@ -5718,14 +5836,14 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
     } else {
         int verify_peer = mode == XHTTP_TLS_MODE_INSECURE ? 0 : xhttp_effective_verify_peer();
         fprintf(stderr, "[grpc] tls_mode=%s\n", xhttp_tls_mode_name(mode));
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd, err,
-                            err_cap) != 0) {
+        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
+                            &c->tls_use_aes_fallback, err, err_cap) != 0) {
             if (!(verify_peer == 1 && mode == XHTTP_TLS_MODE_AUTO && is_cert_verify_error_msg(err))) {
                 return -1;
             }
             fprintf(stderr, "[grpc] tls_mode=auto(selected=insecure+tofu): %s\n", err);
-            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd, err,
-                                err_cap) != 0 ||
+            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
+                                &c->tls_use_aes_fallback, err, err_cap) != 0 ||
                 xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
                 return -1;
             }
@@ -5770,16 +5888,9 @@ static int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, s
         }
     } else if (strcmp(cfg->security, "reality") == 0) {
         c->mode = CONN_MODE_XHTTP_REALITY;
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port);
-        if (c->fd < 0) {
-            set_err(err, err_cap, "tcp connect failed");
+        if (connect_manual_tls(cfg, c, err, err_cap) != 0) {
             return -1;
         }
-        core_set_socket_io_timeout(c->fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
-        if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
-            return -1;
-        }
-        core_set_socket_io_timeout(c->fd, 0);
     } else if (grpc_tls_connect(cfg, c, err, err_cap) != 0) {
         return -1;
     }
@@ -5852,20 +5963,10 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
         return 0;
     }
 
-    int fd = tcp_connect_host(cfg->server_host, cfg->server_port);
-    if (fd < 0) {
-        tls13_reality_close(c);
-        set_err(err, err_cap, "tcp connect failed");
-        return -1;
-    }
-    c->fd = fd;
-
-    core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
-    if (run_tls_handshake(cfg, c, err, err_cap) != 0) {
+    if (connect_manual_tls(cfg, c, err, err_cap) != 0) {
         tls13_reality_close(c);
         return -1;
     }
-    core_set_socket_io_timeout(fd, 0);
 
     *out = c;
     return 0;

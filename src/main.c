@@ -22,7 +22,7 @@
 #include "vless.h"
 #include "vless_encryption.h"
 
-#define VLESS_CORE_VERSION "1.0.8"
+#define VLESS_CORE_VERSION "1.0.9"
 #ifndef VLESS_OPENSSL_PATCH_STATUS
 #define VLESS_OPENSSL_PATCH_STATUS "unpatched"
 #endif
