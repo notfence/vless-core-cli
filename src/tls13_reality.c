@@ -66,6 +66,7 @@ typedef enum {
 #define CORE_TLS_HANDSHAKE_TIMEOUT_MS 12000
 #define CORE_OPENSSL_GROUPS "X25519:P-256:P-384"
 #define TLS_AES_FALLBACK_CACHE_SIZE 16
+#define TLS_ENDPOINT_CACHE_SIZE 16
 
 static int g_xhttp_auto_force_insecure = 0;
 
@@ -75,8 +76,22 @@ typedef struct {
     char sni[256];
 } tls_aes_fallback_entry_t;
 
+typedef struct {
+    int valid;
+    char host[256];
+    uint16_t port;
+    char sni[256];
+    uint8_t pbk[32];
+    uint8_t short_id[16];
+    size_t short_id_len;
+    struct sockaddr_storage address;
+    socklen_t address_len;
+} tls_endpoint_entry_t;
+
 static tls_aes_fallback_entry_t g_tls_aes_fallback_cache[TLS_AES_FALLBACK_CACHE_SIZE];
 static size_t g_tls_aes_fallback_count = 0;
+static tls_endpoint_entry_t g_tls_endpoint_cache[TLS_ENDPOINT_CACHE_SIZE];
+static size_t g_tls_endpoint_replace_index = 0;
 static pthread_mutex_t g_tls_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_tls_cipher_logged = 0;
 
@@ -233,6 +248,96 @@ static void log_tls_cipher_once(const char *cipher) {
     pthread_mutex_unlock(&g_tls_state_lock);
 }
 
+static int tls_endpoint_entry_matches(const tls_endpoint_entry_t *entry, const vless_config_t *cfg, const char *sni) {
+    return entry->valid && entry->port == cfg->server_port && entry->short_id_len == cfg->short_id_len &&
+           strcmp(entry->host, cfg->server_host) == 0 && strcmp(entry->sni, sni) == 0 &&
+           memcmp(entry->pbk, cfg->pbk, sizeof(entry->pbk)) == 0 &&
+           memcmp(entry->short_id, cfg->short_id, cfg->short_id_len) == 0;
+}
+
+static int sockaddr_equal(const struct sockaddr *a, socklen_t a_len, const struct sockaddr *b, socklen_t b_len) {
+    if (a == NULL || b == NULL || a->sa_family != b->sa_family) {
+        return 0;
+    }
+    if (a->sa_family == AF_INET && a_len >= (socklen_t)sizeof(struct sockaddr_in) &&
+        b_len >= (socklen_t)sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
+        const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
+        return a4->sin_port == b4->sin_port && a4->sin_addr.s_addr == b4->sin_addr.s_addr;
+    }
+    if (a->sa_family == AF_INET6 && a_len >= (socklen_t)sizeof(struct sockaddr_in6) &&
+        b_len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
+        const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
+        return a6->sin6_port == b6->sin6_port && a6->sin6_scope_id == b6->sin6_scope_id &&
+               memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr)) == 0;
+    }
+    return 0;
+}
+
+static int get_cached_tls_endpoint(const vless_config_t *cfg, const char *sni, struct sockaddr_storage *address,
+                                   socklen_t *address_len) {
+    int found = 0;
+    pthread_mutex_lock(&g_tls_state_lock);
+    for (size_t i = 0; i < TLS_ENDPOINT_CACHE_SIZE; i++) {
+        if (tls_endpoint_entry_matches(&g_tls_endpoint_cache[i], cfg, sni)) {
+            *address = g_tls_endpoint_cache[i].address;
+            *address_len = g_tls_endpoint_cache[i].address_len;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_tls_state_lock);
+    return found;
+}
+
+static void cache_tls_endpoint(const vless_config_t *cfg, const char *sni, const struct sockaddr *address, socklen_t address_len) {
+    if (address == NULL || address_len > (socklen_t)sizeof(struct sockaddr_storage)) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_tls_state_lock);
+    tls_endpoint_entry_t *entry = NULL;
+    for (size_t i = 0; i < TLS_ENDPOINT_CACHE_SIZE; i++) {
+        if (tls_endpoint_entry_matches(&g_tls_endpoint_cache[i], cfg, sni)) {
+            entry = &g_tls_endpoint_cache[i];
+            break;
+        }
+        if (entry == NULL && !g_tls_endpoint_cache[i].valid) {
+            entry = &g_tls_endpoint_cache[i];
+        }
+    }
+    if (entry == NULL) {
+        entry = &g_tls_endpoint_cache[g_tls_endpoint_replace_index++ % TLS_ENDPOINT_CACHE_SIZE];
+    }
+
+    memset(entry, 0, sizeof(*entry));
+    entry->valid = 1;
+    snprintf(entry->host, sizeof(entry->host), "%s", cfg->server_host);
+    entry->port = cfg->server_port;
+    snprintf(entry->sni, sizeof(entry->sni), "%s", sni);
+    memcpy(entry->pbk, cfg->pbk, sizeof(entry->pbk));
+    memcpy(entry->short_id, cfg->short_id, cfg->short_id_len);
+    entry->short_id_len = cfg->short_id_len;
+    memcpy(&entry->address, address, address_len);
+    entry->address_len = address_len;
+    pthread_mutex_unlock(&g_tls_state_lock);
+}
+
+static void invalidate_cached_tls_endpoint(const vless_config_t *cfg, const char *sni, const struct sockaddr *address,
+                                           socklen_t address_len) {
+    pthread_mutex_lock(&g_tls_state_lock);
+    for (size_t i = 0; i < TLS_ENDPOINT_CACHE_SIZE; i++) {
+        tls_endpoint_entry_t *entry = &g_tls_endpoint_cache[i];
+        if (tls_endpoint_entry_matches(entry, cfg, sni) &&
+            sockaddr_equal((const struct sockaddr *)&entry->address, entry->address_len, address, address_len)) {
+            entry->valid = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_tls_state_lock);
+}
+
 static int db_reserve(dynbuf_t *b, size_t n) {
     if (b->len + n <= b->cap) {
         return 0;
@@ -334,6 +439,19 @@ static int tcp_connect_host(const char *host, uint16_t port) {
 
     freeaddrinfo(res);
     return fd;
+}
+
+static int tcp_connect_address(int family, int socktype, int protocol, const struct sockaddr *address, socklen_t address_len) {
+    int fd = socket(family, socktype, protocol);
+    if (fd < 0) {
+        return -1;
+    }
+    core_tune_tcp_socket(fd);
+    if (core_connect_with_timeout(fd, address, address_len, CORE_CONNECT_TIMEOUT_MS) == 0) {
+        return fd;
+    }
+    close(fd);
+    return -1;
 }
 
 static int ssl_write_all(SSL *ssl, const void *buf, size_t len) {
@@ -4074,12 +4192,15 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
     uint16_t grease = random_grease_value();
     uint16_t boring_grease_cipher = random_grease_value();
     uint16_t boring_grease_group = random_grease_value();
-    uint16_t boring_grease_ext1 = random_grease_value();
-    uint16_t boring_grease_ext2 = random_grease_value();
-    uint16_t boring_grease_vers = random_grease_value();
-    if (boring_grease_ext1 == boring_grease_ext2) {
-        boring_grease_ext2 ^= 0x1010;
+    while (boring_grease_group == boring_grease_cipher) {
+        boring_grease_group = random_grease_value();
     }
+    uint16_t boring_grease_vers = random_grease_value();
+    while (boring_grease_vers == boring_grease_cipher || boring_grease_vers == boring_grease_group) {
+        boring_grease_vers = random_grease_value();
+    }
+    uint16_t boring_grease_ext1 = boring_grease_cipher;
+    uint16_t boring_grease_ext2 = boring_grease_vers;
     uint8_t suites[64];
     size_t soff = 0;
     if (cfg->fp_mode == FP_QQ || cfg->fp_mode == FP_CHROME || cfg->fp_mode == FP_EDGE) {
@@ -5482,16 +5603,19 @@ static void reset_manual_tls_handshake(tls13_conn_t *c) {
     memset(&c->transcript, 0, sizeof(c->transcript));
 }
 
-static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
-    const char *sni = cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host;
-    if (!c->tls_use_aes_fallback && tls_aes_fallback_cached(cfg->server_host, cfg->server_port, sni)) {
-        c->tls_use_aes_fallback = 1;
-    }
-    tls_cipher_offer_t offer = c->tls_use_aes_fallback ? TLS_CIPHER_OFFER_AES : TLS_CIPHER_OFFER_CHACHA;
+static int connect_manual_tls_endpoint(const vless_config_t *cfg, tls13_conn_t *c, const struct sockaddr *address,
+                                       socklen_t address_len, int socktype, int protocol, int start_with_aes,
+                                       tls_cipher_offer_t *successful_offer, char *err, size_t err_cap) {
+    static const tls_cipher_offer_t offer_order[] = {
+        TLS_CIPHER_OFFER_CHACHA,
+        TLS_CIPHER_OFFER_AES,
+    };
+    size_t first_offer = start_with_aes ? 1 : 0;
 
-    for (int attempt = 0; attempt < 2; attempt++) {
+    for (size_t i = first_offer; i < sizeof(offer_order) / sizeof(offer_order[0]); i++) {
+        tls_cipher_offer_t offer = offer_order[i];
         reset_manual_tls_handshake(c);
-        c->fd = tcp_connect_host(cfg->server_host, cfg->server_port);
+        c->fd = tcp_connect_address(address->sa_family, socktype, protocol, address, address_len);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;
@@ -5501,32 +5625,77 @@ static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *
         char attempt_err[256] = {0};
         if (run_tls_handshake(cfg, c, offer, attempt_err, sizeof(attempt_err)) == 0) {
             core_set_socket_io_timeout(c->fd, 0);
-            if (offer == TLS_CIPHER_OFFER_AES) {
-                cache_tls_aes_fallback(cfg->server_host, cfg->server_port, sni);
-            }
-            log_tls_cipher_once(tls_cipher_suite_name(c->tls_cipher_suite));
+            *successful_offer = offer;
             return 0;
         }
 
-        int cipher_selected = c->tls_cipher_suite != 0;
         close(c->fd);
         c->fd = -1;
-
-        if (offer == TLS_CIPHER_OFFER_CHACHA && !cipher_selected) {
-            c->tls_use_aes_fallback = 1;
-            offer = TLS_CIPHER_OFFER_AES;
-            continue;
-        }
-
-        fprintf(stderr, "[tls] handshake failed cipher=%s: %s\n",
-                cipher_selected ? tls_cipher_suite_name(c->tls_cipher_suite)
-                                : (offer == TLS_CIPHER_OFFER_CHACHA ? "TLS_CHACHA20_POLY1305_SHA256" : "AES-GCM"),
-                attempt_err[0] != '\0' ? attempt_err : "unknown error");
         set_err(err, err_cap, attempt_err[0] != '\0' ? attempt_err : "TLS handshake failed");
+    }
+    return -1;
+}
+
+static void remember_manual_tls_success(const vless_config_t *cfg, tls13_conn_t *c, const char *sni,
+                                        const struct sockaddr *address, socklen_t address_len,
+                                        tls_cipher_offer_t successful_offer) {
+    c->tls_use_aes_fallback = successful_offer == TLS_CIPHER_OFFER_AES;
+    if (c->tls_use_aes_fallback) {
+        cache_tls_aes_fallback(cfg->server_host, cfg->server_port, sni);
+    }
+    cache_tls_endpoint(cfg, sni, address, address_len);
+    log_tls_cipher_once(tls_cipher_suite_name(c->tls_cipher_suite));
+}
+
+static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    const char *sni = cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host;
+    int start_with_aes = c->tls_use_aes_fallback || tls_aes_fallback_cached(cfg->server_host, cfg->server_port, sni);
+    char last_err[256] = {0};
+
+    struct sockaddr_storage cached_address;
+    socklen_t cached_address_len = 0;
+    int cached_endpoint_tried = get_cached_tls_endpoint(cfg, sni, &cached_address, &cached_address_len);
+    if (cached_endpoint_tried) {
+        tls_cipher_offer_t successful_offer;
+        if (connect_manual_tls_endpoint(cfg, c, (const struct sockaddr *)&cached_address, cached_address_len, SOCK_STREAM, IPPROTO_TCP,
+                                        start_with_aes, &successful_offer, last_err, sizeof(last_err)) == 0) {
+            remember_manual_tls_success(cfg, c, sni, (const struct sockaddr *)&cached_address, cached_address_len, successful_offer);
+            return 0;
+        }
+        invalidate_cached_tls_endpoint(cfg, sni, (const struct sockaddr *)&cached_address, cached_address_len);
+    }
+
+    char port_text[16];
+    snprintf(port_text, sizeof(port_text), "%u", (unsigned)cfg->server_port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+
+    struct addrinfo *addresses = NULL;
+    if (getaddrinfo(cfg->server_host, port_text, &hints, &addresses) != 0) {
+        set_err(err, err_cap, "tcp resolve failed");
         return -1;
     }
 
-    set_err(err, err_cap, "TLS cipher negotiation failed");
+    for (struct addrinfo *it = addresses; it != NULL; it = it->ai_next) {
+        if (cached_endpoint_tried &&
+            sockaddr_equal((const struct sockaddr *)&cached_address, cached_address_len, it->ai_addr, (socklen_t)it->ai_addrlen)) {
+            continue;
+        }
+
+        tls_cipher_offer_t successful_offer;
+        if (connect_manual_tls_endpoint(cfg, c, it->ai_addr, (socklen_t)it->ai_addrlen, it->ai_socktype, it->ai_protocol,
+                                        start_with_aes, &successful_offer, last_err, sizeof(last_err)) == 0) {
+            remember_manual_tls_success(cfg, c, sni, it->ai_addr, (socklen_t)it->ai_addrlen, successful_offer);
+            freeaddrinfo(addresses);
+            return 0;
+        }
+    }
+    freeaddrinfo(addresses);
+
+    set_err(err, err_cap, last_err[0] != '\0' ? last_err : "tcp connect failed");
     return -1;
 }
 
