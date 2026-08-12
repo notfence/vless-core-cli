@@ -101,7 +101,7 @@ static void init_config_defaults(vless_config_t *cfg, const char *uri) {
     cfg->transport_mode = TRANSPORT_VISION;
     cfg->flow[0] = '\0';
     snprintf(cfg->encryption, sizeof(cfg->encryption), "none");
-    snprintf(cfg->security, sizeof(cfg->security), "reality");
+    snprintf(cfg->security, sizeof(cfg->security), "none");
     cfg->alpn[0] = '\0';
     cfg->allow_insecure = 0;
     snprintf(cfg->spider_x, sizeof(cfg->spider_x), "/");
@@ -427,7 +427,7 @@ static void parse_query(vless_config_t *cfg, char *query) {
         } else if (strcmp(key, "encryption") == 0) {
             copy_trunc(cfg->encryption, sizeof(cfg->encryption), decoded);
         } else if (strcmp(key, "security") == 0) {
-            copy_trunc(cfg->security, sizeof(cfg->security), decoded);
+            copy_trunc(cfg->security, sizeof(cfg->security), decoded[0] != '\0' ? decoded : "none");
         } else if (strcmp(key, "alpn") == 0) {
             copy_trunc(cfg->alpn, sizeof(cfg->alpn), decoded);
         } else if (strcmp(key, "allowInsecure") == 0 || strcmp(key, "insecure") == 0) {
