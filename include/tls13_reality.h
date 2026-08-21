@@ -8,6 +8,7 @@
 
 typedef struct tls13_conn tls13_conn_t;
 
+int tls13_reality_set_xray_version(const char *value);
 int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *err, size_t err_cap);
 void tls13_reality_close(tls13_conn_t *c);
 

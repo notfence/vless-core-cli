@@ -1060,6 +1060,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
     fprintf(stderr, "  --routing <rules>        Optional Proxy, Direct and Block rules\n");
     fprintf(stderr, "  --route-control-port <p> Direct-route controller port\n");
+    fprintf(stderr, "  --xray-version <x.y.z>   Xray version reported by vless-core-cli\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
     fprintf(stderr, "  --openssl-patch-status   Show OpenSSL patch status\n");
@@ -1091,6 +1092,7 @@ int main(int argc, char **argv) {
 
     const char *uri = NULL;
     const char *routing_text = NULL;
+    const char *xray_ver = getenv("XRAY_VER");
     int listen_port = 0;
 
     routing_config_init(&g_routing);
@@ -1103,6 +1105,8 @@ int main(int argc, char **argv) {
             routing_text = argv[++i];
         } else if (strcmp(argv[i], "--route-control-port") == 0 && i + 1 < argc) {
             g_route_control_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--xray-version") == 0 && i + 1 < argc) {
+            xray_ver = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
             printf("vless-core %s\n", VLESS_CORE_VERSION);
             return 0;
@@ -1121,6 +1125,10 @@ int main(int argc, char **argv) {
     }
     if (g_route_control_port < 0 || g_route_control_port > 65535) {
         fprintf(stderr, "Invalid route control port\n");
+        return 1;
+    }
+    if (xray_ver != NULL && tls13_reality_set_xray_version(xray_ver) != 0) {
+        fprintf(stderr, "Invalid Xray version (expected x.y.z, each component 0-255)\n");
         return 1;
     }
 

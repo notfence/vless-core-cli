@@ -67,8 +67,30 @@ typedef enum {
 #define CORE_OPENSSL_GROUPS "X25519:P-256:P-384"
 #define TLS_AES_FALLBACK_CACHE_SIZE 16
 #define TLS_ENDPOINT_CACHE_SIZE 16
+#define XRAY_DEFAULT_VERSION_X 26
+#define XRAY_DEFAULT_VERSION_Y 3
+#define XRAY_DEFAULT_VERSION_Z 27
 
 static int g_xhttp_auto_force_insecure = 0;
+static uint8_t g_xray_version[3] = {
+    XRAY_DEFAULT_VERSION_X,
+    XRAY_DEFAULT_VERSION_Y,
+    XRAY_DEFAULT_VERSION_Z,
+};
+
+int tls13_reality_set_xray_version(const char *value) {
+    unsigned int x = 0, y = 0, z = 0;
+    char trailing = '\0';
+    if (value == NULL ||
+        sscanf(value, "%u.%u.%u%c", &x, &y, &z, &trailing) != 3 ||
+        x > 255 || y > 255 || z > 255) {
+        return -1;
+    }
+    g_xray_version[0] = (uint8_t)x;
+    g_xray_version[1] = (uint8_t)y;
+    g_xray_version[2] = (uint8_t)z;
+    return 0;
+}
 
 typedef struct {
     char host[256];
@@ -4372,19 +4394,9 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
     }
 
     uint8_t sid_plain[16] = {0};
-    uint8_t vx = 26, vy = 3, vz = 27;
-    const char *ver_env = getenv("V2IOS6_VER");
-    if (ver_env != NULL) {
-        unsigned int tx = 0, ty = 0, tz = 0;
-        if (sscanf(ver_env, "%u.%u.%u", &tx, &ty, &tz) == 3 && tx <= 255 && ty <= 255 && tz <= 255) {
-            vx = (uint8_t)tx;
-            vy = (uint8_t)ty;
-            vz = (uint8_t)tz;
-        }
-    }
-    sid_plain[0] = vx;
-    sid_plain[1] = vy;
-    sid_plain[2] = vz;
+    sid_plain[0] = g_xray_version[0];
+    sid_plain[1] = g_xray_version[1];
+    sid_plain[2] = g_xray_version[2];
     sid_plain[3] = 0;
 
     uint32_t now = (uint32_t)time(NULL);

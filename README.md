@@ -80,9 +80,13 @@ Options:
   --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)
   --routing <rules>        Optional Proxy, Direct and Block rules
   --route-control-port <p> Direct-route controller port
+  --xray-version <x.y.z>   Xray version reported by vless-core-cli
   -h, --help               Show help
   -v, --version            Show version
 ```
+
+`vless-core-cli` reports Xray version `26.3.27` by default. Override it with
+`--xray-version x.y.z` or the `XRAY_VER` environment variable.
 
 ## Routing
 
