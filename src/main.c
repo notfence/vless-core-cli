@@ -23,6 +23,8 @@
 #include "vless_encryption.h"
 
 #define VLESS_CORE_VERSION "1.1.0"
+#define MAX_CLIENT_CONNECTIONS 256
+#define SOCKS_HANDSHAKE_TIMEOUT_MS 10000
 #ifndef VLESS_OPENSSL_PATCH_STATUS
 #define VLESS_OPENSSL_PATCH_STATUS "unpatched"
 #endif
@@ -30,6 +32,25 @@
 static routing_config_t g_routing;
 static int g_route_control_port = 0;
 static const char *g_route_control_socket = NULL;
+static pthread_mutex_t g_client_count_mutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int g_active_client_count = 0;
+
+static int acquire_client_slot(void) {
+    int acquired = 0;
+    pthread_mutex_lock(&g_client_count_mutex);
+    if (g_active_client_count < MAX_CLIENT_CONNECTIONS) {
+        g_active_client_count++;
+        acquired = 1;
+    }
+    pthread_mutex_unlock(&g_client_count_mutex);
+    return acquired;
+}
+
+static void release_client_slot(void) {
+    pthread_mutex_lock(&g_client_count_mutex);
+    if (g_active_client_count > 0) g_active_client_count--;
+    pthread_mutex_unlock(&g_client_count_mutex);
+}
 
 static int upstream_write(tls13_conn_t *tls,
                           vless_encryption_conn_t *encryption,
@@ -480,12 +501,13 @@ static void relay_tcp_pair(int fd_a, int fd_b) {
     }
 }
 
-static void *client_worker(void *arg) {
+static void *client_worker_run(void *arg) {
     client_ctx_t *ctx = (client_ctx_t *)arg;
     int cfd = ctx->client_fd;
     vless_config_t cfg = ctx->cfg;
     free(ctx);
 
+    core_set_socket_io_timeout(cfd, SOCKS_HANDSHAKE_TIMEOUT_MS);
     char target_host[512];
     uint16_t target_port = 0;
     if (socks5_negotiate_and_get_target(cfd, target_host, sizeof(target_host), &target_port) != 0) {
@@ -493,6 +515,7 @@ static void *client_worker(void *arg) {
         close(cfd);
         return NULL;
     }
+    core_set_socket_io_timeout(cfd, 0);
 
     int socks_success_sent = 0;
     uint8_t first_payload[8192];
@@ -1055,6 +1078,12 @@ static void *client_worker(void *arg) {
     return NULL;
 }
 
+static void *client_worker(void *arg) {
+    void *result = client_worker_run(arg);
+    release_client_slot();
+    return result;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s --uri <vless://...|socks5://...> --listen-port <port>\n", argv0);
     fprintf(stderr, "\nOptions:\n");
@@ -1247,9 +1276,14 @@ int main(int argc, char **argv) {
             break;
         }
         core_tune_tcp_socket(cfd);
+        if (!acquire_client_slot()) {
+            close(cfd);
+            continue;
+        }
 
         client_ctx_t *ctx = (client_ctx_t *)calloc(1, sizeof(*ctx));
         if (ctx == NULL) {
+            release_client_slot();
             close(cfd);
             continue;
         }
@@ -1259,6 +1293,7 @@ int main(int argc, char **argv) {
         pthread_t th;
         if (pthread_create(&th, NULL, client_worker, ctx) != 0) {
             free(ctx);
+            release_client_slot();
             close(cfd);
             continue;
         }
