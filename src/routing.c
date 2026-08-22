@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "socket_util.h"
@@ -397,21 +398,49 @@ static int write_all(int fd, const char *data, size_t len) {
     return 0;
 }
 
-static int update_bypass(int control_port, const char *operation, const char *ip) {
-    if (control_port <= 0) {
+static int route_control_enabled(int control_port, const char *control_socket) {
+    return control_port > 0 || (control_socket != NULL && control_socket[0] != '\0');
+}
+
+static int update_bypass(int control_port,
+                         const char *control_socket,
+                         const char *operation,
+                         const char *ip) {
+    if (!route_control_enabled(control_port, control_socket)) {
         return 0;
     }
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int family = (control_socket != NULL && control_socket[0] != '\0') ? AF_UNIX : AF_INET;
+    int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     core_set_socket_io_timeout(fd, ROUTING_CONTROL_TIMEOUT_MS);
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons((uint16_t)control_port);
-    if (core_connect_with_timeout(fd, (const struct sockaddr *)&addr, sizeof(addr), ROUTING_CONTROL_TIMEOUT_MS) != 0) {
+    struct sockaddr_storage storage;
+    memset(&storage, 0, sizeof(storage));
+    socklen_t address_length = 0;
+    if (family == AF_UNIX) {
+        struct sockaddr_un *addr = (struct sockaddr_un *)&storage;
+        size_t path_length = strlen(control_socket);
+        if (path_length == 0 || path_length >= sizeof(addr->sun_path)) {
+            close(fd);
+            return -1;
+        }
+        addr->sun_family = AF_UNIX;
+        memcpy(addr->sun_path, control_socket, path_length + 1);
+        address_length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_length + 1);
+#ifdef __APPLE__
+        addr->sun_len = (uint8_t)address_length;
+#endif
+    } else {
+        struct sockaddr_in *addr = (struct sockaddr_in *)&storage;
+        addr->sin_family = AF_INET;
+        addr->sin_addr.s_addr = inet_addr("127.0.0.1");
+        addr->sin_port = htons((uint16_t)control_port);
+        address_length = (socklen_t)sizeof(*addr);
+    }
+
+    if (core_connect_with_timeout(fd, (const struct sockaddr *)&storage, address_length,
+                                  ROUTING_CONTROL_TIMEOUT_MS) != 0) {
         close(fd);
         return -1;
     }
@@ -435,6 +464,7 @@ static int update_bypass(int control_port, const char *operation, const char *ip
 int routing_open_direct(const char *host,
                         uint16_t port,
                         int control_port,
+                        const char *control_socket,
                         char *err,
                         size_t err_cap) {
     char port_text[16];
@@ -442,7 +472,8 @@ int routing_open_direct(const char *host,
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = control_port > 0 ? AF_INET : AF_UNSPEC;
+    int control_enabled = route_control_enabled(control_port, control_socket);
+    hints.ai_family = control_enabled ? AF_INET : AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo *result = NULL;
@@ -469,9 +500,9 @@ int routing_open_direct(const char *host,
         }
 
         int bypass_added = 0;
-        if (control_port > 0) {
+        if (control_enabled) {
             if (it->ai_family != AF_INET ||
-                update_bypass(control_port, "ROUTE_DIRECT_ADD", ip) != 0) {
+                update_bypass(control_port, control_socket, "ROUTE_DIRECT_ADD", ip) != 0) {
                 last_errno = EACCES;
                 continue;
             }
@@ -484,7 +515,7 @@ int routing_open_direct(const char *host,
             if (core_connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen,
                                           ROUTING_CONNECT_TIMEOUT_MS) == 0) {
                 if (bypass_added) {
-                    (void)update_bypass(control_port, "ROUTE_DIRECT_REMOVE", ip);
+                    (void)update_bypass(control_port, control_socket, "ROUTE_DIRECT_REMOVE", ip);
                 }
                 break;
             }
@@ -495,7 +526,7 @@ int routing_open_direct(const char *host,
             last_errno = errno;
         }
         if (bypass_added) {
-            (void)update_bypass(control_port, "ROUTE_DIRECT_REMOVE", ip);
+            (void)update_bypass(control_port, control_socket, "ROUTE_DIRECT_REMOVE", ip);
         }
     }
     freeaddrinfo(result);

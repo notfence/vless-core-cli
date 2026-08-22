@@ -80,6 +80,7 @@ Options:
   --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)
   --routing <rules>        Optional Proxy, Direct and Block rules
   --route-control-port <p> Direct-route controller port
+  --route-control-socket <path> Direct-route controller Unix socket
   --xray-version <x.y.z>   Xray version reported by vless-core-cli
   -h, --help               Show help
   -v, --version            Show version

@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define ROUTING_MAX_RULES 48
+#define ROUTING_CONTROL_SOCKET_PATH_MAX 104
 
 typedef enum {
     ROUTE_ACTION_PROXY = 0,
@@ -49,6 +50,7 @@ const char *routing_action_name(route_action_t action);
 int routing_open_direct(const char *host,
                         uint16_t port,
                         int control_port,
+                        const char *control_socket,
                         char *err,
                         size_t err_cap);
 

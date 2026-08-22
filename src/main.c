@@ -29,6 +29,7 @@
 
 static routing_config_t g_routing;
 static int g_route_control_port = 0;
+static const char *g_route_control_socket = NULL;
 
 static int upstream_write(tls13_conn_t *tls,
                           vless_encryption_conn_t *encryption,
@@ -562,6 +563,7 @@ static void *client_worker(void *arg) {
         int direct_fd = routing_open_direct(target_host,
                                             target_port,
                                             g_route_control_port,
+                                            g_route_control_socket,
                                             direct_err,
                                             sizeof(direct_err));
         if (direct_fd < 0) {
@@ -1060,6 +1062,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
     fprintf(stderr, "  --routing <rules>        Optional Proxy, Direct and Block rules\n");
     fprintf(stderr, "  --route-control-port <p> Direct-route controller port\n");
+    fprintf(stderr, "  --route-control-socket <path> Direct-route controller Unix socket\n");
     fprintf(stderr, "  --xray-version <x.y.z>   Xray version reported by vless-core-cli\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
@@ -1105,6 +1108,8 @@ int main(int argc, char **argv) {
             routing_text = argv[++i];
         } else if (strcmp(argv[i], "--route-control-port") == 0 && i + 1 < argc) {
             g_route_control_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--route-control-socket") == 0 && i + 1 < argc) {
+            g_route_control_socket = argv[++i];
         } else if (strcmp(argv[i], "--xray-version") == 0 && i + 1 < argc) {
             xray_ver = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
@@ -1126,6 +1131,25 @@ int main(int argc, char **argv) {
     if (g_route_control_port < 0 || g_route_control_port > 65535) {
         fprintf(stderr, "Invalid route control port\n");
         return 1;
+    }
+    if (g_route_control_port > 0 && g_route_control_socket != NULL) {
+        fprintf(stderr, "Only one route control endpoint may be configured\n");
+        return 1;
+    }
+    if (g_route_control_socket != NULL) {
+        size_t path_length = strlen(g_route_control_socket);
+        if (path_length == 0 || path_length >= ROUTING_CONTROL_SOCKET_PATH_MAX ||
+            g_route_control_socket[0] != '/') {
+            fprintf(stderr, "Invalid route control socket path\n");
+            return 1;
+        }
+        for (size_t i = 0; i < path_length; i++) {
+            unsigned char c = (unsigned char)g_route_control_socket[i];
+            if (c < 0x20 || c == 0x7f) {
+                fprintf(stderr, "Invalid route control socket path\n");
+                return 1;
+            }
+        }
     }
     if (xray_ver != NULL && tls13_reality_set_xray_version(xray_ver) != 0) {
         fprintf(stderr, "Invalid Xray version (expected x.y.z, each component 0-255)\n");
