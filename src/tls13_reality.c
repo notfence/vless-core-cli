@@ -1,4 +1,7 @@
-#define _POSIX_C_SOURCE 200112L
+#define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 
 #include "socket_util.h"
 #include "tls13_reality.h"
@@ -22,10 +25,12 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -640,140 +645,269 @@ static int xhttp_make_pin_key(const char *host, uint16_t port, char *out, size_t
     return 0;
 }
 
-static int add_path_if_missing(const char **paths, size_t *n, size_t cap, const char *path) {
-    if (path == NULL || path[0] == '\0' || *n >= cap) {
-        return -1;
-    }
-    for (size_t i = 0; i < *n; i++) {
-        if (strcmp(paths[i], path) == 0) {
-            return 0;
-        }
-    }
-    paths[*n] = path;
-    (*n)++;
-    return 0;
-}
+#define TLS_PIN_FILE_MAX_SIZE (1024U * 1024U)
 
-static size_t xhttp_collect_pin_paths(const char **paths, size_t cap) {
-    size_t n = 0;
-    const char *env_path = getenv("VLESS_XHTTP_PIN_FILE");
-    (void)add_path_if_missing(paths, &n, cap, env_path);
-    (void)add_path_if_missing(paths, &n, cap, "/var/mobile/Library/Preferences/vless-core/xhttp-pins.txt");
-    (void)add_path_if_missing(paths, &n, cap, "/tmp/vless-core-xhttp-pins.txt");
-    return n;
-}
-
-static int xhttp_lookup_pin_in_file(const char *path, const char *key, char pin_hex[65]) {
-    FILE *f = fopen(path, "r");
-    if (f == NULL) {
-        return 1;
-    }
-
-    char line[1024];
-    while (fgets(line, sizeof(line), f) != NULL) {
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
-            continue;
+static int tls_pin_file_path(char out[PATH_MAX], char *err, size_t err_cap) {
+    const char *override = getenv("VLESS_XHTTP_PIN_FILE");
+    if (override != NULL && override[0] != '\0') {
+        if (override[0] != '/' || strlen(override) >= PATH_MAX) {
+            set_err(err, err_cap, "TOFU pin path must be absolute");
+            return -1;
         }
-        char file_key[512];
-        char file_pin[130];
-        if (sscanf(line, "%511s %129s", file_key, file_pin) != 2) {
-            continue;
-        }
-        if (strcmp(file_key, key) != 0) {
-            continue;
-        }
-        if (strlen(file_pin) != 64) {
-            continue;
-        }
-        int ok = 1;
-        for (size_t i = 0; i < 64; i++) {
-            if (!isxdigit((unsigned char)file_pin[i])) {
-                ok = 0;
-                break;
-            }
-        }
-        if (!ok) {
-            continue;
-        }
-        memcpy(pin_hex, file_pin, 64);
-        pin_hex[64] = '\0';
-        ascii_lower(pin_hex);
-        fclose(f);
+        snprintf(out, PATH_MAX, "%s", override);
         return 0;
     }
 
-    fclose(f);
-    return 1;
-}
-
-static int xhttp_load_pin(const char *key, char pin_hex[65]) {
-    const char *paths[4] = {0};
-    size_t n = xhttp_collect_pin_paths(paths, sizeof(paths) / sizeof(paths[0]));
-    for (size_t i = 0; i < n; i++) {
-        if (xhttp_lookup_pin_in_file(paths[i], key, pin_hex) == 0) {
-            return 0;
-        }
+#ifdef __APPLE__
+    snprintf(out, PATH_MAX, "%s", "/private/var/mobile/Library/Preferences/vless-core/xhttp-pins.txt");
+#else
+    struct passwd pw;
+    struct passwd *result = NULL;
+    char pw_buffer[4096];
+    if (getpwuid_r(geteuid(), &pw, pw_buffer, sizeof(pw_buffer), &result) != 0 || result == NULL || pw.pw_dir == NULL ||
+        pw.pw_dir[0] != '/') {
+        set_err(err, err_cap, "failed to resolve a private TOFU pin path");
+        return -1;
     }
-    return 1;
+    int n = snprintf(out, PATH_MAX, "%s/.local/state/vless-core/tls-pins.txt", pw.pw_dir);
+    if (n <= 0 || n >= PATH_MAX) {
+        set_err(err, err_cap, "TOFU pin path is too long");
+        return -1;
+    }
+#endif
+    return 0;
 }
 
-static int ensure_parent_dirs(const char *path) {
-    if (path == NULL || path[0] == '\0') {
+static int ensure_private_pin_parent(const char *path, char parent[PATH_MAX], char *err, size_t err_cap) {
+    if (path == NULL || path[0] != '/' || strstr(path, "/../") != NULL) {
+        set_err(err, err_cap, "unsafe TOFU pin path");
         return -1;
     }
 
-    char tmp[1024];
-    size_t n = strlen(path);
-    if (n == 0 || n >= sizeof(tmp)) {
+    size_t length = strlen(path);
+    if (length == 0 || length >= PATH_MAX) {
+        set_err(err, err_cap, "TOFU pin path is too long");
         return -1;
     }
-    memcpy(tmp, path, n + 1);
+    memcpy(parent, path, length + 1);
+    char *slash = strrchr(parent, '/');
+    if (slash == NULL || slash == parent) {
+        set_err(err, err_cap, "TOFU pin path needs a private parent directory");
+        return -1;
+    }
+    *slash = '\0';
 
-    for (size_t i = 1; i < n; i++) {
-        if (tmp[i] != '/') {
-            continue;
+    size_t parent_length = strlen(parent);
+    for (size_t i = 1; i <= parent_length; i++) {
+        if (i != parent_length && parent[i] != '/') continue;
+
+        char saved = parent[i];
+        parent[i] = '\0';
+        struct stat st;
+        if (lstat(parent, &st) != 0) {
+            if (errno != ENOENT || mkdir(parent, 0700) != 0 || lstat(parent, &st) != 0) {
+                parent[i] = saved;
+                set_err(err, err_cap, "failed to create private TOFU pin directory");
+                return -1;
+            }
         }
-        tmp[i] = '\0';
-        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+        if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode) || (st.st_mode & 0022) != 0) {
+            parent[i] = saved;
+            set_err(err, err_cap, "unsafe TOFU pin directory");
             return -1;
         }
-        tmp[i] = '/';
+        if (i == parent_length && st.st_uid != geteuid()) {
+            parent[i] = saved;
+            set_err(err, err_cap, "TOFU pin directory has the wrong owner");
+            return -1;
+        }
+        parent[i] = saved;
     }
     return 0;
 }
 
-static int xhttp_store_pin(const char *key, const char *pin_hex, char *err, size_t err_cap) {
-    const char *paths[4] = {0};
-    size_t n = xhttp_collect_pin_paths(paths, sizeof(paths) / sizeof(paths[0]));
-
-    for (size_t i = 0; i < n; i++) {
-        char existing[65];
-        if (xhttp_lookup_pin_in_file(paths[i], key, existing) == 0) {
-            if (strcmp(existing, pin_hex) == 0) {
-                return 0;
-            }
-            set_err(err, err_cap, "TOFU pin mismatch");
-            return -1;
-        }
-
-        if (ensure_parent_dirs(paths[i]) != 0) {
-            continue;
-        }
-
-        FILE *f = fopen(paths[i], "a");
-        if (f == NULL) {
-            continue;
-        }
-        int wr = fprintf(f, "%s %s\n", key, pin_hex);
-        int fl = fflush(f);
-        fclose(f);
-        if (wr > 0 && fl == 0) {
-            return 0;
-        }
+static int open_private_pin_file(const char *path, int flags, char *err, size_t err_cap) {
+    int fd = open(path, flags | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        set_err(err, err_cap, errno == ELOOP ? "refusing symlink TOFU pin file" : "failed to open TOFU pin file");
+        return -1;
     }
 
-    set_err(err, err_cap, "failed to persist TOFU pin (set VLESS_XHTTP_PIN_FILE)");
-    return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1) {
+        close(fd);
+        set_err(err, err_cap, "unsafe TOFU pin file");
+        return -1;
+    }
+    if ((st.st_mode & 0077) != 0 && fchmod(fd, 0600) != 0) {
+        close(fd);
+        set_err(err, err_cap, "failed to protect TOFU pin file");
+        return -1;
+    }
+    return fd;
+}
+
+static int find_pin_in_fd(int fd, const char *key, char pin_hex[65]) {
+    int copy = dup(fd);
+    if (copy < 0 || lseek(copy, 0, SEEK_SET) < 0) {
+        if (copy >= 0) close(copy);
+        return -1;
+    }
+    FILE *f = fdopen(copy, "r");
+    if (f == NULL) {
+        close(copy);
+        return -1;
+    }
+
+    int result = 1;
+    char line[1024];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char file_key[512];
+        char file_pin[130];
+        if (line[0] == '#' || sscanf(line, "%511s %129s", file_key, file_pin) != 2 || strcmp(file_key, key) != 0 ||
+            strlen(file_pin) != 64) {
+            continue;
+        }
+        size_t i = 0;
+        while (i < 64 && isxdigit((unsigned char)file_pin[i])) i++;
+        if (i != 64) continue;
+        memcpy(pin_hex, file_pin, 64);
+        pin_hex[64] = '\0';
+        ascii_lower(pin_hex);
+        result = 0;
+        break;
+    }
+    if (ferror(f)) result = -1;
+    fclose(f);
+    return result;
+}
+
+static int write_fd_all(int fd, const void *data, size_t length) {
+    const uint8_t *p = (const uint8_t *)data;
+    while (length > 0) {
+        ssize_t written = write(fd, p, length);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return -1;
+        p += (size_t)written;
+        length -= (size_t)written;
+    }
+    return 0;
+}
+
+static int atomic_add_pin(const char *path, const char *parent, int source_fd, const char *key, const char *pin_hex, char *err,
+                          size_t err_cap) {
+    struct stat st;
+    if (fstat(source_fd, &st) != 0 || st.st_size < 0 || (uint64_t)st.st_size > TLS_PIN_FILE_MAX_SIZE) {
+        set_err(err, err_cap, "TOFU pin file is too large");
+        return -1;
+    }
+
+    char temp_path[PATH_MAX];
+    int n = snprintf(temp_path, sizeof(temp_path), "%s.tmp.XXXXXX", path);
+    if (n <= 0 || (size_t)n >= sizeof(temp_path)) {
+        set_err(err, err_cap, "TOFU temporary path is too long");
+        return -1;
+    }
+    int temp_fd = mkstemp(temp_path);
+    if (temp_fd < 0 || fchmod(temp_fd, 0600) != 0) {
+        if (temp_fd >= 0) close(temp_fd);
+        if (temp_fd >= 0) unlink(temp_path);
+        set_err(err, err_cap, "failed to create TOFU pin file");
+        return -1;
+    }
+
+    int result = -1;
+    char buffer[4096];
+    if (lseek(source_fd, 0, SEEK_SET) < 0) goto done;
+    for (;;) {
+        ssize_t count = read(source_fd, buffer, sizeof(buffer));
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 || (count > 0 && write_fd_all(temp_fd, buffer, (size_t)count) != 0)) goto done;
+        if (count == 0) break;
+    }
+
+    if (st.st_size > 0) {
+        char last = '\0';
+        if (pread(source_fd, &last, 1, st.st_size - 1) != 1) goto done;
+        if (last != '\n' && write_fd_all(temp_fd, "\n", 1) != 0) goto done;
+    }
+    char entry[1024];
+    n = snprintf(entry, sizeof(entry), "%s %s\n", key, pin_hex);
+    if (n <= 0 || (size_t)n >= sizeof(entry) || write_fd_all(temp_fd, entry, (size_t)n) != 0 || fsync(temp_fd) != 0) goto done;
+    if (close(temp_fd) != 0) {
+        temp_fd = -1;
+        goto done;
+    }
+    temp_fd = -1;
+    if (rename(temp_path, path) != 0) goto done;
+
+    int parent_fd = open(parent, O_RDONLY | O_NOFOLLOW);
+    if (parent_fd >= 0) {
+        (void)fsync(parent_fd);
+        close(parent_fd);
+    }
+    result = 0;
+
+done:
+    if (temp_fd >= 0) close(temp_fd);
+    if (result != 0) {
+        unlink(temp_path);
+        set_err(err, err_cap, "failed to persist TOFU pin");
+    }
+    return result;
+}
+
+static int secure_tofu_verify_or_store(const char *key, const char *pin_hex, int *stored, char *err, size_t err_cap) {
+    char path[PATH_MAX];
+    char parent[PATH_MAX];
+    if (tls_pin_file_path(path, err, err_cap) != 0 || ensure_private_pin_parent(path, parent, err, err_cap) != 0) return -1;
+
+    char lock_path[PATH_MAX];
+    int n = snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
+    if (n <= 0 || (size_t)n >= sizeof(lock_path)) {
+        set_err(err, err_cap, "TOFU lock path is too long");
+        return -1;
+    }
+    int lock_fd = open_private_pin_file(lock_path, O_RDWR | O_CREAT, err, err_cap);
+    if (lock_fd < 0) return -1;
+    if (flock(lock_fd, LOCK_EX) != 0) {
+        close(lock_fd);
+        set_err(err, err_cap, "failed to lock TOFU pin file");
+        return -1;
+    }
+
+    int result = -1;
+    int pin_fd = open_private_pin_file(path, O_RDWR | O_CREAT, err, err_cap);
+    if (pin_fd >= 0) {
+        struct stat st;
+        if (fstat(pin_fd, &st) != 0 || st.st_size < 0 || (uint64_t)st.st_size > TLS_PIN_FILE_MAX_SIZE) {
+            close(pin_fd);
+            (void)flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+            set_err(err, err_cap, "TOFU pin file is too large");
+            return -1;
+        }
+        char existing[65];
+        int found = find_pin_in_fd(pin_fd, key, existing);
+        if (found == 0) {
+            if (strcmp(existing, pin_hex) == 0) {
+                *stored = 0;
+                result = 0;
+            } else {
+                set_err(err, err_cap, "TOFU pin mismatch");
+            }
+        } else if (found > 0 && atomic_add_pin(path, parent, pin_fd, key, pin_hex, err, err_cap) == 0) {
+            *stored = 1;
+            result = 0;
+        } else if (found < 0) {
+            set_err(err, err_cap, "failed to read TOFU pin file");
+        }
+        close(pin_fd);
+    }
+
+    (void)flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+    return result;
 }
 
 static int sha256_hex(const uint8_t *data, size_t len, char out_hex[65]) {
@@ -789,25 +923,15 @@ static int sha256_hex(const uint8_t *data, size_t len, char out_hex[65]) {
 }
 
 static int tofu_verify_or_store_pin(const char *log_prefix, const char *pin_key, const char *peer_pin, int log_ok, char *err, size_t err_cap) {
-    char known_pin[65];
-    if (xhttp_load_pin(pin_key, known_pin) == 0) {
-        if (strcmp(known_pin, peer_pin) != 0) {
-            if (err != NULL && err_cap > 0) {
-                snprintf(err, err_cap, "TOFU pin mismatch for %s", pin_key);
-            }
-            return -1;
+    int stored = 0;
+    if (secure_tofu_verify_or_store(pin_key, peer_pin, &stored, err, err_cap) != 0) {
+        if (err != NULL && err_cap > 0 && strcmp(err, "TOFU pin mismatch") == 0) {
+            snprintf(err, err_cap, "TOFU pin mismatch for %s", pin_key);
         }
-        if (log_ok) {
-            fprintf(stderr, "%s TOFU pin verified for %s\n", log_prefix, pin_key);
-        }
-        return 0;
-    }
-
-    if (xhttp_store_pin(pin_key, peer_pin, err, err_cap) != 0) {
         return -1;
     }
     if (log_ok) {
-        fprintf(stderr, "%s TOFU pin learned for %s\n", log_prefix, pin_key);
+        fprintf(stderr, "%s TOFU pin %s for %s\n", log_prefix, stored ? "learned" : "verified", pin_key);
     }
     return 0;
 }

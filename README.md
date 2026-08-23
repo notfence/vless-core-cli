@@ -109,10 +109,11 @@ The legacy `VLESS_XHTTP_TLS_MODE` name remains accepted. `auto` is treated as `s
 
 TOFU pin file path:
 
-- `VLESS_XHTTP_PIN_FILE=/path/to/pins.txt` (override)
-- default search/write paths:
-  - `/var/mobile/Library/Preferences/vless-core/xhttp-pins.txt`
-  - `/tmp/vless-core-xhttp-pins.txt`
+- `VLESS_XHTTP_PIN_FILE=/absolute/private/path/to/pins.txt` (override)
+- iOS default: `/private/var/mobile/Library/Preferences/vless-core/xhttp-pins.txt`
+- Linux default: `~/.local/state/vless-core/tls-pins.txt`
+
+The parent directory must not be writable by another user. Pin files are protected with mode `0600`, symlinks are rejected, and updates use locking plus atomic replacement.
 
 ## iOS toolchain notes
 
