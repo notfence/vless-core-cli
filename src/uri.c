@@ -94,7 +94,7 @@ static int starts_with_ci(const char *s, const char *prefix) {
     return 1;
 }
 
-static void init_config_defaults(vless_config_t *cfg, const char *uri) {
+static void init_config_defaults(vless_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->protocol = CORE_PROTOCOL_VLESS;
     cfg->fp_mode = FP_CHROME;
@@ -125,7 +125,6 @@ static void init_config_defaults(vless_config_t *cfg, const char *uri) {
     cfg->xhttp_padding_max = 1000;
     cfg->xhttp_max_each_post_min = 1000000;
     cfg->xhttp_max_each_post_max = 1000000;
-    snprintf(cfg->original_uri, sizeof(cfg->original_uri), "%s", uri ? uri : "");
 }
 
 static const char *skip_json_ws(const char *p) {
@@ -318,8 +317,9 @@ static int parse_host_port(const char *s, char *host, size_t host_cap, uint16_t 
         }
         memcpy(host, s + 1, hlen);
         host[hlen] = '\0';
-        long p = strtol(end + 2, NULL, 10);
-        if (p <= 0 || p > 65535) {
+        char *port_end = NULL;
+        long p = strtol(end + 2, &port_end, 10);
+        if (p <= 0 || p > 65535 || port_end == end + 2 || *port_end != '\0') {
             return -1;
         }
         *port = (uint16_t)p;
@@ -337,8 +337,9 @@ static int parse_host_port(const char *s, char *host, size_t host_cap, uint16_t 
     memcpy(host, s, hlen);
     host[hlen] = '\0';
 
-    long p = strtol(colon + 1, NULL, 10);
-    if (p <= 0 || p > 65535) {
+    char *port_end = NULL;
+    long p = strtol(colon + 1, &port_end, 10);
+    if (p <= 0 || p > 65535 || port_end == colon + 1 || *port_end != '\0') {
         return -1;
     }
     *port = (uint16_t)p;
@@ -381,20 +382,120 @@ static int parse_host_optional_port(const char *s, uint16_t default_port, char *
     return 0;
 }
 
-static void parse_query(vless_config_t *cfg, char *query) {
-    for (char *tok = strtok(query, "&"); tok != NULL; tok = strtok(NULL, "&")) {
-        char *eq = strchr(tok, '=');
-        if (eq == NULL) {
+#define MAX_QUERY_PARAMETERS 128
+#define MAX_QUERY_KEY_LENGTH 127
+
+static int query_value_is_valid_utf8(const unsigned char *value) {
+    size_t length = strlen((const char *)value);
+    for (size_t i = 0; i < length;) {
+        unsigned char c = value[i];
+        if (c < 0x20 || c == 0x7f) return 0;
+        if (c < 0x80) {
+            i++;
             continue;
+        }
+
+        size_t continuation_count = 0;
+        if (c >= 0xc2 && c <= 0xdf) {
+            continuation_count = 1;
+        } else if (c >= 0xe0 && c <= 0xef) {
+            continuation_count = 2;
+        } else if (c >= 0xf0 && c <= 0xf4) {
+            continuation_count = 3;
+        } else {
+            return 0;
+        }
+        if (i + continuation_count >= length) return 0;
+        for (size_t j = 1; j <= continuation_count; j++) {
+            if ((value[i + j] & 0xc0) != 0x80) return 0;
+        }
+        if ((c == 0xe0 && value[i + 1] < 0xa0) ||
+            (c == 0xed && value[i + 1] >= 0xa0) ||
+            (c == 0xf0 && value[i + 1] < 0x90) ||
+            (c == 0xf4 && value[i + 1] >= 0x90)) {
+            return 0;
+        }
+        i += continuation_count + 1;
+    }
+    return 1;
+}
+
+static int normalize_query_key(const char *encoded, char *normalized, size_t normalized_cap) {
+    char decoded[MAX_QUERY_KEY_LENGTH + 1];
+    if (percent_decode(encoded, decoded, sizeof(decoded)) != 0 || decoded[0] == '\0') {
+        return -1;
+    }
+
+    size_t length = strlen(decoded);
+    if (length >= normalized_cap) return -1;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)decoded[i];
+        if (c <= 0x20 || c >= 0x7f || c == '&' || c == '=' || c == '#') return -1;
+        normalized[i] = (char)tolower(c);
+    }
+    normalized[length] = '\0';
+
+    const char *alias = NULL;
+    if (strcmp(normalized, "type") == 0 || strcmp(normalized, "network") == 0 ||
+        strcmp(normalized, "transport") == 0 || strcmp(normalized, "net") == 0) {
+        alias = "transport";
+    } else if (strcmp(normalized, "allowinsecure") == 0 || strcmp(normalized, "insecure") == 0) {
+        alias = "allowinsecure";
+    } else if (strcmp(normalized, "servicename") == 0 || strcmp(normalized, "service_name") == 0) {
+        alias = "servicename";
+    } else if (strcmp(normalized, "xpaddingbytes") == 0 || strcmp(normalized, "x_padding_bytes") == 0) {
+        alias = "xpaddingbytes";
+    } else if (strcmp(normalized, "scmaxeachpostbytes") == 0 || strcmp(normalized, "sc_max_each_post_bytes") == 0) {
+        alias = "scmaxeachpostbytes";
+    }
+    if (alias != NULL) copy_trunc(normalized, normalized_cap, alias);
+    return 0;
+}
+
+static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_cap) {
+    char seen[MAX_QUERY_PARAMETERS][MAX_QUERY_KEY_LENGTH + 1];
+    size_t seen_count = 0;
+    char *cursor = query;
+
+    while (cursor != NULL && *cursor != '\0') {
+        char *next = strchr(cursor, '&');
+        if (next != NULL) *next = '\0';
+
+        char *eq = strchr(cursor, '=');
+        if (eq == NULL || eq == cursor) {
+            set_err(err, err_cap, "invalid query parameter");
+            return -1;
         }
         *eq = '\0';
-        const char *key = tok;
-        const char *val = eq + 1;
+
+        char key[MAX_QUERY_KEY_LENGTH + 1];
+        if (normalize_query_key(cursor, key, sizeof(key)) != 0) {
+            set_err(err, err_cap, "invalid query parameter name");
+            return -1;
+        }
+        for (size_t i = 0; i < seen_count; i++) {
+            if (strcmp(seen[i], key) == 0) {
+                set_err(err, err_cap, "duplicate query parameter");
+                return -1;
+            }
+        }
+        if (seen_count >= MAX_QUERY_PARAMETERS) {
+            set_err(err, err_cap, "too many query parameters");
+            return -1;
+        }
+        copy_trunc(seen[seen_count++], sizeof(seen[0]), key);
 
         char decoded[4096];
-        if (percent_decode(val, decoded, sizeof(decoded)) != 0) {
-            continue;
+        if (percent_decode(eq + 1, decoded, sizeof(decoded)) != 0) {
+            set_err(err, err_cap, "invalid query parameter encoding");
+            return -1;
         }
+        if (!query_value_is_valid_utf8((const unsigned char *)decoded)) {
+            set_err(err, err_cap, "invalid query parameter value");
+            return -1;
+        }
+        char decoded_lower[4096];
+        copy_lower_trunc(decoded_lower, sizeof(decoded_lower), decoded);
 
         if (strcmp(key, "pbk") == 0) {
             size_t n = 0;
@@ -409,44 +510,44 @@ static void parse_query(vless_config_t *cfg, char *query) {
         } else if (strcmp(key, "sni") == 0) {
             copy_trunc(cfg->sni, sizeof(cfg->sni), decoded);
         } else if (strcmp(key, "fp") == 0) {
-            if (strcmp(decoded, "random") == 0) {
+            if (strcmp(decoded_lower, "random") == 0) {
                 cfg->fp_mode = FP_RANDOM;
-            } else if (strcmp(decoded, "randomized") == 0) {
+            } else if (strcmp(decoded_lower, "randomized") == 0) {
                 cfg->fp_mode = FP_RANDOMIZED;
-            } else if (strcmp(decoded, "qq") == 0) {
+            } else if (strcmp(decoded_lower, "qq") == 0) {
                 cfg->fp_mode = FP_QQ;
-            } else if (strcmp(decoded, "firefox") == 0) {
+            } else if (strcmp(decoded_lower, "firefox") == 0) {
                 cfg->fp_mode = FP_FIREFOX;
-            } else if (strcmp(decoded, "edge") == 0) {
+            } else if (strcmp(decoded_lower, "edge") == 0) {
                 cfg->fp_mode = FP_EDGE;
             } else {
                 cfg->fp_mode = FP_CHROME;
             }
         } else if (strcmp(key, "flow") == 0) {
-            copy_trunc(cfg->flow, sizeof(cfg->flow), decoded);
+            copy_trunc(cfg->flow, sizeof(cfg->flow), decoded_lower);
         } else if (strcmp(key, "encryption") == 0) {
             copy_trunc(cfg->encryption, sizeof(cfg->encryption), decoded);
         } else if (strcmp(key, "security") == 0) {
-            copy_trunc(cfg->security, sizeof(cfg->security), decoded[0] != '\0' ? decoded : "none");
+            copy_trunc(cfg->security, sizeof(cfg->security), decoded_lower[0] != '\0' ? decoded_lower : "none");
         } else if (strcmp(key, "alpn") == 0) {
             copy_trunc(cfg->alpn, sizeof(cfg->alpn), decoded);
-        } else if (strcmp(key, "allowInsecure") == 0 || strcmp(key, "insecure") == 0) {
-            cfg->allow_insecure = (strcmp(decoded, "1") == 0 || strcmp(decoded, "true") == 0);
-        } else if (strcmp(key, "type") == 0 || strcmp(key, "transport") == 0 || strcmp(key, "network") == 0 || strcmp(key, "net") == 0) {
-            if (strcmp(decoded, "xhttp") == 0 || strcmp(decoded, "splithttp") == 0) {
+        } else if (strcmp(key, "allowinsecure") == 0) {
+            cfg->allow_insecure = (strcmp(decoded_lower, "1") == 0 || strcmp(decoded_lower, "true") == 0);
+        } else if (strcmp(key, "transport") == 0) {
+            if (strcmp(decoded_lower, "xhttp") == 0 || strcmp(decoded_lower, "splithttp") == 0) {
                 cfg->transport_mode = TRANSPORT_XHTTP;
-            } else if (strcmp(decoded, "ws") == 0 || strcmp(decoded, "websocket") == 0) {
+            } else if (strcmp(decoded_lower, "ws") == 0 || strcmp(decoded_lower, "websocket") == 0) {
                 cfg->transport_mode = TRANSPORT_WS;
-            } else if (strcmp(decoded, "grpc") == 0) {
+            } else if (strcmp(decoded_lower, "grpc") == 0) {
                 cfg->transport_mode = TRANSPORT_GRPC;
-            } else if (decoded[0] == '\0' || strcmp(decoded, "tcp") == 0) {
+            } else if (decoded_lower[0] == '\0' || strcmp(decoded_lower, "tcp") == 0) {
                 cfg->transport_mode = TRANSPORT_VISION;
             }
         } else if (strcmp(key, "path") == 0) {
             copy_trunc(cfg->xhttp_path, sizeof(cfg->xhttp_path), decoded);
         } else if (strcmp(key, "host") == 0) {
             copy_trunc(cfg->xhttp_host, sizeof(cfg->xhttp_host), decoded);
-        } else if (strcmp(key, "serviceName") == 0 || strcmp(key, "service_name") == 0) {
+        } else if (strcmp(key, "servicename") == 0) {
             copy_trunc(cfg->grpc_service_name, sizeof(cfg->grpc_service_name), decoded);
         } else if (strcmp(key, "authority") == 0) {
             copy_trunc(cfg->grpc_authority, sizeof(cfg->grpc_authority), decoded);
@@ -454,14 +555,22 @@ static void parse_query(vless_config_t *cfg, char *query) {
             copy_lower_trunc(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), decoded);
         } else if (strcmp(key, "extra") == 0) {
             parse_xhttp_extra(cfg, decoded);
-        } else if (strcmp(key, "xPaddingBytes") == 0 || strcmp(key, "x_padding_bytes") == 0) {
+        } else if (strcmp(key, "xpaddingbytes") == 0) {
             parse_range_value(decoded, &cfg->xhttp_padding_min, &cfg->xhttp_padding_max);
-        } else if (strcmp(key, "scMaxEachPostBytes") == 0 || strcmp(key, "sc_max_each_post_bytes") == 0) {
+        } else if (strcmp(key, "scmaxeachpostbytes") == 0) {
             parse_range_value_limited(decoded, &cfg->xhttp_max_each_post_min, &cfg->xhttp_max_each_post_max, 16L * 1024L * 1024L);
         } else if (strcmp(key, "spx") == 0) {
             copy_trunc(cfg->spider_x, sizeof(cfg->spider_x), decoded);
         }
+
+        if (next == NULL) break;
+        cursor = next + 1;
+        if (*cursor == '\0') {
+            set_err(err, err_cap, "invalid trailing query separator");
+            return -1;
+        }
     }
+    return 0;
 }
 
 static int parse_vless_encryption(vless_config_t *cfg, char *err, size_t err_cap) {
@@ -545,7 +654,7 @@ static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, siz
         return -1;
     }
 
-    init_config_defaults(cfg, uri);
+    init_config_defaults(cfg);
     cfg->protocol = CORE_PROTOCOL_SOCKS5;
     cfg->flow[0] = '\0';
     snprintf(cfg->security, sizeof(cfg->security), "none");
@@ -556,9 +665,13 @@ static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, siz
         set_err(err, err_cap, "URI must start with socks5://");
         return -1;
     }
+    if (strlen(uri) > CORE_URI_MAX_LENGTH) {
+        set_err(err, err_cap, "URI is too long");
+        return -1;
+    }
 
     char work[4096];
-    snprintf(work, sizeof(work), "%s", uri + 9);
+    memcpy(work, uri + 9, strlen(uri + 9) + 1);
 
     char *end = strpbrk(work, "/?#");
     if (end != NULL) {
@@ -606,15 +719,19 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         return -1;
     }
 
-    init_config_defaults(cfg, uri);
+    init_config_defaults(cfg);
 
     if (!starts_with_ci(uri, "vless://")) {
         set_err(err, err_cap, "URI must start with vless://");
         return -1;
     }
+    if (strlen(uri) > CORE_URI_MAX_LENGTH) {
+        set_err(err, err_cap, "URI is too long");
+        return -1;
+    }
 
     char work[4096];
-    snprintf(work, sizeof(work), "%s", uri + 8);
+    memcpy(work, uri + 8, strlen(uri + 8) + 1);
 
     char *hash = strchr(work, '#');
     if (hash != NULL) {
@@ -647,7 +764,9 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     snprintf(cfg->sni, sizeof(cfg->sni), "%s", cfg->server_host);
 
     if (query != NULL && *query != '\0') {
-        parse_query(cfg, query);
+        if (parse_query(cfg, query, err, err_cap) != 0) {
+            return -1;
+        }
     }
 
     if (parse_vless_encryption(cfg, err, err_cap) != 0) {

@@ -33,8 +33,6 @@ typedef struct {
 } vless_encryption_relay_t;
 
 typedef struct {
-    char original_uri[2048];
-
     core_protocol_t protocol;
 
     uint8_t uuid[16];

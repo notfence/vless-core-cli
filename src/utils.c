@@ -131,10 +131,16 @@ int percent_decode(const char *in, char *out, size_t out_cap) {
         if (oi + 1 >= out_cap) {
             return -1;
         }
-        if (in[i] == '%' && isxdigit((unsigned char)in[i + 1]) && isxdigit((unsigned char)in[i + 2])) {
+        if (in[i] == '%') {
+            if (in[i + 1] == '\0' || in[i + 2] == '\0' ||
+                !isxdigit((unsigned char)in[i + 1]) || !isxdigit((unsigned char)in[i + 2])) {
+                return -1;
+            }
             int hi = hex_value(in[i + 1]);
             int lo = hex_value(in[i + 2]);
-            out[oi++] = (char)((hi << 4) | lo);
+            int decoded = (hi << 4) | lo;
+            if (decoded == 0) return -1;
+            out[oi++] = (char)decoded;
             i += 2;
         } else if (in[i] == '+') {
             out[oi++] = ' ';

@@ -5,6 +5,8 @@
 
 #include "types.h"
 
+#define CORE_URI_MAX_LENGTH 4095
+
 int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap);
 int parse_core_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap);
 

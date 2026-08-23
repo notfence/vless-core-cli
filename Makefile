@@ -1,6 +1,7 @@
 CC ?= cc
 
 COMMON_CFLAGS ?= -O2 -Wall -Wextra -std=c11
+DEPFLAGS := -MMD -MP
 INCLUDES := -Iinclude
 
 SRC := $(wildcard src/*.c)
@@ -60,10 +61,10 @@ $(BIN_IOS): $(OBJ_IOS) $(IOS_OPENSSL_PREFIX)/lib/libssl.a $(IOS_OPENSSL_PREFIX)/
 	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_LDFLAGS) -o $@ $(OBJ_IOS) $(IOS_LDLIBS)
 
 build/linux/%.o: src/%.c | build/linux
-	$(CC) $(COMMON_CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(COMMON_CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
 build/ios/%.o: src/%.c | build/ios
-	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_CFLAGS) -c $< -o $@
+	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 build/ios/main.o: $(IOS_OPENSSL_PATCH_STATUS_FILE)
 
@@ -108,5 +109,7 @@ curl-ios6-package: $(CURL_IOS_BIN) $(CA_BUNDLE)
 
 clean:
 	rm -rf build $(BIN_LINUX) $(BIN_IOS)
+
+-include $(OBJ_LINUX:.o=.d) $(OBJ_IOS:.o=.d)
 
 .PHONY: all linux ios check-ios-toolchain clean openssl-ios6 zlib-ios6 curl-ios6 curl-ios6-package
