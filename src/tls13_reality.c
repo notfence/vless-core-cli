@@ -51,11 +51,10 @@ typedef enum {
 } conn_mode_t;
 
 typedef enum {
-    XHTTP_TLS_MODE_AUTO = 0,
-    XHTTP_TLS_MODE_STRICT = 1,
-    XHTTP_TLS_MODE_INSECURE = 2,
-    XHTTP_TLS_MODE_TOFU = 3
-} xhttp_tls_mode_t;
+    TLS_VERIFY_MODE_STRICT = 0,
+    TLS_VERIFY_MODE_INSECURE = 1,
+    TLS_VERIFY_MODE_TOFU = 2
+} tls_verify_mode_t;
 
 typedef enum {
     TLS_CIPHER_OFFER_CHACHA = 0,
@@ -71,7 +70,6 @@ typedef enum {
 #define XRAY_DEFAULT_VERSION_Y 3
 #define XRAY_DEFAULT_VERSION_Z 27
 
-static int g_xhttp_auto_force_insecure = 0;
 static uint8_t g_xray_version[3] = {
     XRAY_DEFAULT_VERSION_X,
     XRAY_DEFAULT_VERSION_Y,
@@ -182,6 +180,7 @@ struct tls13_conn {
     int xhttp_headers_read;
     int xhttp_tls_insecure;
     char xhttp_pin_key[320];
+    tls_verify_mode_t tls_verify_policy;
     char tls_verify_mode[16];
     int tls_use_aes_fallback;
     char ws_path[512];
@@ -587,70 +586,37 @@ static int random_xpadding_value(int min_len, int max_len, const char *method, c
     return 0;
 }
 
-static int is_cert_verify_error_msg(const char *err) {
-    if (err == NULL || err[0] == '\0') {
-        return 0;
-    }
-    return strstr(err, "certificate verify failed") != NULL || strstr(err, "unable to get local issuer") != NULL ||
-           strstr(err, "self signed certificate") != NULL || strstr(err, "self-signed certificate") != NULL ||
-           strstr(err, "hostname mismatch") != NULL || strstr(err, "no trusted CA bundle") != NULL;
-}
-
-static xhttp_tls_mode_t get_xhttp_tls_mode(void) {
-    const char *v = getenv("VLESS_XHTTP_TLS_MODE");
-    if (v == NULL || v[0] == '\0') {
-        return XHTTP_TLS_MODE_AUTO;
-    }
-    if (strcmp(v, "strict") == 0) {
-        return XHTTP_TLS_MODE_STRICT;
-    }
+static tls_verify_mode_t get_tls_verify_mode(void) {
+    const char *v = getenv("VLESS_TLS_MODE");
+    if (v == NULL || v[0] == '\0') v = getenv("VLESS_XHTTP_TLS_MODE");
+    if (v == NULL || v[0] == '\0') return TLS_VERIFY_MODE_STRICT;
     if (strcmp(v, "insecure") == 0) {
-        return XHTTP_TLS_MODE_INSECURE;
+        return TLS_VERIFY_MODE_INSECURE;
     }
     if (strcmp(v, "tofu") == 0) {
-        return XHTTP_TLS_MODE_TOFU;
+        return TLS_VERIFY_MODE_TOFU;
     }
-    return XHTTP_TLS_MODE_AUTO;
+    return TLS_VERIFY_MODE_STRICT;
 }
 
-static const char *xhttp_tls_mode_name(xhttp_tls_mode_t mode) {
+static tls_verify_mode_t tls_verify_mode_for_config(const vless_config_t *cfg) {
+    return cfg != NULL && cfg->allow_insecure ? TLS_VERIFY_MODE_INSECURE : get_tls_verify_mode();
+}
+
+static const char *tls_verify_mode_name(tls_verify_mode_t mode) {
     switch (mode) {
-    case XHTTP_TLS_MODE_STRICT:
-        return "strict";
-    case XHTTP_TLS_MODE_INSECURE:
+    case TLS_VERIFY_MODE_INSECURE:
         return "insecure";
-    case XHTTP_TLS_MODE_TOFU:
+    case TLS_VERIFY_MODE_TOFU:
         return "tofu";
-    case XHTTP_TLS_MODE_AUTO:
+    case TLS_VERIFY_MODE_STRICT:
     default:
-        return "auto";
+        return "strict";
     }
 }
 
-static void xhttp_log_tls_mode_selected(xhttp_tls_mode_t mode, int verify_peer) {
-    if (mode == XHTTP_TLS_MODE_AUTO) {
-        fprintf(stderr, "[xhttp] tls_mode=auto(selected=%s)\n", verify_peer ? "strict" : "insecure+tofu");
-        return;
-    }
-    fprintf(stderr, "[xhttp] tls_mode=%s\n", xhttp_tls_mode_name(mode));
-}
-
-static int xhttp_effective_verify_peer(void) {
-    xhttp_tls_mode_t mode = get_xhttp_tls_mode();
-    if (mode == XHTTP_TLS_MODE_STRICT) {
-        return 1;
-    }
-    if (mode == XHTTP_TLS_MODE_INSECURE) {
-        return 0;
-    }
-    if (mode == XHTTP_TLS_MODE_TOFU) {
-        return 0;
-    }
-    return g_xhttp_auto_force_insecure ? 0 : 1;
-}
-
-static int xhttp_auto_fallback_allowed(void) {
-    return get_xhttp_tls_mode() == XHTTP_TLS_MODE_AUTO;
+static int tls_verify_peer(tls_verify_mode_t mode) {
+    return mode == TLS_VERIFY_MODE_STRICT;
 }
 
 static void ascii_lower(char *s) {
@@ -3415,8 +3381,8 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, ch
     SSL_CTX *ctx = NULL;
     SSL *ssl = NULL;
     int fd = -1;
-    xhttp_tls_mode_t mode = get_xhttp_tls_mode();
-    if (mode == XHTTP_TLS_MODE_TOFU) {
+    tls_verify_mode_t mode = c->tls_verify_policy;
+    if (mode == TLS_VERIFY_MODE_TOFU) {
         if (c->xhttp_pin_key[0] == '\0' &&
             xhttp_make_pin_key(c->remote_sni[0] != '\0' ? c->remote_sni : c->remote_host, c->remote_port, c->xhttp_pin_key,
                                sizeof(c->xhttp_pin_key)) != 0) {
@@ -3436,46 +3402,10 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len, ch
         }
         c->xhttp_tls_insecure = 1;
     } else {
-        int need_auto_pin_check = 0;
-        int verify_peer = c->xhttp_tls_insecure ? 0 : xhttp_effective_verify_peer();
+        int verify_peer = c->xhttp_tls_insecure ? 0 : tls_verify_peer(mode);
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &ctx, &ssl, &fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
-            if (!(verify_peer == 1 && xhttp_auto_fallback_allowed() && is_cert_verify_error_msg(err))) {
-                return -1;
-            }
-            if (!g_xhttp_auto_force_insecure) {
-                fprintf(stderr, "[xhttp] tls_mode=auto(selected=insecure+tofu): %s\n", err);
-            }
-            g_xhttp_auto_force_insecure = 1;
-            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd,
-                                &c->tls_use_aes_fallback, err, err_cap) != 0) {
-                return -1;
-            }
-            c->xhttp_tls_insecure = 1;
-            if (mode == XHTTP_TLS_MODE_AUTO) {
-                need_auto_pin_check = 1;
-            }
-        } else if (mode == XHTTP_TLS_MODE_AUTO && c->xhttp_tls_insecure) {
-            need_auto_pin_check = 1;
-        }
-        if (need_auto_pin_check) {
-            if (c->xhttp_pin_key[0] == '\0' &&
-                xhttp_make_pin_key(c->remote_sni[0] != '\0' ? c->remote_sni : c->remote_host, c->remote_port, c->xhttp_pin_key,
-                                   sizeof(c->xhttp_pin_key)) != 0) {
-                SSL_shutdown(ssl);
-                SSL_free(ssl);
-                SSL_CTX_free(ctx);
-                close(fd);
-                set_err(err, err_cap, "failed to build xhttp pin key");
-                return -1;
-            }
-            if (xhttp_tofu_verify_or_store(ssl, c->xhttp_pin_key, 0, err, err_cap) != 0) {
-                SSL_shutdown(ssl);
-                SSL_free(ssl);
-                SSL_CTX_free(ctx);
-                close(fd);
-                return -1;
-            }
+            return -1;
         }
     }
 
@@ -5286,7 +5216,10 @@ static int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len
 
 static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, char *err, size_t err_cap) {
     int use_reality = (strcmp(cfg->security, "reality") == 0);
-    snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "%s", use_reality ? "reality" : (cfg->allow_insecure ? "insecure" : "strict"));
+    tls_verify_mode_t verify_mode = tls_verify_mode_for_config(cfg);
+    c->tls_verify_policy = verify_mode;
+    snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "%s",
+             use_reality ? "reality" : tls_verify_mode_name(verify_mode));
 
     uint8_t client_priv[32];
     uint8_t client_pub[32];
@@ -5402,7 +5335,7 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cip
 
     dynbuf_t enc_hs = {0};
     int got_finished = 0;
-    int cert_verified = use_reality ? 0 : (cfg->allow_insecure ? 1 : 0);
+    int cert_verified = use_reality ? 0 : (verify_mode == TLS_VERIFY_MODE_INSECURE ? 1 : 0);
 
     while (!got_finished) {
         uint8_t rtype = 0;
@@ -5475,23 +5408,17 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cip
                                 cert_verified = 1;
                             }
                         }
-                    } else if (!cfg->allow_insecure) {
-                        char verify_err[256] = {0};
-                        if (verify_tls_cert_message(cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host, enc_hs.data, 4 + hlen, verify_err,
-                                                    sizeof(verify_err)) != 0) {
-                            if (!is_cert_verify_error_msg(verify_err)) {
-                                set_err(err, err_cap, verify_err[0] != '\0' ? verify_err : "TLS certificate verify failed");
-                                db_free(&enc_hs);
-                                return -1;
-                            }
-                            fprintf(stderr, "[tls] cert verify failed, using TOFU: %s\n", verify_err);
-                            if (tcp_tls_tofu_verify_or_store(cfg, enc_hs.data, 4 + hlen, err, err_cap) != 0) {
-                                db_free(&enc_hs);
-                                return -1;
-                            }
-                            snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "tofu");
-                        } else {
-                            snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "strict");
+                    } else if (verify_mode == TLS_VERIFY_MODE_TOFU) {
+                        if (tcp_tls_tofu_verify_or_store(cfg, enc_hs.data, 4 + hlen, err, err_cap) != 0) {
+                            db_free(&enc_hs);
+                            return -1;
+                        }
+                        cert_verified = 1;
+                    } else if (verify_mode == TLS_VERIFY_MODE_STRICT) {
+                        if (verify_tls_cert_message(cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host, enc_hs.data, 4 + hlen, err,
+                                                    err_cap) != 0) {
+                            db_free(&enc_hs);
+                            return -1;
                         }
                         cert_verified = 1;
                     }
@@ -5744,10 +5671,18 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
     int verify_peer = 0;
     if (ws_tls) {
         static const unsigned char h1_alpn[] = {0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-        verify_peer = cfg->allow_insecure ? 0 : 1;
+        tls_verify_mode_t mode = tls_verify_mode_for_config(cfg);
+        c->tls_verify_policy = mode;
+        verify_peer = tls_verify_peer(mode);
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, h1_alpn, sizeof(h1_alpn), &c->ssl_ctx, &c->ssl,
                             &c->fd, &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
+        }
+        if (mode == TLS_VERIFY_MODE_TOFU) {
+            if (xhttp_make_pin_key(c->remote_sni, c->remote_port, c->xhttp_pin_key, sizeof(c->xhttp_pin_key)) != 0 ||
+                xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
+                return -1;
+            }
         }
     } else {
         c->fd = tcp_connect_host(c->remote_host, c->remote_port);
@@ -5816,7 +5751,7 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
     }
 
     fprintf(stderr, "[ws] connected path=%s host=%s security=%s verify=%s\n", c->ws_path, c->ws_host, cfg->security,
-            ws_tls ? (verify_peer ? "strict" : "insecure") : "none");
+            ws_tls ? tls_verify_mode_name(c->tls_verify_policy) : "none");
     return 0;
 }
 
@@ -5932,9 +5867,10 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         return -1;
     }
 
-    xhttp_tls_mode_t mode = get_xhttp_tls_mode();
-    if (mode == XHTTP_TLS_MODE_TOFU) {
-        xhttp_log_tls_mode_selected(mode, 0);
+    tls_verify_mode_t mode = tls_verify_mode_for_config(cfg);
+    c->tls_verify_policy = mode;
+    fprintf(stderr, "[xhttp] tls_mode=%s\n", tls_verify_mode_name(mode));
+    if (mode == TLS_VERIFY_MODE_TOFU) {
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
@@ -5944,28 +5880,12 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         }
         c->xhttp_tls_insecure = 1;
     } else {
-        int verify_peer = xhttp_effective_verify_peer();
-        xhttp_log_tls_mode_selected(mode, verify_peer);
+        int verify_peer = tls_verify_peer(mode);
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl,
                             &c->fd, &c->tls_use_aes_fallback, err, err_cap) != 0) {
-            if (!(verify_peer == 1 && xhttp_auto_fallback_allowed() && is_cert_verify_error_msg(err))) {
-                return -1;
-            }
-            if (!g_xhttp_auto_force_insecure) {
-                fprintf(stderr, "[xhttp] tls_mode=auto(selected=insecure+tofu): %s\n", err);
-            }
-            g_xhttp_auto_force_insecure = 1;
-            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
-                                &c->tls_use_aes_fallback, err, err_cap) != 0) {
-                return -1;
-            }
-            if (mode == XHTTP_TLS_MODE_AUTO && xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
-                return -1;
-            }
-            c->xhttp_tls_insecure = 1;
-        } else {
-            c->xhttp_tls_insecure = verify_peer ? 0 : 1;
+            return -1;
         }
+        c->xhttp_tls_insecure = verify_peer ? 0 : 1;
     }
 
     if (ssl_selected_alpn_is_h2(c->ssl)) {
@@ -6002,11 +5922,9 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
         return -1;
     }
 
-    xhttp_tls_mode_t mode = get_xhttp_tls_mode();
-    if (cfg->allow_insecure) {
-        mode = XHTTP_TLS_MODE_INSECURE;
-    }
-    if (mode == XHTTP_TLS_MODE_TOFU) {
+    tls_verify_mode_t mode = tls_verify_mode_for_config(cfg);
+    c->tls_verify_policy = mode;
+    if (mode == TLS_VERIFY_MODE_TOFU) {
         fprintf(stderr, "[grpc] tls_mode=tofu\n");
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0 ||
@@ -6015,23 +5933,13 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
         }
         c->xhttp_tls_insecure = 1;
     } else {
-        int verify_peer = mode == XHTTP_TLS_MODE_INSECURE ? 0 : xhttp_effective_verify_peer();
-        fprintf(stderr, "[grpc] tls_mode=%s\n", xhttp_tls_mode_name(mode));
+        int verify_peer = tls_verify_peer(mode);
+        fprintf(stderr, "[grpc] tls_mode=%s\n", tls_verify_mode_name(mode));
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
-            if (!(verify_peer == 1 && mode == XHTTP_TLS_MODE_AUTO && is_cert_verify_error_msg(err))) {
-                return -1;
-            }
-            fprintf(stderr, "[grpc] tls_mode=auto(selected=insecure+tofu): %s\n", err);
-            if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
-                                &c->tls_use_aes_fallback, err, err_cap) != 0 ||
-                xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
-                return -1;
-            }
-            c->xhttp_tls_insecure = 1;
-        } else {
-            c->xhttp_tls_insecure = verify_peer ? 0 : 1;
+            return -1;
         }
+        c->xhttp_tls_insecure = verify_peer ? 0 : 1;
     }
 
     if (!ssl_selected_alpn_is_h2(c->ssl)) {

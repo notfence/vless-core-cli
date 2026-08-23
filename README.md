@@ -93,20 +93,19 @@ Options:
 
 Routing is optional and is disabled by default. When enabled, ordered rules can send new connections through the selected proxy, connect directly, or block them. Rules can match domains, domain suffixes, IP/CIDR ranges, and ports.
 
-## XHTTP TLS modes
+## TLS verification modes
 
-For `type=xhttp` transport you can control TLS behavior via env:
+TLS certificate verification is strict by default for TCP, WebSocket, XHTTP, and gRPC transports. It can be changed explicitly via:
 
 ```bash
-VLESS_XHTTP_TLS_MODE=auto|strict|insecure|tofu
+VLESS_TLS_MODE=strict|insecure|tofu
 ```
 
-- `auto` (default): try TLS verify, and if cert-verify fails fallback to insecure TLS with TOFU pin check/store.
-- `strict`: only verified TLS, no fallback.
+- `strict` (default): only verified TLS, no fallback.
 - `insecure`: always insecure TLS.
 - `tofu`: Trust-On-First-Use pinning (first cert is saved, next connections must match SHA-256 pin).
 
-`type=tcp&security=tls` uses the same pin storage and falls back to TOFU when strict cert verification fails.
+The legacy `VLESS_XHTTP_TLS_MODE` name remains accepted. `auto` is treated as `strict` and never downgrades certificate verification.
 
 TOFU pin file path:
 

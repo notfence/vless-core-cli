@@ -1098,21 +1098,18 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --openssl-patch-status   Show OpenSSL patch status\n");
 }
 
-static const char *xhttp_tls_mode_startup_label(void) {
-    const char *v = getenv("VLESS_XHTTP_TLS_MODE");
-    if (v == NULL || v[0] == '\0' || strcmp(v, "auto") == 0) {
-        return "auto(selected=strict)";
-    }
-    if (strcmp(v, "strict") == 0) {
-        return "strict";
-    }
+static const char *tls_mode_startup_label(int allow_insecure) {
+    if (allow_insecure) return "insecure";
+    const char *v = getenv("VLESS_TLS_MODE");
+    if (v == NULL || v[0] == '\0') v = getenv("VLESS_XHTTP_TLS_MODE");
+    if (v == NULL || v[0] == '\0') return "strict";
     if (strcmp(v, "insecure") == 0) {
         return "insecure";
     }
     if (strcmp(v, "tofu") == 0) {
         return "tofu";
     }
-    return "auto(selected=strict)";
+    return "strict";
 }
 
 int main(int argc, char **argv) {
@@ -1256,7 +1253,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
                 cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security, transport_label, fp_label);
         if ((cfg.transport_mode == TRANSPORT_XHTTP || cfg.transport_mode == TRANSPORT_GRPC) && strcmp(cfg.security, "tls") == 0) {
-            fprintf(stderr, "[%s] tls_mode=%s\n", transport_label, xhttp_tls_mode_startup_label());
+            fprintf(stderr, "[%s] tls_mode=%s\n", transport_label, tls_mode_startup_label(cfg.allow_insecure));
         }
     }
     if (g_routing.enabled) {
