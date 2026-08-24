@@ -1,0 +1,296 @@
+--- crypto/armv4cpuid.pl
++++ crypto/armv4cpuid.pl
+@@ -212,10 +212,9 @@
+ OPENSSL_wipe_cpu:
+ #if __ARM_MAX_ARCH__>=7
+ 	ldr	r0,.LOPENSSL_armcap
+-#ifndef	__APPLE__
+ 	adr	r1,.LOPENSSL_armcap
+ 	ldr	r0,[r1,r0]
+-#else
++#ifdef	__APPLE__
+ 	ldr	r0,[r0]
+ #endif
+ #endif
+@@ -279,7 +278,7 @@
+ #if __ARM_MAX_ARCH__>=7
+ .LOPENSSL_armcap:
+ # ifdef	__APPLE__
+-.word	_OPENSSL_armcap_P
++.word	.LOPENSSL_armcap_ptr-.LOPENSSL_armcap
+ # else
+ .word	OPENSSL_armcap_P-.
+ # endif
+@@ -299,6 +298,13 @@
+ 
+ .extern	OPENSSL_armcap_P
+ .hidden	OPENSSL_armcap_P
++#ifdef __APPLE__
++.non_lazy_symbol_pointer
++.align	2
++.LOPENSSL_armcap_ptr:
++.indirect_symbol	_OPENSSL_armcap_P
++.long	0
++#endif
+ ___
+ 
+ print $code;
+--- crypto/bn/asm/armv4-mont.pl
++++ crypto/bn/asm/armv4-mont.pl
+@@ -112,7 +112,11 @@
+ .align	5
+ .LOPENSSL_armcap:
+ # if defined(_WIN32) || defined(__APPLE__)
++#  ifdef __APPLE__
++.word	.LOPENSSL_armcap_ptr-.Lbn_mul_mont
++#  else
+ .word	_OPENSSL_armcap_P
++#  endif
+ # else
+ .word	OPENSSL_armcap_P-.Lbn_mul_mont
+ # endif
+@@ -130,7 +134,7 @@
+ 	tst	ip,#7
+ 	bne	.Lialu
+ 	ldr	r0,.LOPENSSL_armcap
+-#if !defined(_WIN32) && !defined(__APPLE__)
++#if !defined(_WIN32)
+ 	adr	r2,.Lbn_mul_mont
+ 	ldr	r0,[r0,r2]
+ # endif
+@@ -751,6 +755,13 @@
+ #if __ARM_MAX_ARCH__>=7
+ .extern	OPENSSL_armcap_P
+ .hidden	OPENSSL_armcap_P
++#ifdef __APPLE__
++.non_lazy_symbol_pointer
++.align	2
++.LOPENSSL_armcap_ptr:
++.indirect_symbol	_OPENSSL_armcap_P
++.long	0
++#endif
+ #endif
+ ___
+ 
+--- crypto/bn/asm/armv4-gf2m.pl
++++ crypto/bn/asm/armv4-gf2m.pl
+@@ -179,7 +179,7 @@
+ #if __ARM_MAX_ARCH__>=7
+ 	stmdb	sp!,{r10,lr}
+ 	ldr	r12,.LOPENSSL_armcap
+-# if !defined(_WIN32) && !defined(__APPLE__)
++# if !defined(_WIN32)
+ 	adr	r10,.LOPENSSL_armcap
+ 	ldr	r12,[r12,r10]
+ # endif
+@@ -315,7 +315,11 @@
+ .align	5
+ .LOPENSSL_armcap:
+ # if defined(_WIN32) || defined(__APPLE__)
++#  ifdef __APPLE__
++.word	.LOPENSSL_armcap_ptr-.LOPENSSL_armcap
++#  else
+ .word	_OPENSSL_armcap_P
++#  endif
+ # else
+ .word	OPENSSL_armcap_P-.
+ # endif
+@@ -328,6 +332,13 @@
+ #if __ARM_MAX_ARCH__>=7
+ .extern	OPENSSL_armcap_P
+ .hidden	OPENSSL_armcap_P
++#ifdef __APPLE__
++.non_lazy_symbol_pointer
++.align	2
++.LOPENSSL_armcap_ptr:
++.indirect_symbol	_OPENSSL_armcap_P
++.long	0
++#endif
+ #endif
+ ___
+
+--- crypto/chacha/asm/chacha-armv4.pl
++++ crypto/chacha/asm/chacha-armv4.pl
+@@ -196,7 +196,11 @@
+ #if __ARM_MAX_ARCH__>=7
+ .LOPENSSL_armcap:
+ # if defined(_WIN32) || defined(__APPLE__)
++#  ifdef __APPLE__
++.word   .LOPENSSL_armcap_ptr-.LChaCha20_ctr32
++#  else
+ .word   _OPENSSL_armcap_P
++#  endif
+ # else
+ .word   OPENSSL_armcap_P-.LChaCha20_ctr32
+ # endif
+@@ -226,7 +230,7 @@
+ 	cmp	r2,#192			@ test len
+ 	bls	.Lshort
+ 	ldr	r4,[r14,#-32]
+-# if !defined(_WIN32) && !defined(__APPLE__)
++# if !defined(_WIN32)
+ 	ldr	r4,[r14,r4]
+ # endif
+ # if defined(__APPLE__) || defined(_WIN32)
+@@ -1156,6 +1160,13 @@
+ .size	ChaCha20_neon,.-ChaCha20_neon
+ .extern	OPENSSL_armcap_P
+ .hidden	OPENSSL_armcap_P
++#ifdef __APPLE__
++.non_lazy_symbol_pointer
++.align	2
++.LOPENSSL_armcap_ptr:
++.indirect_symbol	_OPENSSL_armcap_P
++.long	0
++#endif
+ #endif
+ ___
+ }}}
+--- crypto/poly1305/asm/poly1305-armv4.pl
++++ crypto/poly1305/asm/poly1305-armv4.pl
+@@ -103,7 +103,7 @@
+ 	and	r4,r4,r10
+ 
+ #if	__ARM_MAX_ARCH__>=7
+-# if !defined(_WIN32) && !defined(__APPLE__)
++# if !defined(_WIN32)
+ 	ldr	r12,[r11,r12]		@ OPENSSL_armcap_P
+ # endif
+ # if defined(__APPLE__) || defined(_WIN32)
+@@ -1228,7 +1228,11 @@
+ .long	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ .LOPENSSL_armcap:
+ # if defined(_WIN32) || defined(__APPLE__)
++#  ifdef __APPLE__
++.word	.LOPENSSL_armcap_ptr-.Lpoly1305_init
++#  else
+ .word	_OPENSSL_armcap_P
++#  endif
+ # else
+ .word	OPENSSL_armcap_P-.Lpoly1305_init
+ # endif
+@@ -1241,6 +1245,13 @@
+ #if	__ARM_MAX_ARCH__>=7
+ .extern   OPENSSL_armcap_P
+ .hidden   OPENSSL_armcap_P
++#ifdef __APPLE__
++.non_lazy_symbol_pointer
++.align	2
++.LOPENSSL_armcap_ptr:
++.indirect_symbol	_OPENSSL_armcap_P
++.long	0
++#endif
+ #endif
+ ___
+ 
+--- crypto/sha/asm/sha1-armv4-large.pl
++++ crypto/sha/asm/sha1-armv4-large.pl
+@@ -206,7 +206,7 @@
+ #if __ARM_MAX_ARCH__>=7
+ .Lsha1_block:
+ 	ldr	r12,.LOPENSSL_armcap
+-# if !defined(_WIN32) && !defined(__APPLE__)
++# if !defined(_WIN32)
+ 	adr	r3,.Lsha1_block
+ 	ldr	r12,[r3,r12]		@ OPENSSL_armcap_P
+ # endif
+@@ -317,7 +317,11 @@
+ #if __ARM_MAX_ARCH__>=7
+ .LOPENSSL_armcap:
+ # if defined(_WIN32) || defined(__APPLE__)
++#  ifdef __APPLE__
++.word	.LOPENSSL_armcap_ptr-.Lsha1_block
++#  else
+ .word	_OPENSSL_armcap_P
++#  endif
+ # else
+ .word	OPENSSL_armcap_P-.Lsha1_block
+ # endif
+@@ -709,6 +713,13 @@
+ #if __ARM_MAX_ARCH__>=7
+ .extern	OPENSSL_armcap_P
+ .hidden	OPENSSL_armcap_P
++#ifdef __APPLE__
++.non_lazy_symbol_pointer
++.align	2
++.LOPENSSL_armcap_ptr:
++.indirect_symbol	_OPENSSL_armcap_P
++.long	0
++#endif
+ #endif
+ ___
+ 
+--- crypto/sha/asm/sha256-armv4.pl
++++ crypto/sha/asm/sha256-armv4.pl
+@@ -216,7 +216,11 @@
+ #if __ARM_MAX_ARCH__>=7 && !defined(__KERNEL__)
+ .LOPENSSL_armcap:
+ # if defined(_WIN32) || defined(__APPLE__)
++#  ifdef __APPLE__
++.word	.LOPENSSL_armcap_ptr-.Lsha256_block_data_order
++#  else
+ .word	_OPENSSL_armcap_P
++#  endif
+ # else
+ .word	OPENSSL_armcap_P-.Lsha256_block_data_order
+ # endif
+@@ -234,7 +238,7 @@
+ #endif
+ #if __ARM_MAX_ARCH__>=7 && !defined(__KERNEL__)
+ 	ldr	r12,.LOPENSSL_armcap
+-# if !defined(_WIN32) && !defined(__APPLE__)
++# if !defined(_WIN32)
+ 	ldr	r12,[r3,r12]		@ OPENSSL_armcap_P
+ # endif
+ # if defined(__APPLE__) || defined(_WIN32)
+@@ -695,6 +699,13 @@
+ #if __ARM_MAX_ARCH__>=7 && !defined(__KERNEL__)
+ .extern   OPENSSL_armcap_P
+ .hidden   OPENSSL_armcap_P
++#ifdef __APPLE__
++.non_lazy_symbol_pointer
++.align	2
++.LOPENSSL_armcap_ptr:
++.indirect_symbol	_OPENSSL_armcap_P
++.long	0
++#endif
+ #endif
+ ___
+ 
+--- crypto/sha/asm/sha512-armv4.pl
++++ crypto/sha/asm/sha512-armv4.pl
+@@ -280,7 +280,11 @@
+ #if __ARM_MAX_ARCH__>=7 && !defined(__KERNEL__)
+ .LOPENSSL_armcap:
+ # if defined(_WIN32) || defined(__APPLE__)
++#  ifdef __APPLE__
++.word	.LOPENSSL_armcap_ptr-.Lsha512_block_data_order
++#  else
+ .word	_OPENSSL_armcap_P
++#  endif
+ # else
+ .word	OPENSSL_armcap_P-.Lsha512_block_data_order
+ # endif
+@@ -300,7 +304,7 @@
+ #endif
+ #if __ARM_MAX_ARCH__>=7 && !defined(__KERNEL__)
+ 	ldr	r12,.LOPENSSL_armcap
+-# if !defined(_WIN32) && !defined(__APPLE__)
++# if !defined(_WIN32)
+ 	ldr	r12,[r3,r12]		@ OPENSSL_armcap_P
+ # endif
+ # if defined(__APPLE__) || defined(_WIN32)
+@@ -662,6 +666,13 @@
+ #if __ARM_MAX_ARCH__>=7 && !defined(__KERNEL__)
+ .extern	OPENSSL_armcap_P
+ .hidden	OPENSSL_armcap_P
++#ifdef __APPLE__
++.non_lazy_symbol_pointer
++.align	2
++.LOPENSSL_armcap_ptr:
++.indirect_symbol	_OPENSSL_armcap_P
++.long	0
++#endif
+ #endif
+ ___
+ 

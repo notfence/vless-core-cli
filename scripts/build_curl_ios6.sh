@@ -78,6 +78,8 @@ require_executable "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-ranlib" \
   "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"
 require_executable "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-strip" \
   "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"
+require_executable "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-otool" \
+  "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"
 require_file "${IOS_SDK}" "Set IOS_SDK=/path/to/iPhoneOS6.1.sdk"
 
 require_executable "$(command -v make || true)" "Install make"
@@ -119,7 +121,7 @@ export RANLIB=arm-apple-darwin11-ranlib
 export STRIP=arm-apple-darwin11-strip
 export CPPFLAGS="-I${OPENSSL_PREFIX}/include -I${ZLIB_PREFIX}/include"
 export CFLAGS="-arch armv7 -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -O2 -DNDEBUG"
-export LDFLAGS="-arch armv7 -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -L${OPENSSL_PREFIX}/lib -L${ZLIB_PREFIX}/lib"
+export LDFLAGS="-arch armv7 -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -Wl,-pie -L${OPENSSL_PREFIX}/lib -L${ZLIB_PREFIX}/lib"
 
 pushd "${CURL_SRC_DIR}" >/dev/null
 ./configure \
@@ -182,5 +184,10 @@ pushd "${CURL_SRC_DIR}" >/dev/null
 make -j"$(nproc)"
 make install
 popd >/dev/null
+
+if ! "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-otool" -hv "${CURL_INSTALL_DIR}/bin/curl" | grep -qw PIE; then
+  echo "Refusing non-PIE iOS curl binary: ${CURL_INSTALL_DIR}/bin/curl"
+  exit 1
+fi
 
 echo "Built curl for iOS armv7 at ${CURL_INSTALL_DIR}/bin/curl"

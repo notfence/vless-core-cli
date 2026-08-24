@@ -9,6 +9,7 @@ OPENSSL_SRC_DIR="${THIRD_PARTY_DIR}/openssl-${OPENSSL_VER}"
 OPENSSL_INSTALL_DIR="${THIRD_PARTY_DIR}/openssl-ios6-armv7"
 OPENSSL_PATCH_STATUS_FILE="${OPENSSL_INSTALL_DIR}/VLESS_OPENSSL_PATCH_STATUS"
 OPENSSL_IOS6_ASM_PATCH="${OPENSSL_IOS6_ASM_PATCH:-${ROOT_DIR}/patches/openssl-ios6-armv7-asm.patch}"
+OPENSSL_IOS6_PIE_PATCH="${ROOT_DIR}/patches/openssl-ios6-pie.patch"
 IOS_TOOLCHAIN="${IOS_TOOLCHAIN:-${HOME}/toolchains/ios6}"
 IOS_SDK="${IOS_SDK:-${IOS_TOOLCHAIN}/SDK/iPhoneOS6.1.sdk}"
 
@@ -84,6 +85,8 @@ if [[ "${OPENSSL_NO_ASM:-0}" != "1" ]]; then
   require_executable "$(command -v patch || true)" "Install patch"
   require_file "${OPENSSL_IOS6_ASM_PATCH}" \
     "OpenSSL iOS 6 asm rebuilds require the private patch. Set OPENSSL_IOS6_ASM_PATCH=/path/to/openssl-ios6-armv7-asm.patch, or build without asm: OPENSSL_NO_ASM=1 make openssl-ios6"
+  require_file "${OPENSSL_IOS6_PIE_PATCH}" \
+    "Missing the tracked OpenSSL iOS PIE patch"
 fi
 if [[ ! -f "${OPENSSL_TGZ}" ]]; then
   require_executable "$(command -v curl || true)" "Install curl for host downloads"
@@ -102,6 +105,7 @@ tar -xf "${OPENSSL_TGZ}" -C "${THIRD_PARTY_DIR}"
 if [[ "${OPENSSL_NO_ASM:-0}" != "1" ]]; then
   openssl_patch_status="patched"
   patch -d "${OPENSSL_SRC_DIR}" -p0 < "${OPENSSL_IOS6_ASM_PATCH}"
+  patch -d "${OPENSSL_SRC_DIR}" -p0 < "${OPENSSL_IOS6_PIE_PATCH}"
 else
   openssl_patch_status="unpatched"
 fi
