@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -1085,9 +1086,10 @@ static void *client_worker(void *arg) {
 }
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s --uri <vless://...|socks5://...> --listen-port <port>\n", argv0);
+    fprintf(stderr, "Usage: %s (--uri <uri> | --uri-fd <fd>) --listen-port <port>\n", argv0);
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  --uri <uri>              VLESS URI or SOCKS5 upstream URI\n");
+    fprintf(stderr, "  --uri-fd <fd>            Read the URI from a file descriptor\n");
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
     fprintf(stderr, "  --routing <rules>        Optional Proxy, Direct and Block rules\n");
     fprintf(stderr, "  --route-control-port <p> Direct-route controller port\n");
@@ -1096,6 +1098,22 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
     fprintf(stderr, "  --openssl-patch-status   Show OpenSSL patch status\n");
+}
+
+static int read_uri_from_fd(int fd, char out[CORE_URI_MAX_LENGTH + 1]) {
+    size_t used = 0;
+    for (;;) {
+        uint8_t buffer[1024];
+        ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) return -1;
+        if (count == 0) break;
+        if ((size_t)count > CORE_URI_MAX_LENGTH - used || memchr(buffer, '\0', (size_t)count) != NULL) return -1;
+        memcpy(out + used, buffer, (size_t)count);
+        used += (size_t)count;
+    }
+    out[used] = '\0';
+    return used > 0 ? 0 : -1;
 }
 
 static const char *tls_mode_startup_label(int allow_insecure) {
@@ -1119,7 +1137,9 @@ int main(int argc, char **argv) {
     const char *prog = strrchr(argv[0], '/');
     prog = (prog != NULL) ? (prog + 1) : argv[0];
 
-    const char *uri = NULL;
+    char uri_storage[CORE_URI_MAX_LENGTH + 1];
+    memset(uri_storage, 0, sizeof(uri_storage));
+    int uri_supplied = 0;
     const char *routing_text = NULL;
     const char *xray_ver = getenv("XRAY_VER");
     int listen_port = 0;
@@ -1127,7 +1147,40 @@ int main(int argc, char **argv) {
     routing_config_init(&g_routing);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--uri") == 0 && i + 1 < argc) {
-            uri = argv[++i];
+            char *argument = argv[++i];
+            if (uri_supplied) {
+                memset(argument, 0, strlen(argument));
+                fprintf(stderr, "Only one URI source may be configured\n");
+                return 1;
+            }
+            size_t uri_length = strlen(argument);
+            if (uri_length > CORE_URI_MAX_LENGTH) {
+                memset(argument, 0, uri_length);
+                fprintf(stderr, "Invalid URI: URI is too long\n");
+                return 1;
+            }
+            memcpy(uri_storage, argument, uri_length + 1);
+            memset(argument, 0, uri_length);
+            uri_supplied = 1;
+        } else if (strcmp(argv[i], "--uri-fd") == 0 && i + 1 < argc) {
+            if (uri_supplied) {
+                fprintf(stderr, "Only one URI source may be configured\n");
+                return 1;
+            }
+            char *end = NULL;
+            long value = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value < 0 || value > INT_MAX) {
+                fprintf(stderr, "Invalid URI file descriptor\n");
+                return 1;
+            }
+            int uri_fd = (int)value;
+            int read_result = read_uri_from_fd(uri_fd, uri_storage);
+            close(uri_fd);
+            if (read_result != 0) {
+                fprintf(stderr, "Failed to read URI from file descriptor\n");
+                return 1;
+            }
+            uri_supplied = 1;
         } else if (strcmp(argv[i], "--listen-port") == 0 && i + 1 < argc) {
             listen_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--routing") == 0 && i + 1 < argc) {
@@ -1150,7 +1203,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (uri == NULL || listen_port <= 0 || listen_port > 65535) {
+    if (!uri_supplied || listen_port <= 0 || listen_port > 65535) {
         usage(prog);
         return 1;
     }
@@ -1190,10 +1243,12 @@ int main(int argc, char **argv) {
 
     vless_config_t cfg;
     char err[256] = {0};
-    if (parse_core_uri(uri, &cfg, err, sizeof(err)) != 0) {
+    if (parse_core_uri(uri_storage, &cfg, err, sizeof(err)) != 0) {
         fprintf(stderr, "Invalid URI: %s\n", err);
+        memset(uri_storage, 0, sizeof(uri_storage));
         return 1;
     }
+    memset(uri_storage, 0, sizeof(uri_storage));
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) {
