@@ -23,7 +23,7 @@
 #include "vless.h"
 #include "vless_encryption.h"
 
-#define VLESS_CORE_VERSION "1.1.0"
+#define VLESS_CORE_VERSION "1.1.1"
 #define MAX_CLIENT_CONNECTIONS 256
 #define SOCKS_HANDSHAKE_TIMEOUT_MS 10000
 #define SERVER_IP_LIST_MAX_LENGTH 511

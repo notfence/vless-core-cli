@@ -4871,9 +4871,8 @@ static int load_x509_store_paths(X509_STORE *store) {
         "/usr/share/vless-core/cacert.pem",
         "/Applications/vless-core.app/cacert.pem",
         "third_party/cacert.pem",
-        NULL,
     };
-    for (size_t i = 0; ca_paths[i] != NULL; i++) {
+    for (size_t i = 0; i < sizeof(ca_paths) / sizeof(ca_paths[0]); i++) {
         if (ca_paths[i] == NULL || ca_paths[i][0] == '\0') {
             continue;
         }
