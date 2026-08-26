@@ -7,6 +7,7 @@ ZLIB_VER="${ZLIB_VER:-1.3.1}"
 ZLIB_TGZ="${THIRD_PARTY_DIR}/zlib-${ZLIB_VER}.tar.gz"
 ZLIB_SRC_DIR="${THIRD_PARTY_DIR}/zlib-${ZLIB_VER}"
 ZLIB_INSTALL_DIR="${THIRD_PARTY_DIR}/zlib-ios6-armv7"
+ZLIB_URL="${ZLIB_URL:-https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz}"
 
 IOS_TOOLCHAIN="${IOS_TOOLCHAIN:-${HOME}/toolchains/ios6}"
 IOS_SDK="${IOS_SDK:-${IOS_TOOLCHAIN}/SDK/iPhoneOS6.1.sdk}"
@@ -87,7 +88,7 @@ prepend_ld_library_if_needed
 mkdir -p "${THIRD_PARTY_DIR}"
 
 if [[ ! -f "${ZLIB_TGZ}" ]]; then
-  curl -fL -o "${ZLIB_TGZ}" "https://zlib.net/zlib-${ZLIB_VER}.tar.gz"
+  curl -fL -o "${ZLIB_TGZ}" "${ZLIB_URL}"
 fi
 
 rm -rf "${ZLIB_SRC_DIR}" "${ZLIB_INSTALL_DIR}"
