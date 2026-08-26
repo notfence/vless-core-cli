@@ -71,6 +71,7 @@ typedef enum {
 #define CORE_OPENSSL_GROUPS "X25519:P-256:P-384"
 #define TLS_AES_FALLBACK_CACHE_SIZE 16
 #define TLS_ENDPOINT_CACHE_SIZE 16
+#define SERVER_IP_OVERRIDE_MAX 64
 #define XRAY_DEFAULT_VERSION_X 26
 #define XRAY_DEFAULT_VERSION_Y 3
 #define XRAY_DEFAULT_VERSION_Z 27
@@ -80,6 +81,8 @@ static uint8_t g_xray_version[3] = {
     XRAY_DEFAULT_VERSION_Y,
     XRAY_DEFAULT_VERSION_Z,
 };
+static struct in_addr g_server_ip_overrides[SERVER_IP_OVERRIDE_MAX];
+static size_t g_server_ip_override_count = 0;
 
 int tls13_reality_set_xray_version(const char *value) {
     unsigned int x = 0, y = 0, z = 0;
@@ -92,6 +95,50 @@ int tls13_reality_set_xray_version(const char *value) {
     g_xray_version[0] = (uint8_t)x;
     g_xray_version[1] = (uint8_t)y;
     g_xray_version[2] = (uint8_t)z;
+    return 0;
+}
+
+int tls13_reality_set_server_ips(const char *value) {
+    if (value == NULL || value[0] == '\0') return -1;
+
+    struct in_addr parsed[SERVER_IP_OVERRIDE_MAX];
+    size_t parsed_count = 0;
+    const char *cursor = value;
+
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t') cursor++;
+        const char *end = cursor;
+        while (*end != '\0' && *end != ',') end++;
+        const char *trimmed_end = end;
+        while (trimmed_end > cursor && (trimmed_end[-1] == ' ' || trimmed_end[-1] == '\t')) trimmed_end--;
+
+        size_t length = (size_t)(trimmed_end - cursor);
+        if (length == 0 || length >= INET_ADDRSTRLEN || parsed_count >= SERVER_IP_OVERRIDE_MAX) return -1;
+
+        char ip[INET_ADDRSTRLEN];
+        memcpy(ip, cursor, length);
+        ip[length] = '\0';
+
+        struct in_addr address;
+        if (inet_pton(AF_INET, ip, &address) != 1) return -1;
+
+        int duplicate = 0;
+        for (size_t i = 0; i < parsed_count; i++) {
+            if (parsed[i].s_addr == address.s_addr) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (!duplicate) parsed[parsed_count++] = address;
+
+        if (*end == '\0') break;
+        cursor = end + 1;
+        if (*cursor == '\0') return -1;
+    }
+
+    if (parsed_count == 0) return -1;
+    memcpy(g_server_ip_overrides, parsed, parsed_count * sizeof(parsed[0]));
+    g_server_ip_override_count = parsed_count;
     return 0;
 }
 
@@ -436,6 +483,33 @@ static int read_exact(int fd, void *buf, size_t len) {
 }
 
 static int tcp_connect_host(const char *host, uint16_t port) {
+    if (g_server_ip_override_count > 0) {
+        int fd = -1;
+        int last_errno = 0;
+        for (size_t i = 0; i < g_server_ip_override_count; i++) {
+            struct sockaddr_in address;
+            memset(&address, 0, sizeof(address));
+            address.sin_family = AF_INET;
+            address.sin_port = htons(port);
+            address.sin_addr = g_server_ip_overrides[i];
+
+            fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (fd < 0) {
+                last_errno = errno;
+                continue;
+            }
+            core_tune_tcp_socket(fd);
+            if (core_connect_with_timeout(fd, (const struct sockaddr *)&address, sizeof(address), CORE_CONNECT_TIMEOUT_MS) == 0) {
+                return fd;
+            }
+            last_errno = errno;
+            close(fd);
+            fd = -1;
+        }
+        if (last_errno != 0) errno = last_errno;
+        return -1;
+    }
+
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%u", (unsigned int)port);
 
@@ -450,20 +524,26 @@ static int tcp_connect_host(const char *host, uint16_t port) {
     }
 
     int fd = -1;
+    int last_errno = 0;
     for (struct addrinfo *it = res; it != NULL; it = it->ai_next) {
         fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
         if (fd < 0) {
+            last_errno = errno;
             continue;
         }
         core_tune_tcp_socket(fd);
         if (core_connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen, CORE_CONNECT_TIMEOUT_MS) == 0) {
             break;
         }
+        last_errno = errno;
         close(fd);
         fd = -1;
     }
 
     freeaddrinfo(res);
+    if (fd < 0 && last_errno != 0) {
+        errno = last_errno;
+    }
     return fd;
 }
 
@@ -476,8 +556,20 @@ static int tcp_connect_address(int family, int socktype, int protocol, const str
     if (core_connect_with_timeout(fd, address, address_len, CORE_CONNECT_TIMEOUT_MS) == 0) {
         return fd;
     }
+    int saved_errno = errno;
     close(fd);
+    errno = saved_errno;
     return -1;
+}
+
+static void set_connect_err(char *err, size_t err_cap, const char *prefix) {
+    if (err == NULL || err_cap == 0) return;
+    int code = errno;
+    if (code == 0) {
+        snprintf(err, err_cap, "%s", prefix);
+    } else {
+        snprintf(err, err_cap, "%s: %s (%d)", prefix, strerror(code), code);
+    }
 }
 
 static int ssl_write_all(SSL *ssl, const void *buf, size_t len) {
@@ -1050,7 +1142,7 @@ static int open_tls_socket_once(const char *connect_host, uint16_t connect_port,
 
     int fd = tcp_connect_host(connect_host, connect_port);
     if (fd < 0) {
-        set_err(err, err_cap, "tcp connect failed");
+        set_connect_err(err, err_cap, "tcp connect failed");
         return -1;
     }
 
@@ -5680,7 +5772,7 @@ static int connect_manual_tls_endpoint(const vless_config_t *cfg, tls13_conn_t *
         reset_manual_tls_handshake(c);
         c->fd = tcp_connect_address(address->sa_family, socktype, protocol, address, address_len);
         if (c->fd < 0) {
-            set_err(err, err_cap, "tcp connect failed");
+            set_connect_err(err, err_cap, "tcp connect failed");
             return -1;
         }
 
@@ -5726,6 +5818,31 @@ static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *
             return 0;
         }
         invalidate_cached_tls_endpoint(cfg, sni, (const struct sockaddr *)&cached_address, cached_address_len);
+    }
+
+    if (g_server_ip_override_count > 0) {
+        for (size_t i = 0; i < g_server_ip_override_count; i++) {
+            struct sockaddr_in address;
+            memset(&address, 0, sizeof(address));
+            address.sin_family = AF_INET;
+            address.sin_port = htons(cfg->server_port);
+            address.sin_addr = g_server_ip_overrides[i];
+
+            if (cached_endpoint_tried &&
+                sockaddr_equal((const struct sockaddr *)&cached_address, cached_address_len,
+                               (const struct sockaddr *)&address, sizeof(address))) {
+                continue;
+            }
+
+            tls_cipher_offer_t successful_offer;
+            if (connect_manual_tls_endpoint(cfg, c, (const struct sockaddr *)&address, sizeof(address), SOCK_STREAM, IPPROTO_TCP,
+                                            start_with_aes, &successful_offer, last_err, sizeof(last_err)) == 0) {
+                remember_manual_tls_success(cfg, c, sni, (const struct sockaddr *)&address, sizeof(address), successful_offer);
+                return 0;
+            }
+        }
+        set_err(err, err_cap, last_err[0] != '\0' ? last_err : "tcp connect failed");
+        return -1;
     }
 
     char port_text[16];

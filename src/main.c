@@ -26,6 +26,7 @@
 #define VLESS_CORE_VERSION "1.1.0"
 #define MAX_CLIENT_CONNECTIONS 256
 #define SOCKS_HANDSHAKE_TIMEOUT_MS 10000
+#define SERVER_IP_LIST_MAX_LENGTH 511
 #ifndef VLESS_OPENSSL_PATCH_STATUS
 #define VLESS_OPENSSL_PATCH_STATUS "unpatched"
 #endif
@@ -1086,14 +1087,16 @@ static void *client_worker(void *arg) {
 }
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s (--uri <uri> | --uri-fd <fd>) --listen-port <port>\n", argv0);
+    fprintf(stderr, "Usage: %s (--uri <uri> | --uri-fd <fd> | --connection-fd <fd>) --listen-port <port>\n", argv0);
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  --uri <uri>              VLESS URI or SOCKS5 upstream URI\n");
     fprintf(stderr, "  --uri-fd <fd>            Read the URI from a file descriptor\n");
+    fprintf(stderr, "  --connection-fd <fd>     Read URI and pre-resolved server IPs from a file descriptor\n");
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
     fprintf(stderr, "  --routing <rules>        Optional Proxy, Direct and Block rules\n");
     fprintf(stderr, "  --route-control-port <p> Direct-route controller port\n");
     fprintf(stderr, "  --route-control-socket <path> Direct-route controller Unix socket\n");
+    fprintf(stderr, "  --server-ips <list>      Pre-resolved VLESS server IPv4 addresses\n");
     fprintf(stderr, "  --xray-version <x.y.z>   Xray version reported by vless-core-cli\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
@@ -1114,6 +1117,48 @@ static int read_uri_from_fd(int fd, char out[CORE_URI_MAX_LENGTH + 1]) {
     }
     out[used] = '\0';
     return used > 0 ? 0 : -1;
+}
+
+static int read_connection_from_fd(int fd, char uri[CORE_URI_MAX_LENGTH + 1],
+                                   char server_ips[SERVER_IP_LIST_MAX_LENGTH + 1]) {
+    char input[CORE_URI_MAX_LENGTH + SERVER_IP_LIST_MAX_LENGTH + 3];
+    size_t used = 0;
+    for (;;) {
+        ssize_t count = read(fd, input + used, sizeof(input) - 1 - used);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) return -1;
+        if (count == 0) break;
+        if ((size_t)count > sizeof(input) - 1 - used) return -1;
+        used += (size_t)count;
+        if (used == sizeof(input) - 1) {
+            char extra;
+            do {
+                count = read(fd, &extra, 1);
+            } while (count < 0 && errno == EINTR);
+            if (count != 0) return -1;
+            break;
+        }
+    }
+    if (used == 0 || memchr(input, '\0', used) != NULL) return -1;
+    input[used] = '\0';
+
+    char *separator = memchr(input, '\n', used);
+    if (separator == NULL || separator == input || separator == input + used - 1 ||
+        memchr(separator + 1, '\n', (size_t)((input + used) - (separator + 1))) != NULL ||
+        memchr(input, '\r', used) != NULL) {
+        return -1;
+    }
+
+    size_t uri_length = (size_t)(separator - input);
+    size_t server_ips_length = (size_t)((input + used) - (separator + 1));
+    if (uri_length > CORE_URI_MAX_LENGTH || server_ips_length > SERVER_IP_LIST_MAX_LENGTH) return -1;
+
+    memcpy(uri, input, uri_length);
+    uri[uri_length] = '\0';
+    memcpy(server_ips, separator + 1, server_ips_length);
+    server_ips[server_ips_length] = '\0';
+    memset(input, 0, sizeof(input));
+    return 0;
 }
 
 static const char *tls_mode_startup_label(int allow_insecure) {
@@ -1139,9 +1184,12 @@ int main(int argc, char **argv) {
 
     char uri_storage[CORE_URI_MAX_LENGTH + 1];
     memset(uri_storage, 0, sizeof(uri_storage));
+    char server_ips_storage[SERVER_IP_LIST_MAX_LENGTH + 1];
+    memset(server_ips_storage, 0, sizeof(server_ips_storage));
     int uri_supplied = 0;
     const char *routing_text = NULL;
     const char *xray_ver = getenv("XRAY_VER");
+    const char *server_ips = NULL;
     int listen_port = 0;
 
     routing_config_init(&g_routing);
@@ -1181,6 +1229,26 @@ int main(int argc, char **argv) {
                 return 1;
             }
             uri_supplied = 1;
+        } else if (strcmp(argv[i], "--connection-fd") == 0 && i + 1 < argc) {
+            if (uri_supplied || server_ips != NULL) {
+                fprintf(stderr, "Only one connection source may be configured\n");
+                return 1;
+            }
+            char *end = NULL;
+            long value = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value < 0 || value > INT_MAX) {
+                fprintf(stderr, "Invalid connection file descriptor\n");
+                return 1;
+            }
+            int connection_fd = (int)value;
+            int read_result = read_connection_from_fd(connection_fd, uri_storage, server_ips_storage);
+            close(connection_fd);
+            if (read_result != 0) {
+                fprintf(stderr, "Failed to read connection data from file descriptor\n");
+                return 1;
+            }
+            server_ips = server_ips_storage;
+            uri_supplied = 1;
         } else if (strcmp(argv[i], "--listen-port") == 0 && i + 1 < argc) {
             listen_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--routing") == 0 && i + 1 < argc) {
@@ -1189,6 +1257,12 @@ int main(int argc, char **argv) {
             g_route_control_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--route-control-socket") == 0 && i + 1 < argc) {
             g_route_control_socket = argv[++i];
+        } else if (strcmp(argv[i], "--server-ips") == 0 && i + 1 < argc) {
+            if (server_ips != NULL) {
+                fprintf(stderr, "Only one server IP source may be configured\n");
+                return 1;
+            }
+            server_ips = argv[++i];
         } else if (strcmp(argv[i], "--xray-version") == 0 && i + 1 < argc) {
             xray_ver = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
@@ -1249,6 +1323,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     memset(uri_storage, 0, sizeof(uri_storage));
+    if (server_ips != NULL) {
+        if (cfg.protocol != CORE_PROTOCOL_VLESS || tls13_reality_set_server_ips(server_ips) != 0) {
+            fprintf(stderr, "Invalid pre-resolved server IP list\n");
+            return 1;
+        }
+    }
+    memset(server_ips_storage, 0, sizeof(server_ips_storage));
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) {
