@@ -1,5 +1,7 @@
 CC ?= cc
 
+ROOT_DIR := $(abspath .)
+
 COMMON_CFLAGS ?= -O2 -Wall -Wextra -std=c11
 DEPFLAGS := -MMD -MP
 INCLUDES := -Iinclude
@@ -10,6 +12,9 @@ OBJ_IOS := $(patsubst src/%.c,build/ios/%.o,$(SRC))
 
 BIN_LINUX ?= vless-core-linux-amd64
 BIN_IOS ?= vless-core-darwin-armv7
+RELEASE_DIR ?= build/release
+RELEASE_LINUX_ARCHIVE := $(RELEASE_DIR)/vless-core-linux-amd64.tar.gz
+RELEASE_IOS_ARCHIVE := $(RELEASE_DIR)/vless-core-darwin-armv7.tar.gz
 
 LDFLAGS ?=
 LDLIBS ?= -lssl -lcrypto -lpthread
@@ -40,6 +45,7 @@ IOS_LDFLAGS ?= -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=6.0 -Wl,-
 IOS_LDLIBS ?= $(IOS_OPENSSL_PREFIX)/lib/libssl.a $(IOS_OPENSSL_PREFIX)/lib/libcrypto.a -lpthread
 CA_BUNDLE ?= third_party/cacert.pem
 CURL_IOS_BIN ?= third_party/curl-ios6-armv7/bin/curl
+THIRD_PARTY_LICENSES := THIRD_PARTY_LICENSES.txt
 
 all: linux ios
 
@@ -106,13 +112,27 @@ curl-ios6: $(CURL_IOS_BIN)
 $(CA_BUNDLE):
 	curl -fL -o $@ https://curl.se/ca/cacert.pem
 
-curl-ios6-package: $(CURL_IOS_BIN) $(CA_BUNDLE)
-	tar -czf third_party/curl-ios6-with-ca.tar.gz -C $(abspath third_party/curl-ios6-armv7/bin) curl -C $(abspath third_party) cacert.pem
+curl-ios6-package: $(CURL_IOS_BIN) $(CA_BUNDLE) $(THIRD_PARTY_LICENSES)
+	tar -czf third_party/curl-ios6-with-ca.tar.gz \
+		-C $(abspath third_party/curl-ios6-armv7/bin) curl \
+		-C $(abspath third_party) cacert.pem \
+		-C $(ROOT_DIR) $(THIRD_PARTY_LICENSES)
 	@echo "Packed third_party/curl-ios6-with-ca.tar.gz"
+
+$(RELEASE_LINUX_ARCHIVE): $(BIN_LINUX) $(THIRD_PARTY_LICENSES)
+	mkdir -p $(RELEASE_DIR)
+	tar -czf $@ -C $(ROOT_DIR) $(BIN_LINUX) $(THIRD_PARTY_LICENSES)
+
+$(RELEASE_IOS_ARCHIVE): $(BIN_IOS) $(THIRD_PARTY_LICENSES)
+	mkdir -p $(RELEASE_DIR)
+	tar -czf $@ -C $(ROOT_DIR) $(BIN_IOS) $(THIRD_PARTY_LICENSES)
+
+release-packages: $(RELEASE_LINUX_ARCHIVE) $(RELEASE_IOS_ARCHIVE)
+	cd $(RELEASE_DIR) && sha256sum $(notdir $(RELEASE_LINUX_ARCHIVE)) $(notdir $(RELEASE_IOS_ARCHIVE)) > SHA256SUMS
 
 clean:
 	rm -rf build $(BIN_LINUX) $(BIN_IOS)
 
 -include $(OBJ_LINUX:.o=.d) $(OBJ_IOS:.o=.d)
 
-.PHONY: all linux ios check-ios-toolchain clean openssl-ios6 zlib-ios6 curl-ios6 curl-ios6-package
+.PHONY: all linux ios check-ios-toolchain clean openssl-ios6 zlib-ios6 curl-ios6 curl-ios6-package release-packages

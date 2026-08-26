@@ -166,3 +166,23 @@ make curl-ios6-package
 Archive output:
 
 - `third_party/curl-ios6-with-ca.tar.gz`
+
+The archive includes the combined `THIRD_PARTY_LICENSES.txt` document.
+
+For public CLI releases, package the standalone binaries together with their
+notices instead of publishing the bare iOS executable:
+
+```bash
+make release-packages
+```
+
+Outputs are written to `build/release/`.
+
+## Third-party software
+
+Third-party licenses apply only to the components identified in
+[`THIRD_PARTY_LICENSES.txt`](THIRD_PARTY_LICENSES.txt), not to vless-core-cli
+as a whole. Release and optional curl archives each contain this single
+combined notices and licenses document. The iOS release binary statically
+includes OpenSSL; curl, zlib, and `cacert.pem` belong only to the optional
+`curl-ios6-with-ca` archive.
