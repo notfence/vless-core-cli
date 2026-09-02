@@ -24,9 +24,12 @@ For XHTTP, `mode=auto` follows xray's defaults: `packet-up` without security or 
 ## Platform Support
 
 - Linux on x86-64 (`vless-core-linux-amd64`)
-- iOS 6.x through iOS 10.x on all compatible 32-bit devices (`vless-core-darwin-armv7`)
+- iOS 6.x through iOS 10.x via ARMv7 (`vless-core-darwin-armv7`)
+- iOS 11.x through iOS 14.x via ARM64 (`vless-core-darwin-arm64`)
 
-The iOS binary is built for ARMv7 with iOS 6.0 as the minimum deployment target. 64-bit ARM devices are not supported.
+The two iOS outputs are separate thin binaries. The app package deliberately
+keeps the ARMv7 runtime on iOS 6–10, including ARM64 devices that still support
+32-bit applications, and selects ARM64 only on iOS 11 or newer.
 
 ## Binaries
 
@@ -34,6 +37,7 @@ Build outputs:
 
 - `vless-core-linux-amd64`
 - `vless-core-darwin-armv7`
+- `vless-core-darwin-arm64`
 
 ## Build
 
@@ -53,6 +57,7 @@ Build only iOS:
 
 ```bash
 make ios
+make ios-arm64
 ```
 
 ## Run
@@ -61,6 +66,8 @@ make ios
 ./vless-core-linux-amd64 --uri '<vless://...|socks5://...>' --listen-port <port>
 or
 ./vless-core-darwin-armv7 --uri '<vless://...|socks5://...>' --listen-port <port>
+or
+./vless-core-darwin-arm64 --uri '<vless://...|socks5://...>' --listen-port <port>
 ```
 
 Show CLI help/parameters:
@@ -68,6 +75,7 @@ Show CLI help/parameters:
 ```bash
 ./vless-core-linux-amd64 --help
 ./vless-core-darwin-armv7 --help
+./vless-core-darwin-arm64 --help
 ```
 
 Expected help output:
@@ -117,14 +125,17 @@ The parent directory must not be writable by another user. Pin files are protect
 
 ## iOS toolchain notes
 
-Default toolchain path in `Makefile`:
+Default toolchain and SDK paths in `Makefile`:
 
-- `${HOME}/toolchains/ios6`
+- `../toolchains/ios6`
+- ARMv7 SDK: `../toolchains/ios6/SDK/iPhoneOS6.1.sdk`
+- ARM64 SDK: `../toolchains/sdks/iPhoneOS11.4.sdk`
 
 Override if needed:
 
 ```bash
 make ios IOS_TOOLCHAIN=/path/to/ios6/toolchain
+make ios-arm64 IOS_TOOLCHAIN=/path/to/ios6/toolchain IOS_ARM64_SDK=/path/to/iPhoneOS11.4.sdk
 ```
 
 OpenSSL armv7 is generated at:
@@ -152,6 +163,19 @@ make ios
 file ./vless-core-darwin-armv7
 ```
 
+Build the native iOS 11+ dependencies and CLI separately:
+
+```bash
+make openssl-ios-arm64
+make zlib-ios-arm64
+make curl-ios-arm64
+make ios-arm64
+file ./vless-core-darwin-arm64
+```
+
+The private ARMv7 OpenSSL compatibility patch is not applied to the ARM64
+build; its patch status is therefore reported as `unpatched`.
+
 ## Legacy curl on iOS 6
 
 Old stock iOS 6 curl/OpenSSL may fail modern TLS. Build replacement curl (armv7 + OpenSSL 3.5.7 + zlib 1.3.1):
@@ -176,7 +200,9 @@ notices instead of publishing the bare iOS executable:
 make release-packages
 ```
 
-Outputs are written to `build/release/`.
+Outputs are written to `build/release/`, including separate ARMv7 and ARM64
+iOS archives. No universal iOS executable is produced, so iOS 6–10 cannot
+accidentally select the iOS 11+ ARM64 slice.
 
 ## Third-party software
 

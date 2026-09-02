@@ -2,6 +2,7 @@
 build/
 vless-core-linux-amd64
 vless-core-darwin-armv7
+vless-core-darwin-arm64
 
 # Generated third-party artifacts
 third_party/*

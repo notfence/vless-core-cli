@@ -6,10 +6,12 @@ THIRD_PARTY_DIR="${ROOT_DIR}/third_party"
 CURL_VER="${CURL_VER:-8.21.0}"
 CURL_TAR="${THIRD_PARTY_DIR}/curl-${CURL_VER}.tar.xz"
 CURL_SRC_DIR="${THIRD_PARTY_DIR}/curl-${CURL_VER}"
-CURL_INSTALL_DIR="${THIRD_PARTY_DIR}/curl-ios6-armv7"
+CURL_INSTALL_DIR="${CURL_INSTALL_DIR:-${THIRD_PARTY_DIR}/curl-ios6-armv7}"
 
 IOS_TOOLCHAIN="${IOS_TOOLCHAIN:-${HOME}/toolchains/ios6}"
 IOS_SDK="${IOS_SDK:-${IOS_TOOLCHAIN}/SDK/iPhoneOS6.1.sdk}"
+IOS_ARCH="${IOS_ARCH:-armv7}"
+IOS_MIN_VERSION="${IOS_MIN_VERSION:-6.0}"
 OPENSSL_PREFIX="${OPENSSL_PREFIX:-${THIRD_PARTY_DIR}/openssl-ios6-armv7}"
 ZLIB_PREFIX="${ZLIB_PREFIX:-${THIRD_PARTY_DIR}/zlib-ios6-armv7}"
 
@@ -120,8 +122,8 @@ export AR=arm-apple-darwin11-ar
 export RANLIB=arm-apple-darwin11-ranlib
 export STRIP=arm-apple-darwin11-strip
 export CPPFLAGS="-I${OPENSSL_PREFIX}/include -I${ZLIB_PREFIX}/include"
-export CFLAGS="-arch armv7 -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -O2 -DNDEBUG"
-export LDFLAGS="-arch armv7 -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -Wl,-pie -L${OPENSSL_PREFIX}/lib -L${ZLIB_PREFIX}/lib"
+export CFLAGS="-arch ${IOS_ARCH} -isysroot ${IOS_SDK} -miphoneos-version-min=${IOS_MIN_VERSION} -O2 -DNDEBUG"
+export LDFLAGS="-arch ${IOS_ARCH} -isysroot ${IOS_SDK} -miphoneos-version-min=${IOS_MIN_VERSION} -Wl,-pie -L${OPENSSL_PREFIX}/lib -L${ZLIB_PREFIX}/lib"
 
 pushd "${CURL_SRC_DIR}" >/dev/null
 ./configure \
@@ -190,4 +192,4 @@ if ! "${IOS_TOOLCHAIN}/bin/arm-apple-darwin11-otool" -hv "${CURL_INSTALL_DIR}/bi
   exit 1
 fi
 
-echo "Built curl for iOS armv7 at ${CURL_INSTALL_DIR}/bin/curl"
+echo "Built curl for iOS ${IOS_ARCH} at ${CURL_INSTALL_DIR}/bin/curl"

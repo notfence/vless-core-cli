@@ -6,12 +6,16 @@ THIRD_PARTY_DIR="${ROOT_DIR}/third_party"
 OPENSSL_VER="${OPENSSL_VER:-3.5.7}"
 OPENSSL_TGZ="${THIRD_PARTY_DIR}/openssl-${OPENSSL_VER}.tar.gz"
 OPENSSL_SRC_DIR="${THIRD_PARTY_DIR}/openssl-${OPENSSL_VER}"
-OPENSSL_INSTALL_DIR="${THIRD_PARTY_DIR}/openssl-ios6-armv7"
+OPENSSL_INSTALL_DIR="${OPENSSL_INSTALL_DIR:-${THIRD_PARTY_DIR}/openssl-ios6-armv7}"
 OPENSSL_PATCH_STATUS_FILE="${OPENSSL_INSTALL_DIR}/VLESS_OPENSSL_PATCH_STATUS"
 OPENSSL_IOS6_ASM_PATCH="${OPENSSL_IOS6_ASM_PATCH:-${ROOT_DIR}/patches/openssl-ios6-armv7-asm.patch}"
 OPENSSL_IOS6_PIE_PATCH="${ROOT_DIR}/patches/openssl-ios6-pie.patch"
 IOS_TOOLCHAIN="${IOS_TOOLCHAIN:-${HOME}/toolchains/ios6}"
 IOS_SDK="${IOS_SDK:-${IOS_TOOLCHAIN}/SDK/iPhoneOS6.1.sdk}"
+IOS_ARCH="${IOS_ARCH:-armv7}"
+IOS_MIN_VERSION="${IOS_MIN_VERSION:-6.0}"
+OPENSSL_TARGET="${OPENSSL_TARGET:-ios-cross}"
+OPENSSL_APPLY_LEGACY_PATCHES="${OPENSSL_APPLY_LEGACY_PATCHES:-1}"
 
 require_file() {
   local path="$1"
@@ -81,7 +85,7 @@ require_file "${IOS_SDK}" "Set IOS_SDK=/path/to/iPhoneOS6.1.sdk"
 require_executable "$(command -v perl || true)" "Install perl"
 require_executable "$(command -v make || true)" "Install make"
 require_executable "$(command -v tar || true)" "Install tar"
-if [[ "${OPENSSL_NO_ASM:-0}" != "1" ]]; then
+if [[ "${OPENSSL_APPLY_LEGACY_PATCHES}" == "1" && "${OPENSSL_NO_ASM:-0}" != "1" ]]; then
   require_executable "$(command -v patch || true)" "Install patch"
   require_file "${OPENSSL_IOS6_ASM_PATCH}" \
     "OpenSSL iOS 6 asm rebuilds require the private patch. Set OPENSSL_IOS6_ASM_PATCH=/path/to/openssl-ios6-armv7-asm.patch, or build without asm: OPENSSL_NO_ASM=1 make openssl-ios6"
@@ -102,7 +106,7 @@ fi
 
 rm -rf "${OPENSSL_SRC_DIR}" "${OPENSSL_INSTALL_DIR}"
 tar -xf "${OPENSSL_TGZ}" -C "${THIRD_PARTY_DIR}"
-if [[ "${OPENSSL_NO_ASM:-0}" != "1" ]]; then
+if [[ "${OPENSSL_APPLY_LEGACY_PATCHES}" == "1" && "${OPENSSL_NO_ASM:-0}" != "1" ]]; then
   openssl_patch_status="patched"
   patch -d "${OPENSSL_SRC_DIR}" -p0 < "${OPENSSL_IOS6_ASM_PATCH}"
   patch -d "${OPENSSL_SRC_DIR}" -p0 < "${OPENSSL_IOS6_PIE_PATCH}"
@@ -119,14 +123,17 @@ export PATH="${IOS_TOOLCHAIN}/bin:${PATH}"
 export CC=arm-apple-darwin11-clang
 export AR=arm-apple-darwin11-ar
 export RANLIB=arm-apple-darwin11-ranlib
-export CFLAGS="-arch armv7 -mfpu=neon -isysroot ${IOS_SDK} -miphoneos-version-min=6.0 -O2 -DNDEBUG -DBROKEN_CLANG_ATOMICS"
+OPENSSL_ARCH_CFLAGS="-arch ${IOS_ARCH} -isysroot ${IOS_SDK} -miphoneos-version-min=${IOS_MIN_VERSION} -O2 -DNDEBUG"
+if [[ "${IOS_ARCH}" == "armv7" ]]; then
+  OPENSSL_ARCH_CFLAGS+=" -mfpu=neon -DBROKEN_CLANG_ATOMICS"
+fi
+export CFLAGS="${OPENSSL_ARCH_CFLAGS}"
 export LDFLAGS="${CFLAGS}"
 export CROSS_TOP="${IOS_CROSS_TOP}"
 export CROSS_SDK="$(basename "${IOS_SDK}")"
 
 pushd "${OPENSSL_SRC_DIR}" >/dev/null
 openssl_options=(
-  ios-cross
   no-shared
   no-dso
   no-tests
@@ -176,7 +183,7 @@ if [[ "${OPENSSL_NO_ASM:-0}" == "1" ]]; then
   openssl_options+=(no-asm)
 fi
 
-perl Configure "${openssl_options[@]}" \
+perl Configure "${OPENSSL_TARGET}" "${openssl_options[@]}" \
   --prefix="${OPENSSL_INSTALL_DIR}" \
   --openssldir="${OPENSSL_INSTALL_DIR}/ssl"
 make -j"$(nproc)" build_libs
@@ -185,4 +192,4 @@ cp "${OPENSSL_SRC_DIR}/LICENSE.txt" "${OPENSSL_INSTALL_DIR}/LICENSE.txt"
 printf '%s\n' "${openssl_patch_status}" > "${OPENSSL_PATCH_STATUS_FILE}"
 popd >/dev/null
 
-echo "Built OpenSSL for iOS armv7 at ${OPENSSL_INSTALL_DIR}"
+echo "Built OpenSSL for iOS ${IOS_ARCH} at ${OPENSSL_INSTALL_DIR}"
