@@ -12,6 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "core_log.h"
 #include "socks5.h"
 #include "socks5_upstream.h"
 #include "routing.h"
@@ -23,7 +24,7 @@
 #include "vless.h"
 #include "vless_encryption.h"
 
-#define VLESS_CORE_VERSION "1.1.2"
+#define VLESS_CORE_VERSION "1.1.3"
 #define MAX_CLIENT_CONNECTIONS 256
 #define SOCKS_HANDSHAKE_TIMEOUT_MS 10000
 #define SERVER_IP_LIST_MAX_LENGTH 511
@@ -533,8 +534,8 @@ static void *client_worker_run(void *arg) {
         socks_success_sent = 1;
         first_payload_len = read_sniff_payload(cfd, first_payload, sizeof(first_payload));
         if (first_payload_len < 0) {
-            fprintf(stderr, "[routing] initial payload read failed for %s:%u\n",
-                    target_host, (unsigned)target_port);
+            vc_log_error("routing", "initial payload read failed for %s:%u",
+                         target_host, (unsigned)target_port);
             close(cfd);
             return NULL;
         }
@@ -543,11 +544,8 @@ static void *client_worker_run(void *arg) {
                          (size_t)first_payload_len,
                          sniffed_domain,
                          sizeof(sniffed_domain)) == 0) {
-            fprintf(stderr,
-                    "[routing] sniffed target=%s:%u domain=%s\n",
-                    target_host,
-                    (unsigned)target_port,
-                    sniffed_domain);
+            vc_log_debug("routing", "sniffed target=%s:%u domain=%s",
+                         target_host, (unsigned)target_port, sniffed_domain);
         }
     }
 
@@ -565,14 +563,13 @@ static void *client_worker_run(void *arg) {
         if (matched_rule >= 0) route_source = "rule";
         else if (matched_rule == -2) route_source = "lan";
         else if (matched_rule == -3) route_source = "dns";
-        fprintf(stderr,
-                "[routing] target=%s:%u%s%s action=%s source=%s\n",
-                target_host,
-                (unsigned)target_port,
-                routed_host[0] != '\0' ? " domain=" : "",
-                routed_host[0] != '\0' ? routed_host : "",
-                routing_action_name(route),
-                route_source);
+        vc_log_info("routing", "target=%s:%u%s%s action=%s source=%s",
+                    target_host,
+                    (unsigned)target_port,
+                    routed_host[0] != '\0' ? " domain=" : "",
+                    routed_host[0] != '\0' ? routed_host : "",
+                    routing_action_name(route),
+                    route_source);
     }
 
     if (route == ROUTE_ACTION_BLOCK) {
@@ -592,8 +589,8 @@ static void *client_worker_run(void *arg) {
                                             direct_err,
                                             sizeof(direct_err));
         if (direct_fd < 0) {
-            fprintf(stderr, "[routing] direct connect failed for %s:%u: %s\n",
-                    target_host, (unsigned)target_port, direct_err);
+            vc_log_error("routing", "direct connect failed for %s:%u: %s",
+                         target_host, (unsigned)target_port, direct_err);
             if (!socks_success_sent) {
                 socks5_send_failure(cfd, 0x05);
             }
@@ -633,7 +630,8 @@ static void *client_worker_run(void *arg) {
 
             first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
             if (first_payload_len < 0) {
-                fprintf(stderr, "[socks5] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
+                vc_log_error("socks5", "first client payload read failed for %s:%u",
+                             target_host, (unsigned)target_port);
                 close(cfd);
                 return NULL;
             }
@@ -643,14 +641,15 @@ static void *client_worker_run(void *arg) {
         if (first_payload_len > 0 &&
             parse_tls_sni(first_payload, (size_t)first_payload_len, sni, sizeof(sni)) == 0) {
             snprintf(upstream_target, sizeof(upstream_target), "%s", sni);
-            fprintf(stderr, "[socks5] remapped transparent TLS target=%s:%u to sni=%s\n",
-                    target_host, (unsigned)target_port, upstream_target);
+            vc_log_info("socks5", "remapped transparent TLS target=%s:%u to sni=%s",
+                        target_host, (unsigned)target_port, upstream_target);
         }
 
         int upstream_fd = socks5_upstream_connect(&cfg, upstream_target, target_port, err, sizeof(err));
         if (upstream_fd < 0) {
-            fprintf(stderr, "[socks5] upstream connect failed for %s:%u via %s:%u: %s\n",
-                    upstream_target, (unsigned)target_port, cfg.server_host, (unsigned)cfg.server_port, err);
+            vc_log_error("socks5", "upstream connect failed for %s:%u via %s:%u: %s",
+                         upstream_target, (unsigned)target_port,
+                         cfg.server_host, (unsigned)cfg.server_port, err);
             if (!socks_success_sent) {
                 socks5_send_failure(cfd, 0x05);
             }
@@ -669,14 +668,14 @@ static void *client_worker_run(void *arg) {
             return NULL;
         }
 
-        fprintf(stderr, "[socks5] connected target=%s:%u upstream_target=%s:%u via=%s:%u auth=%s\n",
-                target_host,
-                (unsigned)target_port,
-                upstream_target,
-                (unsigned)target_port,
-                cfg.server_host,
-                (unsigned)cfg.server_port,
-                (cfg.socks5_user[0] != '\0' ? "userpass" : "none"));
+        vc_log_info("socks5", "connected target=%s:%u upstream_target=%s:%u via=%s:%u auth=%s",
+                    target_host,
+                    (unsigned)target_port,
+                    upstream_target,
+                    (unsigned)target_port,
+                    cfg.server_host,
+                    (unsigned)cfg.server_port,
+                    (cfg.socks5_user[0] != '\0' ? "userpass" : "none"));
         relay_tcp_pair(cfd, upstream_fd);
         close(upstream_fd);
         close(cfd);
@@ -686,7 +685,7 @@ static void *client_worker_run(void *arg) {
     char err[256] = {0};
     tls13_conn_t *tls = NULL;
     if (tls13_reality_connect(&cfg, &tls, err, sizeof(err)) != 0) {
-        fprintf(stderr, "[conn] upstream connect failed: %s\n", err);
+        vc_log_error("connection", "upstream connect failed: %s", err);
         if (!socks_success_sent) {
             socks5_send_failure(cfd, 0x05);
         }
@@ -698,7 +697,7 @@ static void *client_worker_run(void *arg) {
     if (cfg.encryption_enabled &&
         vless_encryption_connect(&cfg, tls, &encryption, err,
                                  sizeof(err)) != 0) {
-        fprintf(stderr, "[conn] VLESS encryption handshake failed: %s\n", err);
+        vc_log_error("connection", "VLESS encryption handshake failed: %s", err);
         if (!socks_success_sent) {
             socks5_send_failure(cfd, 0x05);
         }
@@ -736,7 +735,8 @@ static void *client_worker_run(void *arg) {
         if (first_payload_len == 0) {
             first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
             if (first_payload_len < 0) {
-                fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
+                vc_log_error("connection", "first client payload read failed for %s:%u",
+                             target_host, (unsigned)target_port);
                 vision_unpad_free(&vunpad);
                 upstream_close(tls, encryption);
                 close(cfd);
@@ -745,7 +745,8 @@ static void *client_worker_run(void *arg) {
         }
 
         if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
-            fprintf(stderr, "[conn] VLESS/Vision request build failed for %s:%u\n", target_host, (unsigned)target_port);
+            vc_log_error("connection", "VLESS/Vision request build failed for %s:%u",
+                         target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
             upstream_close(tls, encryption);
             close(cfd);
@@ -754,14 +755,16 @@ static void *client_worker_run(void *arg) {
 
         if (first_payload_len > 0) {
             if (vision_wrap_payload(&vwrap, first_payload, (size_t)first_payload_len, &vision_first, &vision_first_len) != 0) {
-                fprintf(stderr, "[conn] first Vision payload wrap failed for %s:%u\n", target_host, (unsigned)target_port);
+                vc_log_error("connection", "first Vision payload wrap failed for %s:%u",
+                             target_host, (unsigned)target_port);
                 vision_unpad_free(&vunpad);
                 upstream_close(tls, encryption);
                 close(cfd);
                 return NULL;
             }
         } else if (vision_wrap_bootstrap(&vwrap, &vision_first, &vision_first_len) != 0) {
-            fprintf(stderr, "[conn] Vision bootstrap build failed for %s:%u\n", target_host, (unsigned)target_port);
+            vc_log_error("connection", "Vision bootstrap build failed for %s:%u",
+                         target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
             upstream_close(tls, encryption);
             close(cfd);
@@ -772,7 +775,8 @@ static void *client_worker_run(void *arg) {
         first_packet = (uint8_t *)malloc(first_packet_len);
         if (first_packet == NULL) {
             free(vision_first);
-            fprintf(stderr, "[conn] VLESS/Vision request alloc failed for %s:%u\n", target_host, (unsigned)target_port);
+            vc_log_error("connection", "VLESS/Vision request alloc failed for %s:%u",
+                         target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
             upstream_close(tls, encryption);
             close(cfd);
@@ -788,7 +792,8 @@ static void *client_worker_run(void *arg) {
         if (upstream_write(tls, encryption, first_packet,
                            first_packet_len) != 0) {
             free(first_packet);
-            fprintf(stderr, "[conn] VLESS/Vision request send failed for %s:%u\n", target_host, (unsigned)target_port);
+            vc_log_error("connection", "VLESS/Vision request send failed for %s:%u",
+                         target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
             upstream_close(tls, encryption);
             close(cfd);
@@ -812,7 +817,8 @@ static void *client_worker_run(void *arg) {
         if (first_payload_len == 0) {
             first_payload_len = read_initial_payload(cfd, first_payload, sizeof(first_payload));
             if (first_payload_len < 0) {
-                fprintf(stderr, "[conn] first client payload read failed for %s:%u\n", target_host, (unsigned)target_port);
+                vc_log_error("connection", "first client payload read failed for %s:%u",
+                             target_host, (unsigned)target_port);
                 upstream_close(tls, encryption);
                 close(cfd);
                 return NULL;
@@ -820,7 +826,8 @@ static void *client_worker_run(void *arg) {
         }
 
         if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
-            fprintf(stderr, "[conn] VLESS/WS request build failed for %s:%u\n", target_host, (unsigned)target_port);
+            vc_log_error("connection", "VLESS/WS request build failed for %s:%u",
+                         target_host, (unsigned)target_port);
             upstream_close(tls, encryption);
             close(cfd);
             return NULL;
@@ -829,7 +836,8 @@ static void *client_worker_run(void *arg) {
         first_packet_len = vless_req_len + ((first_payload_len > 0) ? (size_t)first_payload_len : 0);
         first_packet = (uint8_t *)malloc(first_packet_len);
         if (first_packet == NULL) {
-            fprintf(stderr, "[conn] VLESS/WS request alloc failed for %s:%u\n", target_host, (unsigned)target_port);
+            vc_log_error("connection", "VLESS/WS request alloc failed for %s:%u",
+                         target_host, (unsigned)target_port);
             upstream_close(tls, encryption);
             close(cfd);
             return NULL;
@@ -843,7 +851,8 @@ static void *client_worker_run(void *arg) {
         if (upstream_write(tls, encryption, first_packet,
                            first_packet_len) != 0) {
             free(first_packet);
-            fprintf(stderr, "[conn] VLESS/WS request send failed for %s:%u\n", target_host, (unsigned)target_port);
+            vc_log_error("connection", "VLESS/WS request send failed for %s:%u",
+                         target_host, (unsigned)target_port);
             upstream_close(tls, encryption);
             close(cfd);
             return NULL;
@@ -852,7 +861,8 @@ static void *client_worker_run(void *arg) {
     } else {
         if (vless_send_request(tls, encryption, &cfg, target_host,
                                target_port) != 0) {
-            fprintf(stderr, "[conn] VLESS request send failed for %s:%u\n", target_host, (unsigned)target_port);
+            vc_log_error("connection", "VLESS request send failed for %s:%u",
+                         target_host, (unsigned)target_port);
             if (!socks_success_sent) {
                 socks5_send_failure(cfd, 0x01);
             }
@@ -863,8 +873,8 @@ static void *client_worker_run(void *arg) {
         if (first_payload_len > 0 &&
             upstream_write(tls, encryption, first_payload,
                            (size_t)first_payload_len) != 0) {
-            fprintf(stderr, "[conn] initial payload send failed for %s:%u\n",
-                    target_host, (unsigned)target_port);
+            vc_log_error("connection", "initial payload send failed for %s:%u",
+                         target_host, (unsigned)target_port);
             upstream_close(tls, encryption);
             close(cfd);
             return NULL;
@@ -1008,7 +1018,8 @@ static void *client_worker_run(void *arg) {
                     continue;
                 }
                 if (vless_read_response(tls, encryption) != 0) {
-                    fprintf(stderr, "[conn] VLESS response read failed for %s:%u\n", target_host, (unsigned)target_port);
+                    vc_log_error("connection", "VLESS response read failed for %s:%u",
+                                 target_host, (unsigned)target_port);
                     break;
                 }
                 got_vless_response = 1;
@@ -1035,8 +1046,8 @@ static void *client_worker_run(void *arg) {
                     if (!downstream_direct) {
                         downstream_direct = 1;
                         upstream_direct = 1;
-                        fprintf(stderr, "[conn] switched to Vision downstream direct mode by raw fallback for %s:%u\n", target_host,
-                                (unsigned)target_port);
+                        vc_log_warning("connection", "switched to Vision downstream direct mode by raw fallback for %s:%u",
+                                       target_host, (unsigned)target_port);
                     }
                     continue;
                 }
@@ -1198,13 +1209,13 @@ int main(int argc, char **argv) {
             char *argument = argv[++i];
             if (uri_supplied) {
                 memset(argument, 0, strlen(argument));
-                fprintf(stderr, "Only one URI source may be configured\n");
+                vc_log_error("startup", "only one URI source may be configured");
                 return 1;
             }
             size_t uri_length = strlen(argument);
             if (uri_length > CORE_URI_MAX_LENGTH) {
                 memset(argument, 0, uri_length);
-                fprintf(stderr, "Invalid URI: URI is too long\n");
+                vc_log_error("startup", "invalid URI: URI is too long");
                 return 1;
             }
             memcpy(uri_storage, argument, uri_length + 1);
@@ -1212,39 +1223,39 @@ int main(int argc, char **argv) {
             uri_supplied = 1;
         } else if (strcmp(argv[i], "--uri-fd") == 0 && i + 1 < argc) {
             if (uri_supplied) {
-                fprintf(stderr, "Only one URI source may be configured\n");
+                vc_log_error("startup", "only one URI source may be configured");
                 return 1;
             }
             char *end = NULL;
             long value = strtol(argv[++i], &end, 10);
             if (end == argv[i] || *end != '\0' || value < 0 || value > INT_MAX) {
-                fprintf(stderr, "Invalid URI file descriptor\n");
+                vc_log_error("startup", "invalid URI file descriptor");
                 return 1;
             }
             int uri_fd = (int)value;
             int read_result = read_uri_from_fd(uri_fd, uri_storage);
             close(uri_fd);
             if (read_result != 0) {
-                fprintf(stderr, "Failed to read URI from file descriptor\n");
+                vc_log_error("startup", "failed to read URI from file descriptor");
                 return 1;
             }
             uri_supplied = 1;
         } else if (strcmp(argv[i], "--connection-fd") == 0 && i + 1 < argc) {
             if (uri_supplied || server_ips != NULL) {
-                fprintf(stderr, "Only one connection source may be configured\n");
+                vc_log_error("startup", "only one connection source may be configured");
                 return 1;
             }
             char *end = NULL;
             long value = strtol(argv[++i], &end, 10);
             if (end == argv[i] || *end != '\0' || value < 0 || value > INT_MAX) {
-                fprintf(stderr, "Invalid connection file descriptor\n");
+                vc_log_error("startup", "invalid connection file descriptor");
                 return 1;
             }
             int connection_fd = (int)value;
             int read_result = read_connection_from_fd(connection_fd, uri_storage, server_ips_storage);
             close(connection_fd);
             if (read_result != 0) {
-                fprintf(stderr, "Failed to read connection data from file descriptor\n");
+                vc_log_error("startup", "failed to read connection data from file descriptor");
                 return 1;
             }
             server_ips = server_ips_storage;
@@ -1259,7 +1270,7 @@ int main(int argc, char **argv) {
             g_route_control_socket = argv[++i];
         } else if (strcmp(argv[i], "--server-ips") == 0 && i + 1 < argc) {
             if (server_ips != NULL) {
-                fprintf(stderr, "Only one server IP source may be configured\n");
+                vc_log_error("startup", "only one server IP source may be configured");
                 return 1;
             }
             server_ips = argv[++i];
@@ -1282,50 +1293,50 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (g_route_control_port < 0 || g_route_control_port > 65535) {
-        fprintf(stderr, "Invalid route control port\n");
+        vc_log_error("startup", "invalid route control port");
         return 1;
     }
     if (g_route_control_port > 0 && g_route_control_socket != NULL) {
-        fprintf(stderr, "Only one route control endpoint may be configured\n");
+        vc_log_error("startup", "only one route control endpoint may be configured");
         return 1;
     }
     if (g_route_control_socket != NULL) {
         size_t path_length = strlen(g_route_control_socket);
         if (path_length == 0 || path_length >= ROUTING_CONTROL_SOCKET_PATH_MAX ||
             g_route_control_socket[0] != '/') {
-            fprintf(stderr, "Invalid route control socket path\n");
+            vc_log_error("startup", "invalid route control socket path");
             return 1;
         }
         for (size_t i = 0; i < path_length; i++) {
             unsigned char c = (unsigned char)g_route_control_socket[i];
             if (c < 0x20 || c == 0x7f) {
-                fprintf(stderr, "Invalid route control socket path\n");
+                vc_log_error("startup", "invalid route control socket path");
                 return 1;
             }
         }
     }
     if (xray_ver != NULL && tls13_reality_set_xray_version(xray_ver) != 0) {
-        fprintf(stderr, "Invalid Xray version (expected x.y.z, each component 0-255)\n");
+        vc_log_error("startup", "invalid Xray version (expected x.y.z, each component 0-255)");
         return 1;
     }
 
     char routing_err[256] = {0};
     if (routing_config_parse(routing_text, &g_routing, routing_err, sizeof(routing_err)) != 0) {
-        fprintf(stderr, "Invalid routing policy: %s\n", routing_err);
+        vc_log_error("startup", "invalid routing policy: %s", routing_err);
         return 1;
     }
 
     vless_config_t cfg;
     char err[256] = {0};
     if (parse_core_uri(uri_storage, &cfg, err, sizeof(err)) != 0) {
-        fprintf(stderr, "Invalid URI: %s\n", err);
+        vc_log_error("startup", "invalid URI: %s", err);
         memset(uri_storage, 0, sizeof(uri_storage));
         return 1;
     }
     memset(uri_storage, 0, sizeof(uri_storage));
     if (server_ips != NULL) {
         if (cfg.protocol != CORE_PROTOCOL_VLESS || tls13_reality_set_server_ips(server_ips) != 0) {
-            fprintf(stderr, "Invalid pre-resolved server IP list\n");
+            vc_log_error("startup", "invalid pre-resolved server IP list");
             return 1;
         }
     }
@@ -1333,7 +1344,8 @@ int main(int argc, char **argv) {
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) {
-        perror("socket");
+        int error_number = errno;
+        vc_log_error("startup", "socket failed: %s", strerror(error_number));
         return 1;
     }
 
@@ -1347,24 +1359,26 @@ int main(int argc, char **argv) {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        perror("bind");
+        int error_number = errno;
+        vc_log_error("startup", "bind failed: %s", strerror(error_number));
         close(lfd);
         return 1;
     }
 
     if (listen(lfd, 128) != 0) {
-        perror("listen");
+        int error_number = errno;
+        vc_log_error("startup", "listen failed: %s", strerror(error_number));
         close(lfd);
         return 1;
     }
 
     if (cfg.protocol == CORE_PROTOCOL_SOCKS5) {
-        fprintf(stderr, "%s listening on 127.0.0.1:%d (upstream=socks5://%s:%u, auth=%s)\n",
-                prog,
-                listen_port,
-                cfg.server_host,
-                (unsigned)cfg.server_port,
-                (cfg.socks5_user[0] != '\0' ? "userpass" : "none"));
+        vc_log_info("core", "%s listening on 127.0.0.1:%d (upstream=socks5://%s:%u, auth=%s)",
+                    prog,
+                    listen_port,
+                    cfg.server_host,
+                    (unsigned)cfg.server_port,
+                    (cfg.socks5_user[0] != '\0' ? "userpass" : "none"));
     } else {
         const char *fp_label = "chrome";
         if (cfg.fp_mode == FP_RANDOM) {
@@ -1386,17 +1400,18 @@ int main(int argc, char **argv) {
         } else if (cfg.transport_mode == TRANSPORT_GRPC) {
             transport_label = "grpc";
         }
-        fprintf(stderr, "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)\n", prog, listen_port,
-                cfg.server_host, (unsigned)cfg.server_port, cfg.sni, cfg.security, transport_label, fp_label);
+        vc_log_info("core", "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)",
+                    prog, listen_port, cfg.server_host, (unsigned)cfg.server_port,
+                    cfg.sni, cfg.security, transport_label, fp_label);
         if ((cfg.transport_mode == TRANSPORT_XHTTP || cfg.transport_mode == TRANSPORT_GRPC) && strcmp(cfg.security, "tls") == 0) {
-            fprintf(stderr, "[%s] tls_mode=%s\n", transport_label, tls_mode_startup_label(cfg.allow_insecure));
+            vc_log_info(transport_label, "tls_mode=%s", tls_mode_startup_label(cfg.allow_insecure));
         }
     }
     if (g_routing.enabled) {
-        fprintf(stderr, "[routing] enabled default=%s bypass_lan=%s rules=%lu\n",
-                routing_action_name(g_routing.default_action),
-                g_routing.bypass_lan ? "yes" : "no",
-                (unsigned long)g_routing.rule_count);
+        vc_log_info("routing", "enabled default=%s bypass_lan=%s rules=%lu",
+                    routing_action_name(g_routing.default_action),
+                    g_routing.bypass_lan ? "yes" : "no",
+                    (unsigned long)g_routing.rule_count);
     }
 
     while (1) {
@@ -1405,7 +1420,8 @@ int main(int argc, char **argv) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("accept");
+            int error_number = errno;
+            vc_log_error("core", "accept failed: %s", strerror(error_number));
             break;
         }
         core_tune_tcp_socket(cfd);

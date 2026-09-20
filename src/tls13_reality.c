@@ -3,6 +3,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 
+#include "core_log.h"
 #include "socket_util.h"
 #include "tls13_reality.h"
 
@@ -315,7 +316,7 @@ static void cache_tls_aes_fallback(const char *host, uint16_t port, const char *
 static void log_tls_cipher_once(const char *cipher) {
     pthread_mutex_lock(&g_tls_state_lock);
     if (!g_tls_cipher_logged) {
-        fprintf(stderr, "[tls] selected cipher=%s\n", cipher != NULL ? cipher : "unknown");
+        vc_log_debug("tls", "selected cipher=%s", cipher != NULL ? cipher : "unknown");
         g_tls_cipher_logged = 1;
     }
     pthread_mutex_unlock(&g_tls_state_lock);
@@ -1014,7 +1015,7 @@ static int sha256_hex(const uint8_t *data, size_t len, char out_hex[65]) {
     return 0;
 }
 
-static int tofu_verify_or_store_pin(const char *log_prefix, const char *pin_key, const char *peer_pin, int log_ok, char *err, size_t err_cap) {
+static int tofu_verify_or_store_pin(const char *log_component, const char *pin_key, const char *peer_pin, int log_ok, char *err, size_t err_cap) {
     int stored = 0;
     if (secure_tofu_verify_or_store(pin_key, peer_pin, &stored, err, err_cap) != 0) {
         if (err != NULL && err_cap > 0 && strcmp(err, "TOFU pin mismatch") == 0) {
@@ -1023,7 +1024,7 @@ static int tofu_verify_or_store_pin(const char *log_prefix, const char *pin_key,
         return -1;
     }
     if (log_ok) {
-        fprintf(stderr, "%s TOFU pin %s for %s\n", log_prefix, stored ? "learned" : "verified", pin_key);
+        vc_log_info(log_component, "TOFU pin %s for %s", stored ? "learned" : "verified", pin_key);
     }
     return 0;
 }
@@ -1061,7 +1062,7 @@ static int xhttp_tofu_verify_or_store(SSL *ssl, const char *pin_key, int log_ok,
         return -1;
     }
 
-    return tofu_verify_or_store_pin("[xhttp]", pin_key, peer_pin, log_ok, err, err_cap);
+    return tofu_verify_or_store_pin("xhttp", pin_key, peer_pin, log_ok, err, err_cap);
 }
 
 static int alpn_csv_has_token(const char *csv, const char *token) {
@@ -1834,12 +1835,12 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
         char err[160] = {0};
         if (parse_http_response_headers(c->ssl, c->fd, &c->xhttp_net_cache, &status, &chunked, &content_len, err, sizeof(err)) != 0) {
             if (err[0] != '\0') {
-                fprintf(stderr, "[xhttp] %s\n", err);
+                vc_log_error("xhttp", "%s", err);
             }
             return -1;
         }
         if (status != 200) {
-            fprintf(stderr, "[xhttp] GET returned non-200: %d\n", status);
+            vc_log_error("xhttp", "GET returned non-200: %d", status);
             return -1;
         }
         c->xhttp_chunked = chunked;
@@ -2610,7 +2611,7 @@ static int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
             }
             while (c->h2_peer_conn_window <= 0 || *stream_window <= 0) {
                 if (h2_pump_one_frame(c) != 0) {
-                    fprintf(stderr, "[grpc] failed while waiting for h2 upload window\n");
+                    vc_log_error("grpc", "failed while waiting for h2 upload window");
                     return -1;
                 }
             }
@@ -2624,7 +2625,7 @@ static int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
                 int64_t stream_high = *stream_refill_target / 2;
                 while (c->h2_peer_conn_window < conn_high || *stream_window < stream_high) {
                     if (h2_pump_one_frame(c) != 0) {
-                        fprintf(stderr, "[xhttp] failed while waiting for h2 upload window\n");
+                        vc_log_error("xhttp", "failed while waiting for h2 upload window");
                         return -1;
                     }
                     conn_high = c->h2_peer_conn_refill_target / 2;
@@ -2830,7 +2831,7 @@ static int h2_pump_one_frame(tls13_conn_t *c) {
     } else {
         rc = h2_process_control_frame(c, type, flags, stream_id, payload, payload_len, err, sizeof(err));
         if (rc != 0 && err[0] != '\0') {
-            fprintf(stderr, "[%s] %s\n", c->grpc_transport ? "grpc" : "xhttp", err);
+            vc_log_error(c->grpc_transport ? "grpc" : "xhttp", "%s", err);
         }
         if (rc == 0 && type == H2_FRAME_HEADERS && stream_id == c->h2_stream_id && (flags & H2_FLAG_END_STREAM) != 0) {
             c->h2_stream_eof = 1;
@@ -4814,7 +4815,7 @@ static int tcp_tls_tofu_verify_or_store(const vless_config_t *cfg, const uint8_t
         return -1;
     }
 
-    return tofu_verify_or_store_pin("[tls]", pin_key, peer_pin, 1, err, err_cap);
+    return tofu_verify_or_store_pin("tls", pin_key, peer_pin, 1, err, err_cap);
 }
 
 static int verify_reality_cert(const uint8_t auth_key[32], const uint8_t *cert_der, size_t cert_der_len) {
@@ -4879,16 +4880,17 @@ static int load_x509_store_paths(X509_STORE *store) {
         if (X509_STORE_load_locations(store, ca_paths[i], NULL) == 1) {
             custom_ca_loaded = 1;
             if (debug != NULL && debug[0] != '\0') {
-                fprintf(stderr, "[tls] loaded CA bundle: %s\n", ca_paths[i]);
+                vc_log_debug("tls", "loaded CA bundle: %s", ca_paths[i]);
             }
             break;
         } else if (debug != NULL && debug[0] != '\0') {
-            fprintf(stderr, "[tls] failed to load CA bundle: %s\n", ca_paths[i]);
+            vc_log_debug("tls", "failed to load CA bundle: %s", ca_paths[i]);
         }
     }
 
     if (debug != NULL && debug[0] != '\0') {
-        fprintf(stderr, "[tls] default CA paths ready=%d custom_ca_loaded=%d\n", default_paths_ready, custom_ca_loaded);
+        vc_log_debug("tls", "default CA paths ready=%d custom_ca_loaded=%d",
+                     default_paths_ready, custom_ca_loaded);
     }
     return (custom_ca_loaded || default_paths_ready) ? 0 : -1;
 }
@@ -4991,9 +4993,9 @@ static int verify_tls_cert_message(const char *servername, const uint8_t *cert_m
         char issuer[256];
         X509_NAME_oneline(X509_get_subject_name(leaf), subject, sizeof(subject));
         X509_NAME_oneline(X509_get_issuer_name(leaf), issuer, sizeof(issuer));
-        fprintf(stderr, "[tls] cert chain entries=%d untrusted=%d\n", cert_count, sk_X509_num(untrusted));
-        fprintf(stderr, "[tls] leaf subject=%s\n", subject);
-        fprintf(stderr, "[tls] leaf issuer=%s\n", issuer);
+        vc_log_debug("tls", "cert chain entries=%d untrusted=%d", cert_count, sk_X509_num(untrusted));
+        vc_log_debug("tls", "leaf subject=%s", subject);
+        vc_log_debug("tls", "leaf issuer=%s", issuer);
     }
 
     const char *host = (servername != NULL && servername[0] != '\0') ? servername : NULL;
@@ -5026,7 +5028,8 @@ static int verify_tls_cert_message(const char *servername, const uint8_t *cert_m
             snprintf(err, err_cap, "TLS certificate verify failed: %s", X509_verify_cert_error_string(verify_rc));
         }
         if (debug != NULL && debug[0] != '\0') {
-            fprintf(stderr, "[tls] cert verify failed depth=%d: %s\n", verify_depth, X509_verify_cert_error_string(verify_rc));
+            vc_log_error("tls", "cert verify failed depth=%d: %s",
+                         verify_depth, X509_verify_cert_error_string(verify_rc));
         }
         goto out;
     }
@@ -5888,8 +5891,9 @@ static int tcp_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err
         return -1;
     }
 
-    fprintf(stderr, "[tls] connected mode=vision alpn=%s verify=%s\n", cfg->alpn[0] != '\0' ? cfg->alpn : "default",
-            c->tls_verify_mode[0] != '\0' ? c->tls_verify_mode : (cfg->allow_insecure ? "insecure" : "strict"));
+    vc_log_info("tls", "connected mode=vision alpn=%s verify=%s",
+                cfg->alpn[0] != '\0' ? cfg->alpn : "default",
+                c->tls_verify_mode[0] != '\0' ? c->tls_verify_mode : (cfg->allow_insecure ? "insecure" : "strict"));
     return 0;
 }
 
@@ -5990,8 +5994,9 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
         return -1;
     }
 
-    fprintf(stderr, "[ws] connected path=%s host=%s security=%s verify=%s\n", c->ws_path, c->ws_host, cfg->security,
-            ws_tls ? tls_verify_mode_name(c->tls_verify_policy) : "none");
+    vc_log_info("ws", "connected path=%s host=%s security=%s verify=%s",
+                c->ws_path, c->ws_host, cfg->security,
+                ws_tls ? tls_verify_mode_name(c->tls_verify_policy) : "none");
     return 0;
 }
 
@@ -6055,7 +6060,8 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
             set_err(err, err_cap, "tcp connect failed");
             return -1;
         }
-        fprintf(stderr, "[xhttp] plain mode=%s http=1.1 max_each_post=%d\n", c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
+        vc_log_info("xhttp", "plain mode=%s http=1.1 max_each_post=%d",
+                    c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
         if (strcmp(c->xhttp_transport_mode, "stream-one") == 0) {
             return xhttp_send_plain_stream_request(c, c->fd, err, err_cap);
         }
@@ -6085,7 +6091,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
             return -1;
         }
 
-        fprintf(stderr, "[xhttp] reality mode=%s http=2\n", c->xhttp_transport_mode);
+        vc_log_info("xhttp", "reality mode=%s http=2", c->xhttp_transport_mode);
         if (xhttp_h2_start_mode(c, err, err_cap) != 0) {
             return -1;
         }
@@ -6109,7 +6115,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
 
     tls_verify_mode_t mode = tls_verify_mode_for_config(cfg);
     c->tls_verify_policy = mode;
-    fprintf(stderr, "[xhttp] tls_mode=%s\n", tls_verify_mode_name(mode));
+    vc_log_info("xhttp", "tls_mode=%s", tls_verify_mode_name(mode));
     if (mode == TLS_VERIFY_MODE_TOFU) {
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
@@ -6130,7 +6136,8 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
 
     if (ssl_selected_alpn_is_h2(c->ssl)) {
         c->mode = CONN_MODE_XHTTP_TLS_H2;
-        fprintf(stderr, "[xhttp] tls mode=%s http=2 max_each_post=%d\n", c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
+        vc_log_info("xhttp", "tls mode=%s http=2 max_each_post=%d",
+                    c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
         if (xhttp_h2_start_mode(c, err, err_cap) != 0) {
             return -1;
         }
@@ -6141,7 +6148,8 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         set_err(err, err_cap, "xhttp stream-one and stream-up require HTTP/2");
         return -1;
     }
-    fprintf(stderr, "[xhttp] tls mode=%s http=1.1 max_each_post=%d\n", c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
+    vc_log_info("xhttp", "tls mode=%s http=1.1 max_each_post=%d",
+                c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
     if (xhttp_send_download_request(cfg, c, err, err_cap) != 0) {
         return -1;
     }
@@ -6165,7 +6173,7 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
     tls_verify_mode_t mode = tls_verify_mode_for_config(cfg);
     c->tls_verify_policy = mode;
     if (mode == TLS_VERIFY_MODE_TOFU) {
-        fprintf(stderr, "[grpc] tls_mode=tofu\n");
+        vc_log_info("grpc", "tls_mode=tofu");
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0 ||
             xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
@@ -6174,7 +6182,7 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
         c->xhttp_tls_insecure = 1;
     } else {
         int verify_peer = tls_verify_peer(mode);
-        fprintf(stderr, "[grpc] tls_mode=%s\n", tls_verify_mode_name(mode));
+        vc_log_info("grpc", "tls_mode=%s", tls_verify_mode_name(mode));
         if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
@@ -6227,8 +6235,9 @@ static int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, s
     if (grpc_h2_start(c, err, err_cap) != 0) {
         return -1;
     }
-    fprintf(stderr, "[grpc] connected service=%s authority=%s security=%s mode=%s\n", c->grpc_service_name, c->grpc_authority,
-            cfg->security, c->grpc_multi_mode ? "multi" : "single");
+    vc_log_info("grpc", "connected service=%s authority=%s security=%s mode=%s",
+                c->grpc_service_name, c->grpc_authority,
+                cfg->security, c->grpc_multi_mode ? "multi" : "single");
     return 0;
 }
 
@@ -6278,7 +6287,7 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
             set_err(err, err_cap, "tcp connect failed");
             return -1;
         }
-        fprintf(stderr, "[tcp] connected security=none\n");
+        vc_log_info("tcp", "connected security=none");
         *out = c;
         return 0;
     }
@@ -6405,7 +6414,7 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
             char err[128] = {0};
             if (xhttp_post_packet(c, buf + off, chunk, err, sizeof(err)) != 0) {
                 if (err[0] != '\0') {
-                    fprintf(stderr, "[xhttp] upload failed: %s\n", err);
+                    vc_log_error("xhttp", "upload failed: %s", err);
                 }
                 return -1;
             }
@@ -6428,7 +6437,7 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
             char err[128] = {0};
             if (xhttp_h2_post_packet(c, buf + off, chunk, err, sizeof(err)) != 0) {
                 if (err[0] != '\0') {
-                    fprintf(stderr, "[xhttp] h2 upload failed: %s\n", err);
+                    vc_log_error("xhttp", "h2 upload failed: %s", err);
                 }
                 return -1;
             }
@@ -6449,7 +6458,7 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
                 char err[128] = {0};
                 if (xhttp_h2_post_packet(c, buf + off, chunk, err, sizeof(err)) != 0) {
                     if (err[0] != '\0') {
-                        fprintf(stderr, "[xhttp] h2 upload failed: %s\n", err);
+                        vc_log_error("xhttp", "h2 upload failed: %s", err);
                     }
                     return -1;
                 }
@@ -6468,12 +6477,12 @@ static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
         uint8_t *pl = NULL;
         size_t pl_len = 0;
         if (read_record(c->fd, &rtype, &pl, &pl_len) != 0) {
-            fprintf(stderr, "[tls] read_record failed in app phase\n");
+            vc_log_error("tls", "read_record failed in app phase");
             return -1;
         }
 
         if (rtype != 0x17) {
-            fprintf(stderr, "[tls] non-app record type=0x%02x in app phase\n", rtype);
+            vc_log_warning("tls", "non-app record type=0x%02x in app phase", rtype);
             free(pl);
             continue;
         }
@@ -6493,10 +6502,10 @@ static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
                     return -1;
                 }
                 c->reality_raw_direct = 1;
-                fprintf(stderr, "[tls] decrypt_record failed in app phase, switching to raw direct fallback\n");
+                vc_log_warning("tls", "decrypt_record failed in app phase; switching to raw direct fallback");
                 return 0;
             }
-            fprintf(stderr, "[tls] decrypt_record failed in app phase\n");
+            vc_log_error("tls", "decrypt_record failed in app phase");
             free(pl);
             return -1;
         }
@@ -6514,12 +6523,12 @@ static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
         } else {
             if (inner == 0x15) {
                 if (dec_len >= 2) {
-                    fprintf(stderr, "[tls] alert level=%u desc=%u\n", (unsigned)dec[0], (unsigned)dec[1]);
+                    vc_log_error("tls", "alert level=%u desc=%u", (unsigned)dec[0], (unsigned)dec[1]);
                 } else {
-                    fprintf(stderr, "[tls] alert with short payload len=%zu\n", dec_len);
+                    vc_log_error("tls", "alert with short payload len=%zu", dec_len);
                 }
             } else {
-                fprintf(stderr, "[tls] inner content type=0x%02x in app phase\n", inner);
+                vc_log_warning("tls", "inner content type=0x%02x in app phase", inner);
             }
             free(dec);
             if (inner == 0x15) {
