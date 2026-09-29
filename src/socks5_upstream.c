@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200112L
 
+#include "server_ips.h"
 #include "socket_util.h"
 #include "socks5_upstream.h"
 
@@ -51,6 +52,34 @@ static int write_exact(int fd, const void *buf, size_t len) {
 }
 
 static int connect_tcp_host(const char *host, uint16_t port, char *err, size_t err_cap) {
+    if (core_server_ip_count() > 0) {
+        int saved_errno = 0;
+        for (size_t i = 0; i < core_server_ip_count(); i++) {
+            struct sockaddr_in address;
+            memset(&address, 0, sizeof(address));
+            address.sin_family = AF_INET;
+            address.sin_port = htons(port);
+            address.sin_addr = *core_server_ip_at(i);
+
+            int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (fd < 0) {
+                saved_errno = errno;
+                continue;
+            }
+            core_tune_tcp_socket(fd);
+            core_set_socket_io_timeout(fd, SOCKS5_UPSTREAM_TIMEOUT_MS);
+            if (core_connect_with_timeout(fd, (const struct sockaddr *)&address, sizeof(address),
+                                          SOCKS5_UPSTREAM_TIMEOUT_MS) == 0) {
+                return fd;
+            }
+            saved_errno = errno;
+            close(fd);
+        }
+        set_errf(err, err_cap, "SOCKS5 TCP connect failed for %s:%u: errno=%d",
+                 host, (unsigned)port, saved_errno);
+        return -1;
+    }
+
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
 

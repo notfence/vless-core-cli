@@ -16,6 +16,7 @@
 #include "socks5.h"
 #include "socks5_upstream.h"
 #include "routing.h"
+#include "server_ips.h"
 #include "socket_util.h"
 #include "tls13_reality.h"
 #include "types.h"
@@ -24,7 +25,7 @@
 #include "vless.h"
 #include "vless_encryption.h"
 
-#define VLESS_CORE_VERSION "1.1.3"
+#define VLESS_CORE_VERSION "1.1.4"
 #define MAX_CLIENT_CONNECTIONS 256
 #define SOCKS_HANDSHAKE_TIMEOUT_MS 10000
 #define SERVER_IP_LIST_MAX_LENGTH 511
@@ -1115,7 +1116,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --routing <rules>        Optional Proxy, Direct and Block rules\n");
     fprintf(stderr, "  --route-control-port <p> Direct-route controller port\n");
     fprintf(stderr, "  --route-control-socket <path> Direct-route controller Unix socket\n");
-    fprintf(stderr, "  --server-ips <list>      Pre-resolved VLESS server IPv4 addresses\n");
+    fprintf(stderr, "  --server-ips <list>      Pre-resolved server IPv4 addresses\n");
     fprintf(stderr, "  --xray-version <x.y.z>   Xray version reported by vless-core-cli\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
@@ -1343,7 +1344,7 @@ int main(int argc, char **argv) {
     }
     memset(uri_storage, 0, sizeof(uri_storage));
     if (server_ips != NULL) {
-        if (cfg.protocol != CORE_PROTOCOL_VLESS || tls13_reality_set_server_ips(server_ips) != 0) {
+        if (core_set_server_ips(server_ips) != 0) {
             vc_log_error("startup", "invalid pre-resolved server IP list");
             return 1;
         }
