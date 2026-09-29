@@ -405,7 +405,9 @@ static int route_control_enabled(int control_port, const char *control_socket) {
 static int update_bypass(int control_port,
                          const char *control_socket,
                          const char *operation,
-                         const char *ip) {
+                         const char *ip,
+                         int *hold_until_close) {
+    if (hold_until_close) *hold_until_close = 0;
     if (!route_control_enabled(control_port, control_socket)) {
         return 0;
     }
@@ -454,19 +456,35 @@ static int update_bypass(int control_port,
     }
 
     char reply[64];
-    ssize_t n = recv(fd, reply, sizeof(reply) - 1, 0);
+    size_t reply_length = 0;
+    while (reply_length + 1 < sizeof(reply)) {
+        ssize_t n = recv(fd, reply + reply_length, sizeof(reply) - reply_length - 1, 0);
+        if (n <= 0) break;
+        reply_length += (size_t)n;
+        if (memchr(reply, '\n', reply_length)) break;
+    }
     close(fd);
-    if (n <= 0) return -1;
-    reply[n] = '\0';
-    return strncmp(reply, "OK", 2) == 0 ? 0 : -1;
+    reply[reply_length] = '\0';
+    if (strcmp(reply, "OK\n") == 0) return 0;
+    if (hold_until_close && strcmp(reply, "OK hold\n") == 0) {
+        *hold_until_close = 1;
+        return 0;
+    }
+    return -1;
 }
 
 int routing_open_direct(const char *host,
                         uint16_t port,
                         int control_port,
                         const char *control_socket,
+                        routing_direct_lease_t *lease,
                         char *err,
                         size_t err_cap) {
+    if (lease == NULL) {
+        set_err(err, err_cap, "direct route lease is missing");
+        return -1;
+    }
+    memset(lease, 0, sizeof(*lease));
     char port_text[16];
     snprintf(port_text, sizeof(port_text), "%u", (unsigned)port);
 
@@ -500,9 +518,11 @@ int routing_open_direct(const char *host,
         }
 
         int bypass_added = 0;
+        int hold_until_close = 0;
         if (control_enabled) {
             if (it->ai_family != AF_INET ||
-                update_bypass(control_port, control_socket, "ROUTE_DIRECT_ADD", ip) != 0) {
+                update_bypass(control_port, control_socket, "ROUTE_DIRECT_ADD", ip,
+                              &hold_until_close) != 0) {
                 last_errno = EACCES;
                 continue;
             }
@@ -515,7 +535,12 @@ int routing_open_direct(const char *host,
             if (core_connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen,
                                           ROUTING_CONNECT_TIMEOUT_MS) == 0) {
                 if (bypass_added) {
-                    (void)update_bypass(control_port, control_socket, "ROUTE_DIRECT_REMOVE", ip);
+                    if (hold_until_close) {
+                        snprintf(lease->bypass_ip, sizeof(lease->bypass_ip), "%s", ip);
+                    } else {
+                        (void)update_bypass(control_port, control_socket,
+                                            "ROUTE_DIRECT_REMOVE", ip, NULL);
+                    }
                 }
                 break;
             }
@@ -526,7 +551,8 @@ int routing_open_direct(const char *host,
             last_errno = errno;
         }
         if (bypass_added) {
-            (void)update_bypass(control_port, control_socket, "ROUTE_DIRECT_REMOVE", ip);
+            (void)update_bypass(control_port, control_socket,
+                                "ROUTE_DIRECT_REMOVE", ip, NULL);
         }
     }
     freeaddrinfo(result);
@@ -538,4 +564,16 @@ int routing_open_direct(const char *host,
         return -1;
     }
     return fd;
+}
+
+int routing_close_direct(int fd,
+                         int control_port,
+                         const char *control_socket,
+                         routing_direct_lease_t *lease) {
+    if (fd >= 0) close(fd);
+    if (lease == NULL || lease->bypass_ip[0] == '\0') return 0;
+    int result = update_bypass(control_port, control_socket,
+                               "ROUTE_DIRECT_REMOVE", lease->bypass_ip, NULL);
+    lease->bypass_ip[0] = '\0';
+    return result;
 }

@@ -24,11 +24,11 @@ For XHTTP, `mode=auto` follows xray's defaults: `packet-up` without security or 
 ## Platform Support
 
 - Linux on x86-64 (`vless-core-linux-amd64`)
-- iOS 6.x through iOS 10.x via ARMv7 (`vless-core-darwin-armv7`)
+- iOS 5.0 through iOS 10.x via ARMv7 (`vless-core-darwin-armv7`)
 - iOS 11.x through iOS 14.x via ARM64 (`vless-core-darwin-arm64`)
 
 The two iOS outputs are separate thin binaries. The app package deliberately
-keeps the ARMv7 runtime on iOS 6–10, including ARM64 devices that still support
+keeps the ARMv7 runtime on iOS 5–10, including ARM64 devices that still support
 32-bit applications, and selects ARM64 only on iOS 11 or newer.
 
 ## Binaries
@@ -176,9 +176,9 @@ file ./vless-core-darwin-arm64
 The private ARMv7 OpenSSL compatibility patch is not applied to the ARM64
 build; its patch status is therefore reported as `unpatched`.
 
-## Legacy curl on iOS 6
+## Legacy curl on iOS 5.0+
 
-Old stock iOS 6 curl/OpenSSL may fail modern TLS. Build replacement curl (armv7 + OpenSSL 3.5.7 + zlib 1.3.1):
+Old stock iOS curl/OpenSSL may fail modern TLS. Build replacement curl (armv7 + OpenSSL 3.5.7 + zlib 1.3.1):
 
 ```bash
 make zlib-ios6
@@ -201,7 +201,7 @@ make release-packages
 ```
 
 Outputs are written to `build/release/`, including separate ARMv7 and ARM64
-iOS archives. No universal iOS executable is produced, so iOS 6–10 cannot
+iOS archives. No universal iOS executable is produced, so iOS 5–10 cannot
 accidentally select the iOS 11+ ARM64 slice.
 
 ## Third-party software

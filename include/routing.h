@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <arpa/inet.h>
 
 #define ROUTING_MAX_RULES 48
 #define ROUTING_CONTROL_SOCKET_PATH_MAX 104
@@ -36,6 +37,10 @@ typedef struct {
     routing_rule_t rules[ROUTING_MAX_RULES];
 } routing_config_t;
 
+typedef struct {
+    char bypass_ip[INET6_ADDRSTRLEN];
+} routing_direct_lease_t;
+
 void routing_config_init(routing_config_t *config);
 int routing_config_parse(const char *text, routing_config_t *config, char *err, size_t err_cap);
 route_action_t routing_decide(const routing_config_t *config,
@@ -51,7 +56,12 @@ int routing_open_direct(const char *host,
                         uint16_t port,
                         int control_port,
                         const char *control_socket,
+                        routing_direct_lease_t *lease,
                         char *err,
                         size_t err_cap);
+int routing_close_direct(int fd,
+                         int control_port,
+                         const char *control_socket,
+                         routing_direct_lease_t *lease);
 
 #endif

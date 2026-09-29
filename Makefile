@@ -24,6 +24,7 @@ LDLIBS ?= -lssl -lcrypto -lpthread
 
 IOS_TOOLCHAIN ?= $(abspath ../toolchains/ios6)
 IOS_SDK ?= $(IOS_TOOLCHAIN)/SDK/iPhoneOS6.1.sdk
+IOS_MIN_VERSION ?= 5.0
 IOS_OPENSSL_PREFIX ?= third_party/openssl-ios6-armv7
 IOS_ZLIB_PREFIX ?= third_party/zlib-ios6-armv7
 IOS_CC ?= $(IOS_TOOLCHAIN)/bin/arm-apple-darwin11-clang
@@ -43,8 +44,8 @@ IOS_BLOCKS_RUNTIME_DIR ?= $(shell \
 IOS_RUNTIME_ENV = LD_LIBRARY_PATH="$(IOS_BLOCKS_RUNTIME_DIR)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}"
 IOS_OPENSSL_PATCH_STATUS_FILE ?= $(IOS_OPENSSL_PREFIX)/VLESS_OPENSSL_PATCH_STATUS
 IOS_OPENSSL_PATCH_STATUS ?= $(shell cat "$(IOS_OPENSSL_PATCH_STATUS_FILE)" 2>/dev/null || echo unpatched)
-IOS_CFLAGS ?= $(COMMON_CFLAGS) $(INCLUDES) -I$(IOS_OPENSSL_PREFIX)/include -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=6.0 -DVLESS_OPENSSL_PATCH_STATUS=\"$(IOS_OPENSSL_PATCH_STATUS)\"
-IOS_LDFLAGS ?= -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=6.0 -Wl,-pie
+IOS_CFLAGS ?= $(COMMON_CFLAGS) $(INCLUDES) -I$(IOS_OPENSSL_PREFIX)/include -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=$(IOS_MIN_VERSION) -DVLESS_OPENSSL_PATCH_STATUS=\"$(IOS_OPENSSL_PATCH_STATUS)\"
+IOS_LDFLAGS ?= -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=$(IOS_MIN_VERSION) -Wl,-pie
 IOS_LDLIBS ?= $(IOS_OPENSSL_PREFIX)/lib/libssl.a $(IOS_OPENSSL_PREFIX)/lib/libcrypto.a -lpthread
 IOS_ARM64_SDK ?= $(abspath ../toolchains/sdks/iPhoneOS11.4.sdk)
 IOS_ARM64_MIN_VERSION ?= 11.0

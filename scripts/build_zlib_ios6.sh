@@ -12,7 +12,7 @@ ZLIB_URL="${ZLIB_URL:-https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz}"
 IOS_TOOLCHAIN="${IOS_TOOLCHAIN:-${HOME}/toolchains/ios6}"
 IOS_SDK="${IOS_SDK:-${IOS_TOOLCHAIN}/SDK/iPhoneOS6.1.sdk}"
 IOS_ARCH="${IOS_ARCH:-armv7}"
-IOS_MIN_VERSION="${IOS_MIN_VERSION:-6.0}"
+IOS_MIN_VERSION="${IOS_MIN_VERSION:-5.0}"
 
 require_file() {
   local path="$1"

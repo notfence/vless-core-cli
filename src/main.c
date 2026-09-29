@@ -582,10 +582,12 @@ static void *client_worker_run(void *arg) {
 
     if (route == ROUTE_ACTION_DIRECT) {
         char direct_err[256] = {0};
+        routing_direct_lease_t direct_lease;
         int direct_fd = routing_open_direct(target_host,
                                             target_port,
                                             g_route_control_port,
                                             g_route_control_socket,
+                                            &direct_lease,
                                             direct_err,
                                             sizeof(direct_err));
         if (direct_fd < 0) {
@@ -598,18 +600,24 @@ static void *client_worker_run(void *arg) {
             return NULL;
         }
         if (!socks_success_sent && socks5_send_success(cfd) != 0) {
-            close(direct_fd);
+            if (routing_close_direct(direct_fd, g_route_control_port,
+                                     g_route_control_socket, &direct_lease) != 0)
+                vc_log_error("routing", "direct bypass release failed");
             close(cfd);
             return NULL;
         }
         if (first_payload_len > 0 &&
             write_all(direct_fd, first_payload, (size_t)first_payload_len) != 0) {
-            close(direct_fd);
+            if (routing_close_direct(direct_fd, g_route_control_port,
+                                     g_route_control_socket, &direct_lease) != 0)
+                vc_log_error("routing", "direct bypass release failed");
             close(cfd);
             return NULL;
         }
         relay_tcp_pair(cfd, direct_fd);
-        close(direct_fd);
+        if (routing_close_direct(direct_fd, g_route_control_port,
+                                 g_route_control_socket, &direct_lease) != 0)
+            vc_log_error("routing", "direct bypass release failed");
         close(cfd);
         return NULL;
     }
