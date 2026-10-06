@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+enum { SOCKS5_NEGOTIATION_REJECTED = -2 };
+
 int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_t *port);
 int socks5_send_success(int fd);
 int socks5_send_failure(int fd, uint8_t rep);

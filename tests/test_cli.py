@@ -7,6 +7,21 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_socks_method_negotiation(self):
+        with Server() as target, cli("socks5://127.0.0.1:1",["--routing","1;direct;0"]) as core:
+            for methods in (b"\x02",b"\x01\x02",b"\xff",b"\x00",b"\x02\x00",b"\x00\x02",bytes([2])*254+b"\x00"):
+                with self.subTest(methods=methods.hex()), socket.create_connection(("127.0.0.1",core.port),timeout=3) as connection:
+                    connection.sendall(b"\x05"+bytes([len(methods)])+methods)
+                    accepted = b"\x00" in methods
+                    self.assertEqual(exact(connection,2),b"\x05\x00" if accepted else b"\x05\xff")
+                    if accepted:
+                        connection.sendall(b"\x05\x01\x00\x01\x7f\x00\x00\x01"+target.port.to_bytes(2,"big"))
+                        self.assertEqual(exact(connection,10),b"\x05\x00\x00\x01"+bytes(6))
+                        exchange(connection,b"vless-core method negotiation")
+                    else:
+                        self.assertEqual(connection.recv(1),b"")
+            self.assertIsNone(core.process.poll(),core.log)
+
     def test_listener_collision_recovery(self):
         original = fixtures.port
         with Server() as occupied:

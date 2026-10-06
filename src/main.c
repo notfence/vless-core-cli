@@ -514,8 +514,9 @@ static void *client_worker_run(void *arg) {
     core_set_socket_io_timeout(cfd, SOCKS_HANDSHAKE_TIMEOUT_MS);
     char target_host[512];
     uint16_t target_port = 0;
-    if (socks5_negotiate_and_get_target(cfd, target_host, sizeof(target_host), &target_port) != 0) {
-        socks5_send_failure(cfd, 0x01);
+    int negotiation_result = socks5_negotiate_and_get_target(cfd, target_host, sizeof(target_host), &target_port);
+    if (negotiation_result != 0) {
+        if (negotiation_result != SOCKS5_NEGOTIATION_REJECTED) socks5_send_failure(cfd, 0x01);
         close(cfd);
         return NULL;
     }

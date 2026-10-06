@@ -63,9 +63,13 @@ int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_
         return -1;
     }
 
-    uint8_t method_resp[2] = {0x05, 0x00};
+    int no_auth = memchr(methods, 0x00, n_methods) != NULL;
+    uint8_t method_resp[2] = {0x05, no_auth ? 0x00 : 0xff};
     if (write_exact(fd, method_resp, sizeof(method_resp)) != 0) {
         return -1;
+    }
+    if (!no_auth) {
+        return SOCKS5_NEGOTIATION_REJECTED;
     }
 
     uint8_t req_head[4];

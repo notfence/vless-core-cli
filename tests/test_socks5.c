@@ -13,8 +13,32 @@ static int parse_wire(const uint8_t *wire, size_t length, char *host, size_t cap
     return result;
 }
 
+static void check_methods(const uint8_t *methods, uint8_t count, int accepted) {
+    int pair[2]; REQUIRE("socks/method-pair", socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    uint8_t wire[270] = {5,count}; memcpy(wire+2,methods,count);
+    const uint8_t request[] = {5,1,0,1,127,0,0,1,0x1f,0x90};
+    memcpy(wire+2+count,request,sizeof(request));
+    REQUIRE("socks/method-feed", send(pair[1],wire,2+count+sizeof(request),0) == (ssize_t)(2+count+sizeof(request)) && shutdown(pair[1],SHUT_WR) == 0);
+    char host[64] = "unchanged"; uint16_t port = 0xbeef;
+    int result = socks5_negotiate_and_get_target(pair[0],host,sizeof(host),&port);
+    uint8_t reply[2], expected[] = {5,accepted ? 0 : 0xff};
+    CHECK("socks/method-reply", recv(pair[1],reply,sizeof(reply),MSG_WAITALL) == sizeof(reply) && memcmp(reply,expected,sizeof(reply)) == 0);
+    if (accepted) CHECK("socks/method-target", result == 0 && strcmp(host,"127.0.0.1") == 0 && port == 8080);
+    else {
+        CHECK("socks/method-reject", result == SOCKS5_NEGOTIATION_REJECTED && strcmp(host,"unchanged") == 0 && port == 0xbeef);
+        uint8_t pending[sizeof(request)];
+        CHECK("socks/method-no-connect-read", recv(pair[0],pending,sizeof(pending),MSG_WAITALL) == sizeof(pending) && memcmp(pending,request,sizeof(pending)) == 0);
+    }
+    close(pair[0]); close(pair[1]);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    for (int method = 0; method <= 255; method++) { uint8_t value = (uint8_t)method; check_methods(&value,1,method == 0); }
+    const uint8_t first[] = {0,2,1}, last[] = {2,1,0};
+    check_methods(first,sizeof(first),1); check_methods(last,sizeof(last),1);
+    uint8_t maximum[255]; memset(maximum,2,sizeof(maximum)); check_methods(maximum,sizeof(maximum),0);
+    maximum[254] = 0; check_methods(maximum,sizeof(maximum),1);
     uint8_t wire[300] = {5,1,0,5,1,0,1,127,0,0,1,0x1f,0x90};
     const uint8_t types[] = {1,3,4};
     const char *hosts[] = {"127.0.0.1","vless-core.test","::1"};
