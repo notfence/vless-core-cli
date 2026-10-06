@@ -62,13 +62,30 @@ CURL_IOS_ARM64_PREFIX ?= third_party/curl-ios-arm64
 CURL_IOS_ARM64_BIN ?= $(CURL_IOS_ARM64_PREFIX)/bin/curl
 THIRD_PARTY_LICENSES := THIRD_PARTY_LICENSES.txt
 
-all: linux ios
+all: preflight linux ios
 
-linux: $(BIN_LINUX)
+test:
+	$(MAKE) -C tests test
 
-ios: check-ios-toolchain $(BIN_IOS)
+preflight: test
 
-ios-arm64: check-ios-arm64-toolchain $(BIN_IOS_ARM64)
+test-asan:
+	$(MAKE) -C tests asan
+
+test-sanitizers:
+	$(MAKE) -C tests sanitizers
+
+test-coverage:
+	$(MAKE) -C tests coverage
+
+linux: preflight $(BIN_LINUX)
+	python3 tests/test_build.py binary $(BIN_LINUX) linux
+
+ios: preflight check-ios-toolchain $(BIN_IOS)
+	python3 tests/test_build.py binary $(BIN_IOS) armv7
+
+ios-arm64: preflight check-ios-arm64-toolchain $(BIN_IOS_ARM64)
+	python3 tests/test_build.py binary $(BIN_IOS_ARM64) arm64
 
 check-ios-toolchain:
 	@test -x "$(IOS_CC)" || (echo "Missing iOS compiler: $(IOS_CC)"; echo "Set IOS_TOOLCHAIN=/path/to/ios6/toolchain"; exit 1)
@@ -82,24 +99,27 @@ check-ios-toolchain:
 check-ios-arm64-toolchain: check-ios-toolchain
 	@test -d "$(IOS_ARM64_SDK)" || (echo "Missing arm64 iOS SDK: $(IOS_ARM64_SDK)"; echo "Set IOS_ARM64_SDK=/path/to/iPhoneOS.sdk"; exit 1)
 
-$(BIN_LINUX): $(OBJ_LINUX)
+$(BIN_LINUX): $(OBJ_LINUX) | preflight
 	$(CC) $(LDFLAGS) -o $@ $(OBJ_LINUX) $(LDLIBS)
+	python3 tests/test_build.py binary $@ linux
 
-$(BIN_IOS): $(OBJ_IOS) $(IOS_OPENSSL_PREFIX)/lib/libssl.a $(IOS_OPENSSL_PREFIX)/lib/libcrypto.a
+$(BIN_IOS): $(OBJ_IOS) $(IOS_OPENSSL_PREFIX)/lib/libssl.a $(IOS_OPENSSL_PREFIX)/lib/libcrypto.a | preflight
 	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_LDFLAGS) -o $@ $(OBJ_IOS) $(IOS_LDLIBS)
 	@$(IOS_OTOOL) -hv $@ | grep -qw PIE || (echo "Refusing non-PIE iOS binary: $@"; exit 1)
+	python3 tests/test_build.py binary $@ armv7
 
-$(BIN_IOS_ARM64): $(OBJ_IOS_ARM64) $(IOS_ARM64_OPENSSL_PREFIX)/lib/libssl.a $(IOS_ARM64_OPENSSL_PREFIX)/lib/libcrypto.a
+$(BIN_IOS_ARM64): $(OBJ_IOS_ARM64) $(IOS_ARM64_OPENSSL_PREFIX)/lib/libssl.a $(IOS_ARM64_OPENSSL_PREFIX)/lib/libcrypto.a | preflight
 	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_ARM64_LDFLAGS) -o $@ $(OBJ_IOS_ARM64) $(IOS_ARM64_LDLIBS)
 	@$(IOS_OTOOL) -hv $@ | grep -qw PIE || (echo "Refusing non-PIE iOS binary: $@"; exit 1)
+	python3 tests/test_build.py binary $@ arm64
 
-build/linux/%.o: src/%.c | build/linux
+build/linux/%.o: src/%.c | preflight build/linux
 	$(CC) $(COMMON_CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
 
-build/ios/%.o: src/%.c | build/ios
+build/ios/%.o: src/%.c | preflight build/ios
 	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
-build/ios-arm64/%.o: src/%.c | build/ios-arm64
+build/ios-arm64/%.o: src/%.c | preflight build/ios-arm64
 	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_ARM64_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 build/ios/main.o: $(IOS_OPENSSL_PATCH_STATUS_FILE)
@@ -185,24 +205,28 @@ curl-ios6-package: $(CURL_IOS_BIN) $(CA_BUNDLE) $(THIRD_PARTY_LICENSES)
 		-C $(ROOT_DIR) $(THIRD_PARTY_LICENSES)
 	@echo "Packed third_party/curl-ios6-with-ca.tar.gz"
 
-$(RELEASE_LINUX_ARCHIVE): $(BIN_LINUX) $(THIRD_PARTY_LICENSES)
+$(RELEASE_LINUX_ARCHIVE): $(BIN_LINUX) $(THIRD_PARTY_LICENSES) | preflight
 	mkdir -p $(RELEASE_DIR)
 	tar -czf $@ -C $(ROOT_DIR) $(BIN_LINUX) $(THIRD_PARTY_LICENSES)
+	python3 tests/test_build.py archive $@ $(BIN_LINUX) linux
 
-$(RELEASE_IOS_ARMV7_ARCHIVE): $(BIN_IOS) $(THIRD_PARTY_LICENSES)
+$(RELEASE_IOS_ARMV7_ARCHIVE): $(BIN_IOS) $(THIRD_PARTY_LICENSES) | preflight
 	mkdir -p $(RELEASE_DIR)
 	tar -czf $@ -C $(ROOT_DIR) $(BIN_IOS) $(THIRD_PARTY_LICENSES)
+	python3 tests/test_build.py archive $@ $(BIN_IOS) armv7
 
-$(RELEASE_IOS_ARM64_ARCHIVE): $(BIN_IOS_ARM64) $(THIRD_PARTY_LICENSES)
+$(RELEASE_IOS_ARM64_ARCHIVE): $(BIN_IOS_ARM64) $(THIRD_PARTY_LICENSES) | preflight
 	mkdir -p $(RELEASE_DIR)
 	tar -czf $@ -C $(ROOT_DIR) $(BIN_IOS_ARM64) $(THIRD_PARTY_LICENSES)
+	python3 tests/test_build.py archive $@ $(BIN_IOS_ARM64) arm64
 
-release-packages: $(RELEASE_LINUX_ARCHIVE) $(RELEASE_IOS_ARMV7_ARCHIVE) $(RELEASE_IOS_ARM64_ARCHIVE)
+release-packages: preflight $(RELEASE_LINUX_ARCHIVE) $(RELEASE_IOS_ARMV7_ARCHIVE) $(RELEASE_IOS_ARM64_ARCHIVE)
 	cd $(RELEASE_DIR) && sha256sum $(notdir $(RELEASE_LINUX_ARCHIVE)) $(notdir $(RELEASE_IOS_ARMV7_ARCHIVE)) $(notdir $(RELEASE_IOS_ARM64_ARCHIVE)) > SHA256SUMS
+	python3 tests/test_build.py release $(RELEASE_DIR)
 
 clean:
 	rm -rf build $(BIN_LINUX) $(BIN_IOS) $(BIN_IOS_ARM64)
 
 -include $(OBJ_LINUX:.o=.d) $(OBJ_IOS:.o=.d) $(OBJ_IOS_ARM64:.o=.d)
 
-.PHONY: all linux ios ios-arm64 check-ios-toolchain check-ios-arm64-toolchain clean openssl-ios6 openssl-ios-arm64 zlib-ios6 zlib-ios-arm64 curl-ios6 curl-ios-arm64 curl-ios6-package release-packages
+.PHONY: all linux ios ios-arm64 test preflight test-asan test-sanitizers test-coverage check-ios-toolchain check-ios-arm64-toolchain clean openssl-ios6 openssl-ios-arm64 zlib-ios6 zlib-ios-arm64 curl-ios6 curl-ios-arm64 curl-ios6-package release-packages

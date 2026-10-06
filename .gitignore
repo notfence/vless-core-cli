@@ -12,7 +12,7 @@ patches/openssl-ios6-armv7-asm.patch
 patches/private/
 
 # Local clutter
-tests/
+tests/__pycache__/
 .DS_Store
 *.swp
 *.swo
