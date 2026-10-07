@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1203,6 +1204,10 @@ static const char *tls_mode_startup_label(int allow_insecure) {
 }
 
 int main(int argc, char **argv) {
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        vc_log_error("startup", "failed to ignore SIGPIPE: %s", strerror(errno));
+        return 1;
+    }
     setvbuf(stderr, NULL, _IONBF, 0);
     srand((unsigned int)time(NULL));
 

@@ -1,12 +1,31 @@
 import os
 import socket
+import struct
 import subprocess
+import time
 import unittest
 from unittest import mock
 import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_aborted_clients_keep_existing_and_new_connections_alive(self):
+        greeting = b"\x05\x01\x00"
+        request = b"\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\x90"
+        with Server() as target, cli("socks5://127.0.0.1:1",["--routing","1;direct;0"]) as core:
+            with socks_connect(core.port,target.port) as active:
+                for data in (b"",greeting[:1],greeting,greeting+request[:4],greeting+request):
+                    with self.subTest(data=data.hex()):
+                        for _ in range(4):
+                            with socket.create_connection(("127.0.0.1",core.port),timeout=3) as aborted:
+                                aborted.sendall(data)
+                                aborted.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack("ii",1,0))
+                            time.sleep(0.02)
+                            self.assertIsNone(core.process.poll(),core.log)
+                        exchange(active,b"vless-core existing connection survives")
+                        with socks_connect(core.port,target.port) as recovered:
+                            exchange(recovered,b"vless-core new connection survives")
+
     def test_socks_method_negotiation(self):
         with Server() as target, cli("socks5://127.0.0.1:1",["--routing","1;direct;0"]) as core:
             for methods in (b"\x02",b"\x01\x02",b"\xff",b"\x00",b"\x02\x00",b"\x00\x02",bytes([2])*254+b"\x00"):
