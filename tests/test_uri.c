@@ -47,6 +47,27 @@ static void check_base64(void) {
     CHECK("utils/base64-exact-capacity", base64url_decode("Zm9v", bytes, 3, &length) == 0 && length == 3 && memcmp(bytes, "foo", 3) == 0);
     CHECK("utils/base64-capacity-rejected", base64url_decode("Zm9v", bytes, 2, &length) != 0);
     CHECK("utils/base64-null", base64url_decode(NULL, bytes, sizeof(bytes), &length) != 0 && base64url_decode("AA", NULL, sizeof(bytes), &length) != 0 && base64url_decode("AA", bytes, sizeof(bytes), NULL) != 0);
+
+    const size_t lengths[] = {4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1182, 1183, 1184, 4096};
+    uint8_t source[4096], decoded[4096];
+    char long_encoded[4 * ((sizeof(source) + 2) / 3) + 1];
+    for (unsigned pattern = 0; pattern < 4; pattern++) {
+        for (size_t i = 0; i < sizeof(source); i++) {
+            source[i] = pattern == 0 ? 0 : pattern == 1 ? 255 : pattern == 2 ? (i % 2 ? 0x55 : 0xaa) : (uint8_t)i;
+        }
+        for (size_t i = 0; i < sizeof(lengths) / sizeof(*lengths); i++) {
+            int encoded_length = EVP_EncodeBlock((unsigned char *)long_encoded, source, (int)lengths[i]);
+            REQUIRE("utils/base64-reference-encoding", encoded_length == (int)(4 * ((lengths[i] + 2) / 3)));
+            for (int j = 0; j < encoded_length; j++) {
+                if (long_encoded[j] == '+') long_encoded[j] = '-';
+                if (long_encoded[j] == '/') long_encoded[j] = '_';
+            }
+            CHECK("utils/base64-long-padded-roundtrip", base64url_decode(long_encoded, decoded, lengths[i], &length) == 0 && length == lengths[i] && memcmp(decoded, source, length) == 0);
+            while (encoded_length > 0 && long_encoded[encoded_length - 1] == '=') long_encoded[--encoded_length] = '\0';
+            CHECK("utils/base64-long-unpadded-roundtrip", base64url_decode(long_encoded, decoded, lengths[i], &length) == 0 && length == lengths[i] && memcmp(decoded, source, length) == 0);
+            CHECK("utils/base64-long-capacity-rejected", base64url_decode(long_encoded, decoded, lengths[i] - 1, &length) != 0);
+        }
+    }
 }
 
 int main(void) {

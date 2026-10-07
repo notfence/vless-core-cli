@@ -94,7 +94,7 @@ int base64url_decode(const char *in, uint8_t *out, size_t out_cap, size_t *out_l
     };
 
     size_t olen = 0;
-    int val = 0;
+    uint32_t val = 0;
     int valb = -8;
 
     for (size_t i = 0; in[i] != '\0'; i++) {
@@ -110,7 +110,7 @@ int base64url_decode(const char *in, uint8_t *out, size_t out_cap, size_t *out_l
         if (d < 0 || (d == 0 && c != 'A')) {
             return -1;
         }
-        val = (val << 6) | d;
+        val = (val << 6) | (uint32_t)d;
         valb += 6;
         if (valb >= 0) {
             if (olen >= out_cap) {
