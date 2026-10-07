@@ -21,7 +21,10 @@ PUBLIC_KEY = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8"
 def exact(connection, length):
     data = bytearray()
     while len(data) < length:
-        block = connection.recv(length - len(data))
+        try:
+            block = connection.recv(length - len(data))
+        except TimeoutError as error:
+            raise TimeoutError(f"expected {length} bytes, received {len(data)} before timeout") from error
         if not block:
             raise EOFError(f"expected {length} bytes, received {len(data)}")
         data.extend(block)
@@ -227,7 +230,22 @@ def socks_connect(listen_port, target_port, target="127.0.0.1"):
         raise
 
 @contextlib.contextmanager
-def xray_server(transport, security, mode=None, flow="", decryption="none", tls_certificate=None, **transport_parameters):
+def xray_tls_target(groups=None):
+    cert, key = certificate()
+    settings = {"minVersion":"1.3", "maxVersion":"1.3", "alpn":["h2", "http/1.1"], "certificates":[{"certificateFile":str(cert), "keyFile":str(key)}]}
+    if groups:
+        settings["curvePreferences"] = groups
+    config = {"log":{"loglevel":"info"}, "inbounds":[{"listen":"127.0.0.1", "port":0, "protocol":"vless", "settings":{"clients":[{"id":UUID}], "decryption":"none"}, "streamSettings":{"network":"raw", "security":"tls", "tlsSettings":settings}}], "outbounds":[{"protocol":"blackhole"}]}
+    def command(listen_port):
+        config["inbounds"][0]["port"] = listen_port
+        path = PRIVATE / f"reality-target-{listen_port}.json"
+        path.write_text(json.dumps(config))
+        return [str(XRAY), "run", "-c", str(path)]
+    with start_listener(command, "reality-target", "started") as process:
+        yield process
+
+@contextlib.contextmanager
+def xray_server(transport, security, mode=None, flow="", decryption="none", tls_certificate=None, reality_target_groups=None, **transport_parameters):
     cert, key = certificate()
     cert = tls_certificate or cert
     with contextlib.ExitStack() as stack:
@@ -241,7 +259,7 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
         if security == "tls":
             stream["tlsSettings"] = {"alpn":["h2", "http/1.1"], "certificates":[{"certificateFile":str(cert),"keyFile":str(key)}]}
         elif security == "reality":
-            mask = stack.enter_context(Server(tls=True))
+            mask = stack.enter_context(xray_tls_target(reality_target_groups))
             stream["realitySettings"] = {"target":f"127.0.0.1:{mask.port}", "serverNames":["vless-core.test"], "privateKey":KEY, "shortIds":["01020304"], "maxTimeDiff":60000}
         config = {"log":{"loglevel":"info"}, "inbounds":[{"listen":"127.0.0.1", "port":0, "protocol":"vless", "settings":{"clients":[{"id":UUID,"flow":flow}],"decryption":decryption}, "streamSettings":stream}], "outbounds":[{"protocol":"freedom","settings":{"domainStrategy":"AsIs"},"tag":"local"},{"protocol":"blackhole","tag":"deny"}], "routing":{"rules":[{"type":"field","ip":["127.0.0.0/8","::1/128"],"outboundTag":"local"},{"type":"field","network":"tcp,udp","outboundTag":"deny"}]}}
         config["outbounds"][0]["settings"]["finalRules"] = [{"action":"allow","ip":["127.0.0.0/8","::1/128"]}]
@@ -251,6 +269,25 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
             path.write_text(json.dumps(config))
             return [str(XRAY),"run","-c",str(path)]
         process = stack.enter_context(start_listener(command,"xray","started"))
+        yield process
+
+@contextlib.contextmanager
+def xray_client(server_port, transport="tcp", security="reality", mode=None, flow="", encryption="none", extra=None, fingerprint="firefox"):
+    cert, _ = certificate()
+    stream = {"network":"raw" if transport == "tcp" else transport, "security":security}
+    if security == "reality":
+        stream["realitySettings"] = {"serverName":"vless-core.test", "fingerprint":fingerprint, "publicKey":PUBLIC_KEY, "shortId":"01020304"}
+    elif security == "tls":
+        stream["tlsSettings"] = {"serverName":"vless-core.test", "fingerprint":fingerprint, "certificates":[{"certificateFile":str(cert), "usage":"verify"}]}
+    if transport == "xhttp":
+        stream["xhttpSettings"] = {"path":"/vless-core", "mode":mode or "auto", **(extra or {})}
+    config = {"log":{"loglevel":"info"}, "inbounds":[{"listen":"127.0.0.1", "port":0, "protocol":"socks", "settings":{"auth":"noauth", "udp":False}}], "outbounds":[{"protocol":"vless", "settings":{"vnext":[{"address":"127.0.0.1", "port":server_port, "users":[{"id":UUID, "encryption":encryption, "flow":flow}]}]}, "streamSettings":stream}]}
+    def command(listen_port):
+        config["inbounds"][0]["port"] = listen_port
+        path = PRIVATE / f"reference-client-{listen_port}.json"
+        path.write_text(json.dumps(config))
+        return [str(XRAY), "run", "-c", str(path)]
+    with start_listener(command, "reference-client", "started") as process:
         yield process
 
 def exchange(connection, data):

@@ -14,6 +14,13 @@ int tls13_read_exact_app(tls13_conn_t *c, uint8_t *data, size_t length) {
     size_t got; return tls13_read_app(c, data, length, &got) != 0 || got != length ? -1 : 0;
 }
 int main(void) {
+    vless_encryption_conn_t pending = {0};
+    CHECK("encryption/null-readiness", !vless_encryption_has_pending_input(NULL));
+    CHECK("encryption/empty-readiness", !vless_encryption_has_pending_input(&pending));
+    pending.input_len = 16384; pending.input_off = 8192;
+    CHECK("encryption/buffered-readiness", vless_encryption_has_pending_input(&pending));
+    pending.input_off = pending.input_len;
+    CHECK("encryption/drained-readiness", !vless_encryption_has_pending_input(&pending));
     uint8_t public_key[1184], ciphertext[1088], secret[32], recovered[32];
     EVP_PKEY *kem = mlkem_generate(public_key); REQUIRE("encryption/mlkem-provider", kem != NULL);
     CHECK("encryption/mlkem-roundtrip", mlkem_encapsulate_public(public_key, ciphertext, secret) == 0 && mlkem_decapsulate(kem, ciphertext, recovered) == 0 && memcmp(secret, recovered, 32) == 0);

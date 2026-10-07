@@ -134,5 +134,30 @@ int main(void) {
         CHECK("vision/downstream-direct-flag", direct == (i == 2)); free(plain); free(out);
     }
     vision_unpad_free(&receive);
+    const size_t lengths[] = {65534, 65535, 65536, 98304, 131071, 131072, 131073};
+    for (size_t sample = 0; sample < sizeof(lengths) / sizeof(lengths[0]); sample++) {
+        size_t input_length = lengths[sample];
+        uint8_t *input = malloc(input_length), *recovered = malloc(input_length);
+        REQUIRE("vision/large-allocate", input != NULL && recovered != NULL);
+        for (size_t i = 0; i < input_length; i++) input[i] = (uint8_t)(i % 251);
+        for (int pad_packets = 1; pad_packets <= 3; pad_packets++) {
+            vision_wrap_init(&wrap, cfg.uuid); wrap.packets_left = pad_packets;
+            vision_unpad_init(&receive, cfg.uuid);
+            REQUIRE("vision/large-wrap", vision_wrap_payload(&wrap, input, input_length, &out, &out_length) == 0);
+            size_t recovered_length = 0;
+            for (size_t offset = 0; offset < out_length;) {
+                size_t chunk = out_length - offset;
+                if (chunk > 8192) chunk = 8192;
+                uint8_t *plain = NULL; size_t plain_length = 0; int direct = 0;
+                REQUIRE("vision/large-unpad", vision_unpad_feed(&receive, out + offset, chunk, &plain, &plain_length, &direct) == 0);
+                REQUIRE("vision/large-output-bound", plain_length <= input_length - recovered_length);
+                if (plain_length > 0) memcpy(recovered + recovered_length, plain, plain_length);
+                recovered_length += plain_length; offset += chunk; free(plain);
+            }
+            CHECK("vision/large-payload-preserved", recovered_length == input_length && memcmp(recovered, input, input_length) == 0);
+            free(out); vision_unpad_free(&receive);
+        }
+        free(input); free(recovered);
+    }
     return test_result();
 }

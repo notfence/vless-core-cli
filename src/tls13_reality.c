@@ -71,6 +71,11 @@ typedef enum {
 #define CORE_CONNECT_TIMEOUT_MS 12000
 #define CORE_TLS_HANDSHAKE_TIMEOUT_MS 12000
 #define CORE_OPENSSL_GROUPS "X25519:P-256:P-384"
+#define TLS_GROUP_X25519MLKEM768 0x11ec
+#define TLS_MLKEM768_PUBLIC_KEY_SIZE 1184
+#define TLS_MLKEM768_CIPHERTEXT_SIZE 1088
+#define TLS_HYBRID_CLIENT_SHARE_SIZE (TLS_MLKEM768_PUBLIC_KEY_SIZE + 32)
+#define TLS_HYBRID_SERVER_SHARE_SIZE (TLS_MLKEM768_CIPHERTEXT_SIZE + 32)
 #define TLS_AES_FALLBACK_CACHE_SIZE 16
 #define TLS_ENDPOINT_CACHE_SIZE 16
 #define XRAY_DEFAULT_VERSION_X 26
@@ -212,14 +217,12 @@ struct tls13_conn {
     uint32_t h2_peer_max_frame_size;
     int64_t h2_peer_conn_window;
     int64_t h2_peer_stream_window;
-    int64_t h2_peer_conn_refill_target;
-    int64_t h2_peer_stream_refill_target;
     uint32_t h2_upload_stream_id;
     int64_t h2_upload_stream_window;
-    int64_t h2_upload_stream_refill_target;
     uint32_t h2_recv_conn_pending;
     uint32_t h2_recv_stream_pending;
     int h2_stream_eof;
+    int h2_request_cancelled;
 };
 
 static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len);
@@ -429,7 +432,11 @@ static int read_exact(int fd, void *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
         ssize_t n = recv(fd, p + off, len - off, 0);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
         if (n <= 0) {
+            if (n == 0) errno = EPROTO;
             return -1;
         }
         off += (size_t)n;
@@ -1741,9 +1748,28 @@ static int xhttp_stream_read_line(tls13_conn_t *c, char *line, size_t cap) {
     return 0;
 }
 
-static int xhttp_plain_buffer_available(tls13_conn_t *c) {
-    if (c->mode != CONN_MODE_XHTTP_PLAIN) {
+static int xhttp_buffer_available(tls13_conn_t *c) {
+    if (c->mode != CONN_MODE_XHTTP_PLAIN && c->mode != CONN_MODE_XHTTP_TLS) {
         return 0;
+    }
+    if (c->ssl != NULL) {
+        int flags = fcntl(c->fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(c->fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            return -1;
+        }
+        uint8_t tmp[4096];
+        ERR_clear_error();
+        int n = SSL_read(c->ssl, tmp, sizeof(tmp));
+        int error = n > 0 ? SSL_ERROR_NONE : SSL_get_error(c->ssl, n);
+        int saved_errno = errno;
+        if (fcntl(c->fd, F_SETFL, flags) != 0) {
+            return -1;
+        }
+        errno = saved_errno;
+        if (n > 0) {
+            return db_append(&c->xhttp_net_cache, tmp, (size_t)n);
+        }
+        return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ? 0 : -1;
     }
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -1764,11 +1790,14 @@ static int xhttp_plain_buffer_available(tls13_conn_t *c) {
     return errno == EINTR ? 0 : -1;
 }
 
-static int xhttp_plain_line_ready(tls13_conn_t *c, size_t skip) {
-    if (c->mode != CONN_MODE_XHTTP_PLAIN) {
+static int xhttp_line_ready(tls13_conn_t *c, size_t skip) {
+    if (c->mode != CONN_MODE_XHTTP_PLAIN && c->mode != CONN_MODE_XHTTP_TLS) {
         return 1;
     }
-    if (xhttp_plain_buffer_available(c) != 0) {
+    if (c->xhttp_net_cache.len > skip && memchr(c->xhttp_net_cache.data + skip, '\n', c->xhttp_net_cache.len - skip) != NULL) {
+        return 1;
+    }
+    if (xhttp_buffer_available(c) != 0) {
         return -1;
     }
     if (c->xhttp_net_cache.len <= skip) {
@@ -1829,7 +1858,7 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
 
     for (;;) {
         if (c->xhttp_chunk_rem < 0) {
-            int line_ready = xhttp_plain_line_ready(c, 0);
+            int line_ready = xhttp_line_ready(c, 0);
             if (line_ready < 0) {
                 return -1;
             }
@@ -1865,7 +1894,7 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
         }
 
         if (c->xhttp_chunk_rem == 0) {
-            int line_ready = xhttp_plain_line_ready(c, 2);
+            int line_ready = xhttp_line_ready(c, 2);
             if (line_ready < 0) {
                 return -1;
             }
@@ -1886,8 +1915,8 @@ static int xhttp_fill_app_cache(tls13_conn_t *c) {
             ask = (size_t)c->xhttp_chunk_rem;
         }
         size_t got = 0;
-        if (c->mode == CONN_MODE_XHTTP_PLAIN && c->xhttp_net_cache.len == 0) {
-            if (xhttp_plain_buffer_available(c) != 0) {
+        if (c->xhttp_net_cache.len == 0) {
+            if (xhttp_buffer_available(c) != 0) {
                 return -1;
             }
             if (c->xhttp_net_cache.len == 0) {
@@ -2448,14 +2477,8 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
                 int64_t delta = (int64_t)val - (int64_t)c->h2_peer_initial_window;
                 c->h2_peer_initial_window = val;
                 c->h2_peer_stream_window += delta;
-                if (c->h2_peer_stream_window > c->h2_peer_stream_refill_target) {
-                    c->h2_peer_stream_refill_target = c->h2_peer_stream_window;
-                }
                 if (c->h2_upload_stream_id != 0) {
                     c->h2_upload_stream_window += delta;
-                    if (c->h2_upload_stream_window > c->h2_upload_stream_refill_target) {
-                        c->h2_upload_stream_refill_target = c->h2_upload_stream_window;
-                    }
                 }
             } else if (id == 5 && val >= 16384 && val <= 16777215) {
                 c->h2_peer_max_frame_size = val;
@@ -2479,24 +2502,15 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
                     set_err(err, err_cap, "h2 connection window overflow");
                     return -1;
                 }
-                if (c->h2_peer_conn_window > c->h2_peer_conn_refill_target) {
-                    c->h2_peer_conn_refill_target = c->h2_peer_conn_window;
-                }
             } else if (stream_id == c->h2_stream_id) {
                 if (h2_add_send_window(&c->h2_peer_stream_window, inc) != 0) {
                     set_err(err, err_cap, "h2 stream window overflow");
                     return -1;
                 }
-                if (c->h2_peer_stream_window > c->h2_peer_stream_refill_target) {
-                    c->h2_peer_stream_refill_target = c->h2_peer_stream_window;
-                }
             } else if (stream_id == c->h2_upload_stream_id) {
                 if (h2_add_send_window(&c->h2_upload_stream_window, inc) != 0) {
                     set_err(err, err_cap, "h2 upload window overflow");
                     return -1;
-                }
-                if (c->h2_upload_stream_window > c->h2_upload_stream_refill_target) {
-                    c->h2_upload_stream_refill_target = c->h2_upload_stream_window;
                 }
             }
         }
@@ -2509,7 +2523,23 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
     case H2_FRAME_HEADERS:
         return h2_process_headers(c, flags, stream_id, payload, payload_len, err, err_cap);
     case H2_FRAME_RST_STREAM:
-        set_err(err, err_cap, "h2 stream reset");
+        if (stream_id == 0 || payload_len != 4) {
+            set_err(err, err_cap, "invalid h2 stream reset");
+            return -1;
+        }
+        {
+            uint32_t code = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
+                            ((uint32_t)payload[2] << 8) | (uint32_t)payload[3];
+            if (code == 0 && stream_id == c->h2_stream_id && c->h2_stream_eof) {
+                c->h2_request_cancelled = 1;
+                vc_log_debug(c->grpc_transport ? "grpc" : "xhttp", "h2 request closed after response fd=%d stream=%u", c->fd, (unsigned)stream_id);
+                return 0;
+            }
+            if (err != NULL && err_cap > 0) {
+                snprintf(err, err_cap, "h2 stream reset fd=%d stream=%u code=%u response_complete=%d",
+                         c->fd, (unsigned)stream_id, (unsigned)code, c->h2_stream_eof);
+            }
+        }
         return -1;
     case H2_FRAME_GOAWAY:
         set_err(err, err_cap, "h2 goaway");
@@ -2559,34 +2589,18 @@ static int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     }
     size_t off = 0;
     while (off < len) {
-        if (c->grpc_transport) {
-            if (tls13_drain_h2_input(c) < 0) {
+        if (!stream_up && c->h2_request_cancelled) return 0;
+        if (c->grpc_transport && tls13_drain_h2_input(c) < 0) {
+            return -1;
+        }
+        while (c->h2_peer_conn_window <= 0 || *stream_window <= 0) {
+            if (!stream_up && c->h2_request_cancelled) return 0;
+            if (h2_pump_one_frame(c) != 0) {
+                vc_log_error(c->grpc_transport ? "grpc" : "xhttp", "failed while waiting for h2 upload window");
                 return -1;
             }
-            while (c->h2_peer_conn_window <= 0 || *stream_window <= 0) {
-                if (h2_pump_one_frame(c) != 0) {
-                    vc_log_error("grpc", "failed while waiting for h2 upload window");
-                    return -1;
-                }
-            }
-        } else {
-            int64_t *stream_refill_target =
-                stream_up ? &c->h2_upload_stream_refill_target : &c->h2_peer_stream_refill_target;
-            int64_t conn_low = c->h2_peer_conn_refill_target / 4;
-            int64_t stream_low = *stream_refill_target / 4;
-            if (c->h2_peer_conn_window <= conn_low || *stream_window <= stream_low) {
-                int64_t conn_high = c->h2_peer_conn_refill_target / 2;
-                int64_t stream_high = *stream_refill_target / 2;
-                while (c->h2_peer_conn_window < conn_high || *stream_window < stream_high) {
-                    if (h2_pump_one_frame(c) != 0) {
-                        vc_log_error("xhttp", "failed while waiting for h2 upload window");
-                        return -1;
-                    }
-                    conn_high = c->h2_peer_conn_refill_target / 2;
-                    stream_high = *stream_refill_target / 2;
-                }
-            }
         }
+        if (!stream_up && c->h2_request_cancelled) return 0;
         size_t chunk = len - off;
         if (chunk > c->h2_peer_max_frame_size) {
             chunk = c->h2_peer_max_frame_size;
@@ -3161,14 +3175,12 @@ static int xhttp_h2_begin(tls13_conn_t *c, char *err, size_t err_cap) {
     c->h2_peer_max_frame_size = H2_DEFAULT_MAX_FRAME;
     c->h2_peer_conn_window = H2_DEFAULT_WINDOW;
     c->h2_peer_stream_window = H2_DEFAULT_WINDOW;
-    c->h2_peer_conn_refill_target = H2_DEFAULT_WINDOW;
-    c->h2_peer_stream_refill_target = H2_DEFAULT_WINDOW;
-    c->h2_upload_stream_refill_target = H2_DEFAULT_WINDOW;
     c->h2_upload_stream_id = 0;
     c->h2_upload_stream_window = 0;
     c->h2_recv_conn_pending = 0;
     c->h2_recv_stream_pending = 0;
     c->h2_stream_eof = 0;
+    c->h2_request_cancelled = 0;
 
     if (h2_send_client_preface(c, err, err_cap) != 0) {
         return -1;
@@ -3217,7 +3229,6 @@ static int xhttp_h2_send_stream_up_request(tls13_conn_t *c, char *err, size_t er
     c->h2_next_stream_id += 2;
     c->h2_upload_stream_id = stream_id;
     c->h2_upload_stream_window = c->h2_peer_initial_window;
-    c->h2_upload_stream_refill_target = c->h2_peer_initial_window;
     const char *method = strcmp(c->xhttp_uplink_method, "GET") == 0 ? "GET" : "POST";
     return h2_send_xhttp_request_headers(c, stream_id, method, request_path, extra_headers, 0, 1, 1, err, err_cap);
 }
@@ -3954,14 +3965,15 @@ static int ext_server_name(dynbuf_t *exts, const char *sni) {
     return add_ext(exts, 0x0000, data, off);
 }
 
-static int ext_supported_groups(dynbuf_t *exts, uint16_t grease, int random_mode) {
+static int ext_supported_groups(dynbuf_t *exts, uint16_t grease, int random_mode, int hybrid) {
     uint8_t data[32];
-    uint16_t groups[4] = {grease, 0x001d, 0x0017, 0x0018};
-    size_t gcount = random_mode ? 2 : 4;
-    if (random_mode) {
-        groups[0] = 0x001d;
-        groups[1] = 0x0017;
-    }
+    uint16_t groups[5];
+    size_t gcount = 0;
+    if (!random_mode) groups[gcount++] = grease;
+    if (hybrid) groups[gcount++] = TLS_GROUP_X25519MLKEM768;
+    groups[gcount++] = 0x001d;
+    groups[gcount++] = 0x0017;
+    if (!random_mode) groups[gcount++] = 0x0018;
 
     size_t off = 0;
     size_t glen = gcount * 2;
@@ -3975,14 +3987,15 @@ static int ext_supported_groups(dynbuf_t *exts, uint16_t grease, int random_mode
     return add_ext(exts, 0x000a, data, off);
 }
 
-static int ext_supported_groups_firefox(dynbuf_t *exts) {
-    uint16_t groups[] = {0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101};
+static int ext_supported_groups_firefox(dynbuf_t *exts, int hybrid) {
+    uint16_t groups[] = {TLS_GROUP_X25519MLKEM768, 0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101};
     uint8_t data[32];
     size_t off = 0;
-    size_t glen = sizeof(groups);
+    size_t start = hybrid ? 0 : 1;
+    size_t glen = sizeof(groups) - start * sizeof(groups[0]);
     data[off++] = (uint8_t)(glen >> 8);
     data[off++] = (uint8_t)(glen & 0xFF);
-    for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
+    for (size_t i = start; i < sizeof(groups) / sizeof(groups[0]); i++) {
         data[off++] = (uint8_t)(groups[i] >> 8);
         data[off++] = (uint8_t)(groups[i] & 0xFF);
     }
@@ -4094,8 +4107,29 @@ static int ext_psk_modes(dynbuf_t *exts) {
     return add_ext(exts, 0x002d, data, sizeof(data));
 }
 
-static int ext_key_share(dynbuf_t *exts, uint16_t grease, const uint8_t pubkey[32], int random_mode) {
-    uint8_t data[128];
+static size_t append_x25519_key_shares(uint8_t *data, size_t off, const uint8_t pubkey[32], const uint8_t *hybrid_pub) {
+    if (hybrid_pub != NULL) {
+        data[off++] = (uint8_t)(TLS_GROUP_X25519MLKEM768 >> 8);
+        data[off++] = (uint8_t)TLS_GROUP_X25519MLKEM768;
+        data[off++] = (uint8_t)(TLS_HYBRID_CLIENT_SHARE_SIZE >> 8);
+        data[off++] = (uint8_t)TLS_HYBRID_CLIENT_SHARE_SIZE;
+        memcpy(data + off, hybrid_pub, TLS_MLKEM768_PUBLIC_KEY_SIZE);
+        off += TLS_MLKEM768_PUBLIC_KEY_SIZE;
+        memcpy(data + off, pubkey, 32);
+        off += 32;
+    }
+
+    data[off++] = 0x00;
+    data[off++] = 0x1d;
+    data[off++] = 0x00;
+    data[off++] = 0x20;
+    memcpy(data + off, pubkey, 32);
+    off += 32;
+    return off;
+}
+
+static int ext_key_share(dynbuf_t *exts, uint16_t grease, const uint8_t pubkey[32], int random_mode, const uint8_t *hybrid_pub) {
+    uint8_t data[2 + 5 + 4 + TLS_HYBRID_CLIENT_SHARE_SIZE + 4 + 32];
     size_t off = 2;
 
     if (!random_mode) {
@@ -4105,13 +4139,7 @@ static int ext_key_share(dynbuf_t *exts, uint16_t grease, const uint8_t pubkey[3
         data[off++] = 0x01;
         data[off++] = 0x00;
     }
-
-    data[off++] = 0x00;
-    data[off++] = 0x1d;
-    data[off++] = 0x00;
-    data[off++] = 0x20;
-    memcpy(data + off, pubkey, 32);
-    off += 32;
+    off = append_x25519_key_shares(data, off, pubkey, hybrid_pub);
 
     size_t list_len = off - 2;
     data[0] = (uint8_t)(list_len >> 8);
@@ -4120,21 +4148,14 @@ static int ext_key_share(dynbuf_t *exts, uint16_t grease, const uint8_t pubkey[3
     return add_ext(exts, 0x0033, data, off);
 }
 
-static int ext_key_share_firefox(dynbuf_t *exts, const uint8_t x25519_pub[32]) {
+static int ext_key_share_firefox(dynbuf_t *exts, const uint8_t x25519_pub[32], const uint8_t *hybrid_pub) {
     uint8_t p256_pub[65];
     if (p256_generate_public(p256_pub) != 0) {
         return -1;
     }
 
-    uint8_t data[2 + 4 + 32 + 4 + 65];
-    size_t off = 2;
-
-    data[off++] = 0x00;
-    data[off++] = 0x1d;
-    data[off++] = 0x00;
-    data[off++] = 0x20;
-    memcpy(data + off, x25519_pub, 32);
-    off += 32;
+    uint8_t data[2 + 4 + TLS_HYBRID_CLIENT_SHARE_SIZE + 4 + 32 + 4 + 65];
+    size_t off = append_x25519_key_shares(data, 2, x25519_pub, hybrid_pub);
 
     data[off++] = 0x00;
     data[off++] = 0x17;
@@ -4273,7 +4294,7 @@ static int shuffle_indices(size_t *idx, size_t n) {
 
 static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_offer_t cipher_offer, uint8_t client_priv[32],
                               uint8_t client_pub[32], uint8_t client_random[32], uint8_t auth_key[32], uint8_t **out, size_t *out_len,
-                              size_t *sid_pos) {
+                              size_t *sid_pos, const uint8_t *hybrid_pub) {
     dynbuf_t hs = {0};
 
     if (x25519_generate(client_priv, client_pub) != 0) {
@@ -4358,9 +4379,9 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
         size_t header_len = hs.len - 4;
         if (ext_grease(&exts, boring_grease_ext1) != 0 || ext_server_name(&exts, cfg->sni) != 0 ||
             ext_extended_master_secret(&exts) != 0 || ext_renegotiation_info(&exts) != 0 ||
-            ext_supported_groups(&exts, boring_grease_group, 0) != 0 || ext_ec_point_formats(&exts) != 0 ||
+            ext_supported_groups(&exts, boring_grease_group, 0, hybrid_pub != NULL) != 0 || ext_ec_point_formats(&exts) != 0 ||
             ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
-            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0) != 0 ||
+            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0, hybrid_pub) != 0 ||
             ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, boring_grease_vers) != 0 ||
             ext_compress_cert_brotli(&exts) != 0 || ext_application_settings_h2(&exts) != 0 ||
             ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
@@ -4379,9 +4400,9 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
         size_t header_len = hs.len - 4;
         if (ext_grease(&exts, boring_grease_ext1) != 0 || ext_server_name(&exts, cfg->sni) != 0 ||
             ext_extended_master_secret(&exts) != 0 || ext_renegotiation_info(&exts) != 0 ||
-            ext_supported_groups(&exts, boring_grease_group, 0) != 0 || ext_ec_point_formats(&exts) != 0 ||
+            ext_supported_groups(&exts, boring_grease_group, 0, hybrid_pub != NULL) != 0 || ext_ec_point_formats(&exts) != 0 ||
             ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
-            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0) != 0 ||
+            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0, hybrid_pub) != 0 ||
             ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, boring_grease_vers) != 0 ||
             ext_compress_cert_brotli(&exts) != 0 || ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
             db_free(&exts);
@@ -4397,10 +4418,10 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
         }
     } else if (cfg->fp_mode == FP_FIREFOX) {
         if (ext_server_name(&exts, cfg->sni) != 0 || ext_extended_master_secret(&exts) != 0 ||
-            ext_renegotiation_info(&exts) != 0 || ext_supported_groups_firefox(&exts) != 0 ||
+            ext_renegotiation_info(&exts) != 0 || ext_supported_groups_firefox(&exts, hybrid_pub != NULL) != 0 ||
             ext_ec_point_formats(&exts) != 0 || ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 ||
             ext_status_request(&exts) != 0 || ext_delegated_credentials_firefox(&exts) != 0 ||
-            ext_key_share_firefox(&exts, client_pub) != 0 || ext_supported_versions_firefox(&exts) != 0 ||
+            ext_key_share_firefox(&exts, client_pub, hybrid_pub) != 0 || ext_supported_versions_firefox(&exts) != 0 ||
             ext_sig_algs_firefox(&exts) != 0 || ext_psk_modes(&exts) != 0 || ext_record_size_limit_firefox(&exts) != 0 ||
             ext_ech_grease_firefox(&exts) != 0) {
             db_free(&exts);
@@ -4421,7 +4442,7 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
                     }
                     break;
                 case EX_GROUPS:
-                    if (ext_supported_groups(&exts, grease, 1) != 0) {
+                    if (ext_supported_groups(&exts, grease, 1, 0) != 0) {
                         db_free(&exts);
                         db_free(&hs);
                         return -1;
@@ -4456,7 +4477,7 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
                     }
                     break;
                 case EX_KEYSHARE:
-                    if (ext_key_share(&exts, grease, client_pub, 1) != 0) {
+                    if (ext_key_share(&exts, grease, client_pub, 1, NULL) != 0) {
                         db_free(&exts);
                         db_free(&hs);
                         return -1;
@@ -4564,8 +4585,16 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
 
 static int read_record(int fd, uint8_t *rtype, uint8_t **payload, size_t *payload_len) {
     uint8_t hdr[5];
-    if (read_exact(fd, hdr, sizeof(hdr)) != 0) {
-        return -1;
+    size_t off = 0;
+    while (off < sizeof(hdr)) {
+        ssize_t count = recv(fd, hdr + off, sizeof(hdr) - off, 0);
+        if (count < 0 && errno == EINTR) continue;
+        if (count == 0 && off == 0) return 1;
+        if (count <= 0) {
+            if (count == 0) errno = EPROTO;
+            return -1;
+        }
+        off += (size_t)count;
     }
 
     size_t len = ((size_t)hdr[3] << 8) | hdr[4];
@@ -4607,7 +4636,8 @@ static int configure_tls_cipher(tls13_conn_t *c, uint16_t suite) {
     return -1;
 }
 
-static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, uint16_t *cipher_out, uint8_t server_pub[32]) {
+static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, uint16_t *cipher_out,
+                                         uint8_t server_share[TLS_HYBRID_SERVER_SHARE_SIZE], size_t *share_len) {
     if (msg_len < 4 || msg[0] != 0x02) {
         return -1;
     }
@@ -4672,10 +4702,12 @@ static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, u
             const uint8_t *k = p + eoff;
             uint16_t group = ((uint16_t)k[0] << 8) | k[1];
             uint16_t klen = ((uint16_t)k[2] << 8) | k[3];
-            if (group != 0x001d || klen != 32 || el < 4 + 32) {
+            if (!((group == 0x001d && klen == 32) ||
+                  (group == TLS_GROUP_X25519MLKEM768 && klen == TLS_HYBRID_SERVER_SHARE_SIZE)) || el != 4 + klen) {
                 return -1;
             }
-            memcpy(server_pub, k + 4, 32);
+            memcpy(server_share, k + 4, klen);
+            *share_len = klen;
             return 0;
         }
 
@@ -5015,7 +5047,7 @@ static int calc_finished_verify(const tls13_conn_t *c, const uint8_t *traffic_se
     return hmac_digest(c->tls_md, finished_key, c->tls_hash_len, transcript_hash_val, c->tls_hash_len, out, c->tls_hash_len);
 }
 
-static int derive_handshake_keys(tls13_conn_t *c, const uint8_t shared[32]) {
+static int derive_handshake_keys(tls13_conn_t *c, const uint8_t *shared, size_t shared_len) {
     uint8_t zero[64] = {0};
     uint8_t empty_hash[64];
     uint8_t early_secret[64];
@@ -5032,7 +5064,7 @@ static int derive_handshake_keys(tls13_conn_t *c, const uint8_t shared[32]) {
     if (derive_secret_md(c->tls_md, early_secret, c->tls_hash_len, "derived", empty_hash, c->tls_hash_len, derived, c->tls_hash_len) != 0) {
         return -1;
     }
-    if (hkdf_extract_md(c->tls_md, derived, c->tls_hash_len, shared, 32, c->hs_secret, c->tls_hash_len) != 0) {
+    if (hkdf_extract_md(c->tls_md, derived, c->tls_hash_len, shared, shared_len, c->hs_secret, c->tls_hash_len) != 0) {
         return -1;
     }
     if (transcript_hash(c, thash) != 0) {
@@ -5260,16 +5292,30 @@ int tls13_reality_is_raw_direct(const tls13_conn_t *c) {
     return (c != NULL && c->reality_raw_direct);
 }
 
+int tls13_needs_write(const tls13_conn_t *c) {
+    return c != NULL && c->mode == CONN_MODE_XHTTP_TLS && c->ssl != NULL && SSL_want_write(c->ssl);
+}
+
 int tls13_has_pending_app(const tls13_conn_t *c) {
+    if (tls13_uses_h2(c)) {
+        return c->app_cache.len > 0 || c->h2_stream_eof;
+    }
+    return tls13_has_pending_input(c);
+}
+
+int tls13_has_pending_input(const tls13_conn_t *c) {
     if (c == NULL) {
         return 0;
     }
     if (c->app_cache.len > 0) {
         return 1;
     }
+    if (tls13_uses_h2(c) && c->h2_stream_eof) {
+        return 1;
+    }
     if (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_PLAIN) {
         int cache_ready = c->xhttp_net_cache.len > 0;
-        if (c->mode == CONN_MODE_XHTTP_PLAIN && c->xhttp_headers_read && c->xhttp_chunked && c->xhttp_chunk_rem <= 0) {
+        if (c->xhttp_headers_read && c->xhttp_chunked && c->xhttp_chunk_rem <= 0) {
             size_t skip = c->xhttp_chunk_rem == 0 ? 2 : 0;
             cache_ready = c->xhttp_net_cache.len > skip &&
                           memchr(c->xhttp_net_cache.data + skip, '\n', c->xhttp_net_cache.len - skip) != NULL;
@@ -5386,7 +5432,7 @@ static int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len
     return db_append(&c->transcript, msg, msg_len);
 }
 
-static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, char *err, size_t err_cap) {
+static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, EVP_PKEY *hybrid_key, const uint8_t *hybrid_pub, char *err, size_t err_cap) {
     int use_reality = (strcmp(cfg->security, "reality") == 0);
     tls_verify_mode_t verify_mode = tls_verify_mode_for_config(cfg);
     c->tls_verify_policy = verify_mode;
@@ -5400,7 +5446,7 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cip
     size_t ch_len = 0;
     size_t sid_pos = 0;
 
-    if (build_client_hello(cfg, use_reality, cipher_offer, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos) !=
+    if (build_client_hello(cfg, use_reality, cipher_offer, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos, hybrid_pub) !=
         0) {
         set_err(err, err_cap, "failed to build ClientHello");
         return -1;
@@ -5434,7 +5480,8 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cip
     free(ch);
 
     dynbuf_t plain_hs = {0};
-    uint8_t server_pub[32];
+    uint8_t server_share[TLS_HYBRID_SERVER_SHARE_SIZE];
+    size_t share_len = 0;
     uint16_t server_cipher = 0;
     int got_server_hello = 0;
 
@@ -5462,7 +5509,7 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cip
                     break;
                 }
                 if (plain_hs.data[0] == 0x02) {
-                    if (parse_server_hello_for_keyshare(plain_hs.data, 4 + mlen, &server_cipher, server_pub) != 0) {
+                    if (parse_server_hello_for_keyshare(plain_hs.data, 4 + mlen, &server_cipher, server_share, &share_len) != 0) {
                         db_free(&plain_hs);
                         set_err(err, err_cap, "invalid ServerHello");
                         return -1;
@@ -5494,16 +5541,36 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cip
         return -1;
     }
 
-    uint8_t shared[32];
-    if (x25519_shared(client_priv, server_pub, shared) != 0) {
+    uint8_t shared[64];
+    size_t shared_len = 32;
+    if (share_len == TLS_HYBRID_SERVER_SHARE_SIZE) {
+#if OPENSSL_VERSION_NUMBER >= 0x30500000L
+        EVP_PKEY_CTX *kem = hybrid_key != NULL ? EVP_PKEY_CTX_new_from_pkey(NULL, hybrid_key, NULL) : NULL;
+        size_t kem_len = 32;
+        int ok = kem != NULL && EVP_PKEY_decapsulate_init(kem, NULL) == 1 &&
+                 EVP_PKEY_decapsulate(kem, shared, &kem_len, server_share, TLS_MLKEM768_CIPHERTEXT_SIZE) == 1 && kem_len == 32;
+        EVP_PKEY_CTX_free(kem);
+        if (!ok) {
+            set_err(err, err_cap, "TLS ML-KEM decapsulation failed");
+            return -1;
+        }
+        shared_len = 64;
+#else
+        (void)hybrid_key;
+        set_err(err, err_cap, "TLS X25519MLKEM768 requires OpenSSL 3.5 or newer");
+        return -1;
+#endif
+    }
+    if (x25519_shared(client_priv, server_share + share_len - 32, shared + shared_len - 32) != 0) {
         set_err(err, err_cap, "ECDH failed");
         return -1;
     }
 
-    if (derive_handshake_keys(c, shared) != 0) {
+    if (derive_handshake_keys(c, shared, shared_len) != 0) {
         set_err(err, err_cap, "failed to derive handshake keys");
         return -1;
     }
+    vc_log_debug("tls", "selected key exchange=%s", shared_len == 64 ? "X25519MLKEM768" : "X25519");
 
     dynbuf_t enc_hs = {0};
     int got_finished = 0;
@@ -5670,6 +5737,31 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cip
     }
 
     return 0;
+}
+
+static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, char *err, size_t err_cap) {
+    EVP_PKEY *hybrid_key = NULL;
+    uint8_t hybrid_pub[TLS_MLKEM768_PUBLIC_KEY_SIZE];
+#if OPENSSL_VERSION_NUMBER >= 0x30500000L
+    if (strcmp(cfg->security, "reality") == 0 &&
+        (cfg->fp_mode == FP_CHROME || cfg->fp_mode == FP_EDGE || cfg->fp_mode == FP_FIREFOX)) {
+        hybrid_key = EVP_PKEY_Q_keygen(NULL, NULL, "ML-KEM-768");
+        unsigned char *encoded = NULL;
+        size_t encoded_len = hybrid_key != NULL ? EVP_PKEY_get1_encoded_public_key(hybrid_key, &encoded) : 0;
+        if (encoded_len != sizeof(hybrid_pub)) {
+            OPENSSL_free(encoded);
+            EVP_PKEY_free(hybrid_key);
+            set_err(err, err_cap, "TLS ML-KEM key generation failed");
+            return -1;
+        }
+        memcpy(hybrid_pub, encoded, encoded_len);
+        OPENSSL_free(encoded);
+    }
+#endif
+    int result = run_tls_handshake_with_key(cfg, c, cipher_offer, hybrid_key,
+                                          hybrid_key != NULL ? hybrid_pub : NULL, err, err_cap);
+    EVP_PKEY_free(hybrid_key);
+    return result;
 }
 
 static const char *tls_cipher_suite_name(uint16_t suite) {
@@ -6430,8 +6522,13 @@ static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
         uint8_t rtype = 0;
         uint8_t *pl = NULL;
         size_t pl_len = 0;
-        if (read_record(c->fd, &rtype, &pl, &pl_len) != 0) {
-            vc_log_error("tls", "read_record failed in app phase");
+        int record_result = read_record(c->fd, &rtype, &pl, &pl_len);
+        if (record_result > 0) {
+            vc_log_debug("tls", "peer EOF in app phase fd=%d", c->fd);
+            return 0;
+        }
+        if (record_result < 0) {
+            vc_log_error("tls", "read_record failed in app phase fd=%d errno=%d (%s)", c->fd, errno, strerror(errno));
             return -1;
         }
 
@@ -6476,6 +6573,11 @@ static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
             }
         } else {
             if (inner == 0x15) {
+                if (dec_len == 2 && dec[1] == 0) {
+                    vc_log_debug("tls", "close_notify in app phase fd=%d", c->fd);
+                    free(dec);
+                    return 0;
+                }
                 if (dec_len >= 2) {
                     vc_log_error("tls", "alert level=%u desc=%u", (unsigned)dec[0], (unsigned)dec[1]);
                 } else {
@@ -6544,7 +6646,7 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
     if (take > cap) {
         take = cap;
     }
-    memcpy(buf, c->app_cache.data, take);
+    if (take > 0) memcpy(buf, c->app_cache.data, take);
     db_consume(&c->app_cache, take);
     *out_len = take;
     return 0;

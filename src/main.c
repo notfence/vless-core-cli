@@ -25,7 +25,7 @@
 #include "vless.h"
 #include "vless_encryption.h"
 
-#define VLESS_CORE_VERSION "1.1.4"
+#define VLESS_CORE_VERSION "1.1.5"
 #define MAX_CLIENT_CONNECTIONS 256
 #define SOCKS_HANDSHAKE_TIMEOUT_MS 10000
 #define SERVER_IP_LIST_MAX_LENGTH 511
@@ -901,6 +901,7 @@ static void *client_worker_run(void *arg) {
     }
 
     int tfd = tls13_get_fd(tls);
+    vc_log_debug("connection", "upstream fd=%d target=%s:%u", tfd, target_host, (unsigned)target_port);
     size_t cbuf_cap = tls13_write_batch_size(tls);
     if (cbuf_cap < 8192) {
         cbuf_cap = 8192;
@@ -924,7 +925,8 @@ static void *client_worker_run(void *arg) {
 
     while (1) {
         int client_ready = 0;
-        int upstream_ready = (!downstream_direct && tls13_has_pending_app(tls));
+        int upstream_ready = !downstream_direct &&
+                             (tls13_has_pending_input(tls) || vless_encryption_has_pending_input(encryption));
         fd_set rfds;
         FD_ZERO(&rfds);
 
@@ -939,16 +941,19 @@ static void *client_worker_run(void *arg) {
             }
             client_ready = (s > 0 && FD_ISSET(cfd, &rfds));
         } else {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            if (tls13_needs_write(tls)) FD_SET(tfd, &wfds);
             FD_SET(cfd, &rfds);
             FD_SET(tfd, &rfds);
 
             int maxfd = (cfd > tfd) ? cfd : tfd;
-            int s = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+            int s = select(maxfd + 1, &rfds, &wfds, NULL, NULL);
             if (s <= 0) {
                 break;
             }
             client_ready = FD_ISSET(cfd, &rfds);
-            upstream_ready = FD_ISSET(tfd, &rfds);
+            upstream_ready = FD_ISSET(tfd, &rfds) || FD_ISSET(tfd, &wfds);
         }
 
         if (client_ready) {
@@ -1007,7 +1012,7 @@ static void *client_worker_run(void *arg) {
                 break;
             }
             if (tls13_uses_h2(tls)) {
-                upstream_ready = tls13_has_pending_app(tls);
+                upstream_ready = tls13_has_pending_app(tls) || vless_encryption_has_pending_input(encryption);
             }
         }
 
@@ -1033,6 +1038,9 @@ static void *client_worker_run(void *arg) {
                     break;
                 }
                 got_vless_response = 1;
+                if (tls13_uses_h2(tls) && !tls13_has_pending_app(tls) && !vless_encryption_has_pending_input(encryption)) {
+                    continue;
+                }
             }
 
             size_t got = 0;

@@ -19,6 +19,7 @@ int vless_encryption_write_raw(vless_encryption_conn_t *conn,
                                const uint8_t *buf, size_t len);
 int vless_encryption_read(vless_encryption_conn_t *conn,
                           uint8_t *buf, size_t cap, size_t *out_len);
+int vless_encryption_has_pending_input(const vless_encryption_conn_t *conn);
 int vless_encryption_read_raw(vless_encryption_conn_t *conn,
                               uint8_t *buf, size_t cap, size_t *out_len);
 int vless_encryption_read_exact(vless_encryption_conn_t *conn,

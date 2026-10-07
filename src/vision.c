@@ -198,7 +198,7 @@ int vision_wrap_bootstrap(vision_wrap_t *ctx, uint8_t **out, size_t *out_len) {
     return vision_build_block(ctx, CMD_CONTINUE, NULL, 0, 1, out, out_len);
 }
 
-int vision_wrap_payload(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len) {
+static int vision_wrap_chunk(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len) {
     *out = NULL;
     *out_len = 0;
 
@@ -218,9 +218,7 @@ int vision_wrap_payload(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, ui
     }
 
     size_t payload_len = in_len;
-    if (payload_len > 0xFFFF) {
-        payload_len = 0xFFFF;
-    }
+    if (payload_len > 0xFFFF) return -1;
 
     int has_client_hello = 0;
     int app_records = 0;
@@ -251,6 +249,32 @@ int vision_wrap_payload(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, ui
     }
     if (command == CMD_DIRECT) {
         ctx->direct_sent = 1;
+    }
+    return 0;
+}
+
+int vision_wrap_payload(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len) {
+    if (in_len <= 0xFFFF || !ctx->padding_active) {
+        return vision_wrap_chunk(ctx, in, in_len, out, out_len);
+    }
+    *out = NULL;
+    *out_len = 0;
+    size_t capacity = 0;
+    for (size_t offset = 0; offset < in_len;) {
+        size_t length = in_len - offset;
+        if (ctx->padding_active && length > 0xFFFF) length = 0xFFFF;
+        uint8_t *chunk = NULL;
+        size_t chunk_length = 0;
+        if (vision_wrap_chunk(ctx, in + offset, length, &chunk, &chunk_length) != 0 ||
+            append_bytes(out, out_len, &capacity, chunk, chunk_length) != 0) {
+            free(chunk);
+            free(*out);
+            *out = NULL;
+            *out_len = 0;
+            return -1;
+        }
+        free(chunk);
+        offset += length;
     }
     return 0;
 }

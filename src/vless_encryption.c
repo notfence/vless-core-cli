@@ -717,6 +717,10 @@ static int read_record(vless_encryption_conn_t *conn) {
     return 0;
 }
 
+int vless_encryption_has_pending_input(const vless_encryption_conn_t *conn) {
+    return conn != NULL && conn->input_off < conn->input_len;
+}
+
 int vless_encryption_read(vless_encryption_conn_t *conn,
                           uint8_t *buf, size_t cap, size_t *out_len) {
     *out_len = 0;

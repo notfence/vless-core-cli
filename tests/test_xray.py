@@ -1,14 +1,130 @@
 import base64
+import concurrent.futures
+import hashlib
 import json
 import os
+from pathlib import Path
+import socket
 import ssl
 import subprocess
+import threading
+import time
 import unittest
 from unittest import mock
 import fixtures
-from fixtures import BUILD, OPENSSL, XRAY, PRIVATE, KEY, PUBLIC_KEY, Process, Server, certificate, cli, exchange, port, socks_connect, uri, xray_server
+from fixtures import BUILD, OPENSSL, XRAY, PRIVATE, KEY, PUBLIC_KEY, Process, Server, certificate, cli, exact, exchange, port, socks_connect, uri, xray_client, xray_server
+
+SUBSCRIPTION_EXTRA = {
+    "mode":"stream-one", "seqKey":"x-amz-cf-pop", "seqPlacement":"header",
+    "sessionIDKey":"x-amz-cf-id", "sessionIDLength":"16-32",
+    "sessionIDPlacement":"header", "sessionIDTable":"Base62",
+    "sessionKey":"x-amz-cf-id", "sessionPlacement":"header",
+    "uplinkHTTPMethod":"POST", "xPaddingBytes":"128-1280",
+    "xPaddingHeader":"X-Cache", "xPaddingKey":"x-padding",
+    "xPaddingMethod":"tokenish", "xPaddingObfsMode":True, "xPaddingPlacement":"header",
+    "xmux":{"cMaxReuseTimes":"300-600", "hKeepAlivePeriod":600,
+            "hMaxRequestTimes":"1000-2000", "hMaxReusableSecs":"1200-2400",
+            "maxConcurrency":"0", "maxConnections":"1-3"},
+}
 
 class XrayTests(unittest.TestCase):
+    def test_reality_hybrid_target(self):
+        for transport in ("tcp", "xhttp"):
+            for fingerprint in ("firefox", "chrome"):
+                with self.subTest(transport=transport, fingerprint=fingerprint):
+                    self.transfer(transport, "reality", "stream-one" if transport == "xhttp" else None,
+                                  fingerprint=fingerprint, server_extra={"reality_target_groups":["X25519MLKEM768"]})
+
+    def test_reference_hybrid_fixture(self):
+        for transport in ("tcp", "xhttp"):
+            with self.subTest(transport=transport):
+                with Server() as target, xray_server(transport, "reality", reality_target_groups=["X25519MLKEM768"]) as reference:
+                    with xray_client(reference.port, transport) as client:
+                        with socks_connect(client.port, target.port) as tunnel:
+                            exchange(tunnel, b"vless-core reference hybrid" * 3000)
+
+    def test_xhttp_encryption_vision_large_payload(self):
+        for mode in ("auto", "stream-one", "stream-up", "packet-up"):
+            with self.subTest(mode=mode):
+                self.transfer("xhttp", "reality", mode, flow="xtls-rprx-vision",
+                              encryption=f"mlkem768x25519plus.native.0rtt.{PUBLIC_KEY}",
+                              decryption=f"mlkem768x25519plus.native.0s.{KEY}", fingerprint="firefox")
+
+    def test_xhttp_custom_subscription_options(self):
+        for fingerprint in ("firefox", "edge"):
+            with self.subTest(fingerprint=fingerprint):
+                self.transfer("xhttp", "reality", "stream-one", flow="xtls-rprx-vision",
+                              encryption=f"mlkem768x25519plus.native.0rtt.{PUBLIC_KEY}",
+                              decryption=f"mlkem768x25519plus.native.0s.{KEY}", fingerprint=fingerprint,
+                              extra=SUBSCRIPTION_EXTRA, server_extra=SUBSCRIPTION_EXTRA)
+
+    def test_xhttp_repeated_parallel_duplex(self):
+        upload = bytes(range(251)) * 16711
+        download = bytes(range(250, -1, -1)) * 16711
+        digest = hashlib.sha256(upload).digest()
+        completed = []
+        lock = threading.Lock()
+        def handler(connection):
+            self.assertEqual(exact(connection, 1), b"D")
+            connection.sendall(download)
+            self.assertEqual(hashlib.sha256(exact(connection, len(upload))).digest(), digest)
+            connection.sendall(digest)
+            with lock:
+                completed.append(True)
+        cases = [(mode, fingerprint, False) for mode in ("auto", "stream-one", "stream-up", "packet-up") for fingerprint in ("edge", "chrome")]
+        cases.append(("stream-one", "firefox", True))
+        for mode, fingerprint, encrypted in cases:
+            with self.subTest(mode=mode, fingerprint=fingerprint, encrypted=encrypted):
+                completed.clear()
+                extra = dict(SUBSCRIPTION_EXTRA) if encrypted else {"mode":mode, "xPaddingBytes":"100-1000"}
+                decryption = f"mlkem768x25519plus.native.0s.{KEY}" if encrypted else "none"
+                encryption = f"mlkem768x25519plus.native.0rtt.{PUBLIC_KEY}" if encrypted else "none"
+                flow = "xtls-rprx-vision" if encrypted else ""
+                server_extra = dict(extra)
+                server_extra.pop("mode")
+                with Server(handler) as target, xray_server("xhttp", "reality", flow=flow, decryption=decryption,
+                        reality_target_groups=["X25519MLKEM768"] if encrypted else None, **server_extra) as reference:
+                    config = uri(reference.port, "xhttp", "reality", mode=mode, fp=fingerprint,
+                                 flow=flow, encryption=encryption, extra=json.dumps(extra))
+                    with cli(config) as core:
+                        descriptors = Path(f"/proc/{core.process.pid}/fd")
+                        tasks = Path(f"/proc/{core.process.pid}/task")
+                        baseline_fds = len(list(descriptors.iterdir()))
+                        baseline_tasks = len(list(tasks.iterdir()))
+                        def transfer(index):
+                            with socks_connect(core.port, target.port) as tunnel:
+                                tunnel.settimeout(8)
+                                errors = []
+                                def send():
+                                    try:
+                                        tunnel.sendall(b"D" + upload)
+                                    except BaseException as error:
+                                        errors.append(error)
+                                sender = threading.Thread(target=send, daemon=True)
+                                sender.start()
+                                try:
+                                    self.assertEqual(exact(tunnel, len(download)), download)
+                                    self.assertEqual(exact(tunnel, len(digest)), digest)
+                                    self.assertEqual(tunnel.recv(1), b"")
+                                finally:
+                                    tunnel.shutdown(socket.SHUT_RDWR)
+                                    sender.join(timeout=2)
+                                self.assertFalse(sender.is_alive())
+                                self.assertFalse(errors, errors)
+                        try:
+                            for repetition in range(3):
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers:
+                                    list(workers.map(transfer, range(4)))
+                            self.assertEqual(len(completed), 12)
+                            deadline = time.monotonic() + 3
+                            while len(list(descriptors.iterdir())) > baseline_fds or len(list(tasks.iterdir())) > baseline_tasks:
+                                if time.monotonic() >= deadline:
+                                    self.fail(f"connections did not release resources: fds={len(list(descriptors.iterdir()))}, threads={len(list(tasks.iterdir()))}")
+                                time.sleep(0.02)
+                        except BaseException as error:
+                            raise AssertionError(f"{mode}/{fingerprint}: {error}\n{core.log}\n{reference.log}") from error
+                        self.assertIsNone(core.process.poll(), core.log)
+
     def test_reference_listener_collision_recovery(self):
         original = fixtures.port
         with Server() as occupied:
@@ -23,7 +139,9 @@ class XrayTests(unittest.TestCase):
                 self.assertIsNone(reference.process.poll(),reference.log)
 
     def transfer(self, transport, security, mode=None, flow="", encryption=None, decryption="none", tls_target=False, extra=None, server_extra=None, alpn=None, fingerprint=None):
-        with Server(tls=tls_target) as target, xray_server(transport, security, mode, flow, decryption, **(server_extra or {})) as reference:
+        server_parameters = dict(server_extra or {})
+        server_mode = server_parameters.pop("mode", mode)
+        with Server(tls=tls_target) as target, xray_server(transport, security, server_mode, flow, decryption, **server_parameters) as reference:
             parameters = {"flow":flow}
             if mode:
                 parameters["mode"] = mode
@@ -78,10 +196,110 @@ class XrayTests(unittest.TestCase):
                                     exchange(tunnel,bytes([sequence])+b"vless-core")
                             self.assertIsNone(core.process.poll(),core.log)
 
+    def test_vision_repeated_download(self):
+        payload = bytes(range(251)) * 16711
+        cert, _ = certificate()
+        for encrypted_target, reference_client in ((False, False), (True, True), (True, False)):
+            with self.subTest(encrypted_target=encrypted_target, reference_client=reference_client):
+                def handler(connection):
+                    self.assertEqual(exact(connection, 1), b"D")
+                    connection.sendall(payload)
+                    if encrypted_target:
+                        connection.unwrap().close()
+                with Server(handler, tls=encrypted_target) as target, xray_server("tcp", "reality", flow="xtls-rprx-vision") as reference:
+                    client = xray_client(reference.port, flow="xtls-rprx-vision") if reference_client else cli(uri(reference.port, "tcp", "reality", flow="xtls-rprx-vision", fp="firefox"))
+                    with client as core:
+                        def download(index):
+                            with socks_connect(core.port, target.port) as tunnel:
+                                tunnel.settimeout(8)
+                                if encrypted_target:
+                                    context = ssl.create_default_context(cafile=str(cert))
+                                    tunnel = context.wrap_socket(tunnel, server_hostname="vless-core.test")
+                                with tunnel:
+                                    tunnel.sendall(b"D")
+                                    self.assertEqual(exact(tunnel, len(payload)), payload)
+                                    self.assertEqual(tunnel.recv(1), b"")
+                                    if encrypted_target:
+                                        tunnel.unwrap().close()
+                        for repetition in range(3):
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers:
+                                list(workers.map(download, range(4)))
+                        self.assertIsNone(core.process.poll(), core.log)
+
     def test_xhttp_h1_packet_up(self):
         for attempt in range(3):
             with self.subTest(attempt=attempt):
                 self.transfer("xhttp", "tls", "packet-up", alpn="http/1.1")
+
+    def test_xhttp_stream_upload(self):
+        block = bytes(range(256))*128
+        reply = b"vless-core upload complete"
+        def handler(connection):
+            for _ in range(128):
+                self.assertEqual(exact(connection,len(block)),block)
+            connection.sendall(reply)
+        cert, _ = certificate()
+        for security in ("tls","reality"):
+            for mode in ("stream-one","stream-up"):
+                with self.subTest(security=security,mode=mode):
+                    with Server(handler) as target, xray_server("xhttp",security,mode) as reference:
+                        with cli(uri(reference.port,"xhttp",security,mode=mode,fp="edge"),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                            with socks_connect(core.port,target.port) as tunnel:
+                                for _ in range(128):
+                                    tunnel.sendall(block)
+                                self.assertEqual(exact(tunnel,len(reply)),reply)
+                            self.assertIsNone(core.process.poll(),core.log)
+
+    def test_xhttp_h2_header_only_response(self):
+        first = threading.Event()
+        first_payload, second_payload = b"vless-core first", b"vless-core second"
+        reply = b"vless-core complete"
+        def frame(kind, flags, payload, stream=1):
+            return len(payload).to_bytes(3,"big")+bytes([kind,flags])+stream.to_bytes(4,"big")+payload
+        def read_data(connection):
+            while True:
+                header = exact(connection,9)
+                size = int.from_bytes(header[:3],"big")
+                self.assertLessEqual(size,1048576)
+                payload = exact(connection,size)
+                if header[3] == 0:
+                    self.assertEqual(int.from_bytes(header[5:],"big"),1)
+                    return payload
+        def handler(connection):
+            self.assertEqual(exact(connection,24),b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            self.assertTrue(read_data(connection).startswith(b"\x00"))
+            connection.sendall(frame(4,0,b"",0)+frame(1,4,b"\x88")+frame(0,0,b"\x00\x00"))
+            self.assertEqual(read_data(connection),first_payload)
+            first.set()
+            self.assertEqual(read_data(connection),second_payload)
+            connection.sendall(frame(0,0,reply)+frame(0,1,b""))
+        cert, _ = certificate()
+        with Server(handler,tls=True) as target:
+            with cli(uri(target.port,"xhttp","tls",mode="stream-one"),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                with socks_connect(core.port,80) as tunnel:
+                    tunnel.settimeout(3)
+                    tunnel.sendall(first_payload)
+                    self.assertTrue(first.wait(3))
+                    tunnel.sendall(second_payload)
+                    self.assertEqual(exact(tunnel,len(reply)),reply)
+                    self.assertEqual(tunnel.recv(1),b"")
+                self.assertIsNone(core.process.poll(),core.log)
+
+    def test_xhttp_h1_fragmented_metadata(self):
+        def handler(connection):
+            headers = bytearray()
+            while not headers.endswith(b"\r\n\r\n"):
+                headers.extend(exact(connection,1))
+                self.assertLess(len(headers),8192)
+            self.assertTrue(headers.startswith(b"GET /vless-core/"))
+            connection.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n")
+            for part in (b"4",b"\r",b"\n",b"v",b"pn!\r\n",b"0\r\n\r\n"):
+                self.assertEqual(exact(connection,3),b"ack")
+                connection.sendall(part)
+        cert, _ = certificate()
+        with Server(handler,tls=True) as server:
+            result = subprocess.run([str(BUILD/"test_tls"),"--xhttp-chunks",uri(server.port,"xhttp","tls",mode="packet-up",alpn="http/1.1")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=15)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
     def test_xhttp_placements(self):
         for placement in ("path","header","query","cookie"):
