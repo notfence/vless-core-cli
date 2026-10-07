@@ -11,7 +11,46 @@ static vless_config_t config;
 static char error[256];
 static int parse(const char *uri) { return parse_core_uri(uri, &config, error, sizeof(error)); }
 
+static void check_base64(void) {
+    const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    uint8_t bytes[8], expected[8];
+    size_t length;
+    for (unsigned value = 1; value <= 255; value++) {
+        if (strchr(alphabet, (int)value) || value == '=') continue;
+        for (size_t position = 0; position < 4; position++) {
+            char input[] = "AAAA";
+            input[position] = (char)value;
+            length = sizeof(bytes);
+            CHECK("utils/base64-reject-every-nonalphabet-byte", base64url_decode(input, bytes, sizeof(bytes), &length) != 0 && length == sizeof(bytes));
+        }
+    }
+    for (unsigned value = 1; value <= 255; value++) {
+        if (value == '=') continue;
+        char input[] = "AA==x";
+        input[4] = (char)value;
+        CHECK("utils/base64-reject-data-after-padding", base64url_decode(input, bytes, sizeof(bytes), &length) != 0);
+    }
+    for (size_t value = 0; value < 64; value++) {
+        for (size_t position = 0; position < 4; position++) {
+            char input[] = "AAAA", standard[] = "AAAA";
+            input[position] = alphabet[value];
+            standard[position] = value == 62 ? '+' : value == 63 ? '/' : alphabet[value];
+            int expected_length = EVP_DecodeBlock(expected, (unsigned char *)standard, 4);
+            CHECK("utils/base64-preserve-every-alphabet-value", expected_length == 3 && base64url_decode(input, bytes, sizeof(bytes), &length) == 0 && length == 3 && memcmp(bytes, expected, length) == 0);
+        }
+    }
+    const char *encoded[] = {"", "Zg", "Zg==", "Zm8", "Zm8=", "Zm9v"};
+    const char *plain[] = {"", "f", "f", "fo", "fo", "foo"};
+    for (size_t i = 0; i < sizeof(encoded) / sizeof(*encoded); i++) {
+        CHECK("utils/base64-preserve-padded-and-unpadded", base64url_decode(encoded[i], bytes, sizeof(bytes), &length) == 0 && length == strlen(plain[i]) && memcmp(bytes, plain[i], length) == 0);
+    }
+    CHECK("utils/base64-exact-capacity", base64url_decode("Zm9v", bytes, 3, &length) == 0 && length == 3 && memcmp(bytes, "foo", 3) == 0);
+    CHECK("utils/base64-capacity-rejected", base64url_decode("Zm9v", bytes, 2, &length) != 0);
+    CHECK("utils/base64-null", base64url_decode(NULL, bytes, sizeof(bytes), &length) != 0 && base64url_decode("AA", NULL, sizeof(bytes), &length) != 0 && base64url_decode("AA", bytes, sizeof(bytes), NULL) != 0);
+}
+
 int main(void) {
+    check_base64();
     CHECK("uri/tcp-defaults", parse(PREFIX "type=tcp") == 0 && strcmp(config.security, "none") == 0 && config.flow[0] == 0 && config.fp_mode == FP_CHROME);
     const char *types[] = {"tcp", "ws", "xhttp", "grpc"};
     const char *securities[] = {"none", "tls", "reality"};

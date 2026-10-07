@@ -100,10 +100,14 @@ int base64url_decode(const char *in, uint8_t *out, size_t out_cap, size_t *out_l
     for (size_t i = 0; in[i] != '\0'; i++) {
         unsigned char c = (unsigned char)in[i];
         if (c == '=') {
+            while (in[i] == '=') i++;
+            if (in[i] != '\0') {
+                return -1;
+            }
             break;
         }
         int8_t d = table[c];
-        if (d < 0) {
+        if (d < 0 || (d == 0 && c != 'A')) {
             return -1;
         }
         val = (val << 6) | d;

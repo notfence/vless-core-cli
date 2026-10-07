@@ -54,6 +54,15 @@ class CliTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertNotEqual(self.invoke(args).returncode,0)
 
+    def test_invalid_base64_keys(self):
+        for key in ("!"*43,"A"*42+"!","A"*43+"=!","A"*43+"=A","A"*42+"%20","A"*42+"%2B","A"*42+"%2F","A"*42+"%C2%A0"):
+            for parameter, expected in (("security=reality&pbk=","pbk is required"),("encryption=mlkem768x25519plus.native.1rtt.","invalid VLESS encryption relay key")):
+                with self.subTest(key=key,parameter=parameter):
+                    result = self.invoke(["--uri",uri(443).split("?",1)[0]+"?"+parameter+key,"--listen-port","12345"])
+                    self.assertNotEqual(result.returncode,0)
+                    self.assertIn(expected,result.stdout+result.stderr)
+                    self.assertNotIn("listening on",result.stdout+result.stderr)
+
     def test_fd_inputs_and_connection_overrides(self):
         for option, data in (("--uri-fd",b"socks5://127.0.0.1:1080#vless-core"),("--connection-fd",b"socks5://no-dns.invalid:1080#vless-core\n127.0.0.1")):
             read, write = os.pipe()
