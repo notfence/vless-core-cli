@@ -75,6 +75,9 @@ test-asan:
 test-sanitizers:
 	$(MAKE) -C tests sanitizers
 
+test-fuzz:
+	$(MAKE) -C tests fuzz
+
 test-coverage:
 	$(MAKE) -C tests coverage
 
@@ -229,4 +232,4 @@ clean:
 
 -include $(OBJ_LINUX:.o=.d) $(OBJ_IOS:.o=.d) $(OBJ_IOS_ARM64:.o=.d)
 
-.PHONY: all linux ios ios-arm64 test preflight test-asan test-sanitizers test-coverage check-ios-toolchain check-ios-arm64-toolchain clean openssl-ios6 openssl-ios-arm64 zlib-ios6 zlib-ios-arm64 curl-ios6 curl-ios-arm64 curl-ios6-package release-packages
+.PHONY: all linux ios ios-arm64 test preflight test-asan test-sanitizers test-fuzz test-coverage check-ios-toolchain check-ios-arm64-toolchain clean openssl-ios6 openssl-ios-arm64 zlib-ios6 zlib-ios-arm64 curl-ios6 curl-ios-arm64 curl-ios6-package release-packages

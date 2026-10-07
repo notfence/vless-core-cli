@@ -1,6 +1,7 @@
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -8,6 +9,9 @@ XRAY_VERSION = "26.6.27"
 XRAY_SHA256 = "8ef87ac07f95617e094b8e9302ea3e0c2d0edaa7045d57b455fdee28b3c9e41e"
 
 def verify():
+    compiler = os.environ.get("TEST_FUZZ_CC","clang")
+    if not shutil.which(compiler):
+        raise RuntimeError(f"Missing local fuzz compiler: {compiler}. Clang with libFuzzer, ASan and UBSan is required; make never installs dependencies.")
     prefix = Path(os.environ["TEST_OPENSSL_PREFIX"])
     required = [prefix / "include/openssl/evp.h", prefix / "lib/libssl.a", prefix / "lib/libcrypto.a", prefix / "bin/openssl"]
     for path in required:
