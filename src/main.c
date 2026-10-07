@@ -1055,7 +1055,6 @@ static void *client_worker_run(void *arg) {
                     }
                     if (!downstream_direct) {
                         downstream_direct = 1;
-                        upstream_direct = 1;
                         vc_log_warning("connection", "switched to Vision downstream direct mode by raw fallback for %s:%u",
                                        target_host, (unsigned)target_port);
                     }
@@ -1080,7 +1079,6 @@ static void *client_worker_run(void *arg) {
                         downstream_encryption_direct = 1;
                     } else if (allow_raw_vision) {
                         downstream_direct = 1;
-                        upstream_direct = 1;
                         tls13_mark_raw_direct(tls);
                     }
                 }

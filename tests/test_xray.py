@@ -22,7 +22,7 @@ class XrayTests(unittest.TestCase):
                 self.assertGreaterEqual(len(selected),2)
                 self.assertIsNone(reference.process.poll(),reference.log)
 
-    def transfer(self, transport, security, mode=None, flow="", encryption=None, decryption="none", tls_target=False, extra=None, server_extra=None, alpn=None):
+    def transfer(self, transport, security, mode=None, flow="", encryption=None, decryption="none", tls_target=False, extra=None, server_extra=None, alpn=None, fingerprint=None):
         with Server(tls=tls_target) as target, xray_server(transport, security, mode, flow, decryption, **(server_extra or {})) as reference:
             parameters = {"flow":flow}
             if mode:
@@ -33,6 +33,8 @@ class XrayTests(unittest.TestCase):
                 parameters["extra"] = json.dumps(extra)
             if alpn:
                 parameters["alpn"] = alpn
+            if fingerprint:
+                parameters["fp"] = fingerprint
             cert, _ = certificate()
             with cli(uri(reference.port, transport, security, **parameters), environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
                 try:
@@ -59,8 +61,9 @@ class XrayTests(unittest.TestCase):
 
     def test_vision(self):
         for security in ("tls","reality"):
-            with self.subTest(security=security):
-                self.transfer("tcp", security, flow="xtls-rprx-vision", tls_target=True)
+            for fingerprint in ("chrome","firefox","edge","random","randomized","qq"):
+                with self.subTest(security=security,fingerprint=fingerprint):
+                    self.transfer("tcp", security, flow="xtls-rprx-vision", tls_target=True, fingerprint=fingerprint)
 
     def test_vision_short_reads_after_padding(self):
         cert, _ = certificate()
