@@ -62,6 +62,19 @@ class XrayTests(unittest.TestCase):
             with self.subTest(security=security):
                 self.transfer("tcp", security, flow="xtls-rprx-vision", tls_target=True)
 
+    def test_vision_short_reads_after_padding(self):
+        cert, _ = certificate()
+        for security in ("tls","reality"):
+            for fingerprint in ("chrome","firefox"):
+                with self.subTest(security=security,fingerprint=fingerprint):
+                    with Server() as target, xray_server("tcp",security,flow="xtls-rprx-vision") as reference:
+                        with cli(uri(reference.port,"tcp",security,flow="xtls-rprx-vision",fp=fingerprint),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                            with socks_connect(core.port,target.port) as tunnel:
+                                tunnel.settimeout(5)
+                                for sequence in range(12):
+                                    exchange(tunnel,bytes([sequence])+b"vless-core")
+                            self.assertIsNone(core.process.poll(),core.log)
+
     def test_xhttp_h1_packet_up(self):
         for attempt in range(3):
             with self.subTest(attempt=attempt):

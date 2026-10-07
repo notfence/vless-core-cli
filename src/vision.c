@@ -291,10 +291,11 @@ int vision_unpad_feed(vision_unpad_t *ctx, const uint8_t *in, size_t in_len, uin
     while (i < ctx->stash_len) {
         if (ctx->remaining_command == -1 && ctx->remaining_content == -1 && ctx->remaining_padding == -1) {
             size_t remain = ctx->stash_len - i;
-            if (remain < 16) {
+            int padding_ended = ctx->current_command == CMD_END || ctx->current_command == CMD_DIRECT;
+            if (!padding_ended && remain < 16) {
                 break;
             }
-            if (memcmp(ctx->stash + i, ctx->uuid, 16) != 0) {
+            if (padding_ended || memcmp(ctx->stash + i, ctx->uuid, 16) != 0) {
                 if (append_bytes(&plain, &plain_len, &plain_cap, ctx->stash + i, remain) != 0) {
                     free(plain);
                     return -1;

@@ -10,7 +10,7 @@ static void vision_wire_vectors(const uint8_t uuid[16]) {
         memcpy(wire+16, blocks, sizeof(blocks)); wire[16+16] = (uint8_t)command;
         memcpy(wire+16+sizeof(blocks), "/raw-tail", 9);
         size_t wire_length = 16+sizeof(blocks)+9;
-        for (size_t cut = 0; cut < 16+sizeof(blocks); cut++) {
+        for (size_t cut = 0; cut <= wire_length; cut++) {
             vision_unpad_t unpad; vision_unpad_init(&unpad, uuid);
             uint8_t recovered[80]; size_t recovered_length = 0; int switched = 0;
             size_t offsets[] = {0,cut,wire_length};
@@ -37,10 +37,56 @@ static void vision_wire_vectors(const uint8_t uuid[16]) {
     free(plain); vision_unpad_free(&unpad);
 }
 
+static void vision_terminal_reads(const uint8_t uuid[16]) {
+    uint8_t raw[64];
+    for (size_t i = 0; i < sizeof(raw); i++) raw[i] = (uint8_t)(0x80 + i);
+    memcpy(raw, uuid, 16);
+    const uint8_t fake_block[] = {0,0,3,0,2,'f','o','o',0xaa,0xbb};
+    memcpy(raw + 16, fake_block, sizeof(fake_block));
+    for (int command = 1; command <= 2; command++) {
+        for (size_t content = 0; content <= 10; content += 10) {
+            for (size_t padding = 0; padding <= 3; padding += 3) {
+                uint8_t frame[40]; memcpy(frame, uuid, 16);
+                frame[16] = (uint8_t)command;
+                frame[17] = 0; frame[18] = (uint8_t)content;
+                frame[19] = 0; frame[20] = (uint8_t)padding;
+                memcpy(frame + 21, "vless-core", content);
+                memset(frame + 21 + content, 0xff, padding);
+                size_t frame_length = 21 + content + padding;
+                vision_unpad_t unpad; vision_unpad_init(&unpad, uuid);
+                for (size_t i = 0; i < frame_length; i++) {
+                    uint8_t *plain = NULL; size_t plain_length = 0; int direct = 0;
+                    REQUIRE("vision/fragmented-terminal-feed", vision_unpad_feed(&unpad, frame + i, 1, &plain, &plain_length, &direct) == 0);
+                    int is_content = i >= 21 && i < 21 + content;
+                    CHECK("vision/fragmented-terminal-content", plain_length == (size_t)is_content && (!is_content || plain[0] == frame[i]));
+                    CHECK("vision/direct-only-after-complete-frame", direct == (command == 2 && i + 1 == frame_length));
+                    free(plain);
+                }
+                for (size_t length = 0; length <= sizeof(raw); length++) {
+                    uint8_t *plain = NULL; size_t plain_length = 0; int direct = -1;
+                    REQUIRE("vision/terminal-next-feed", vision_unpad_feed(&unpad, raw, length, &plain, &plain_length, &direct) == 0);
+                    CHECK("vision/terminal-forwards-next-read", plain_length == length && (length == 0 || memcmp(plain, raw, length) == 0) && direct == 0 && unpad.stash_len == 0);
+                    free(plain);
+                }
+                uint8_t *plain = NULL; size_t plain_length = 0;
+                REQUIRE("vision/terminal-feed-without-direct-output", vision_unpad_feed(&unpad, raw, sizeof(raw), &plain, &plain_length, NULL) == 0);
+                CHECK("vision/terminal-preserves-uuid-like-data", plain_length == sizeof(raw) && memcmp(plain, raw, sizeof(raw)) == 0 && unpad.stash_len == 0);
+                free(plain); vision_unpad_free(&unpad);
+                vision_unpad_init(&unpad, uuid);
+                int direct = -1;
+                REQUIRE("vision/reinitialized-prefix-feed", vision_unpad_feed(&unpad, uuid, 1, &plain, &plain_length, &direct) == 0);
+                CHECK("vision/reinitialized-awaits-uuid", plain_length == 0 && direct == 0 && unpad.stash_len == 1);
+                free(plain); vision_unpad_free(&unpad);
+            }
+        }
+    }
+}
+
 int main(void) {
     vless_config_t cfg; char error[128]; uint8_t packet[2048]; size_t length = 0;
     REQUIRE("packets/config", parse_core_uri("vless://00000000-0000-0000-0000-000000000001@127.0.0.1:443", &cfg, error, sizeof(error)) == 0);
     vision_wire_vectors(cfg.uuid);
+    vision_terminal_reads(cfg.uuid);
     const uint8_t ipv4[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,1,187,1,127,0,0,1};
     CHECK("packets/vless-ipv4-golden", vless_build_request(packet, sizeof(packet), &length, &cfg, "127.0.0.1", 443) == 0 && length == sizeof(ipv4) && memcmp(packet, ipv4, length) == 0);
     CHECK("packets/vless-capacity", vless_build_request(packet, sizeof(ipv4)-1, &length, &cfg, "127.0.0.1", 443) != 0 && length == 0);
