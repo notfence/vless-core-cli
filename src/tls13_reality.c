@@ -206,12 +206,15 @@ struct tls13_conn {
     dynbuf_t ws_net_cache;
     dynbuf_t h2_net_cache;
     dynbuf_t h2_send_buf;
+    dynbuf_t h2_header_block;
     dynbuf_t grpc_recv_cache;
     dynbuf_t transcript;
     dynbuf_t app_cache;
     int reality_raw_direct;
 
     uint32_t h2_stream_id;
+    uint32_t h2_header_stream_id;
+    uint8_t h2_header_flags;
     uint32_t h2_next_stream_id;
     uint32_t h2_peer_initial_window;
     uint32_t h2_peer_max_frame_size;
@@ -1944,6 +1947,7 @@ enum {
     H2_FRAME_PING = 0x6,
     H2_FRAME_GOAWAY = 0x7,
     H2_FRAME_WINDOW_UPDATE = 0x8,
+    H2_FRAME_CONTINUATION = 0x9,
 };
 
 enum {
@@ -2241,7 +2245,7 @@ static int hpack_append_literal_new_name(dynbuf_t *b, const char *name, const ch
 }
 
 static int h2_decode_int(const uint8_t *buf, size_t len, size_t *off, uint8_t prefix_bits, uint32_t *value) {
-    if (*off >= len) {
+    if (*off >= len || prefix_bits == 0 || prefix_bits > 8) {
         return -1;
     }
     uint8_t first = buf[*off];
@@ -2260,6 +2264,9 @@ static int h2_decode_int(const uint8_t *buf, size_t len, size_t *off, uint8_t pr
         }
         uint8_t b = buf[*off];
         (*off)++;
+        if ((uint32_t)(b & 0x7F) > (UINT32_MAX - v) >> m) {
+            return -1;
+        }
         v += (uint32_t)(b & 0x7F) << m;
         if ((b & 0x80) == 0) {
             *value = v;
@@ -2269,23 +2276,69 @@ static int h2_decode_int(const uint8_t *buf, size_t len, size_t *off, uint8_t pr
     }
 }
 
-static int h2_skip_string(const uint8_t *buf, size_t len, size_t *off) {
-    if (*off >= len) {
+static int h2_decode_huffman(const uint8_t *buf, size_t len, char *out, size_t out_cap, size_t *out_len) {
+    static const uint8_t counts[31] = {
+        0,0,0,0,0,10,26,32,6,0,5,3,2,6,2,3,0,0,0,3,8,13,26,29,12,4,15,19,29,0,4,
+    };
+    static const uint16_t symbols[257] = {
+        48, 49, 50, 97, 99, 101, 105, 111, 115, 116, 32, 37, 45, 46, 47, 51,
+        52, 53, 54, 55, 56, 57, 61, 65, 95, 98, 100, 102, 103, 104, 108, 109,
+        110, 112, 114, 117, 58, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76,
+        77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 89, 106, 107, 113, 118,
+        119, 120, 121, 122, 38, 42, 44, 59, 88, 90, 33, 34, 40, 41, 63, 39,
+        43, 124, 35, 62, 0, 36, 64, 91, 93, 126, 94, 125, 60, 96, 123, 92,
+        195, 208, 128, 130, 131, 162, 184, 194, 224, 226, 153, 161, 167, 172, 176, 177,
+        179, 209, 216, 217, 227, 229, 230, 129, 132, 133, 134, 136, 146, 154, 156, 160,
+        163, 164, 169, 170, 173, 178, 181, 185, 186, 187, 189, 190, 196, 198, 228, 232,
+        233, 1, 135, 137, 138, 139, 140, 141, 143, 147, 149, 150, 151, 152, 155, 157,
+        158, 165, 166, 168, 174, 175, 180, 182, 183, 188, 191, 197, 231, 239, 9, 142,
+        144, 145, 148, 159, 171, 206, 215, 225, 236, 237, 199, 207, 234, 235, 192, 193,
+        200, 201, 202, 205, 210, 213, 218, 219, 238, 240, 242, 243, 255, 203, 204, 211,
+        212, 214, 221, 222, 223, 241, 244, 245, 246, 247, 248, 250, 251, 252, 253, 254,
+        2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20,
+        21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127, 220, 249, 10, 13, 22,
+        256,
+    };
+    uint32_t code = 0, first = 0;
+    size_t base = 0, written = 0;
+    unsigned bits = 0;
+    for (size_t i = 0; i < len; i++) {
+        for (int bit = 7; bit >= 0; bit--) {
+            code = (code << 1) | ((buf[i] >> bit) & 1U);
+            bits++;
+            if (code >= first && code - first < counts[bits]) {
+                uint16_t symbol = symbols[base + code - first];
+                if (symbol == 256) {
+                    return -1;
+                }
+                if (out_cap > 0 && written < out_cap - 1) {
+                    out[written] = (char)symbol;
+                }
+                written++;
+                code = first = 0;
+                bits = 0;
+                base = 0;
+            } else {
+                if (bits == 30) {
+                    return -1;
+                }
+                base += counts[bits];
+                first = (first + counts[bits]) << 1;
+            }
+        }
+    }
+    if (bits > 7 || code != (1U << bits) - 1U) {
         return -1;
     }
-    uint32_t slen = 0;
-    if (h2_decode_int(buf, len, off, 7, &slen) != 0) {
-        return -1;
+    if (out_cap > 0) {
+        out[written < out_cap ? written : out_cap - 1] = '\0';
     }
-    if ((size_t)slen > len - *off) {
-        return -1;
-    }
-    *off += (size_t)slen;
+    *out_len = written;
     return 0;
 }
 
-static int h2_read_string_plain(const uint8_t *buf, size_t len, size_t *off, char *out, size_t out_cap) {
-    if (*off >= len || out_cap == 0) {
+static int h2_read_string(const uint8_t *buf, size_t len, size_t *off, char *out, size_t out_cap, size_t *out_len) {
+    if (*off >= len) {
         return -1;
     }
     int huffman = (buf[*off] & 0x80) != 0;
@@ -2294,14 +2347,17 @@ static int h2_read_string_plain(const uint8_t *buf, size_t len, size_t *off, cha
         return -1;
     }
     if (huffman) {
-        return -1;
+        if (h2_decode_huffman(buf + *off, slen, out, out_cap, out_len) != 0) {
+            return -1;
+        }
+    } else {
+        if (out_cap > 0) {
+            size_t copy = slen < out_cap ? slen : out_cap - 1;
+            memcpy(out, buf + *off, copy);
+            out[copy] = '\0';
+        }
+        *out_len = slen;
     }
-    size_t copy = (size_t)slen;
-    if (copy >= out_cap) {
-        copy = out_cap - 1;
-    }
-    memcpy(out, buf + *off, copy);
-    out[copy] = '\0';
     *off += (size_t)slen;
     return 0;
 }
@@ -2334,80 +2390,90 @@ static int h2_decode_status_header(const uint8_t *block, size_t len) {
         uint8_t first = block[off];
         if ((first & 0x80) != 0) {
             uint32_t index = 0;
-            if (h2_decode_int(block, len, &off, 7, &index) != 0) {
-                return status;
+            if (h2_decode_int(block, len, &off, 7, &index) != 0 || index == 0) {
+                return -1;
             }
             int s = hpack_static_status(index);
             if (s != 0) {
-                return s;
-            }
-        } else if ((first & 0x40) != 0) {
-            uint32_t name_index = 0;
-            if (h2_decode_int(block, len, &off, 6, &name_index) != 0) {
-                return status;
-            }
-            if (name_index == 0) {
-                if (h2_skip_string(block, len, &off) != 0) {
-                    return status;
+                if (status != 0) {
+                    return -1;
                 }
+                status = s;
             }
-            if (name_index == 8) {
-                char value[16];
-                value[0] = '\0';
-                if (h2_read_string_plain(block, len, &off, value, sizeof(value)) == 0) {
-                    return atoi(value);
-                }
-                return status;
-            }
-            if (h2_skip_string(block, len, &off) != 0) {
-                return status;
-            }
-        } else if ((first & 0x20) != 0) {
+        } else if ((first & 0xE0) == 0x20) {
             uint32_t ignored = 0;
             if (h2_decode_int(block, len, &off, 5, &ignored) != 0) {
-                return status;
+                return -1;
             }
         } else {
             uint32_t name_index = 0;
-            if (h2_decode_int(block, len, &off, 4, &name_index) != 0) {
-                return status;
+            if (h2_decode_int(block, len, &off, (first & 0x40) != 0 ? 6 : 4, &name_index) != 0) {
+                return -1;
             }
-            char value[16];
-            value[0] = '\0';
+            int is_status = name_index >= 8 && name_index <= 14;
             if (name_index == 0) {
-                char name[32];
-                name[0] = '\0';
-                size_t name_off = off;
-                if (h2_read_string_plain(block, len, &name_off, name, sizeof(name)) == 0) {
-                    off = name_off;
-                    if (h2_read_string_plain(block, len, &off, value, sizeof(value)) == 0 && strcmp(name, ":status") == 0) {
-                        status = atoi(value);
-                    }
-                } else {
-                    if (h2_skip_string(block, len, &off) != 0 || h2_skip_string(block, len, &off) != 0) {
-                        return status;
-                    }
+                char name[8];
+                size_t name_len = 0;
+                if (h2_read_string(block, len, &off, name, sizeof(name), &name_len) != 0 || name_len == 0) {
+                    return -1;
                 }
-            } else {
-                if (name_index == 8) {
-                    if (h2_read_string_plain(block, len, &off, value, sizeof(value)) == 0) {
-                        return atoi(value);
-                    }
-                    return status;
+                is_status = name_len == 7 && memcmp(name, ":status", 7) == 0;
+            }
+            char value[4];
+            size_t value_len = 0;
+            if (h2_read_string(block, len, &off, is_status ? value : NULL, is_status ? sizeof(value) : 0, &value_len) != 0) {
+                return -1;
+            }
+            if (is_status) {
+                if (status != 0 || value_len != 3 || value[0] < '1' || value[0] > '9' || value[1] < '0' || value[1] > '9' ||
+                    value[2] < '0' || value[2] > '9') {
+                    return -1;
                 }
-                if (h2_skip_string(block, len, &off) != 0) {
-                    return status;
-                }
+                status = (value[0] - '0') * 100 + (value[1] - '0') * 10 + value[2] - '0';
             }
         }
     }
     return status;
 }
 
+static int h2_finish_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id, const uint8_t *block, size_t len, char *err,
+                             size_t err_cap) {
+    int status = h2_decode_status_header(block, len);
+    if (status < 0) {
+        set_err(err, err_cap, "invalid h2 header block");
+        return -1;
+    }
+    if (status != 0 && status != 200) {
+        if (err != NULL && err_cap > 0) {
+            snprintf(err, err_cap, "%s h2 stream %u returned non-200: %d", c->grpc_transport ? "grpc" : "xhttp",
+                     (unsigned)stream_id, status);
+        }
+        return -1;
+    }
+    if (stream_id == c->h2_stream_id && (flags & H2_FLAG_END_STREAM) != 0) {
+        c->h2_stream_eof = 1;
+    }
+    return 0;
+}
+
+static int h2_append_header_block(tls13_conn_t *c, const uint8_t *data, size_t len, char *err, size_t err_cap) {
+    if (c->h2_header_block.len > H2_MAX_INBOUND_FRAME || len > H2_MAX_INBOUND_FRAME - c->h2_header_block.len) {
+        set_err(err, err_cap, "h2 header block too large");
+        return -1;
+    }
+    if (db_append(&c->h2_header_block, data, len) != 0) {
+        set_err(err, err_cap, "failed to buffer h2 headers");
+        return -1;
+    }
+    return 0;
+}
+
 static int h2_process_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id, const uint8_t *payload, size_t payload_len, char *err,
                               size_t err_cap) {
-    (void)c;
-
+    if (stream_id == 0 || c->h2_header_stream_id != 0) {
+        set_err(err, err_cap, "invalid h2 headers stream");
+        return -1;
+    }
     size_t off = 0;
     if ((flags & H2_FLAG_PADDED) != 0) {
         if (payload_len == 0) {
@@ -2433,16 +2499,15 @@ static int h2_process_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id
         return -1;
     }
 
-    int status = h2_decode_status_header(payload + off, payload_len - off);
-    if (status != 0) {
-        if (status != 200) {
-            if (err != NULL && err_cap > 0) {
-                snprintf(err, err_cap, "%s h2 stream %u returned non-200: %d", c->grpc_transport ? "grpc" : "xhttp",
-                         (unsigned)stream_id, status);
-            }
-            return -1;
-        }
+    const uint8_t *block = off != 0 ? payload + off : payload;
+    if ((flags & H2_FLAG_END_HEADERS) != 0) {
+        return h2_finish_headers(c, flags, stream_id, block, payload_len - off, err, err_cap);
     }
+    if (h2_append_header_block(c, block, payload_len - off, err, err_cap) != 0) {
+        return -1;
+    }
+    c->h2_header_stream_id = stream_id;
+    c->h2_header_flags = flags & H2_FLAG_END_STREAM;
     return 0;
 }
 
@@ -2456,6 +2521,10 @@ static int h2_add_send_window(int64_t *window, uint32_t increment) {
 
 static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_id, const uint8_t *payload,
                                     size_t payload_len, char *err, size_t err_cap) {
+    if (c->h2_header_stream_id != 0 && type != H2_FRAME_CONTINUATION) {
+        set_err(err, err_cap, "interleaved h2 header block");
+        return -1;
+    }
     switch (type) {
     case H2_FRAME_SETTINGS:
         if ((flags & H2_FLAG_ACK) != 0) {
@@ -2522,6 +2591,22 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
         return 0;
     case H2_FRAME_HEADERS:
         return h2_process_headers(c, flags, stream_id, payload, payload_len, err, err_cap);
+    case H2_FRAME_CONTINUATION:
+        if (c->h2_header_stream_id == 0 || stream_id != c->h2_header_stream_id) {
+            set_err(err, err_cap, "invalid h2 continuation stream");
+            return -1;
+        }
+        if (h2_append_header_block(c, payload, payload_len, err, err_cap) != 0) {
+            return -1;
+        }
+        if ((flags & H2_FLAG_END_HEADERS) != 0) {
+            int rc = h2_finish_headers(c, c->h2_header_flags, stream_id, c->h2_header_block.data, c->h2_header_block.len, err, err_cap);
+            c->h2_header_stream_id = 0;
+            c->h2_header_flags = 0;
+            c->h2_header_block.len = 0;
+            return rc;
+        }
+        return 0;
     case H2_FRAME_RST_STREAM:
         if (stream_id == 0 || payload_len != 4) {
             set_err(err, err_cap, "invalid h2 stream reset");
@@ -2766,7 +2851,7 @@ static int h2_pump_one_frame(tls13_conn_t *c) {
     }
 
     int rc = 0;
-    if (type == H2_FRAME_DATA && stream_id == c->h2_stream_id) {
+    if (type == H2_FRAME_DATA && stream_id == c->h2_stream_id && c->h2_header_stream_id == 0) {
         size_t off = 0;
         size_t data_len = payload_len;
         if ((flags & H2_FLAG_PADDED) != 0) {
@@ -2800,9 +2885,6 @@ static int h2_pump_one_frame(tls13_conn_t *c) {
         rc = h2_process_control_frame(c, type, flags, stream_id, payload, payload_len, err, sizeof(err));
         if (rc != 0 && err[0] != '\0') {
             vc_log_error(c->grpc_transport ? "grpc" : "xhttp", "%s", err);
-        }
-        if (rc == 0 && type == H2_FRAME_HEADERS && stream_id == c->h2_stream_id && (flags & H2_FLAG_END_STREAM) != 0) {
-            c->h2_stream_eof = 1;
         }
     }
 
@@ -3170,6 +3252,9 @@ static int h2_send_xhttp_body(tls13_conn_t *c, uint32_t stream_id, const uint8_t
 
 static int xhttp_h2_begin(tls13_conn_t *c, char *err, size_t err_cap) {
     c->h2_stream_id = 1;
+    c->h2_header_stream_id = 0;
+    c->h2_header_flags = 0;
+    c->h2_header_block.len = 0;
     c->h2_next_stream_id = 3;
     c->h2_peer_initial_window = H2_DEFAULT_WINDOW;
     c->h2_peer_max_frame_size = H2_DEFAULT_MAX_FRAME;
@@ -6393,6 +6478,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     db_free(&c->ws_net_cache);
     db_free(&c->h2_net_cache);
     db_free(&c->h2_send_buf);
+    db_free(&c->h2_header_block);
     db_free(&c->grpc_recv_cache);
     db_free(&c->transcript);
     db_free(&c->app_cache);

@@ -250,6 +250,68 @@ class XrayTests(unittest.TestCase):
                                 self.assertEqual(exact(tunnel,len(reply)),reply)
                             self.assertIsNone(core.process.poll(),core.log)
 
+    def test_h2_huffman_status_responses(self):
+        cases = ((200,bytes.fromhex("48821001")),(302,bytes.fromhex("48826402")),
+                 (403,bytes.fromhex("4883680cff")),(429,bytes.fromhex("4883684fff")),
+                 (503,bytes.fromhex("48836c0cff")),(None,bytes.fromhex("48821000")))
+        cases = [(status,block,fragmented) for status,block in cases for fragmented in (False,True)]
+        request = b"vless-core request"
+        reply = b"vless-core huffman response"
+        def frame(kind, flags, payload, stream=1):
+            return len(payload).to_bytes(3,"big")+bytes([kind,flags])+stream.to_bytes(4,"big")+payload
+        def read_frame(connection):
+            header = exact(connection,9)
+            size = int.from_bytes(header[:3],"big")
+            self.assertLessEqual(size,1048576)
+            return header[3],header[4],int.from_bytes(header[5:],"big"),exact(connection,size)
+        cert, _ = certificate()
+        for transport in ("xhttp","grpc"):
+            parameters = {"mode":"stream-one"} if transport == "xhttp" else {}
+            for status, block, fragmented in cases:
+                with self.subTest(transport=transport,status=status,fragmented=fragmented):
+                    def handler(connection):
+                        self.assertEqual(exact(connection,24),b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                        received = bytearray()
+                        while not received.endswith(request):
+                            kind, _, stream, payload = read_frame(connection)
+                            if kind == 0:
+                                self.assertEqual(stream,1)
+                                if not received:
+                                    self.assertTrue(payload.startswith(b"\x00"))
+                                received.extend(payload)
+                        data = b"\x00\x00"+reply
+                        trailer = b""
+                        if transport == "grpc":
+                            message = b"\x0a"+bytes([len(data)])+data
+                            data = b"\x00"+len(message).to_bytes(4,"big")+message
+                            trailer = frame(1,5,b"\x00\x0bgrpc-status\x010")
+                        headers = frame(1,0,block[:1])+frame(9,4,block[1:]) if fragmented else frame(1,4,block)
+                        response = frame(4,0,b"",0)+headers+frame(0,0 if trailer else 1,data)+trailer
+                        for offset in range(0,len(response),3):
+                            connection.sendall(response[offset:offset+3])
+                        if transport == "grpc":
+                            while True:
+                                kind, flags, _, _ = read_frame(connection)
+                                if kind == 0 and flags & 1:
+                                    break
+                        connection.unwrap()
+                    with Server(handler,tls=True) as server, cli(uri(server.port,transport,"tls",**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                        with socks_connect(core.port,80) as tunnel:
+                            tunnel.settimeout(3)
+                            tunnel.sendall(request)
+                            if status == 200:
+                                self.assertEqual(exact(tunnel,len(reply)),reply)
+                                self.assertEqual(tunnel.recv(1),b"")
+                            else:
+                                try:
+                                    self.assertEqual(tunnel.recv(1),b"")
+                                except ConnectionError:
+                                    pass
+                        if status != 200:
+                            expected = "invalid h2 header block" if status is None else f"{transport} h2 stream 1 returned non-200: {status}"
+                            self.assertIn(expected,core.log)
+                        self.assertIsNone(core.process.poll(),core.log)
+
     def test_xhttp_h2_header_only_response(self):
         first = threading.Event()
         first_payload, second_payload = b"vless-core first", b"vless-core second"
