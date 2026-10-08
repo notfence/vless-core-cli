@@ -3,14 +3,14 @@
 #include <arpa/inet.h>
 static int mode, interrupted;
 int __real_connect(int fd, const struct sockaddr *address, socklen_t length);
-int __real_select(int size, fd_set *read, fd_set *write, fd_set *error, struct timeval *timeout);
+int __real_poll(struct pollfd *fds, nfds_t count, int timeout);
 int __real_getsockopt(int fd, int level, int option, void *value, socklen_t *length);
 int __wrap_connect(int fd, const struct sockaddr *address, socklen_t length) { if (mode) { errno = EINPROGRESS; return -1; } return __real_connect(fd,address,length); }
-int __wrap_select(int size, fd_set *read, fd_set *write, fd_set *error, struct timeval *timeout) {
+int __wrap_poll(struct pollfd *fds, nfds_t count, int timeout) {
     if (mode == 1) return 0;
     if (mode == 3 && !interrupted++) { errno = EINTR; return -1; }
-    if (mode) return 1;
-    return __real_select(size,read,write,error,timeout);
+    if (mode) { for (nfds_t i=0;i<count;i++) fds[i].revents=fds[i].events; return 1; }
+    return __real_poll(fds,count,timeout);
 }
 int __wrap_getsockopt(int fd, int level, int option, void *value, socklen_t *length) {
     if (mode && level == SOL_SOCKET && option == SO_ERROR) { *(int *)value = mode == 2 ? ECONNREFUSED : 0; *length = sizeof(int); return 0; }
@@ -37,6 +37,14 @@ int main(void) {
     CHECK("socket/io-timeout", getsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,&length) == 0 && timeout.tv_sec == 0 && timeout.tv_usec >= 250000);
     core_set_socket_io_timeout(fd,0); getsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,&length); CHECK("socket/reset-timeout", timeout.tv_sec == 0 && timeout.tv_usec == 0);
     close(peer); close(fd); close(listener);
+    int pair[2]; REQUIRE("socket/high-fd-pair", socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    int high = fcntl(pair[0],F_DUPFD,4096); REQUIRE("socket/high-fd", high >= 4096); close(pair[0]);
+    CHECK("socket/high-fd-empty", core_wait_socket(high,POLLIN,0) == 0);
+    REQUIRE("socket/high-fd-write", write(pair[1],"v",1) == 1);
+    CHECK("socket/high-fd-ready", core_wait_socket(high,POLLIN,100) == 1);
+    char byte; CHECK("socket/high-fd-data", read(high,&byte,1) == 1 && byte == 'v'); close(pair[1]);
+    CHECK("socket/high-fd-eof", core_wait_socket(high,POLLIN,100) == 1 && read(high,&byte,1) == 0);
+    close(high); CHECK("socket/closed-fd", core_wait_socket(high,POLLIN,0) == -1 && errno == EBADF);
     CHECK("socket/invalid-fd", core_connect_with_timeout(-1,(void *)&address,sizeof(address),100) != 0);
     return test_result();
 }

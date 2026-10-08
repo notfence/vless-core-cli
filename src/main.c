@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -81,19 +80,11 @@ static void upstream_close(tls13_conn_t *tls,
 }
 
 static ssize_t read_with_timeout(int fd, uint8_t *buf, size_t cap, int timeout_ms) {
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-    int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+    int rc = core_wait_socket(fd, POLLIN, timeout_ms);
     if (rc < 0) {
         return -1;
     }
-    if (rc == 0 || !FD_ISSET(fd, &rfds)) {
+    if (rc == 0) {
         return 0;
     }
     return recv(fd, buf, cap, 0);
@@ -107,15 +98,8 @@ static ssize_t recv_coalesced(int fd, uint8_t *buf, size_t cap, int wait_us) {
 
     size_t total = (size_t)first;
     while (total < cap) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = wait_us;
-        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
-        if (rc <= 0 || !FD_ISSET(fd, &rfds)) {
+        int rc = core_wait_socket(fd, POLLIN, (wait_us + 999) / 1000);
+        if (rc <= 0) {
             break;
         }
 
@@ -479,36 +463,18 @@ static void relay_tcp_pair(int fd_a, int fd_b) {
     int received_reply = 0;
 
     while (1) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd_a, &rfds);
-        FD_SET(fd_b, &rfds);
-
-        int maxfd = (fd_a > fd_b) ? fd_a : fd_b;
-        int s = select(maxfd + 1, &rfds, NULL, NULL, NULL);
-        if (s <= 0) {
-            if (s < 0 && errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-
-        if (FD_ISSET(fd_a, &rfds)) {
+        struct pollfd fds[2] = {{.fd=fd_a,.events=POLLIN},{.fd=fd_b,.events=POLLIN}};
+        int s = core_poll(fds, 2, -1);
+        if (s <= 0) break;
+        if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             ssize_t n = recv(fd_a, buf, sizeof(buf), 0);
-            if (n <= 0 || write_all(fd_b, buf, (size_t)n) != 0) {
-                break;
-            }
+            if (n <= 0 || write_all(fd_b, buf, (size_t)n) != 0) break;
         }
-        if (FD_ISSET(fd_b, &rfds)) {
+        if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
             ssize_t n = recv(fd_b, buf, sizeof(buf), 0);
             if (n <= 0) break;
-            if (!received_reply) {
-                received_reply = 1;
-                core_trace_complete(1);
-            }
-            if (write_all(fd_a, buf, (size_t)n) != 0) {
-                break;
-            }
+            if (!received_reply) { received_reply = 1; core_trace_complete(1); }
+            if (write_all(fd_a, buf, (size_t)n) != 0) break;
         }
     }
 }
@@ -938,33 +904,21 @@ static void *client_worker_run(void *arg) {
         int client_ready = 0;
         int upstream_ready = !downstream_direct &&
                              (tls13_has_pending_input(tls) || vless_encryption_has_pending_input(encryption));
-        fd_set rfds;
-        FD_ZERO(&rfds);
-
         if (upstream_ready) {
-            FD_SET(cfd, &rfds);
-            struct timeval tv;
-            tv.tv_sec = 0;
-            tv.tv_usec = 0;
-            int s = select(cfd + 1, &rfds, NULL, NULL, &tv);
+            int s = core_wait_socket(cfd, POLLIN, 0);
             if (s < 0 && errno != EINTR) {
                 break;
             }
-            client_ready = (s > 0 && FD_ISSET(cfd, &rfds));
+            client_ready = s > 0;
         } else {
-            fd_set wfds;
-            FD_ZERO(&wfds);
-            if (tls13_needs_write(tls)) FD_SET(tfd, &wfds);
-            FD_SET(cfd, &rfds);
-            FD_SET(tfd, &rfds);
-
-            int maxfd = (cfd > tfd) ? cfd : tfd;
-            int s = select(maxfd + 1, &rfds, &wfds, NULL, NULL);
+            struct pollfd fds[2] = {{.fd=cfd,.events=POLLIN},
+                {.fd=tfd,.events=(short)(POLLIN | (tls13_needs_write(tls) ? POLLOUT : 0))}};
+            int s = core_poll(fds, 2, -1);
             if (s <= 0) {
                 break;
             }
-            client_ready = FD_ISSET(cfd, &rfds);
-            upstream_ready = FD_ISSET(tfd, &rfds) || FD_ISSET(tfd, &wfds);
+            client_ready = (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0;
+            upstream_ready = (fds[1].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR)) != 0;
         }
 
         if (client_ready) {
@@ -1456,6 +1410,8 @@ int main(int argc, char **argv) {
                     (unsigned long)g_routing.rule_count);
     }
 
+    uint64_t last_accept_warning = 0;
+    int listener_result = 0;
     while (1) {
         int cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) {
@@ -1463,7 +1419,23 @@ int main(int argc, char **argv) {
                 continue;
             }
             int error_number = errno;
+            if (error_number == ECONNABORTED || error_number == EAGAIN || error_number == EWOULDBLOCK) continue;
+#ifdef __linux__
+            if (error_number == ENETDOWN || error_number == EPROTO || error_number == ENOPROTOOPT ||
+                error_number == EHOSTDOWN || error_number == ENONET || error_number == EHOSTUNREACH ||
+                error_number == EOPNOTSUPP || error_number == ENETUNREACH) continue;
+#endif
+            if (error_number == EMFILE || error_number == ENFILE || error_number == ENOBUFS || error_number == ENOMEM) {
+                uint64_t now = core_now_ms();
+                if (last_accept_warning == 0 || now - last_accept_warning >= 1000) {
+                    vc_log_warning("core", "accept temporarily unavailable: %s", strerror(error_number));
+                    last_accept_warning = now;
+                }
+                (void)core_poll(NULL, 0, 100);
+                continue;
+            }
             vc_log_error("core", "accept failed: %s", strerror(error_number));
+            listener_result = 1;
             break;
         }
         core_tune_tcp_socket(cfd);
@@ -1492,5 +1464,5 @@ int main(int argc, char **argv) {
     }
 
     close(lfd);
-    return 0;
+    return listener_result;
 }

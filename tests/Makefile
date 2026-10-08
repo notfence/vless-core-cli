@@ -58,7 +58,7 @@ $(HOST_BUILD_DIR)/test_tls: $(HOST_BUILD_DIR)/test_tls.o $(filter-out $(HOST_BUI
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=write,--wrap=rename,--wrap=fsync
 
 $(HOST_BUILD_DIR)/test_socket: $(HOST_BUILD_DIR)/test_socket.o $(HOST_BUILD_DIR)/src/connection_trace.o $(HOST_BUILD_DIR)/src/core_log.o
-	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=connect,--wrap=select,--wrap=getsockopt
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=connect,--wrap=poll,--wrap=getsockopt
 
 $(HOST_BUILD_DIR)/test_encryption: $(HOST_BUILD_DIR)/test_encryption.o $(HOST_BUILD_DIR)/src/blake3.o
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS)

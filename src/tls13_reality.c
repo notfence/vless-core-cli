@@ -34,7 +34,6 @@
 #include <strings.h>
 #include <string.h>
 #include <sys/file.h>
-#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -1775,11 +1774,7 @@ static int xhttp_buffer_available(tls13_conn_t *c) {
         }
         return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ? 0 : -1;
     }
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(c->fd, &rfds);
-    struct timeval tv = {0, 0};
-    int ready = select(c->fd + 1, &rfds, NULL, NULL, &tv);
+    int ready = core_wait_socket(c->fd, POLLIN, 0);
     if (ready <= 0) {
         return ready < 0 && errno != EINTR ? -1 : 0;
     }
@@ -2108,20 +2103,7 @@ static int h2_collect_tls_available(tls13_conn_t *c, int *want_write) {
 }
 
 static int h2_wait_tls_input(tls13_conn_t *c, int want_write) {
-    fd_set rfds;
-    fd_set wfds;
-    FD_ZERO(&rfds);
-    FD_ZERO(&wfds);
-    if (want_write) {
-        FD_SET(c->fd, &wfds);
-    } else {
-        FD_SET(c->fd, &rfds);
-    }
-
-    int rc;
-    do {
-        rc = select(c->fd + 1, &rfds, &wfds, NULL, NULL);
-    } while (rc < 0 && errno == EINTR);
+    int rc = core_wait_socket(c->fd, want_write ? POLLOUT : POLLIN, -1);
     return rc > 0 ? 0 : -1;
 }
 
@@ -5450,12 +5432,7 @@ static int h2_input_ready(const tls13_conn_t *c) {
         return 0;
     }
 
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(c->fd, &rfds);
-    struct timeval tv = {0, 0};
-    int rc = select(c->fd + 1, &rfds, NULL, NULL, &tv);
-    return rc > 0 && FD_ISSET(c->fd, &rfds);
+    return core_wait_socket(c->fd, POLLIN, 0) > 0;
 }
 
 int tls13_drain_h2_input(tls13_conn_t *c) {
