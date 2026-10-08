@@ -469,22 +469,47 @@ static int write_all(int fd, const uint8_t *buf, size_t len) {
 }
 
 static void relay_tcp_pair(int fd_a, int fd_b) {
-    uint8_t buf[8192];
+    uint8_t buffers[2][8192];
+    size_t lengths[2] = {0, 0}, offsets[2] = {0, 0};
+    int descriptors[2] = {fd_a, fd_b};
+    int reading[2] = {1, 1}, shutdown_sent[2] = {0, 0};
     int received_reply = 0;
 
     while (1) {
-        struct pollfd fds[2] = {{.fd=fd_a,.events=POLLIN},{.fd=fd_b,.events=POLLIN}};
-        int s = core_poll(fds, 2, -1);
-        if (s <= 0) break;
-        if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t n = core_recv(fd_a, buf, sizeof(buf), 0);
-            if (n <= 0 || write_all(fd_b, buf, (size_t)n) != 0) break;
+        struct pollfd fds[2];
+        for (int i = 0; i < 2; i++) {
+            int other = 1 - i;
+            if (!reading[i] && offsets[i] == lengths[i] && !shutdown_sent[i]) {
+                int result;
+                do { result = shutdown(descriptors[other], SHUT_WR); } while (result != 0 && errno == EINTR);
+                if (result != 0 && errno != ENOTCONN) return;
+                shutdown_sent[i] = 1;
+            }
+            short events = reading[i] && lengths[i] == 0 ? POLLIN : 0;
+            if (offsets[other] < lengths[other]) events |= POLLOUT;
+            fds[i] = (struct pollfd){.fd=events ? descriptors[i] : -1,.events=events};
         }
-        if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t n = core_recv(fd_b, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            if (!received_reply) { received_reply = 1; core_trace_complete(1); }
-            if (write_all(fd_a, buf, (size_t)n) != 0) break;
+        if (!reading[0] && !reading[1] && lengths[0] == 0 && lengths[1] == 0) return;
+        if (core_poll(fds, 2, -1) <= 0) return;
+        for (int i = 0; i < 2; i++) {
+            int other = 1 - i;
+            if (reading[i] && lengths[i] == 0 && (fds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+                ssize_t n = core_recv(descriptors[i], buffers[i], sizeof(buffers[i]), MSG_DONTWAIT);
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return;
+                if (n == 0) reading[i] = 0;
+                if (n > 0) {
+                    lengths[i] = (size_t)n; offsets[i] = 0;
+                    if (i == 1 && !received_reply) { received_reply = 1; core_trace_complete(1); }
+                }
+            }
+            if (offsets[other] < lengths[other] && (fds[i].revents & (POLLOUT | POLLHUP | POLLERR))) {
+                ssize_t n = core_send(descriptors[i], buffers[other] + offsets[other], lengths[other] - offsets[other], MSG_DONTWAIT);
+                if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) return;
+                if (n > 0) {
+                    offsets[other] += (size_t)n;
+                    if (offsets[other] == lengths[other]) lengths[other] = offsets[other] = 0;
+                }
+            }
         }
     }
 }

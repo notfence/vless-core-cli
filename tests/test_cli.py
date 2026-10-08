@@ -1,6 +1,7 @@
 import os
 import socket
 import struct
+import threading
 import subprocess
 import time
 import unittest
@@ -37,6 +38,80 @@ class CliTests(unittest.TestCase):
             with socks_connect(core.port,target.port) as tunnel:
                 time.sleep(0.2)
                 exchange(tunnel,b"vless-core idle connection remains usable")
+
+    def test_direct_half_close_preserves_response(self):
+        payload = b"vless-core half close" * 4096
+        def respond(connection):
+            request = bytearray()
+            while True:
+                block = connection.recv(65536)
+                if not block: break
+                request.extend(block)
+            self.assertEqual(bytes(request), payload)
+            connection.sendall(payload[::-1])
+        with Server(respond) as target, cli("socks5://127.0.0.1:1", ["--routing", "1;direct;0"]) as core:
+            with socks_connect(core.port, target.port) as tunnel:
+                tunnel.sendall(payload)
+                tunnel.shutdown(socket.SHUT_WR)
+                self.assertEqual(exact(tunnel, len(payload)), payload[::-1])
+                self.assertEqual(tunnel.recv(1), b"")
+
+    def test_direct_upstream_half_close_preserves_upload(self):
+        payload = b"vless-core reverse half close" * 4096
+        completed = threading.Event()
+        def respond(connection):
+            connection.sendall(payload)
+            connection.shutdown(socket.SHUT_WR)
+            request = bytearray()
+            while True:
+                block=connection.recv(65536)
+                if not block: break
+                request.extend(block)
+            self.assertEqual(bytes(request),payload[::-1]); completed.set()
+        with Server(respond) as target, cli("socks5://127.0.0.1:1",["--routing","1;direct;0"]) as core:
+            with socks_connect(core.port,target.port) as tunnel:
+                self.assertEqual(exact(tunnel,len(payload)),payload)
+                self.assertEqual(tunnel.recv(1),b"")
+                tunnel.sendall(payload[::-1]); tunnel.shutdown(socket.SHUT_WR)
+                self.assertTrue(completed.wait(2))
+
+    def test_socks_upstream_half_close_preserves_response(self):
+        payload=b"vless-core socks half close" * 4096
+        def respond(connection):
+            exact(connection,3); connection.sendall(b"\x05\x00")
+            exact(connection,10); connection.sendall(b"\x05\x00\x00\x01"+bytes(6))
+            request=bytearray()
+            while True:
+                block=connection.recv(65536)
+                if not block: break
+                request.extend(block)
+            self.assertEqual(bytes(request),payload); connection.sendall(payload[::-1])
+        with Server(respond) as upstream, cli(f"socks5://127.0.0.1:{upstream.port}") as core:
+            with socks_connect(core.port,8080) as tunnel:
+                tunnel.sendall(payload); tunnel.shutdown(socket.SHUT_WR)
+                self.assertEqual(exact(tunnel,len(payload)),payload[::-1]); self.assertEqual(tunnel.recv(1),b"")
+
+    def test_direct_duplex_with_backpressure(self):
+        payload=bytes(range(251))*4096
+        def transfer(connection):
+            connection.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,4096)
+            errors=[]
+            def send():
+                try: connection.sendall(payload[::-1])
+                except BaseException as error: errors.append(error)
+            sender=threading.Thread(target=send,daemon=True); sender.start()
+            self.assertEqual(exact(connection,len(payload)),payload)
+            sender.join(timeout=5); self.assertFalse(sender.is_alive()); self.assertFalse(errors,errors)
+        with Server(transfer) as target, cli("socks5://127.0.0.1:1",["--routing","1;direct;0"]) as core:
+            with socks_connect(core.port,target.port) as tunnel:
+                tunnel.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,4096)
+                errors=[]
+                def send():
+                    try: tunnel.sendall(payload)
+                    except BaseException as error: errors.append(error)
+                sender=threading.Thread(target=send,daemon=True); sender.start()
+                self.assertEqual(exact(tunnel,len(payload)),payload[::-1])
+                sender.join(timeout=5); self.assertFalse(sender.is_alive()); self.assertFalse(errors,errors)
 
     def wait_for_probe(self, core, stage):
         deadline = time.monotonic()+2
