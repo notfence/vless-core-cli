@@ -167,6 +167,13 @@ class XrayTests(unittest.TestCase):
                     raise AssertionError(f"{transport}/{security}/{mode}/{flow}: {error}\n{core.log}\n{reference.log}") from error
                 self.assertIsNone(core.process.poll(), core.log)
 
+                reports = [line.split("[probe] ",1)[1] for line in core.log.splitlines() if "[probe] " in line]
+                self.assertTrue(reports,core.log)
+                result = dict(field.split("=",1) for field in reports[-1].split())
+                self.assertEqual((result["v"],result["success"],result["stage"]),("1","1","none"))
+                for field in ("dns_ms","tcp_ms","transport_ms","protocol_ms","carry_ms","total_ms"):
+                    self.assertGreaterEqual(int(result[field]),0,(field,core.log))
+
     def test_transport_matrix(self):
         for transport in ("tcp","ws","xhttp","grpc"):
             for security in ("none","tls","reality"):

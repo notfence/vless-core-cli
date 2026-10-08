@@ -495,7 +495,7 @@ int routing_open_direct(const char *host,
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo *result = NULL;
-    int gai = getaddrinfo(host, port_text, &hints, &result);
+    int gai = core_getaddrinfo(host, port_text, &hints, &result);
     if (gai != 0) {
         set_err(err, err_cap, "direct DNS resolution failed");
         return -1;

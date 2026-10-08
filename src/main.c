@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "core_log.h"
+#include "connection_trace.h"
 #include "socks5.h"
 #include "socks5_upstream.h"
 #include "routing.h"
@@ -475,6 +476,7 @@ static int write_all(int fd, const uint8_t *buf, size_t len) {
 
 static void relay_tcp_pair(int fd_a, int fd_b) {
     uint8_t buf[8192];
+    int received_reply = 0;
 
     while (1) {
         fd_set rfds;
@@ -499,7 +501,12 @@ static void relay_tcp_pair(int fd_a, int fd_b) {
         }
         if (FD_ISSET(fd_b, &rfds)) {
             ssize_t n = recv(fd_b, buf, sizeof(buf), 0);
-            if (n <= 0 || write_all(fd_a, buf, (size_t)n) != 0) {
+            if (n <= 0) break;
+            if (!received_reply) {
+                received_reply = 1;
+                core_trace_complete(1);
+            }
+            if (write_all(fd_a, buf, (size_t)n) != 0) {
                 break;
             }
         }
@@ -617,6 +624,7 @@ static void *client_worker_run(void *arg) {
             close(cfd);
             return NULL;
         }
+        core_trace_stage(CORE_TRACE_CARRY);
         relay_tcp_pair(cfd, direct_fd);
         if (routing_close_direct(direct_fd, g_route_control_port,
                                  g_route_control_socket, &direct_lease) != 0)
@@ -705,6 +713,7 @@ static void *client_worker_run(void *arg) {
     }
 
     vless_encryption_conn_t *encryption = NULL;
+    core_trace_stage(CORE_TRACE_PROTOCOL);
     if (cfg.encryption_enabled &&
         vless_encryption_connect(&cfg, tls, &encryption, err,
                                  sizeof(err)) != 0) {
@@ -918,6 +927,7 @@ static void *client_worker_run(void *arg) {
     }
     uint8_t tbuf[8192];
     int got_vless_response = 0;
+    int received_reply = 0;
     int upstream_direct = 0;
     int downstream_direct = 0;
     int upstream_encryption_direct = 0;
@@ -1023,6 +1033,7 @@ static void *client_worker_run(void *arg) {
                 if (n <= 0) {
                     break;
                 }
+                if (!received_reply) { received_reply = 1; core_trace_complete(1); }
                 if (write_all(cfd, tbuf, (size_t)n) != 0) {
                     break;
                 }
@@ -1039,6 +1050,7 @@ static void *client_worker_run(void *arg) {
                     break;
                 }
                 got_vless_response = 1;
+                core_trace_stage(CORE_TRACE_CARRY);
                 if (tls13_uses_h2(tls) && !tls13_has_pending_app(tls) && !vless_encryption_has_pending_input(encryption)) {
                     continue;
                 }
@@ -1059,6 +1071,7 @@ static void *client_worker_run(void *arg) {
 
             if (use_vision) {
                 if (allow_raw_vision && tls13_reality_is_raw_direct(tls)) {
+                    if (!received_reply) { received_reply = 1; core_trace_complete(1); }
                     if (write_all(cfd, tbuf, got) != 0) {
                         break;
                     }
@@ -1077,6 +1090,7 @@ static void *client_worker_run(void *arg) {
                     break;
                 }
 
+                if (plain_len > 0 && !received_reply) { received_reply = 1; core_trace_complete(1); }
                 if (plain_len > 0 && write_all(cfd, plain, plain_len) != 0) {
                     free(plain);
                     break;
@@ -1092,6 +1106,7 @@ static void *client_worker_run(void *arg) {
                     }
                 }
             } else {
+                if (!received_reply) { received_reply = 1; core_trace_complete(1); }
                 if (write_all(cfd, tbuf, got) != 0) {
                     break;
                 }
@@ -1109,7 +1124,13 @@ static void *client_worker_run(void *arg) {
 }
 
 static void *client_worker(void *arg) {
+    core_connection_trace_t trace;
+    int attached = core_trace_attach(&trace) == 0;
     void *result = client_worker_run(arg);
+    if (attached) {
+        core_trace_complete(0);
+        core_trace_detach();
+    }
     release_client_slot();
     return result;
 }

@@ -9,6 +9,35 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def wait_for_probe(self, core, stage):
+        deadline = time.monotonic()+2
+        while f"success=0 stage={stage} " not in core.log and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn(f"success=0 stage={stage} ",core.log)
+        self.assertIsNone(core.process.poll(),core.log)
+
+    def test_connection_failure_stage_reports(self):
+        for config, stage in (("socks5://no-dns.invalid:1080","dns"),(uri(fixtures.port()),"tcp")):
+            with self.subTest(stage=stage), cli(config) as core:
+                with self.assertRaises(AssertionError):
+                    socks_connect(core.port,8080)
+                self.wait_for_probe(core,stage)
+        def alert(connection):
+            connection.sendall(b"\x15\x03\x03\x00\x02\x02\x28")
+        with Server(alert) as upstream, cli(uri(upstream.port,security="tls")) as core:
+            with self.assertRaises(AssertionError):
+                socks_connect(core.port,8080)
+            self.wait_for_probe(core,"transport")
+        for stage in ("protocol","carry"):
+            def reject(connection):
+                exact(connection,26)
+                if stage == "carry": connection.sendall(b"\x00\x00")
+            with self.subTest(stage=stage), Server(reject) as upstream, cli(uri(upstream.port)) as core:
+                with socks_connect(core.port,8080) as tunnel:
+                    tunnel.sendall(b"vless-core probe")
+                    self.assertEqual(tunnel.recv(64),b"")
+                self.wait_for_probe(core,stage)
+
     def test_aborted_clients_keep_existing_and_new_connections_alive(self):
         greeting = b"\x05\x01\x00"
         request = b"\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\x90"

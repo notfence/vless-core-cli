@@ -2,6 +2,7 @@
 
 #include "server_ips.h"
 #include "socket_util.h"
+#include "connection_trace.h"
 #include "socks5_upstream.h"
 
 #include <arpa/inet.h>
@@ -89,7 +90,7 @@ static int connect_tcp_host(const char *host, uint16_t port, char *err, size_t e
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo *res = NULL;
-    int gai = getaddrinfo(host, port_str, &hints, &res);
+    int gai = core_getaddrinfo(host, port_str, &hints, &res);
     if (gai != 0) {
         set_errf(err, err_cap, "SOCKS5 resolve failed for %s:%u: %s", host, (unsigned)port, gai_strerror(gai));
         return -1;
@@ -277,6 +278,7 @@ int socks5_upstream_connect(const vless_config_t *cfg, const char *target_host, 
         return -1;
     }
 
+    core_trace_stage(CORE_TRACE_PROTOCOL);
     if (socks5_authenticate(fd, cfg, err, err_cap) != 0) {
         close(fd);
         return -1;
@@ -286,5 +288,6 @@ int socks5_upstream_connect(const vless_config_t *cfg, const char *target_host, 
         close(fd);
         return -1;
     }
+    core_trace_stage(CORE_TRACE_CARRY);
     return fd;
 }

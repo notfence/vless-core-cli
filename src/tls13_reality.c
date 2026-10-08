@@ -6,6 +6,7 @@
 #include "core_log.h"
 #include "server_ips.h"
 #include "socket_util.h"
+#include "connection_trace.h"
 #include "tls13_reality.h"
 
 #include <arpa/inet.h>
@@ -484,7 +485,7 @@ static int tcp_connect_host(const char *host, uint16_t port) {
     hints.ai_family = AF_UNSPEC;
 
     struct addrinfo *res = NULL;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+    if (core_getaddrinfo(host, port_str, &hints, &res) != 0) {
         return -1;
     }
 
@@ -2440,10 +2441,12 @@ static int h2_finish_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id,
                              size_t err_cap) {
     int status = h2_decode_status_header(block, len);
     if (status < 0) {
+        core_trace_failure(CORE_TRACE_TRANSPORT);
         set_err(err, err_cap, "invalid h2 header block");
         return -1;
     }
     if (status != 0 && status != 200) {
+        core_trace_failure(CORE_TRACE_TRANSPORT);
         if (err != NULL && err_cap > 0) {
             snprintf(err, err_cap, "%s h2 stream %u returned non-200: %d", c->grpc_transport ? "grpc" : "xhttp",
                      (unsigned)stream_id, status);
@@ -2883,6 +2886,7 @@ static int h2_pump_one_frame(tls13_conn_t *c) {
         }
     } else {
         rc = h2_process_control_frame(c, type, flags, stream_id, payload, payload_len, err, sizeof(err));
+        if (rc != 0) core_trace_failure(CORE_TRACE_TRANSPORT);
         if (rc != 0 && err[0] != '\0') {
             vc_log_error(c->grpc_transport ? "grpc" : "xhttp", "%s", err);
         }
@@ -5987,7 +5991,7 @@ static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *
     hints.ai_family = AF_UNSPEC;
 
     struct addrinfo *addresses = NULL;
-    if (getaddrinfo(cfg->server_host, port_text, &hints, &addresses) != 0) {
+    if (core_getaddrinfo(cfg->server_host, port_text, &hints, &addresses) != 0) {
         set_err(err, err_cap, "tcp resolve failed");
         return -1;
     }

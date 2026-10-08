@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200112L
 
 #include "socket_util.h"
+#include "connection_trace.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -28,7 +29,7 @@ void core_set_socket_io_timeout(int fd, int timeout_ms) {
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-int core_connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t addr_len, int timeout_ms) {
+static int connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t addr_len, int timeout_ms) {
     if (timeout_ms <= 0) {
         return connect(fd, addr, addr_len);
     }
@@ -87,4 +88,18 @@ int core_connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t add
 
     (void)fcntl(fd, F_SETFL, flags);
     return 0;
+}
+
+int core_connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t addr_len, int timeout_ms) {
+    core_trace_stage(CORE_TRACE_TCP);
+    int result = connect_with_timeout(fd, addr, addr_len, timeout_ms);
+    if (result == 0) core_trace_stage(CORE_TRACE_TRANSPORT);
+    return result;
+}
+
+int core_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **addresses) {
+    core_trace_stage(CORE_TRACE_DNS);
+    int result = getaddrinfo(host, service, hints, addresses);
+    if (result == 0) core_trace_stage(CORE_TRACE_TCP);
+    return result;
 }
