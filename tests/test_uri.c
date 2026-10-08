@@ -107,6 +107,18 @@ int main(void) {
     CHECK("uri/socks-default", parse("socks5://127.0.0.1#vless-core") == 0 && config.protocol == CORE_PROTOCOL_SOCKS5 && config.server_port == 1080);
     CHECK("uri/socks-auth", parse("socks5://vless%2Dcore:p%40ss@[::1]:1081#vless-core") == 0 && strcmp(config.socks5_user, "vless-core") == 0 && strcmp(config.socks5_pass, "p@ss") == 0);
     CHECK("uri/extra", parse(PREFIX "type=xhttp&extra=%7B%22sessionPlacement%22%3A%22header%22%2C%22seqKey%22%3A%22X-vless-core%22%2C%22xPaddingBytes%22%3A%2210-20%22%2C%22scMaxEachPostBytes%22%3A%222000%22%7D") == 0 && strcmp(config.xhttp_session_placement, "header") == 0 && strcmp(config.xhttp_seq_key, "X-vless-core") == 0 && config.xhttp_padding_min == 10 && config.xhttp_padding_max == 20 && config.xhttp_max_each_post_min == 2000);
+    CHECK("uri/extra-invalid-json", parse(PREFIX "type=xhttp&extra=%7B%22sessionPlacement%22%3A%22header%22") != 0);
+    CHECK("uri/extra-nested-field-is-not-root", parse(PREFIX "type=xhttp&extra=%7B%22unknown%22%3A%7B%22sessionPlacement%22%3A%22header%22%7D%7D") == 0 && !strcmp(config.xhttp_session_placement,"path"));
+    CHECK("uri/extra-explicit-priority-before", parse(PREFIX "type=xhttp&x_padding_bytes=10-20&extra=%7B%22xPaddingBytes%22%3A%2230-40%22%7D") == 0 && config.xhttp_padding_min == 10 && config.xhttp_padding_max == 20);
+    CHECK("uri/extra-explicit-priority-after", parse(PREFIX "type=xhttp&extra=%7B%22xPaddingBytes%22%3A%2230-40%22%7D&x_padding_bytes=10-20") == 0 && config.xhttp_padding_min == 10 && config.xhttp_padding_max == 20);
+    CHECK("uri/extra-escaped-name", parse(PREFIX "type=xhttp&extra=%7B%22session%5Cu0050lacement%22%3A%22header%22%7D") == 0 && !strcmp(config.xhttp_session_placement,"header"));
+    CHECK("uri/extra-known-invalid-range", parse(PREFIX "type=xhttp&extra=%7B%22xPaddingBytes%22%3A%2210junk%22%7D") != 0);
+    CHECK("uri/extra-conflicting-aliases", parse(PREFIX "type=xhttp&extra=%7B%22sessionPlacement%22%3A%22header%22%2C%22sessionIDPlacement%22%3A%22cookie%22%7D") != 0);
+    CHECK("uri/extra-equal-aliases", parse(PREFIX "type=xhttp&extra=%7B%22sessionPlacement%22%3A%22header%22%2C%22sessionIDPlacement%22%3A%22header%22%7D") == 0);
+    CHECK("uri/extra-xmux-defaults", parse(PREFIX "type=xhttp&extra=%7B%22xmux%22%3A%7B%7D%7D") == 0 && config.xmux.present && config.xmux.max_connections.min == 6 && config.xmux.request_times.min == 600);
+    CHECK("uri/extra-xmux-absent", parse(PREFIX "type=xhttp") == 0 && !config.xmux.present);
+    CHECK("uri/extra-xmux-conflict", parse(PREFIX "type=xhttp&extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A2%2C%22maxConnections%22%3A2%7D%7D") != 0);
+    CHECK("uri/extra-xmux-types", parse(PREFIX "type=xhttp&extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A%222-5%22%2C%22cMaxReuseTimes%22%3A7%2C%22hKeepAlivePeriod%22%3A-1%7D%7D") == 0 && config.xmux.max_concurrency.min == 2 && config.xmux.max_concurrency.max == 5 && config.xmux.reuse_times.min == 7 && config.xmux.keep_alive_period == -1);
     const char *modes[] = {"native", "xorpub", "random"};
     const char *rtts[] = {"0rtt", "1rtt"};
     for (int m = 0; m < 3; m++) for (int r = 0; r < 2; r++) {

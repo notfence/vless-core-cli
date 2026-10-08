@@ -32,6 +32,13 @@ typedef struct {
     size_t key_len;
 } vless_encryption_relay_t;
 
+typedef struct { int min, max; } core_range_t;
+typedef struct {
+    int present;
+    core_range_t max_concurrency, max_connections, reuse_times, request_times, reusable_secs;
+    int keep_alive_period;
+} core_xmux_config_t;
+
 typedef struct {
     core_protocol_t protocol;
 
@@ -80,6 +87,7 @@ typedef struct {
     int xhttp_padding_max;
     int xhttp_max_each_post_min;
     int xhttp_max_each_post_max;
+    core_xmux_config_t xmux;
 
     int encryption_enabled;
     int encryption_xor_mode;

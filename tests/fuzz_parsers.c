@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "../src/tls13_reality.c"
 #include "uri.h"
+#include "json.h"
 #include "utils.h"
 #include "vision.h"
 
@@ -46,6 +47,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         text[size] = '\0';
         vless_config_t config;
         (void)parse_core_uri(text, &config, error, sizeof(error));
+        core_json_t *json = core_json_parse(text, error, sizeof(error));
+        core_json_free(json);
         uint8_t decoded[256];
         size_t length = 0, capacity = size ? data[0] : 0;
         (void)base64url_decode(text, decoded, capacity, &length);
