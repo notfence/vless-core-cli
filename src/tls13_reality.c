@@ -6,6 +6,7 @@
 #include "core_log.h"
 #include "server_ips.h"
 #include "socket_util.h"
+#include "deadline.h"
 #include "connection_trace.h"
 #include "tls13_reality.h"
 
@@ -421,7 +422,7 @@ static int write_exact(int fd, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t off = 0;
     while (off < len) {
-        ssize_t n = send(fd, p + off, len - off, 0);
+        ssize_t n = core_send(fd, p + off, len - off, 0);
         if (n <= 0) {
             return -1;
         }
@@ -434,7 +435,7 @@ static int read_exact(int fd, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     size_t off = 0;
     while (off < len) {
-        ssize_t n = recv(fd, p + off, len - off, 0);
+        ssize_t n = core_recv(fd, p + off, len - off, 0);
         if (n < 0 && errno == EINTR) {
             continue;
         }
@@ -537,11 +538,33 @@ static void set_connect_err(char *err, size_t err_cap, const char *prefix) {
     }
 }
 
+static int ssl_budget_call(SSL *ssl, void *buffer, int length, int operation) {
+    if (!core_deadline_active()) {
+        return operation == 0 ? SSL_connect(ssl) : operation == 1 ? SSL_read(ssl, buffer, length) : SSL_write(ssl, buffer, length);
+    }
+    int fd = SSL_get_fd(ssl), flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) return -1;
+    int result = -1;
+    for (;;) {
+        if (core_deadline_remaining() == 0) break;
+        result = operation == 0 ? SSL_connect(ssl) : operation == 1 ? SSL_read(ssl, buffer, length) : SSL_write(ssl, buffer, length);
+        if (result > 0) break;
+        int error = SSL_get_error(ssl, result);
+        if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) break;
+        int ready = core_wait_socket(fd, error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, -1);
+        if (ready <= 0) { if (ready == 0) errno = ETIMEDOUT; result = -1; break; }
+    }
+    int saved_errno = errno;
+    if (fcntl(fd, F_SETFL, flags) != 0) result = -1;
+    errno = saved_errno;
+    return result;
+}
+
 static int ssl_write_all(SSL *ssl, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t off = 0;
     while (off < len) {
-        int n = SSL_write(ssl, p + off, (int)(len - off));
+        int n = ssl_budget_call(ssl, (void *)(p + off), (int)(len - off), 2);
         if (n <= 0) {
             return -1;
         }
@@ -555,7 +578,7 @@ static int ssl_read_some(SSL *ssl, uint8_t *buf, size_t cap, size_t *out_len) {
     if (cap == 0) {
         return 0;
     }
-    int n = SSL_read(ssl, buf, (int)cap);
+    int n = ssl_budget_call(ssl, buf, (int)cap, 1);
     if (n <= 0) {
         return -1;
     }
@@ -568,7 +591,7 @@ static int fd_read_some(int fd, uint8_t *buf, size_t cap, size_t *out_len) {
     if (cap == 0) {
         return 0;
     }
-    ssize_t n = recv(fd, buf, cap, 0);
+    ssize_t n = core_recv(fd, buf, cap, 0);
     if (n <= 0) {
         return -1;
     }
@@ -1204,7 +1227,7 @@ static int open_tls_socket_once(const char *connect_host, uint16_t connect_port,
         return -1;
     }
     core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
-    if (SSL_connect(ssl) != 1) {
+    if (ssl_budget_call(ssl, NULL, 0, 0) != 1) {
         unsigned long e = ERR_get_error();
         *retry_with_aes = SSL_get_current_cipher(ssl) == NULL;
         long verify_rc = X509_V_OK;
@@ -1455,7 +1478,7 @@ static int ws_conn_read_some(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *
     if (c->ssl != NULL) {
         return ssl_read_some(c->ssl, buf, cap, out_len);
     }
-    ssize_t n = recv(c->fd, buf, cap, 0);
+    ssize_t n = core_recv(c->fd, buf, cap, 0);
     if (n <= 0) {
         return -1;
     }
@@ -1779,7 +1802,7 @@ static int xhttp_buffer_available(tls13_conn_t *c) {
         return ready < 0 && errno != EINTR ? -1 : 0;
     }
     uint8_t tmp[4096];
-    ssize_t n = recv(c->fd, tmp, sizeof(tmp), 0);
+    ssize_t n = core_recv(c->fd, tmp, sizeof(tmp), 0);
     if (n > 0) {
         return db_append(&c->xhttp_net_cache, tmp, (size_t)n);
     }
@@ -2226,6 +2249,7 @@ static int hpack_append_literal_new_name(dynbuf_t *b, const char *name, const ch
     }
     return 0;
 }
+
 
 static int h2_decode_int(const uint8_t *buf, size_t len, size_t *off, uint8_t prefix_bits, uint32_t *value) {
     if (*off >= len || prefix_bits == 0 || prefix_bits > 8) {
@@ -3474,7 +3498,7 @@ static int xhttp_conn_write_all(tls13_conn_t *c, const void *buf, size_t len) {
 static void *xhttp_plain_upload_reader(void *arg) {
     int fd = (int)(intptr_t)arg;
     uint8_t buf[4096];
-    while (recv(fd, buf, sizeof(buf), 0) > 0) {
+    while (core_recv(fd, buf, sizeof(buf), 0) > 0) {
     }
     return NULL;
 }
@@ -4658,7 +4682,7 @@ static int read_record(int fd, uint8_t *rtype, uint8_t **payload, size_t *payloa
     uint8_t hdr[5];
     size_t off = 0;
     while (off < sizeof(hdr)) {
-        ssize_t count = recv(fd, hdr + off, sizeof(hdr) - off, 0);
+        ssize_t count = core_recv(fd, hdr + off, sizeof(hdr) - off, 0);
         if (count < 0 && errno == EINTR) continue;
         if (count == 0 && off == 0) return 1;
         if (count <= 0) {

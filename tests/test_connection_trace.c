@@ -5,6 +5,7 @@
 
 static uint64_t ticks;
 static uint64_t fake_clock(void) { return ticks; }
+static void observed_stage(core_trace_stage_t stage, void *opaque) { *(core_trace_stage_t *)opaque=stage; errno=EIO; }
 
 static void *parallel_trace(void *opaque) {
     core_connection_trace_t *trace = opaque;
@@ -42,6 +43,19 @@ int main(void) {
     CHECK("trace/short-report-buffer", core_trace_format(&trace,text,2) < 0 && text[1] == '\0');
     CHECK("trace/null-report-rejected", core_trace_format(NULL,text,sizeof(text)) < 0 && core_trace_format(&trace,NULL,0) < 0);
     core_trace_detach();
+    core_trace_stage_t observed=CORE_TRACE_NONE;
+    core_connection_trace_t transferred;
+    REQUIRE("trace/transfer-attach", core_trace_attach(&trace) == 0);
+    core_trace_observe(observed_stage,&observed); errno=ENOTTY;
+    core_trace_stage(CORE_TRACE_DNS);
+    CHECK("trace/observer-phase-and-errno", observed == CORE_TRACE_DNS && errno == ENOTTY);
+    CHECK("trace/snapshot", core_trace_snapshot(&transferred) == 1 && transferred.id == trace.id);
+    core_trace_detach(); REQUIRE("trace/borrowed-copy-bind", core_trace_bind(&transferred) == 0);
+    core_trace_stage(CORE_TRACE_TRANSPORT); core_trace_detach();
+    REQUIRE("trace/original-bind", core_trace_bind(&trace) == 0);
+    core_trace_restore(&transferred);
+    CHECK("trace/transfer-preserves-identity-and-phase", trace.id == transferred.id && trace.stage == CORE_TRACE_TRANSPORT);
+    core_trace_observe(NULL,NULL); core_trace_detach();
     for (int stage = 0; stage < CORE_TRACE_STAGE_COUNT; stage++) {
         REQUIRE("trace/failure-attach", core_trace_attach(&trace) == 0);
         trace.now_ms = fake_clock;

@@ -1,4 +1,6 @@
 #include "socks5.h"
+#include "socket_util.h"
+#include "deadline.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -12,7 +14,7 @@ static int read_exact(int fd, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     size_t off = 0;
     while (off < len) {
-        ssize_t n = recv(fd, p + off, len - off, 0);
+        ssize_t n = core_recv(fd, p + off, len - off, 0);
         if (n <= 0) {
             return -1;
         }
@@ -25,7 +27,7 @@ static int write_exact(int fd, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t off = 0;
     while (off < len) {
-        ssize_t n = send(fd, p + off, len - off, 0);
+        ssize_t n = core_send(fd, p + off, len - off, 0);
         if (n <= 0) {
             return -1;
         }
@@ -36,7 +38,10 @@ static int write_exact(int fd, const void *buf, size_t len) {
 
 int socks5_send_failure(int fd, uint8_t rep) {
     uint8_t resp[10] = {0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
-    return write_exact(fd, resp, sizeof(resp));
+    core_deadline_pause();
+    int result = write_exact(fd, resp, sizeof(resp));
+    core_deadline_resume();
+    return result;
 }
 
 int socks5_send_success(int fd) {

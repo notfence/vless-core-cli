@@ -9,6 +9,35 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_absolute_socks_handshake_budget(self):
+        def slow(connection):
+            exact(connection, 3)
+            for byte in b"\x05\x00":
+                connection.sendall(bytes([byte])); time.sleep(0.05)
+            exact(connection, 10)
+            for byte in b"\x05\x00\x00\x01" + bytes(6):
+                connection.sendall(bytes([byte])); time.sleep(0.05)
+        with Server(slow) as upstream, cli(f"socks5://127.0.0.1:{upstream.port}", ["--connect-timeout-ms", "150"]) as core:
+            started = time.monotonic()
+            with self.assertRaises(AssertionError):
+                with socks_connect(core.port, 8080): pass
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.wait_for_probe(core, "protocol")
+
+    def test_invalid_connection_budget(self):
+        for value in ("0", "-1", "300001", "1ms", "", "999999999999999999999"):
+            with self.subTest(value=value):
+                result=self.invoke(["--uri","socks5://127.0.0.1:1","--listen-port","12345","--connect-timeout-ms",value])
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn("invalid connection timeout",result.stderr)
+        self.assertNotEqual(self.invoke(["--connect-timeout-ms"]).returncode,0)
+
+    def test_idle_direct_connection_has_no_establishment_timeout(self):
+        with Server() as target, cli("socks5://127.0.0.1:1",["--routing","1;direct;0","--connect-timeout-ms","100"]) as core:
+            with socks_connect(core.port,target.port) as tunnel:
+                time.sleep(0.2)
+                exchange(tunnel,b"vless-core idle connection remains usable")
+
     def wait_for_probe(self, core, stage):
         deadline = time.monotonic()+2
         while f"success=0 stage={stage} " not in core.log and time.monotonic() < deadline:

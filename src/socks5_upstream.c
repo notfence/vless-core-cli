@@ -30,7 +30,7 @@ static int read_exact(int fd, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     size_t off = 0;
     while (off < len) {
-        ssize_t n = recv(fd, p + off, len - off, 0);
+        ssize_t n = core_recv(fd, p + off, len - off, 0);
         if (n <= 0) {
             return -1;
         }
@@ -43,7 +43,7 @@ static int write_exact(int fd, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t off = 0;
     while (off < len) {
-        ssize_t n = send(fd, p + off, len - off, 0);
+        ssize_t n = core_send(fd, p + off, len - off, 0);
         if (n <= 0) {
             return -1;
         }

@@ -61,6 +61,32 @@ void core_trace_detach(void) {
     errno = saved_errno;
 }
 
+int core_trace_snapshot(core_connection_trace_t *trace) {
+    core_connection_trace_t *current=trace_current();
+    if (!current || !trace) return 0;
+    *trace=*current; return 1;
+}
+
+int core_trace_bind(core_connection_trace_t *trace) {
+    pthread_once(&trace_once,trace_key_init);
+    return trace_key_ready && trace && pthread_setspecific(trace_key,trace) == 0 ? 0 : -1;
+}
+
+void core_trace_restore(const core_connection_trace_t *trace) {
+    core_connection_trace_t *current=trace_current();
+    if (current && trace) {
+        void (*observer)(core_trace_stage_t,void *)=current->stage_observer;
+        void *context=current->observer_context;
+        *current=*trace; current->stage_observer=observer; current->observer_context=context;
+    }
+}
+
+void core_trace_observe(void (*observer)(core_trace_stage_t, void *), void *context) {
+    int saved=errno; core_connection_trace_t *trace=trace_current();
+    if (trace) { trace->stage_observer=observer; trace->observer_context=context; }
+    errno=saved;
+}
+
 static void trace_charge(core_connection_trace_t *trace, uint64_t now) {
     if (trace->started && trace->stage >= 0 && trace->stage < CORE_TRACE_STAGE_COUNT) {
         uint64_t elapsed = now >= trace->entered_ms ? now - trace->entered_ms : 0;
@@ -83,6 +109,7 @@ void core_trace_stage(core_trace_stage_t stage) {
         trace->stage = stage;
         trace->entered_ms = now;
         if (trace->durations[stage] < 0) trace->durations[stage] = 0;
+        if (trace->stage_observer) trace->stage_observer(stage,trace->observer_context);
     }
     errno = saved_errno;
 }
@@ -90,8 +117,10 @@ void core_trace_stage(core_trace_stage_t stage) {
 void core_trace_failure(core_trace_stage_t stage) {
     int saved_errno = errno;
     core_connection_trace_t *trace = trace_current();
-    if (trace && !trace->finished && stage >= 0 && stage < CORE_TRACE_STAGE_COUNT)
+    if (trace && !trace->finished && stage >= 0 && stage < CORE_TRACE_STAGE_COUNT) {
         trace->failed_stage = stage;
+        if (trace->stage_observer) trace->stage_observer(stage,trace->observer_context);
+    }
     errno = saved_errno;
 }
 

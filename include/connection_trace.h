@@ -22,12 +22,18 @@ typedef struct {
     core_trace_stage_t stage;
     core_trace_stage_t failed_stage;
     uint64_t (*now_ms)(void);
+    void (*stage_observer)(core_trace_stage_t, void *);
+    void *observer_context;
     int started;
     int finished;
     int success;
 } core_connection_trace_t;
 
 int core_trace_attach(core_connection_trace_t *trace);
+int core_trace_snapshot(core_connection_trace_t *trace);
+int core_trace_bind(core_connection_trace_t *trace);
+void core_trace_restore(const core_connection_trace_t *trace);
+void core_trace_observe(void (*observer)(core_trace_stage_t, void *), void *context);
 void core_trace_detach(void);
 void core_trace_stage(core_trace_stage_t stage);
 void core_trace_failure(core_trace_stage_t stage);

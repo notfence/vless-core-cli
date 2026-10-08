@@ -57,8 +57,14 @@ $(HOST_BUILD_DIR)/test_main: $(HOST_BUILD_DIR)/test_main.o $(BASE_OBJ) $(NETWORK
 $(HOST_BUILD_DIR)/test_tls: $(HOST_BUILD_DIR)/test_tls.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=write,--wrap=rename,--wrap=fsync
 
-$(HOST_BUILD_DIR)/test_socket: $(HOST_BUILD_DIR)/test_socket.o $(HOST_BUILD_DIR)/src/connection_trace.o $(HOST_BUILD_DIR)/src/core_log.o
+$(HOST_BUILD_DIR)/test_socket: $(HOST_BUILD_DIR)/test_socket.o $(HOST_BUILD_DIR)/src/connection_trace.o $(HOST_BUILD_DIR)/src/core_log.o $(HOST_BUILD_DIR)/src/deadline.o $(HOST_BUILD_DIR)/src/resolver.o
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=connect,--wrap=poll,--wrap=getsockopt
+
+$(HOST_BUILD_DIR)/routing_direct_lease_test: $(HOST_BUILD_DIR)/routing_direct_lease_test.o $(BASE_OBJ) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=core_connect_with_timeout
+
+$(HOST_BUILD_DIR)/test_resolver: $(HOST_BUILD_DIR)/test_resolver.o $(filter-out $(HOST_BUILD_DIR)/src/resolver.o,$(BASE_OBJ))
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=getaddrinfo
 
 $(HOST_BUILD_DIR)/test_encryption: $(HOST_BUILD_DIR)/test_encryption.o $(HOST_BUILD_DIR)/src/blake3.o
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS)

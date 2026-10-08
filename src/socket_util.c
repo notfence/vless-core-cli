@@ -5,6 +5,8 @@
 
 #include "socket_util.h"
 #include "connection_trace.h"
+#include "deadline.h"
+#include "resolver.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -32,6 +34,8 @@ uint64_t core_now_ms(void) {
 }
 
 int core_poll(struct pollfd *fds, nfds_t count, int timeout_ms) {
+    timeout_ms = core_deadline_limit(timeout_ms);
+    if (core_deadline_active() && core_deadline_remaining() == 0) return 0;
     uint64_t deadline = timeout_ms >= 0 ? core_now_ms() + (unsigned)timeout_ms : 0;
     int wait = timeout_ms;
     for (;;) {
@@ -49,6 +53,7 @@ int core_poll(struct pollfd *fds, nfds_t count, int timeout_ms) {
             uint64_t left = deadline - now;
             wait = left > INT_MAX ? INT_MAX : (int)left;
         }
+        wait = core_deadline_limit(wait);
     }
 }
 
@@ -56,6 +61,30 @@ int core_wait_socket(int fd, short events, int timeout_ms) {
     if (fd < 0) { errno = EBADF; return -1; }
     struct pollfd socket = {.fd = fd, .events = events};
     return core_poll(&socket, 1, timeout_ms);
+}
+
+ssize_t core_recv(int fd, void *buffer, size_t length, int flags) {
+    for (;;) {
+        int bounded = core_deadline_active();
+        if (bounded && core_deadline_remaining() == 0) return -1;
+        ssize_t result = recv(fd, buffer, length, flags | (bounded ? MSG_DONTWAIT : 0));
+        if (result >= 0 || (errno != EINTR && (!bounded || (errno != EAGAIN && errno != EWOULDBLOCK)))) return result;
+        if (errno == EINTR) continue;
+        int ready = core_wait_socket(fd, POLLIN, -1);
+        if (ready <= 0) { if (ready == 0) errno = ETIMEDOUT; return -1; }
+    }
+}
+
+ssize_t core_send(int fd, const void *buffer, size_t length, int flags) {
+    for (;;) {
+        int bounded = core_deadline_active();
+        if (bounded && core_deadline_remaining() == 0) return -1;
+        ssize_t result = send(fd, buffer, length, flags | (bounded ? MSG_DONTWAIT : 0));
+        if (result >= 0 || (errno != EINTR && (!bounded || (errno != EAGAIN && errno != EWOULDBLOCK)))) return result;
+        if (errno == EINTR) continue;
+        int ready = core_wait_socket(fd, POLLOUT, -1);
+        if (ready <= 0) { if (ready == 0) errno = ETIMEDOUT; return -1; }
+    }
 }
 
 void core_tune_tcp_socket(int fd) {
@@ -76,6 +105,8 @@ void core_set_socket_io_timeout(int fd, int timeout_ms) {
 }
 
 static int connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t addr_len, int timeout_ms) {
+    timeout_ms = core_deadline_limit(timeout_ms <= 0 ? -1 : timeout_ms);
+    if (timeout_ms == 0) { errno = ETIMEDOUT; return -1; }
     if (timeout_ms <= 0) {
         return connect(fd, addr, addr_len);
     }
@@ -94,7 +125,7 @@ static int connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t a
         (void)fcntl(fd, F_SETFL, flags);
         return 0;
     }
-    if (errno != EINPROGRESS) {
+    if (errno != EINPROGRESS && errno != EINTR) {
         int saved_errno = errno;
         (void)fcntl(fd, F_SETFL, flags);
         errno = saved_errno;
@@ -132,7 +163,12 @@ int core_connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t add
 
 int core_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **addresses) {
     core_trace_stage(CORE_TRACE_DNS);
-    int result = getaddrinfo(host, service, hints, addresses);
+    core_resolver_query_t *query = core_resolver_start(host, service, hints);
+    if (!query) { *addresses = NULL; return EAI_SYSTEM; }
+    int result = core_resolver_wait(query, addresses);
+    int saved_errno = errno;
+    core_resolver_release(query);
+    errno = saved_errno;
     if (result == 0) core_trace_stage(CORE_TRACE_TCP);
     return result;
 }

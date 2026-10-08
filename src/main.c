@@ -14,6 +14,8 @@
 
 #include "core_log.h"
 #include "connection_trace.h"
+#include "deadline.h"
+#include "resolver.h"
 #include "socks5.h"
 #include "socks5_upstream.h"
 #include "routing.h"
@@ -37,6 +39,7 @@
 static routing_config_t g_routing;
 static int g_route_control_port = 0;
 static const char *g_route_control_socket = NULL;
+static int g_connect_timeout_ms = 30000;
 static pthread_mutex_t g_client_count_mutex = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int g_active_client_count = 0;
 
@@ -87,11 +90,11 @@ static ssize_t read_with_timeout(int fd, uint8_t *buf, size_t cap, int timeout_m
     if (rc == 0) {
         return 0;
     }
-    return recv(fd, buf, cap, 0);
+    return core_recv(fd, buf, cap, 0);
 }
 
 static ssize_t recv_coalesced(int fd, uint8_t *buf, size_t cap, int wait_us) {
-    ssize_t first = recv(fd, buf, cap, 0);
+    ssize_t first = core_recv(fd, buf, cap, 0);
     if (first <= 0 || wait_us <= 0) {
         return first;
     }
@@ -103,7 +106,7 @@ static ssize_t recv_coalesced(int fd, uint8_t *buf, size_t cap, int wait_us) {
             break;
         }
 
-        ssize_t n = recv(fd, buf + total, cap - total, 0);
+        ssize_t n = core_recv(fd, buf + total, cap - total, 0);
         if (n <= 0) {
             break;
         }
@@ -163,7 +166,7 @@ static int tls_records_needed(const uint8_t *buf, size_t len, size_t *needed) {
     return 1;
 }
 
-static ssize_t read_initial_payload(int fd, uint8_t *buf, size_t cap) {
+static ssize_t read_initial_payload_impl(int fd, uint8_t *buf, size_t cap) {
     ssize_t n = read_with_timeout(fd, buf, cap, 500);
     if (n <= 0) {
         return n;
@@ -196,6 +199,13 @@ static ssize_t read_initial_payload(int fd, uint8_t *buf, size_t cap) {
     }
 
     return (ssize_t)len;
+}
+
+static ssize_t read_initial_payload(int fd, uint8_t *buf, size_t cap) {
+    core_deadline_pause();
+    ssize_t result = read_initial_payload_impl(fd, buf, cap);
+    core_deadline_resume();
+    return result;
 }
 
 static ssize_t read_sniff_payload(int fd, uint8_t *buf, size_t cap) {
@@ -449,7 +459,7 @@ static int sniff_domain(const uint8_t *buf, size_t len, char *out, size_t out_ca
 static int write_all(int fd, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
-        ssize_t n = send(fd, buf + off, len - off, 0);
+        ssize_t n = core_send(fd, buf + off, len - off, 0);
         if (n <= 0) {
             return -1;
         }
@@ -467,11 +477,11 @@ static void relay_tcp_pair(int fd_a, int fd_b) {
         int s = core_poll(fds, 2, -1);
         if (s <= 0) break;
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t n = recv(fd_a, buf, sizeof(buf), 0);
+            ssize_t n = core_recv(fd_a, buf, sizeof(buf), 0);
             if (n <= 0 || write_all(fd_b, buf, (size_t)n) != 0) break;
         }
         if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t n = recv(fd_b, buf, sizeof(buf), 0);
+            ssize_t n = core_recv(fd_b, buf, sizeof(buf), 0);
             if (n <= 0) break;
             if (!received_reply) { received_reply = 1; core_trace_complete(1); }
             if (write_all(fd_a, buf, (size_t)n) != 0) break;
@@ -557,6 +567,7 @@ static void *client_worker_run(void *arg) {
     }
 
     if (route == ROUTE_ACTION_DIRECT) {
+        core_deadline_begin(g_connect_timeout_ms);
         char direct_err[256] = {0};
         routing_direct_lease_t direct_lease;
         int direct_fd = routing_open_direct(target_host,
@@ -591,6 +602,7 @@ static void *client_worker_run(void *arg) {
             return NULL;
         }
         core_trace_stage(CORE_TRACE_CARRY);
+        core_deadline_end();
         relay_tcp_pair(cfd, direct_fd);
         if (routing_close_direct(direct_fd, g_route_control_port,
                                  g_route_control_socket, &direct_lease) != 0)
@@ -630,6 +642,7 @@ static void *client_worker_run(void *arg) {
                         target_host, (unsigned)target_port, upstream_target);
         }
 
+        core_deadline_begin(g_connect_timeout_ms);
         int upstream_fd = socks5_upstream_connect(&cfg, upstream_target, target_port, err, sizeof(err));
         if (upstream_fd < 0) {
             vc_log_error("socks5", "upstream connect failed for %s:%u via %s:%u: %s",
@@ -661,6 +674,7 @@ static void *client_worker_run(void *arg) {
                     cfg.server_host,
                     (unsigned)cfg.server_port,
                     (cfg.socks5_user[0] != '\0' ? "userpass" : "none"));
+        core_deadline_end();
         relay_tcp_pair(cfd, upstream_fd);
         close(upstream_fd);
         close(cfd);
@@ -669,6 +683,7 @@ static void *client_worker_run(void *arg) {
 
     char err[256] = {0};
     tls13_conn_t *tls = NULL;
+    core_deadline_begin(g_connect_timeout_ms);
     if (tls13_reality_connect(&cfg, &tls, err, sizeof(err)) != 0) {
         vc_log_error("connection", "upstream connect failed: %s", err);
         if (!socks_success_sent) {
@@ -891,6 +906,7 @@ static void *client_worker_run(void *arg) {
         close(cfd);
         return NULL;
     }
+    core_deadline_end();
     uint8_t tbuf[8192];
     int got_vless_response = 0;
     int received_reply = 0;
@@ -983,7 +999,7 @@ static void *client_worker_run(void *arg) {
 
         if (upstream_ready) {
             if (downstream_direct) {
-                ssize_t n = recv(tfd, tbuf, sizeof(tbuf), 0);
+                ssize_t n = core_recv(tfd, tbuf, sizeof(tbuf), 0);
                 if (n <= 0) {
                     break;
                 }
@@ -1079,6 +1095,12 @@ static void *client_worker_run(void *arg) {
 
 static void *client_worker(void *arg) {
     core_connection_trace_t trace;
+    core_deadline_t deadline;
+    if (core_deadline_attach(&deadline) != 0) {
+        client_ctx_t *ctx = arg;
+        close(ctx->client_fd); free(ctx); release_client_slot();
+        return NULL;
+    }
     int attached = core_trace_attach(&trace) == 0;
     void *result = client_worker_run(arg);
     if (attached) {
@@ -1086,6 +1108,7 @@ static void *client_worker(void *arg) {
         core_trace_detach();
     }
     release_client_slot();
+    core_deadline_detach();
     return result;
 }
 
@@ -1096,6 +1119,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --uri-fd <fd>            Read the URI from a file descriptor\n");
     fprintf(stderr, "  --connection-fd <fd>     Read URI and pre-resolved server IPs from a file descriptor\n");
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
+    fprintf(stderr, "  --connect-timeout-ms <n> Connection budget, 1-300000 ms (default 30000)\n");
     fprintf(stderr, "  --routing <rules>        Optional Proxy, Direct and Block rules\n");
     fprintf(stderr, "  --route-control-port <p> Direct-route controller port\n");
     fprintf(stderr, "  --route-control-socket <path> Direct-route controller Unix socket\n");
@@ -1200,6 +1224,7 @@ int main(int argc, char **argv) {
     int listen_port = 0;
 
     routing_config_init(&g_routing);
+    g_connect_timeout_ms = 30000;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--uri") == 0 && i + 1 < argc) {
             char *argument = argv[++i];
@@ -1258,6 +1283,16 @@ int main(int argc, char **argv) {
             uri_supplied = 1;
         } else if (strcmp(argv[i], "--listen-port") == 0 && i + 1 < argc) {
             listen_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--connect-timeout-ms") == 0) {
+            if (i + 1 >= argc) { vc_log_error("startup", "missing connection timeout"); return 1; }
+            char *end = NULL;
+            errno = 0;
+            const char *argument = argv[++i];
+            long timeout = strtol(argument, &end, 10);
+            if (errno || end == argument || *end || timeout < 1 || timeout > 300000) {
+                vc_log_error("startup", "invalid connection timeout (expected 1-300000 ms)"); return 1;
+            }
+            g_connect_timeout_ms = (int)timeout;
         } else if (strcmp(argv[i], "--routing") == 0 && i + 1 < argc) {
             routing_text = argv[++i];
         } else if (strcmp(argv[i], "--route-control-port") == 0 && i + 1 < argc) {
@@ -1366,6 +1401,10 @@ int main(int argc, char **argv) {
         vc_log_error("startup", "listen failed: %s", strerror(error_number));
         close(lfd);
         return 1;
+    }
+
+    if (core_resolver_init() != 0) {
+        vc_log_error("startup", "failed to start DNS workers"); close(lfd); return 1;
     }
 
     if (cfg.protocol == CORE_PROTOCOL_SOCKS5) {

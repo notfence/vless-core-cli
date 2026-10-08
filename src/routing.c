@@ -14,6 +14,8 @@
 #include <unistd.h>
 
 #include "socket_util.h"
+#include "deadline.h"
+#include "connection_trace.h"
 
 #define ROUTING_CONNECT_TIMEOUT_MS 10000
 #define ROUTING_CONTROL_TIMEOUT_MS 2000
@@ -390,7 +392,7 @@ const char *routing_action_name(route_action_t action) {
 static int write_all(int fd, const char *data, size_t len) {
     size_t offset = 0;
     while (offset < len) {
-        ssize_t n = send(fd, data + offset, len - offset, 0);
+        ssize_t n = core_send(fd, data + offset, len - offset, 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         offset += (size_t)n;
@@ -458,7 +460,7 @@ static int update_bypass(int control_port,
     char reply[64];
     size_t reply_length = 0;
     while (reply_length + 1 < sizeof(reply)) {
-        ssize_t n = recv(fd, reply + reply_length, sizeof(reply) - reply_length - 1, 0);
+        ssize_t n = core_recv(fd, reply + reply_length, sizeof(reply) - reply_length - 1, 0);
         if (n <= 0) break;
         reply_length += (size_t)n;
         if (memchr(reply, '\n', reply_length)) break;
@@ -471,6 +473,19 @@ static int update_bypass(int control_port,
         return 0;
     }
     return -1;
+}
+
+static int release_bypass(int control_port, const char *control_socket, const char *ip) {
+    core_deadline_scope_t scope;
+    core_connection_trace_t trace;
+    int traced=core_trace_snapshot(&trace),saved_errno=errno;
+    if (core_deadline_scope_begin(&scope,ROUTING_CONTROL_TIMEOUT_MS) != 0) return -1;
+    int result=update_bypass(control_port,control_socket,"ROUTE_DIRECT_REMOVE",ip,NULL);
+    int cleanup_errno=errno;
+    core_deadline_scope_end(&scope);
+    if (traced) core_trace_restore(&trace);
+    errno=result ? cleanup_errno : saved_errno;
+    return result;
 }
 
 int routing_open_direct(const char *host,
@@ -538,8 +553,7 @@ int routing_open_direct(const char *host,
                     if (hold_until_close) {
                         snprintf(lease->bypass_ip, sizeof(lease->bypass_ip), "%s", ip);
                     } else {
-                        (void)update_bypass(control_port, control_socket,
-                                            "ROUTE_DIRECT_REMOVE", ip, NULL);
+                        (void)release_bypass(control_port, control_socket, ip);
                     }
                 }
                 break;
@@ -551,8 +565,7 @@ int routing_open_direct(const char *host,
             last_errno = errno;
         }
         if (bypass_added) {
-            (void)update_bypass(control_port, control_socket,
-                                "ROUTE_DIRECT_REMOVE", ip, NULL);
+            (void)release_bypass(control_port, control_socket, ip);
         }
     }
     freeaddrinfo(result);
@@ -572,8 +585,7 @@ int routing_close_direct(int fd,
                          routing_direct_lease_t *lease) {
     if (fd >= 0) close(fd);
     if (lease == NULL || lease->bypass_ip[0] == '\0') return 0;
-    int result = update_bypass(control_port, control_socket,
-                               "ROUTE_DIRECT_REMOVE", lease->bypass_ip, NULL);
+    int result = release_bypass(control_port, control_socket, lease->bypass_ip);
     lease->bypass_ip[0] = '\0';
     return result;
 }
