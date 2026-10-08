@@ -24,6 +24,7 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
 static void fuzz_clear(tls13_conn_t *c) {
     db_free(&c->h2_net_cache);
     db_free(&c->h2_header_block);
+    core_hpack_clear(&c->hpack);
     db_free(&c->h2_send_buf);
     db_free(&c->app_cache);
     db_free(&c->grpc_recv_cache);
@@ -55,11 +56,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
     }
     case 1: {
-        (void)h2_decode_status_header(data, size);
+        (void)core_hpack_status(data, size);
+        core_hpack_decoder_t decoder = {0}; core_hpack_headers_t headers;
+        size_t split=size ? data[0] % size : 0;
+        (void)core_hpack_decode(&decoder,data,split,&headers);
+        (void)core_hpack_decode(&decoder,data+split,size-split,&headers);
+        core_hpack_clear(&decoder);
         char decoded[256];
         size_t length = 0, capacity = size ? data[0] : 0;
-        (void)h2_decode_huffman(data, size, decoded, capacity, &length);
-        (void)h2_decode_huffman(data, size, NULL, 0, &length);
+        (void)core_hpack_decode_huffman(data, size, decoded, capacity, &length);
+        (void)core_hpack_decode_huffman(data, size, NULL, 0, &length);
         break;
     }
     case 2: {

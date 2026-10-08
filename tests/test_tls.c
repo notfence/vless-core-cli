@@ -14,6 +14,7 @@ static void clear_conn(tls13_conn_t *c) {
     db_free(&c->h2_net_cache); db_free(&c->h2_send_buf); db_free(&c->app_cache); db_free(&c->grpc_recv_cache); db_free(&c->transcript);
     db_free(&c->ws_net_cache); db_free(&c->xhttp_net_cache);
     db_free(&c->h2_header_block);
+    core_hpack_clear(&c->hpack);
 }
 static void hpack_status_vectors(void) {
     static const struct { uint8_t data[5]; size_t size; int status; } cases[] = {
@@ -26,7 +27,7 @@ static void hpack_status_vectors(void) {
     tls13_conn_t connection = {0};
     char error[160];
     for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
-        CHECK("h2/huffman-status", h2_decode_status_header(cases[i].data,cases[i].size) == cases[i].status);
+        CHECK("h2/huffman-status", core_hpack_status(cases[i].data,cases[i].size) == cases[i].status);
         for (int grpc = 0; grpc <= 1; grpc++) {
             connection.grpc_transport = grpc;
             error[0] = 0;
@@ -39,27 +40,27 @@ static void hpack_status_vectors(void) {
         }
     }
     const uint8_t named[] = {0,0x85,0xb8,0x84,0x8d,0x36,0xa3,0x83,0x68,0x0c,0xff};
-    CHECK("h2/huffman-status-name", h2_decode_status_header(named,sizeof(named)) == 403);
+    CHECK("h2/huffman-status-name", core_hpack_status(named,sizeof(named)) == 403);
     uint8_t literal[] = {0x48,0x82,0x10,0x01};
     for (unsigned prefix = 0; prefix < 3; prefix++) {
         literal[0] = (const uint8_t[]){0x48,0x08,0x18}[prefix];
-        CHECK("h2/huffman-literal-representations", h2_decode_status_header(literal,sizeof(literal)) == 200);
+        CHECK("h2/huffman-literal-representations", core_hpack_status(literal,sizeof(literal)) == 200);
     }
     for (unsigned index = 8; index <= 14; index++) {
         literal[0] = 0x40 | index;
-        CHECK("h2/literal-static-status-names", h2_decode_status_header(literal,sizeof(literal)) == 200);
+        CHECK("h2/literal-static-status-names", core_hpack_status(literal,sizeof(literal)) == 200);
     }
     const uint8_t new_name[] = {0x40,0x85,0xb8,0x84,0x8d,0x36,0xa3,3,'2','0','0'};
-    CHECK("h2/huffman-indexed-new-name", h2_decode_status_header(new_name,sizeof(new_name)) == 200);
+    CHECK("h2/huffman-indexed-new-name", core_hpack_status(new_name,sizeof(new_name)) == 200);
     const uint8_t rfc[] = {
         0x48,0x82,0x64,0x02,0x58,0x85,0xae,0xc3,0x77,0x1a,0x4b,0x61,0x96,0xd0,0x7a,0xbe,
         0x94,0x10,0x54,0xd4,0x44,0xa8,0x20,0x05,0x95,0x04,0x0b,0x81,0x66,0xe0,0x82,0xa6,
         0x2d,0x1b,0xff,0x6e,0x91,0x9d,0x29,0xad,0x17,0x18,0x63,0xc7,0x8f,0x0b,0x97,0xc8,
         0xe9,0xae,0x82,0xae,0x43,0xd3,
     };
-    CHECK("h2/rfc7541-response", h2_decode_status_header(rfc,sizeof(rfc)) == 302);
+    CHECK("h2/rfc7541-response", core_hpack_status(rfc,sizeof(rfc)) == 302);
     for (size_t cut = 1; cut < sizeof(cases[2].data); cut++) {
-        CHECK("h2/huffman-truncated-status", h2_decode_status_header(cases[2].data,cut) < 0);
+        CHECK("h2/huffman-truncated-status", core_hpack_status(cases[2].data,cut) < 0);
     }
     static const struct { uint8_t data[10]; size_t size; } malformed[] = {
         {{0x48,0x81,0xff},3},
@@ -76,21 +77,26 @@ static void hpack_status_vectors(void) {
         {{0xff,0xff,0xff,0xff,0xff,0x10},6},
     };
     for (size_t i = 0; i < sizeof(malformed)/sizeof(malformed[0]); i++) {
-        CHECK("h2/malformed-status-block", h2_decode_status_header(malformed[i].data,malformed[i].size) < 0);
+        CHECK("h2/malformed-status-block", core_hpack_status(malformed[i].data,malformed[i].size) < 0);
         error[0] = 0;
         CHECK("h2/malformed-header-diagnostic", h2_process_headers(&connection,H2_FLAG_END_HEADERS,1,malformed[i].data,malformed[i].size,error,sizeof(error)) < 0 && strstr(error,"invalid h2 header block") != NULL);
     }
     const uint8_t trailer[] = {0,11,'g','r','p','c','-','s','t','a','t','u','s',1,'0'};
-    CHECK("h2/statusless-trailers", h2_decode_status_header(trailer,sizeof(trailer)) == 0 && h2_process_headers(&connection,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,trailer,sizeof(trailer),error,sizeof(error)) == 0);
+    CHECK("h2/statusless-trailers", core_hpack_status(trailer,sizeof(trailer)) == 0 && h2_process_headers(&connection,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,trailer,sizeof(trailer),error,sizeof(error)) == 0);
     const uint8_t long_name[] = {0,8,':','s','t','a','t','u','s','x',4,'2','0','0','0'};
-    CHECK("h2/status-name-not-truncated", h2_decode_status_header(long_name,sizeof(long_name)) == 0);
+    CHECK("h2/status-name-not-truncated", core_hpack_status(long_name,sizeof(long_name)) == 0);
     uint8_t wrapped[16] = {2,0,0,0,0,0};
     memcpy(wrapped+6,cases[2].data,cases[2].size);
     CHECK("h2/padded-priority-huffman-status", h2_process_headers(&connection,H2_FLAG_END_HEADERS|H2_FLAG_PADDED|H2_FLAG_PRIORITY,1,wrapped,6+cases[2].size+2,error,sizeof(error)) < 0 && strstr(error,"non-200: 403") != NULL);
     const uint8_t maximum[] = {0xff,0x80,0xff,0xff,0xff,0x0f}; size_t off = 0; uint32_t value = 0;
-    CHECK("h2/integer-uint32-maximum", h2_decode_int(maximum,sizeof(maximum),&off,7,&value) == 0 && value == UINT32_MAX && off == sizeof(maximum));
+    CHECK("h2/integer-uint32-maximum", core_hpack_decode_int(maximum,sizeof(maximum),&off,7,&value) == 0 && value == UINT32_MAX && off == sizeof(maximum));
+    clear_conn(&connection);
 }
 static void hpack_huffman_vectors(void) {
+    const uint8_t missing_dynamic[] = {0xbe};
+    CHECK("h2/missing-dynamic-index", core_hpack_status(missing_dynamic, sizeof(missing_dynamic)) < 0);
+    const uint8_t oversized_table[] = {0x3f,0xe2,0x1f};
+    CHECK("h2/oversized-dynamic-table", core_hpack_status(oversized_table, sizeof(oversized_table)) < 0);
     const uint8_t alphabet[] = {
         0xff,0xc7,0xff,0xfd,0x8f,0xff,0xff,0xe2,0xff,0xff,0xfe,0x3f,0xff,0xff,0xe4,0xff,
         0xff,0xfe,0x5f,0xff,0xff,0xe6,0xff,0xff,0xfe,0x7f,0xff,0xff,0xe8,0xff,0xff,0xea,
@@ -131,15 +137,15 @@ static void hpack_huffman_vectors(void) {
         0xff,0xff,0xf0,0xff,0xff,0xfb,0xbf,
     };
     char output[258]; size_t length = 0;
-    CHECK("h2/huffman-full-alphabet", h2_decode_huffman(alphabet,sizeof(alphabet),output,257,&length) == 0 && length == 256 && output[256] == 0);
+    CHECK("h2/huffman-full-alphabet", core_hpack_decode_huffman(alphabet,sizeof(alphabet),output,257,&length) == 0 && length == 256 && output[256] == 0);
     for (unsigned i = 0; i < 256; i++) CHECK("h2/huffman-symbol-integrity", (uint8_t)output[i] == i);
     for (size_t cap = 0; cap <= 257; cap++) {
         memset(output,0x55,sizeof(output));
-        CHECK("h2/huffman-bounded-output", h2_decode_huffman(alphabet,sizeof(alphabet),output,cap,&length) == 0 && length == 256 && output[cap] == 0x55 && (cap == 0 || output[cap-1] == 0));
+        CHECK("h2/huffman-bounded-output", core_hpack_decode_huffman(alphabet,sizeof(alphabet),output,cap,&length) == 0 && length == 256 && output[cap] == 0x55 && (cap == 0 || output[cap-1] == 0));
     }
-    CHECK("h2/huffman-skip-output", h2_decode_huffman(alphabet,sizeof(alphabet),NULL,0,&length) == 0 && length == 256);
+    CHECK("h2/huffman-skip-output", core_hpack_decode_huffman(alphabet,sizeof(alphabet),NULL,0,&length) == 0 && length == 256);
     uint8_t repeated[320] = {0};
-    CHECK("h2/huffman-expands", h2_decode_huffman(repeated,sizeof(repeated),output,33,&length) == 0 && length == 512 && output[32] == 0);
+    CHECK("h2/huffman-expands", core_hpack_decode_huffman(repeated,sizeof(repeated),output,33,&length) == 0 && length == 512 && output[32] == 0);
     for (unsigned i = 0; i < 32; i++) CHECK("h2/huffman-expanded-prefix", output[i] == '0');
 }
 static void hpack_continuation_vectors(void) {
@@ -166,10 +172,31 @@ static void hpack_continuation_vectors(void) {
     CHECK("h2/multipart-middle", h2_process_control_frame(&c,H2_FRAME_CONTINUATION,0,1,success+1,1,error,sizeof(error)) == 0 && !c.h2_stream_eof);
     CHECK("h2/multipart-end", h2_process_control_frame(&c,H2_FRAME_CONTINUATION,H2_FLAG_END_HEADERS,1,success+2,2,error,sizeof(error)) == 0 && c.h2_stream_eof);
     c.h2_stream_eof = 0;
-    CHECK("h2/next-header-block", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success),error,sizeof(error)) == 0);
+    CHECK("h2/next-header-block", h2_process_headers(&c,H2_FLAG_END_HEADERS,3,success,sizeof(success),error,sizeof(error)) == 0);
     REQUIRE("h2/oversized-header-start", h2_process_headers(&c,0,1,success,1,error,sizeof(error)) == 0);
     c.h2_header_block.len = H2_MAX_INBOUND_FRAME;
     CHECK("h2/oversized-continuation-rejected", h2_process_control_frame(&c,H2_FRAME_CONTINUATION,H2_FLAG_END_HEADERS,1,success,1,error,sizeof(error)) < 0 && strstr(error,"too large") != NULL);
+    clear_conn(&c);
+}
+static void hpack_response_phases(void) {
+    tls13_conn_t c = {.h2_stream_id=1,.grpc_transport=1}; char error[160];
+    const uint8_t interim[] = {0x48,3,'1','0','3'}, success[] = {0x88};
+    const uint8_t upgrade[] = {0x48,3,'1','0','1'};
+    CHECK("h2/protocol-upgrade-status-rejected",h2_process_headers(&c,H2_FLAG_END_HEADERS,1,upgrade,sizeof(upgrade),error,sizeof(error)) != 0);
+    core_hpack_clear(&c.hpack);
+    const uint8_t trailer[] = {0x40,11,'g','r','p','c','-','s','t','a','t','u','s',1,'0'};
+    CHECK("h2/informational-response", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,interim,sizeof(interim),error,sizeof(error)) == 0 && !c.h2_headers_received && !c.h2_stream_eof);
+    CHECK("h2/informational-end-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,interim,sizeof(interim),error,sizeof(error)) != 0);
+    CHECK("h2/initial-response", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success),error,sizeof(error)) == 0 && c.h2_headers_received);
+    CHECK("h2/repeated-initial-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success),error,sizeof(error)) != 0);
+    CHECK("h2/late-informational-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,interim,sizeof(interim),error,sizeof(error)) != 0);
+    CHECK("h2/nonfinal-trailer-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,trailer,sizeof(trailer),error,sizeof(error)) != 0);
+    CHECK("h2/grpc-trailer-completes", h2_process_headers(&c,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,trailer,sizeof(trailer),error,sizeof(error)) == 0 && c.h2_stream_eof);
+    clear_conn(&c); c.h2_headers_received=0; c.h2_stream_eof=0;
+    CHECK("h2/trailer-before-response-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,trailer,sizeof(trailer),error,sizeof(error)) != 0);
+    CHECK("h2/new-stream-response", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success),error,sizeof(error)) == 0);
+    const uint8_t failed[] = {0x7e,2,'1','3'};
+    CHECK("h2/grpc-error-trailer", h2_process_headers(&c,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,failed,sizeof(failed),error,sizeof(error)) != 0 && strstr(error,"grpc-status=13"));
     clear_conn(&c);
 }
 static void wait_tls_fixture(tls13_conn_t *c) {
@@ -419,6 +446,7 @@ int main(int argc, char **argv) {
     hpack_status_vectors();
     hpack_huffman_vectors();
     hpack_continuation_vectors();
+    hpack_response_phases();
     protocol_edges();
     unsetenv("VLESS_TLS_MODE"); unsetenv("VLESS_XHTTP_TLS_MODE"); CHECK("tls/default-strict", get_tls_verify_mode() == TLS_VERIFY_MODE_STRICT);
     setenv("VLESS_XHTTP_TLS_MODE", "tofu", 1); CHECK("tls/legacy-tofu", get_tls_verify_mode() == TLS_VERIFY_MODE_TOFU);
@@ -459,14 +487,14 @@ int main(int argc, char **argv) {
     const uint8_t plain_status[] = {0x08,3,'2','0','0'};
     const uint8_t named_status[] = {0,7,':','s','t','a','t','u','s',3,'2','0','4'};
     const uint8_t extra_header[] = {0x40,3,'f','o','o',3,'b','a','r',0x88};
-    CHECK("h2/literal-indexed-status", h2_decode_status_header(literal_status,sizeof(literal_status)) == 200);
-    CHECK("h2/literal-plain-status", h2_decode_status_header(plain_status,sizeof(plain_status)) == 200);
-    CHECK("h2/literal-named-status", h2_decode_status_header(named_status,sizeof(named_status)) == 204);
-    CHECK("h2/unknown-header-skipped", h2_decode_status_header(extra_header,sizeof(extra_header)) == 200);
-    for (size_t cut = 0; cut < sizeof(literal_status); cut++) CHECK("h2/truncated-literal-status", cut == 0 ? h2_decode_status_header(literal_status,cut) == 0 : h2_decode_status_header(literal_status,cut) < 0);
-    for (size_t cut = 0; cut < sizeof(extra_header); cut++) CHECK("h2/truncated-unknown-header", cut == 0 || cut == sizeof(extra_header)-1 ? h2_decode_status_header(extra_header,cut) == 0 : h2_decode_status_header(extra_header,cut) < 0);
+    CHECK("h2/literal-indexed-status", core_hpack_status(literal_status,sizeof(literal_status)) == 200);
+    CHECK("h2/literal-plain-status", core_hpack_status(plain_status,sizeof(plain_status)) == 200);
+    CHECK("h2/literal-named-status", core_hpack_status(named_status,sizeof(named_status)) == 204);
+    CHECK("h2/unknown-header-skipped", core_hpack_status(extra_header,sizeof(extra_header)) == 200);
+    for (size_t cut = 0; cut < sizeof(literal_status); cut++) CHECK("h2/truncated-literal-status", cut == 0 ? core_hpack_status(literal_status,cut) == 0 : core_hpack_status(literal_status,cut) < 0);
+    for (size_t cut = 0; cut < sizeof(extra_header); cut++) CHECK("h2/truncated-unknown-header", cut == 0 || cut == sizeof(extra_header)-1 ? core_hpack_status(extra_header,cut) == 0 : core_hpack_status(extra_header,cut) < 0);
     const uint8_t huffman_status[] = {0x48,0x81,0xff};
-    CHECK("h2/invalid-huffman-padding", h2_decode_status_header(huffman_status,sizeof(huffman_status)) < 0);
+    CHECK("h2/invalid-huffman-padding", core_hpack_status(huffman_status,sizeof(huffman_status)) < 0);
     errno = 0; set_connect_err(error,sizeof(error),"vless-core"); CHECK("tls/connect-error-without-errno", strcmp(error,"vless-core") == 0);
     errno = ECONNREFUSED; set_connect_err(error,sizeof(error),"vless-core"); CHECK("tls/connect-error-with-errno", strstr(error,strerror(ECONNREFUSED)) != NULL);
     set_connect_err(NULL,0,"vless-core");

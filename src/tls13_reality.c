@@ -7,6 +7,7 @@
 #include "server_ips.h"
 #include "socket_util.h"
 #include "deadline.h"
+#include "hpack.h"
 #include "connection_trace.h"
 #include "tls13_reality.h"
 
@@ -129,6 +130,7 @@ static pthread_mutex_t g_tls_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_tls_cipher_logged = 0;
 
 struct tls13_conn {
+    core_hpack_decoder_t hpack;
     int fd;
     conn_mode_t mode;
     int xhttp_upload_fd;
@@ -226,6 +228,7 @@ struct tls13_conn {
     uint32_t h2_recv_conn_pending;
     uint32_t h2_recv_stream_pending;
     int h2_stream_eof;
+    int h2_headers_received;
     int h2_request_cancelled;
 };
 
@@ -2251,205 +2254,21 @@ static int hpack_append_literal_new_name(dynbuf_t *b, const char *name, const ch
 }
 
 
-static int h2_decode_int(const uint8_t *buf, size_t len, size_t *off, uint8_t prefix_bits, uint32_t *value) {
-    if (*off >= len || prefix_bits == 0 || prefix_bits > 8) {
-        return -1;
-    }
-    uint8_t first = buf[*off];
-    (*off)++;
-    uint32_t mask = (1U << prefix_bits) - 1U;
-    uint32_t v = first & mask;
-    if (v != mask) {
-        *value = v;
-        return 0;
-    }
-
-    uint32_t m = 0;
-    for (;;) {
-        if (*off >= len || m > 28) {
-            return -1;
-        }
-        uint8_t b = buf[*off];
-        (*off)++;
-        if ((uint32_t)(b & 0x7F) > (UINT32_MAX - v) >> m) {
-            return -1;
-        }
-        v += (uint32_t)(b & 0x7F) << m;
-        if ((b & 0x80) == 0) {
-            *value = v;
-            return 0;
-        }
-        m += 7;
-    }
-}
-
-static int h2_decode_huffman(const uint8_t *buf, size_t len, char *out, size_t out_cap, size_t *out_len) {
-    static const uint8_t counts[31] = {
-        0,0,0,0,0,10,26,32,6,0,5,3,2,6,2,3,0,0,0,3,8,13,26,29,12,4,15,19,29,0,4,
-    };
-    static const uint16_t symbols[257] = {
-        48, 49, 50, 97, 99, 101, 105, 111, 115, 116, 32, 37, 45, 46, 47, 51,
-        52, 53, 54, 55, 56, 57, 61, 65, 95, 98, 100, 102, 103, 104, 108, 109,
-        110, 112, 114, 117, 58, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76,
-        77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 89, 106, 107, 113, 118,
-        119, 120, 121, 122, 38, 42, 44, 59, 88, 90, 33, 34, 40, 41, 63, 39,
-        43, 124, 35, 62, 0, 36, 64, 91, 93, 126, 94, 125, 60, 96, 123, 92,
-        195, 208, 128, 130, 131, 162, 184, 194, 224, 226, 153, 161, 167, 172, 176, 177,
-        179, 209, 216, 217, 227, 229, 230, 129, 132, 133, 134, 136, 146, 154, 156, 160,
-        163, 164, 169, 170, 173, 178, 181, 185, 186, 187, 189, 190, 196, 198, 228, 232,
-        233, 1, 135, 137, 138, 139, 140, 141, 143, 147, 149, 150, 151, 152, 155, 157,
-        158, 165, 166, 168, 174, 175, 180, 182, 183, 188, 191, 197, 231, 239, 9, 142,
-        144, 145, 148, 159, 171, 206, 215, 225, 236, 237, 199, 207, 234, 235, 192, 193,
-        200, 201, 202, 205, 210, 213, 218, 219, 238, 240, 242, 243, 255, 203, 204, 211,
-        212, 214, 221, 222, 223, 241, 244, 245, 246, 247, 248, 250, 251, 252, 253, 254,
-        2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20,
-        21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127, 220, 249, 10, 13, 22,
-        256,
-    };
-    uint32_t code = 0, first = 0;
-    size_t base = 0, written = 0;
-    unsigned bits = 0;
-    for (size_t i = 0; i < len; i++) {
-        for (int bit = 7; bit >= 0; bit--) {
-            code = (code << 1) | ((buf[i] >> bit) & 1U);
-            bits++;
-            if (code >= first && code - first < counts[bits]) {
-                uint16_t symbol = symbols[base + code - first];
-                if (symbol == 256) {
-                    return -1;
-                }
-                if (out_cap > 0 && written < out_cap - 1) {
-                    out[written] = (char)symbol;
-                }
-                written++;
-                code = first = 0;
-                bits = 0;
-                base = 0;
-            } else {
-                if (bits == 30) {
-                    return -1;
-                }
-                base += counts[bits];
-                first = (first + counts[bits]) << 1;
-            }
-        }
-    }
-    if (bits > 7 || code != (1U << bits) - 1U) {
-        return -1;
-    }
-    if (out_cap > 0) {
-        out[written < out_cap ? written : out_cap - 1] = '\0';
-    }
-    *out_len = written;
-    return 0;
-}
-
-static int h2_read_string(const uint8_t *buf, size_t len, size_t *off, char *out, size_t out_cap, size_t *out_len) {
-    if (*off >= len) {
-        return -1;
-    }
-    int huffman = (buf[*off] & 0x80) != 0;
-    uint32_t slen = 0;
-    if (h2_decode_int(buf, len, off, 7, &slen) != 0 || (size_t)slen > len - *off) {
-        return -1;
-    }
-    if (huffman) {
-        if (h2_decode_huffman(buf + *off, slen, out, out_cap, out_len) != 0) {
-            return -1;
-        }
-    } else {
-        if (out_cap > 0) {
-            size_t copy = slen < out_cap ? slen : out_cap - 1;
-            memcpy(out, buf + *off, copy);
-            out[copy] = '\0';
-        }
-        *out_len = slen;
-    }
-    *off += (size_t)slen;
-    return 0;
-}
-
-static int hpack_static_status(uint32_t index) {
-    switch (index) {
-    case 8:
-        return 200;
-    case 9:
-        return 204;
-    case 10:
-        return 206;
-    case 11:
-        return 304;
-    case 12:
-        return 400;
-    case 13:
-        return 404;
-    case 14:
-        return 500;
-    default:
-        return 0;
-    }
-}
-
-static int h2_decode_status_header(const uint8_t *block, size_t len) {
-    size_t off = 0;
-    int status = 0;
-    while (off < len) {
-        uint8_t first = block[off];
-        if ((first & 0x80) != 0) {
-            uint32_t index = 0;
-            if (h2_decode_int(block, len, &off, 7, &index) != 0 || index == 0) {
-                return -1;
-            }
-            int s = hpack_static_status(index);
-            if (s != 0) {
-                if (status != 0) {
-                    return -1;
-                }
-                status = s;
-            }
-        } else if ((first & 0xE0) == 0x20) {
-            uint32_t ignored = 0;
-            if (h2_decode_int(block, len, &off, 5, &ignored) != 0) {
-                return -1;
-            }
-        } else {
-            uint32_t name_index = 0;
-            if (h2_decode_int(block, len, &off, (first & 0x40) != 0 ? 6 : 4, &name_index) != 0) {
-                return -1;
-            }
-            int is_status = name_index >= 8 && name_index <= 14;
-            if (name_index == 0) {
-                char name[8];
-                size_t name_len = 0;
-                if (h2_read_string(block, len, &off, name, sizeof(name), &name_len) != 0 || name_len == 0) {
-                    return -1;
-                }
-                is_status = name_len == 7 && memcmp(name, ":status", 7) == 0;
-            }
-            char value[4];
-            size_t value_len = 0;
-            if (h2_read_string(block, len, &off, is_status ? value : NULL, is_status ? sizeof(value) : 0, &value_len) != 0) {
-                return -1;
-            }
-            if (is_status) {
-                if (status != 0 || value_len != 3 || value[0] < '1' || value[0] > '9' || value[1] < '0' || value[1] > '9' ||
-                    value[2] < '0' || value[2] > '9') {
-                    return -1;
-                }
-                status = (value[0] - '0') * 100 + (value[1] - '0') * 10 + value[2] - '0';
-            }
-        }
-    }
-    return status;
-}
-
 static int h2_finish_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id, const uint8_t *block, size_t len, char *err,
                              size_t err_cap) {
-    int status = h2_decode_status_header(block, len);
-    if (status < 0) {
+    core_hpack_headers_t headers;
+    if (core_hpack_decode(&c->hpack, block, len, &headers) != 0) {
         core_trace_failure(CORE_TRACE_TRANSPORT);
         set_err(err, err_cap, "invalid h2 header block");
         return -1;
+    }
+    int status = headers.status;
+    if (status == 101) { set_err(err,err_cap,"HTTP/2 does not support status 101"); return -1; }
+    if (status >= 100 && status < 200) {
+        if ((flags & H2_FLAG_END_STREAM) != 0 || (stream_id == c->h2_stream_id && c->h2_headers_received)) {
+            set_err(err, err_cap, "invalid h2 informational response"); return -1;
+        }
+        return 0;
     }
     if (status != 0 && status != 200) {
         core_trace_failure(CORE_TRACE_TRANSPORT);
@@ -2457,6 +2276,18 @@ static int h2_finish_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id,
             snprintf(err, err_cap, "%s h2 stream %u returned non-200: %d", c->grpc_transport ? "grpc" : "xhttp",
                      (unsigned)stream_id, status);
         }
+        return -1;
+    }
+    if (stream_id == c->h2_stream_id) {
+        if ((!c->h2_headers_received && status == 0) ||
+            (c->h2_headers_received && (status != 0 || !(flags & H2_FLAG_END_STREAM)))) {
+            set_err(err, err_cap, "invalid h2 response header order"); return -1;
+        }
+        if (status) c->h2_headers_received = 1;
+    }
+    if (c->grpc_transport && headers.has_grpc_status && headers.grpc_status != 0) {
+        core_trace_failure(CORE_TRACE_TRANSPORT);
+        if (err && err_cap) snprintf(err, err_cap, "grpc stream %u returned grpc-status=%d", (unsigned)stream_id, headers.grpc_status);
         return -1;
     }
     if (stream_id == c->h2_stream_id && (flags & H2_FLAG_END_STREAM) != 0) {
@@ -2658,13 +2489,15 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
         return -1;
     }
 
-    uint8_t settings[6] = {
+    uint8_t settings[18] = {
         0x00,
         0x04,
         (uint8_t)(H2_CLIENT_INITIAL_WINDOW >> 24),
         (uint8_t)(H2_CLIENT_INITIAL_WINDOW >> 16),
         (uint8_t)(H2_CLIENT_INITIAL_WINDOW >> 8),
         (uint8_t)H2_CLIENT_INITIAL_WINDOW,
+        0,1,0,0,0x10,0,
+        0,6,0,1,0,0,
     };
     if (h2_send_frame(c, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings)) != 0 ||
         h2_send_window_update(c, 0, H2_CONNECTION_WINDOW_INC) != 0) {
@@ -6479,6 +6312,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     if (c->fd >= 0) {
         close(c->fd);
     }
+    core_hpack_clear(&c->hpack);
     db_free(&c->xhttp_net_cache);
     db_free(&c->ws_net_cache);
     db_free(&c->h2_net_cache);
