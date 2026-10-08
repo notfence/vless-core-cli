@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "socket_util.h"
+#include "dialer.h"
 #include "deadline.h"
 #include "connection_trace.h"
 
@@ -506,6 +507,11 @@ int routing_open_direct(const char *host,
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     int control_enabled = route_control_enabled(control_port, control_socket);
+    if (!control_enabled) {
+        int fd = core_dial_host(host, port, 0, ROUTING_CONNECT_TIMEOUT_MS);
+        if (fd < 0) set_err(err, err_cap, "direct DNS or TCP connection failed");
+        return fd;
+    }
     hints.ai_family = control_enabled ? AF_INET : AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 

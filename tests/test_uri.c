@@ -128,12 +128,13 @@ int main(void) {
     CHECK("server-ips/order-deduplicate", core_set_server_ips(" 127.0.0.2 ,127.0.0.1,127.0.0.2\t") == 0 && core_server_ip_count() == 2);
     struct in_addr ip; inet_pton(AF_INET, "127.0.0.2", &ip);
     CHECK("server-ips/first", core_server_ip_at(0)->s_addr == ip.s_addr && core_server_ip_at(2) == NULL);
-    const char *bad_ips[] = {"", "127.0.0.1,", ",127.0.0.1", "127.0.0.1,,127.0.0.2", "host", "::1", "999.0.0.1", "127.0.0.1\n"};
+    const char *bad_ips[] = {"", "127.0.0.1,", ",127.0.0.1", "127.0.0.1,,127.0.0.2", "host", "[::1]", "999.0.0.1", "127.0.0.1\n"};
     for (size_t i = 0; i < sizeof(bad_ips) / sizeof(*bad_ips); i++) CHECK("server-ips/reject-atomic", core_set_server_ips(bad_ips[i]) != 0 && core_server_ip_count() == 2);
     char maximum_ips[1024] = "";
     for (int i = 0; i < 64; i++) { char value[32]; snprintf(value, sizeof(value), "%s127.0.0.%d", i ? "," : "", i+1); strcat(maximum_ips,value); }
     CHECK("server-ips/maximum", core_set_server_ips(maximum_ips) == 0 && core_server_ip_count() == 64);
     strcat(maximum_ips, ",127.0.0.65"); CHECK("server-ips/overflow-atomic", core_set_server_ips(maximum_ips) != 0 && core_server_ip_count() == 64);
+    CHECK("server-ips/ipv6-mixed-deduplicate", core_set_server_ips("::1,127.0.0.1,0:0:0:0:0:0:0:1") == 0 && core_server_ip_count() == 2);
     uint8_t bytes[32]; size_t length = 0; char decoded[64];
     CHECK("utils/uuid", parse_uuid("00000000-0000-0000-0000-000000000001", bytes) == 0 && bytes[15] == 1);
     CHECK("utils/hex", hex_to_bytes("00ff10", bytes, sizeof(bytes), &length) == 0 && length == 3 && bytes[1] == 255);

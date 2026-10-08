@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200112L
 
 #include "server_ips.h"
+#include "dialer.h"
 #include "socket_util.h"
 #include "connection_trace.h"
 #include "socks5_upstream.h"
@@ -53,73 +54,10 @@ static int write_exact(int fd, const void *buf, size_t len) {
 }
 
 static int connect_tcp_host(const char *host, uint16_t port, char *err, size_t err_cap) {
-    if (core_server_ip_count() > 0) {
-        int saved_errno = 0;
-        for (size_t i = 0; i < core_server_ip_count(); i++) {
-            struct sockaddr_in address;
-            memset(&address, 0, sizeof(address));
-            address.sin_family = AF_INET;
-            address.sin_port = htons(port);
-            address.sin_addr = *core_server_ip_at(i);
-
-            int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (fd < 0) {
-                saved_errno = errno;
-                continue;
-            }
-            core_tune_tcp_socket(fd);
-            core_set_socket_io_timeout(fd, SOCKS5_UPSTREAM_TIMEOUT_MS);
-            if (core_connect_with_timeout(fd, (const struct sockaddr *)&address, sizeof(address),
-                                          SOCKS5_UPSTREAM_TIMEOUT_MS) == 0) {
-                return fd;
-            }
-            saved_errno = errno;
-            close(fd);
-        }
-        set_errf(err, err_cap, "SOCKS5 TCP connect failed for %s:%u: errno=%d",
-                 host, (unsigned)port, saved_errno);
-        return -1;
-    }
-
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
-
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    struct addrinfo *res = NULL;
-    int gai = core_getaddrinfo(host, port_str, &hints, &res);
-    if (gai != 0) {
-        set_errf(err, err_cap, "SOCKS5 resolve failed for %s:%u: %s", host, (unsigned)port, gai_strerror(gai));
-        return -1;
-    }
-
-    int fd = -1;
-    int saved_errno = 0;
-    for (struct addrinfo *it = res; it != NULL; it = it->ai_next) {
-        fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-        if (fd < 0) {
-            saved_errno = errno;
-            continue;
-        }
-        core_tune_tcp_socket(fd);
-        core_set_socket_io_timeout(fd, SOCKS5_UPSTREAM_TIMEOUT_MS);
-
-        if (core_connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen, SOCKS5_UPSTREAM_TIMEOUT_MS) == 0) {
-            freeaddrinfo(res);
-            return fd;
-        }
-
-        saved_errno = errno;
-        close(fd);
-        fd = -1;
-    }
-
-    freeaddrinfo(res);
-    set_errf(err, err_cap, "SOCKS5 TCP connect failed for %s:%u: errno=%d", host, (unsigned)port, saved_errno);
-    return -1;
+    int fd = core_dial_host(host, port, 1, SOCKS5_UPSTREAM_TIMEOUT_MS);
+    if (fd < 0) set_errf(err, err_cap, "SOCKS5 TCP connect failed for %s:%u: errno=%d", host, (unsigned)port, errno);
+    else core_set_socket_io_timeout(fd, SOCKS5_UPSTREAM_TIMEOUT_MS);
+    return fd;
 }
 
 static int socks5_read_address_tail(int fd, uint8_t atyp) {

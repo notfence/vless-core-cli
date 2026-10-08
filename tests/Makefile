@@ -66,6 +66,9 @@ $(HOST_BUILD_DIR)/routing_direct_lease_test: $(HOST_BUILD_DIR)/routing_direct_le
 $(HOST_BUILD_DIR)/test_resolver: $(HOST_BUILD_DIR)/test_resolver.o $(filter-out $(HOST_BUILD_DIR)/src/resolver.o,$(BASE_OBJ))
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=getaddrinfo
 
+$(HOST_BUILD_DIR)/test_dialer: $(HOST_BUILD_DIR)/test_dialer.o $(filter-out $(HOST_BUILD_DIR)/src/dialer.o,$(BASE_OBJ))
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=getaddrinfo,--wrap=connect,--wrap=poll
+
 $(HOST_BUILD_DIR)/test_encryption: $(HOST_BUILD_DIR)/test_encryption.o $(HOST_BUILD_DIR)/src/blake3.o
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS)
 

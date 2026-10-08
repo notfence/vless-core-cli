@@ -1,4 +1,5 @@
 import socket
+import os
 import ssl
 import unittest
 from fixtures import Server, certificate, cli, exact, exchange, socks_connect
@@ -143,6 +144,21 @@ class SocksTests(unittest.TestCase):
                 with socks_connect(core.port,8080,"vless-core.test") as connection:
                     exchange(connection,b"vless-core pre-resolved")
                 self.assertIn(("vless-core.test",8080),upstream.targets)
+
+    def test_pre_resolved_ipv6_addresses_no_dns(self):
+        with Upstream() as protocol, Server(protocol.handle,address="::1") as upstream:
+            with cli(f"socks5://no-dns.invalid:{upstream.port}",["--server-ips","127.0.0.2,::1"]) as core:
+                with socks_connect(core.port,8080) as connection:
+                    exchange(connection,b"vless-core pre-resolved IPv6")
+            read_fd, write_fd=os.pipe()
+            try:
+                os.write(write_fd,f"socks5://no-dns.invalid:{upstream.port}\n::1,127.0.0.2".encode()); os.close(write_fd); write_fd=-1
+                with cli(None,["--connection-fd",str(read_fd)],pass_fds=(read_fd,)) as core:
+                    with socks_connect(core.port,8080) as connection:
+                        exchange(connection,b"vless-core connection descriptor IPv6")
+            finally:
+                os.close(read_fd)
+                if write_fd >= 0: os.close(write_fd)
 
     def test_rejected_authentication(self):
         with Upstream(auth=True,reject=True) as upstream:

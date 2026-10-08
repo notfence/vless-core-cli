@@ -5,6 +5,7 @@
 
 #include "core_log.h"
 #include "server_ips.h"
+#include "dialer.h"
 #include "socket_util.h"
 #include "deadline.h"
 #include "hpack.h"
@@ -452,68 +453,7 @@ static int read_exact(int fd, void *buf, size_t len) {
 }
 
 static int tcp_connect_host(const char *host, uint16_t port) {
-    if (core_server_ip_count() > 0) {
-        int fd = -1;
-        int last_errno = 0;
-        for (size_t i = 0; i < core_server_ip_count(); i++) {
-            struct sockaddr_in address;
-            memset(&address, 0, sizeof(address));
-            address.sin_family = AF_INET;
-            address.sin_port = htons(port);
-            address.sin_addr = *core_server_ip_at(i);
-
-            fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (fd < 0) {
-                last_errno = errno;
-                continue;
-            }
-            core_tune_tcp_socket(fd);
-            if (core_connect_with_timeout(fd, (const struct sockaddr *)&address, sizeof(address), CORE_CONNECT_TIMEOUT_MS) == 0) {
-                return fd;
-            }
-            last_errno = errno;
-            close(fd);
-            fd = -1;
-        }
-        if (last_errno != 0) errno = last_errno;
-        return -1;
-    }
-
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned int)port);
-
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-
-    struct addrinfo *res = NULL;
-    if (core_getaddrinfo(host, port_str, &hints, &res) != 0) {
-        return -1;
-    }
-
-    int fd = -1;
-    int last_errno = 0;
-    for (struct addrinfo *it = res; it != NULL; it = it->ai_next) {
-        fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-        if (fd < 0) {
-            last_errno = errno;
-            continue;
-        }
-        core_tune_tcp_socket(fd);
-        if (core_connect_with_timeout(fd, it->ai_addr, (socklen_t)it->ai_addrlen, CORE_CONNECT_TIMEOUT_MS) == 0) {
-            break;
-        }
-        last_errno = errno;
-        close(fd);
-        fd = -1;
-    }
-
-    freeaddrinfo(res);
-    if (fd < 0 && last_errno != 0) {
-        errno = last_errno;
-    }
-    return fd;
+    return core_dial_host(host, port, 1, CORE_CONNECT_TIMEOUT_MS);
 }
 
 static int tcp_connect_address(int family, int socktype, int protocol, const struct sockaddr *address, socklen_t address_len) {
@@ -5730,7 +5670,7 @@ static void reset_manual_tls_handshake(tls13_conn_t *c) {
 }
 
 static int connect_manual_tls_endpoint(const vless_config_t *cfg, tls13_conn_t *c, const struct sockaddr *address,
-                                       socklen_t address_len, int socktype, int protocol, int start_with_aes,
+                                       socklen_t address_len, int socktype, int protocol, int start_with_aes, int initial_fd,
                                        tls_cipher_offer_t *successful_offer, char *err, size_t err_cap) {
     static const tls_cipher_offer_t offer_order[] = {
         TLS_CIPHER_OFFER_CHACHA,
@@ -5741,7 +5681,7 @@ static int connect_manual_tls_endpoint(const vless_config_t *cfg, tls13_conn_t *
     for (size_t i = first_offer; i < sizeof(offer_order) / sizeof(offer_order[0]); i++) {
         tls_cipher_offer_t offer = offer_order[i];
         reset_manual_tls_handshake(c);
-        c->fd = tcp_connect_address(address->sa_family, socktype, protocol, address, address_len);
+        c->fd = i == first_offer ? initial_fd : tcp_connect_address(address->sa_family, socktype, protocol, address, address_len);
         if (c->fd < 0) {
             set_connect_err(err, err_cap, "tcp connect failed");
             return -1;
@@ -5776,77 +5716,29 @@ static void remember_manual_tls_success(const vless_config_t *cfg, tls13_conn_t 
 static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
     const char *sni = cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host;
     int start_with_aes = c->tls_use_aes_fallback || tls_aes_fallback_cached(cfg->server_host, cfg->server_port, sni);
-    char last_err[256] = {0};
-
     struct sockaddr_storage cached_address;
-    socklen_t cached_address_len = 0;
-    int cached_endpoint_tried = get_cached_tls_endpoint(cfg, sni, &cached_address, &cached_address_len);
-    if (cached_endpoint_tried) {
-        tls_cipher_offer_t successful_offer;
-        if (connect_manual_tls_endpoint(cfg, c, (const struct sockaddr *)&cached_address, cached_address_len, SOCK_STREAM, IPPROTO_TCP,
-                                        start_with_aes, &successful_offer, last_err, sizeof(last_err)) == 0) {
-            remember_manual_tls_success(cfg, c, sni, (const struct sockaddr *)&cached_address, cached_address_len, successful_offer);
-            return 0;
+    socklen_t cached_length = 0;
+    int cached = get_cached_tls_endpoint(cfg, sni, &cached_address, &cached_length);
+    core_dialer_t *dialer = core_dialer_start(cfg->server_host, cfg->server_port, 1, CORE_CONNECT_TIMEOUT_MS,
+        cached ? (const struct sockaddr *)&cached_address : NULL, cached_length);
+    if (!dialer) { set_connect_err(err, err_cap, "tcp resolve failed"); return -1; }
+    char last_err[256] = {0};
+    struct sockaddr_storage address; socklen_t length;
+    int fd;
+    while ((fd = core_dialer_next(dialer, &address, &length)) >= 0) {
+        tls_cipher_offer_t offer;
+        if (connect_manual_tls_endpoint(cfg, c, (const struct sockaddr *)&address, length, SOCK_STREAM, IPPROTO_TCP,
+                                        start_with_aes, fd, &offer, last_err, sizeof(last_err)) == 0) {
+            remember_manual_tls_success(cfg, c, sni, (const struct sockaddr *)&address, length, offer);
+            core_dialer_free(dialer); return 0;
         }
-        invalidate_cached_tls_endpoint(cfg, sni, (const struct sockaddr *)&cached_address, cached_address_len);
+        if (cached && sockaddr_equal((const struct sockaddr *)&cached_address, cached_length,
+                                     (const struct sockaddr *)&address, length))
+            invalidate_cached_tls_endpoint(cfg, sni, (const struct sockaddr *)&address, length);
     }
-
-    if (core_server_ip_count() > 0) {
-        for (size_t i = 0; i < core_server_ip_count(); i++) {
-            struct sockaddr_in address;
-            memset(&address, 0, sizeof(address));
-            address.sin_family = AF_INET;
-            address.sin_port = htons(cfg->server_port);
-            address.sin_addr = *core_server_ip_at(i);
-
-            if (cached_endpoint_tried &&
-                sockaddr_equal((const struct sockaddr *)&cached_address, cached_address_len,
-                               (const struct sockaddr *)&address, sizeof(address))) {
-                continue;
-            }
-
-            tls_cipher_offer_t successful_offer;
-            if (connect_manual_tls_endpoint(cfg, c, (const struct sockaddr *)&address, sizeof(address), SOCK_STREAM, IPPROTO_TCP,
-                                            start_with_aes, &successful_offer, last_err, sizeof(last_err)) == 0) {
-                remember_manual_tls_success(cfg, c, sni, (const struct sockaddr *)&address, sizeof(address), successful_offer);
-                return 0;
-            }
-        }
-        set_err(err, err_cap, last_err[0] != '\0' ? last_err : "tcp connect failed");
-        return -1;
-    }
-
-    char port_text[16];
-    snprintf(port_text, sizeof(port_text), "%u", (unsigned)cfg->server_port);
-
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-
-    struct addrinfo *addresses = NULL;
-    if (core_getaddrinfo(cfg->server_host, port_text, &hints, &addresses) != 0) {
-        set_err(err, err_cap, "tcp resolve failed");
-        return -1;
-    }
-
-    for (struct addrinfo *it = addresses; it != NULL; it = it->ai_next) {
-        if (cached_endpoint_tried &&
-            sockaddr_equal((const struct sockaddr *)&cached_address, cached_address_len, it->ai_addr, (socklen_t)it->ai_addrlen)) {
-            continue;
-        }
-
-        tls_cipher_offer_t successful_offer;
-        if (connect_manual_tls_endpoint(cfg, c, it->ai_addr, (socklen_t)it->ai_addrlen, it->ai_socktype, it->ai_protocol,
-                                        start_with_aes, &successful_offer, last_err, sizeof(last_err)) == 0) {
-            remember_manual_tls_success(cfg, c, sni, it->ai_addr, (socklen_t)it->ai_addrlen, successful_offer);
-            freeaddrinfo(addresses);
-            return 0;
-        }
-    }
-    freeaddrinfo(addresses);
-
-    set_err(err, err_cap, last_err[0] != '\0' ? last_err : "tcp connect failed");
+    core_dialer_free(dialer);
+    if (last_err[0]) set_err(err, err_cap, last_err);
+    else set_connect_err(err, err_cap, "tcp connect failed");
     return -1;
 }
 
