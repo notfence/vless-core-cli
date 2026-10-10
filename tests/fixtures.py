@@ -1,6 +1,7 @@
 import base64
 import contextlib
 import json
+import selectors
 import os
 from pathlib import Path
 import socket
@@ -193,6 +194,21 @@ class Server:
     def __exit__(self, *_):
         self.close()
 
+class CountingProxy(Server):
+    def __init__(self, upstream_port, address="127.0.0.1"):
+        self.upstream_port=upstream_port
+        super().__init__(self.forward,address=address)
+
+    def forward(self, connection):
+        with socket.create_connection(("127.0.0.1",self.upstream_port),timeout=10) as upstream, selectors.DefaultSelector() as selector:
+            selector.register(connection,selectors.EVENT_READ,upstream)
+            selector.register(upstream,selectors.EVENT_READ,connection)
+            while not self.stop.is_set():
+                for key,_ in selector.select(timeout=0.1):
+                    block=key.fileobj.recv(65536)
+                    if not block: return
+                    key.data.sendall(block)
+
 @contextlib.contextmanager
 def cli(config, extra=(), environment=None, pass_fds=()):
     def command(listen_port):
@@ -272,13 +288,14 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
         yield process
 
 @contextlib.contextmanager
-def xray_client(server_port, transport="tcp", security="reality", mode=None, flow="", encryption="none", extra=None, fingerprint="firefox"):
+def xray_client(server_port, transport="tcp", security="reality", mode=None, flow="", encryption="none", extra=None, fingerprint="firefox", alpn=None):
     cert, _ = certificate()
     stream = {"network":"raw" if transport == "tcp" else transport, "security":security}
     if security == "reality":
         stream["realitySettings"] = {"serverName":"vless-core.test", "fingerprint":fingerprint, "publicKey":PUBLIC_KEY, "shortId":"01020304"}
     elif security == "tls":
         stream["tlsSettings"] = {"serverName":"vless-core.test", "fingerprint":fingerprint, "certificates":[{"certificateFile":str(cert), "usage":"verify"}]}
+        if alpn is not None: stream["tlsSettings"]["alpn"]=alpn
     if transport == "xhttp":
         stream["xhttpSettings"] = {"path":"/vless-core", "mode":mode or "auto", **(extra or {})}
     config = {"log":{"loglevel":"info"}, "inbounds":[{"listen":"127.0.0.1", "port":0, "protocol":"socks", "settings":{"auth":"noauth", "udp":False}}], "outbounds":[{"protocol":"vless", "settings":{"vnext":[{"address":"127.0.0.1", "port":server_port, "users":[{"id":UUID, "encryption":encryption, "flow":flow}]}]}, "streamSettings":stream}]}

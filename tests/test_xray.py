@@ -12,7 +12,7 @@ import time
 import unittest
 from unittest import mock
 import fixtures
-from fixtures import BUILD, OPENSSL, XRAY, PRIVATE, KEY, PUBLIC_KEY, Process, Server, certificate, cli, exact, exchange, port, socks_connect, uri, xray_client, xray_server
+from fixtures import BUILD, OPENSSL, XRAY, PRIVATE, KEY, PUBLIC_KEY, Process, Server, CountingProxy, certificate, cli, exact, exchange, port, socks_connect, uri, xray_client, xray_server
 
 SUBSCRIPTION_EXTRA = {
     "mode":"stream-one", "seqKey":"x-amz-cf-pop", "seqPlacement":"header",
@@ -28,6 +28,131 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_xmux_reuses_physical_http2_connection(self):
+        with Server() as target, xray_server("xhttp","reality") as reference:
+            with CountingProxy(reference.port) as proxy:
+                config=uri(proxy.port,"xhttp","reality",mode="stream-one",extra=json.dumps({"xmux":{"maxConnections":1}}))
+                with cli(config) as core:
+                    for index in range(4):
+                        with socks_connect(core.port,target.port) as tunnel:
+                            exchange(tunnel,b"vless-core XMUX reuse"*10000)
+                    self.assertEqual(len(proxy.connections),1)
+
+    def test_xmux_http1_packet_reuse(self):
+        cert,_=certificate()
+        for security in ("none","tls"):
+            with self.subTest(security=security), Server() as target, xray_server("xhttp",security) as reference, CountingProxy(reference.port) as proxy:
+                config=uri(proxy.port,"xhttp",security,mode="packet-up",alpn="http/1.1",extra=json.dumps({"xmux":{"maxConnections":1}}))
+                with cli(config,environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    with socks_connect(core.port,target.port) as tunnel:
+                        for repetition in range(8): exchange(tunnel,b"vless-core HTTP/1.1 reused packet"*1000)
+                    self.assertEqual(len(proxy.connections),2)
+
+    def test_xmux_http1_parallel_channels(self):
+        cert,_=certificate()
+        payload=bytes(range(251))*1024
+        for security in ("none","tls"):
+            for mode in ("stream-one","stream-up","packet-up"):
+                with self.subTest(security=security,mode=mode), Server() as target, xray_server("xhttp",security) as reference:
+                    config=uri(reference.port,"xhttp",security,mode=mode,alpn="http/1.1",extra=json.dumps({"xmux":{"maxConnections":1}}))
+                    with cli(config,environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                        def transfer(index):
+                            with socks_connect(core.port,target.port) as tunnel:
+                                exchange(tunnel,payload+bytes([index]))
+                        for repetition in range(2):
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as workers:
+                                list(workers.map(transfer,range(3)))
+                        successes=[line.split(" id=",1)[1].split()[0] for line in core.log.splitlines() if "[probe] v=1" in line and "success=1" in line]
+                        self.assertEqual(len(successes),6)
+                        self.assertEqual(len(set(successes)),6)
+
+    def test_reference_http1_fixture(self):
+        for mode in ("stream-one","stream-up","packet-up"):
+            with self.subTest(mode=mode), Server() as target, xray_server("xhttp","tls") as reference:
+                with xray_client(reference.port,"xhttp","tls",mode=mode,alpn=["http/1.1"],fingerprint="unsafe") as client:
+                    with socks_connect(client.port,target.port) as tunnel:
+                        exchange(tunnel,b"vless-core reference HTTP/1.1"*10000)
+
+    def test_xmux_rotation_limits(self):
+        for settings, expected in (({"maxConnections":3},3),({"maxConnections":1,"cMaxReuseTimes":2},3),({"maxConnections":1,"hMaxRequestTimes":2},3)):
+            with self.subTest(settings=settings), Server() as target, xray_server("xhttp","reality") as reference, CountingProxy(reference.port) as proxy:
+                with cli(uri(proxy.port,"xhttp","reality",mode="stream-one",extra=json.dumps({"xmux":settings}))) as core:
+                    for index in range(5):
+                        with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core rotation"*1024)
+                    self.assertEqual(len(proxy.connections),expected)
+
+    def test_xmux_rotation_keeps_active_streams(self):
+        for settings, delay in (({"maxConnections":1,"cMaxReuseTimes":1},0),({"maxConnections":1,"hMaxReusableSecs":1},1.1),({"maxConcurrency":1},0)):
+            with self.subTest(settings=settings), Server() as target, xray_server("xhttp","reality") as reference, CountingProxy(reference.port) as proxy:
+                with cli(uri(proxy.port,"xhttp","reality",mode="stream-one",extra=json.dumps({"xmux":settings}))) as core:
+                    with socks_connect(core.port,target.port) as first:
+                        exchange(first,b"vless-core first active stream")
+                        if delay: time.sleep(delay)
+                        with socks_connect(core.port,target.port) as second:
+                            exchange(second,b"vless-core second active stream")
+                            exchange(first,b"vless-core first stream survives rotation")
+                    self.assertEqual(len(proxy.connections),2)
+
+    def test_xmux_slow_download_does_not_block_another_stream(self):
+        payload=b"vless-core slow stream"*400000
+        def handler(connection):
+            marker=exact(connection,1)
+            if marker == b"S": connection.sendall(payload)
+            else: connection.sendall(marker); Server.echo(connection)
+        with Server(handler) as target, xray_server("xhttp","reality") as reference:
+            with cli(uri(reference.port,"xhttp","reality",mode="stream-one",extra=json.dumps({"xmux":{"maxConnections":1}}))) as core:
+                with socks_connect(core.port,target.port) as slow:
+                    slow.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,65536); slow.sendall(b"S")
+                    time.sleep(0.1)
+                    with socks_connect(core.port,target.port) as fast:
+                        fast.settimeout(2); exchange(fast,b"vless-core fast stream"*10000)
+                    self.assertEqual(exact(slow,len(payload)),payload)
+
+    def test_xmux_transport_modes(self):
+        for security in ("tls","reality"):
+            for mode in ("stream-one","stream-up","packet-up"):
+                with self.subTest(security=security,mode=mode):
+                    self.transfer("xhttp",security,mode,extra={"xmux":{"maxConnections":1}})
+
+    def test_xmux_parallel_clients(self):
+        payload=bytes(range(251))*4096
+        cert,_=certificate()
+        for security in ("tls","reality"):
+            for mode in ("stream-one","stream-up","packet-up"):
+                with self.subTest(security=security,mode=mode), Server() as target, xray_server("xhttp",security) as reference:
+                    config=uri(reference.port,"xhttp",security,mode=mode,extra=json.dumps({"xmux":{"maxConnections":1}}))
+                    with cli(config,environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                        def transfer(index):
+                            with socks_connect(core.port,target.port) as tunnel:
+                                exchange(tunnel,payload+bytes([index]))
+                        for repetition in range(3):
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers:
+                                list(workers.map(transfer,range(4)))
+
+    def test_xmux_new_clients_during_continuous_upload(self):
+        def receive(connection):
+            while connection.recv(16384): time.sleep(0.001)
+        cert,_=certificate()
+        for security in ("tls","reality"):
+            with self.subTest(security=security), Server(receive) as receiver, Server() as target, xray_server("xhttp",security) as reference:
+                config=uri(reference.port,"xhttp",security,mode="stream-one",extra=json.dumps({"xmux":{"maxConnections":1}}))
+                with cli(config,extra=["--connect-timeout-ms","1000"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    with socks_connect(core.port,receiver.port) as background:
+                        stopped=threading.Event(); started=threading.Event(); errors=[]
+                        def upload():
+                            try:
+                                while not stopped.is_set(): background.sendall(b"vless-core continuous upload"*4000); started.set()
+                            except OSError as error:
+                                if not stopped.is_set(): errors.append(error)
+                        worker=threading.Thread(target=upload,daemon=True); worker.start()
+                        try:
+                            self.assertTrue(started.wait(2)); time.sleep(0.05)
+                            for repetition in range(5):
+                                with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core independent setup")
+                        finally:
+                            stopped.set(); background.shutdown(socket.SHUT_RDWR); worker.join(timeout=2)
+                        self.assertFalse(worker.is_alive())
+                        self.assertFalse(errors,errors)
     def test_reality_hybrid_target(self):
         for transport in ("tcp", "xhttp"):
             for fingerprint in ("firefox", "chrome"):
@@ -89,6 +214,16 @@ class XrayTests(unittest.TestCase):
                     with cli(config) as core:
                         descriptors = Path(f"/proc/{core.process.pid}/fd")
                         tasks = Path(f"/proc/{core.process.pid}/task")
+                        if "xmux" in extra:
+                            for warmup in range(3):
+                                with socks_connect(core.port,target.port): pass
+                            previous=None; stable=time.monotonic(); end=stable+2
+                            while True:
+                                now=time.monotonic(); state=(len(list(descriptors.iterdir())),len(list(tasks.iterdir())))
+                                if state != previous: previous=state; stable=now
+                                if now-stable >= 0.1: break
+                                self.assertLess(now,end,"XMUX warmup did not release client workers")
+                                time.sleep(0.01)
                         baseline_fds = len(list(descriptors.iterdir()))
                         baseline_tasks = len(list(tasks.iterdir()))
                         def transfer(index):

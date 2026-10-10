@@ -88,6 +88,7 @@ typedef struct {
     int xhttp_max_each_post_min;
     int xhttp_max_each_post_max;
     core_xmux_config_t xmux;
+    int xhttp_physical_only;
 
     int encryption_enabled;
     int encryption_xor_mode;

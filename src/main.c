@@ -943,16 +943,17 @@ static void *client_worker_run(void *arg) {
 
     while (1) {
         int client_ready = 0;
+        int client_writable = tls13_write_capacity(tls) >= 128U*1024U;
         int upstream_ready = !downstream_direct &&
                              (tls13_has_pending_input(tls) || vless_encryption_has_pending_input(encryption));
         if (upstream_ready) {
-            int s = core_wait_socket(cfd, POLLIN, 0);
+            int s = client_writable ? core_wait_socket(cfd, POLLIN, 0) : 0;
             if (s < 0 && errno != EINTR) {
                 break;
             }
             client_ready = s > 0;
         } else {
-            struct pollfd fds[2] = {{.fd=cfd,.events=POLLIN},
+            struct pollfd fds[2] = {{.fd=client_writable ? cfd : -1,.events=POLLIN},
                 {.fd=tfd,.events=(short)(POLLIN | (tls13_needs_write(tls) ? POLLOUT : 0))}};
             int s = core_poll(fds, 2, -1);
             if (s <= 0) {
@@ -962,7 +963,7 @@ static void *client_worker_run(void *arg) {
             upstream_ready = (fds[1].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR)) != 0;
         }
 
-        if (client_ready) {
+        if (client_ready && tls13_reserve_write(tls, 128U*1024U)) {
             ssize_t n = recv_coalesced(cfd, cbuf, cbuf_cap, cbuf_cap > 8192 ? 2000 : 0);
             if (n <= 0) {
                 break;
@@ -1010,6 +1011,7 @@ static void *client_worker_run(void *arg) {
                 }
                 forwarded_client_payload = 1;
             }
+            tls13_release_write(tls);
         }
 
         if (upstream_ready) {
@@ -1017,7 +1019,7 @@ static void *client_worker_run(void *arg) {
             if (drained < 0) {
                 break;
             }
-            if (tls13_uses_h2(tls)) {
+            if (tls13_uses_h2(tls) || tls13_uses_async_io(tls)) {
                 upstream_ready = tls13_has_pending_app(tls) || vless_encryption_has_pending_input(encryption);
             }
         }
@@ -1046,7 +1048,7 @@ static void *client_worker_run(void *arg) {
                 }
                 got_vless_response = 1;
                 core_trace_stage(CORE_TRACE_CARRY);
-                if (tls13_uses_h2(tls) && !tls13_has_pending_app(tls) && !vless_encryption_has_pending_input(encryption)) {
+                if ((tls13_uses_h2(tls) || tls13_uses_async_io(tls)) && !tls13_has_pending_app(tls) && !vless_encryption_has_pending_input(encryption)) {
                     continue;
                 }
             }

@@ -96,6 +96,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
     }
     case 4: {
+        core_http1_response_t response={0}; core_http1_event_t event; size_t offset=0;
+        for (size_t iteration=0;iteration<size+8;iteration++) {
+            int result=core_http1_next(&response,data+offset,size-offset,1,4096,&event);
+            offset+=event.consumed;
+            if (result || event.kind == 3) break;
+        }
         if (db_append(&c.xhttp_net_cache, data, size) != 0) abort();
         int status, chunked, upgrade, connection_upgrade;
         int64_t length;

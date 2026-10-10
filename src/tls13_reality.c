@@ -6,9 +6,11 @@
 #include "core_log.h"
 #include "server_ips.h"
 #include "dialer.h"
+#include "xmux.h"
 #include "socket_util.h"
 #include "deadline.h"
 #include "hpack.h"
+#include "http1.h"
 #include "connection_trace.h"
 #include "tls13_reality.h"
 
@@ -131,6 +133,17 @@ static pthread_mutex_t g_tls_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_tls_cipher_logged = 0;
 
 struct tls13_conn {
+    core_xmux_stream_t *xmux_stream;
+    struct tls13_conn *xmux_owner;
+    int xmux_physical, xmux_async;
+    dynbuf_t xmux_raw_input, xmux_plain_output, xmux_wire_output;
+    size_t xmux_ssl_write_length;
+    uint64_t xmux_enqueued, xmux_flushed;
+    size_t xmux_wire_plain_length;
+    int xmux_read_wants_write, xmux_write_wants_read;
+    core_http1_response_t xmux_http1_response;
+    uint32_t xmux_http1_id;
+    int xmux_http1_role, xmux_http1_eof;
     core_hpack_decoder_t hpack;
     int fd;
     conn_mode_t mode;
@@ -237,6 +250,7 @@ static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t
 static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache);
 static int h2_pump_one_frame(tls13_conn_t *c);
 static int h2_cached_frame_ready(const tls13_conn_t *c);
+static const core_xmux_backend_t xmux_backend;
 
 static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
@@ -1954,6 +1968,13 @@ static int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t 
     }
     c->h2_send_buf.len = 9 + len;
 
+    if (c->xmux_async) {
+        tls13_conn_t *owner = c->xmux_owner ? c->xmux_owner : c;
+        if (c->h2_send_buf.len > 256U*1024U - owner->xmux_plain_output.len) return -1;
+        int result=db_append(&owner->xmux_plain_output, c->h2_send_buf.data, c->h2_send_buf.len);
+        if (!result) owner->xmux_enqueued+=c->h2_send_buf.len;
+        return result;
+    }
     if (c->mode == CONN_MODE_XHTTP_TLS_H2) {
         if (ssl_write_all(c->ssl, c->h2_send_buf.data, c->h2_send_buf.len) != 0) {
             return -1;
@@ -2028,6 +2049,7 @@ static int h2_collect_tls_available(tls13_conn_t *c, int *want_write) {
     int result = 0;
     uint8_t buf[16384];
     for (int reads = 0; reads < 64; reads++) {
+        ERR_clear_error();
         int n = SSL_read(c->ssl, buf, sizeof(buf));
         if (n > 0) {
             if (db_append(&c->h2_net_cache, buf, (size_t)n) != 0) {
@@ -2429,18 +2451,19 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
         return -1;
     }
 
+    uint32_t initial_window = c->xmux_physical ? 65535 : H2_CLIENT_INITIAL_WINDOW;
     uint8_t settings[18] = {
         0x00,
         0x04,
-        (uint8_t)(H2_CLIENT_INITIAL_WINDOW >> 24),
-        (uint8_t)(H2_CLIENT_INITIAL_WINDOW >> 16),
-        (uint8_t)(H2_CLIENT_INITIAL_WINDOW >> 8),
-        (uint8_t)H2_CLIENT_INITIAL_WINDOW,
+        (uint8_t)(initial_window >> 24),
+        (uint8_t)(initial_window >> 16),
+        (uint8_t)(initial_window >> 8),
+        (uint8_t)initial_window,
         0,1,0,0,0x10,0,
         0,6,0,1,0,0,
     };
     if (h2_send_frame(c, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings)) != 0 ||
-        h2_send_window_update(c, 0, H2_CONNECTION_WINDOW_INC) != 0) {
+        (!c->xmux_physical && h2_send_window_update(c, 0, H2_CONNECTION_WINDOW_INC) != 0)) {
         set_err(err, err_cap, "failed to send h2 settings");
         return -1;
     }
@@ -3122,6 +3145,7 @@ static int xhttp_h2_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t len,
 }
 
 static int xhttp_h2_start_mode(tls13_conn_t *c, char *err, size_t err_cap) {
+    if (c->xmux_physical) return xhttp_h2_begin(c, err, err_cap);
     if (strcmp(c->xhttp_transport_mode, "stream-one") == 0) {
         return xhttp_h2_send_stream_one_request(c, err, err_cap);
     }
@@ -5165,6 +5189,7 @@ int tls13_needs_write(const tls13_conn_t *c) {
 }
 
 int tls13_has_pending_app(const tls13_conn_t *c) {
+    if (c && c->xmux_stream) return core_xmux_pending(c->xmux_stream);
     if (tls13_uses_h2(c)) {
         return c->app_cache.len > 0 || c->h2_stream_eof;
     }
@@ -5175,6 +5200,7 @@ int tls13_has_pending_input(const tls13_conn_t *c) {
     if (c == NULL) {
         return 0;
     }
+    if (c->xmux_stream) return core_xmux_pending(c->xmux_stream);
     if (c->app_cache.len > 0) {
         return 1;
     }
@@ -5233,6 +5259,7 @@ static int h2_input_ready(const tls13_conn_t *c) {
 }
 
 int tls13_drain_h2_input(tls13_conn_t *c) {
+    if (c && c->xmux_stream) { core_xmux_drain_notifications(c->xmux_stream); return 0; }
     if (c == NULL ||
         (c->mode != CONN_MODE_XHTTP_TLS_H2 && c->mode != CONN_MODE_XHTTP_REALITY && c->mode != CONN_MODE_GRPC_PLAIN)) {
         return 0;
@@ -5267,7 +5294,10 @@ int tls13_uses_h2(const tls13_conn_t *c) {
             c->mode == CONN_MODE_GRPC_PLAIN);
 }
 
+int tls13_uses_async_io(const tls13_conn_t *c) { return c && c->xmux_stream; }
+
 size_t tls13_write_batch_size(const tls13_conn_t *c) {
+    if (c && c->xmux_stream) return 64U*1024U;
     if (c != NULL && c->grpc_transport) {
         return H2_WRITE_BATCH_SIZE;
     }
@@ -5283,6 +5313,18 @@ size_t tls13_write_batch_size(const tls13_conn_t *c) {
         return H2_WRITE_BATCH_SIZE;
     }
     return 8192;
+}
+
+size_t tls13_write_capacity(const tls13_conn_t *c) {
+    return c && c->xmux_stream ? core_xmux_write_capacity(c->xmux_stream) : SIZE_MAX;
+}
+
+int tls13_reserve_write(tls13_conn_t *c, size_t capacity) {
+    return c && c->xmux_stream ? core_xmux_reserve_write(c->xmux_stream, capacity) : 1;
+}
+
+void tls13_release_write(tls13_conn_t *c) {
+    if (c && c->xmux_stream) core_xmux_release_write(c->xmux_stream);
 }
 
 void tls13_mark_raw_direct(tls13_conn_t *c) {
@@ -5910,6 +5952,7 @@ static int xhttp_configure(const vless_config_t *cfg, tls13_conn_t *c, char *err
 }
 
 static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
+    c->xmux_physical = cfg->xhttp_physical_only;
     if (xhttp_configure(cfg, c, err, err_cap) != 0) {
         return -1;
     }
@@ -5923,6 +5966,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         }
         vc_log_info("xhttp", "plain mode=%s http=1.1 max_each_post=%d",
                     c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
+        if (c->xmux_physical) return 0;
         if (strcmp(c->xhttp_transport_mode, "stream-one") == 0) {
             return xhttp_send_plain_stream_request(c, c->fd, err, err_cap);
         }
@@ -6005,12 +6049,13 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         return 0;
     }
 
-    if (strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
+    if (!c->xmux_physical && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
         set_err(err, err_cap, "xhttp stream-one and stream-up require HTTP/2");
         return -1;
     }
     vc_log_info("xhttp", "tls mode=%s http=1.1 max_each_post=%d",
                 c->xhttp_transport_mode, c->xhttp_max_each_post_bytes);
+    if (c->xmux_physical) return 0;
     if (xhttp_send_download_request(cfg, c, err, err_cap) != 0) {
         return -1;
     }
@@ -6114,6 +6159,12 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
     c->mode = CONN_MODE_REALITY;
 
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
+        if (cfg->xmux.present) {
+            c->xmux_stream = core_xmux_connect(cfg, &xmux_backend, err, err_cap);
+            if (!c->xmux_stream) { free(c); return -1; }
+            c->fd = core_xmux_fd(c->xmux_stream);
+            *out = c; return 0;
+        }
         if (xhttp_connect(cfg, c, err, err_cap) != 0) {
             tls13_reality_close(c);
             return -1;
@@ -6175,6 +6226,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     if (c == NULL) {
         return;
     }
+    if (c->xmux_stream) { core_xmux_close(c->xmux_stream); free(c); return; }
     if (c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
         int upload_fd = strcmp(c->xhttp_transport_mode, "stream-one") == 0 ? c->fd : c->xhttp_upload_fd;
         if (upload_fd >= 0) {
@@ -6213,6 +6265,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     db_free(&c->grpc_recv_cache);
     db_free(&c->transcript);
     db_free(&c->app_cache);
+    db_free(&c->xmux_raw_input); db_free(&c->xmux_plain_output); db_free(&c->xmux_wire_output);
     free(c);
 }
 
@@ -6250,6 +6303,7 @@ static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t
 }
 
 int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    if (c->xmux_stream) return core_xmux_write(c->xmux_stream, buf, len);
     if (c->grpc_transport) {
         return grpc_write_hunk(c, buf, len);
     }
@@ -6416,6 +6470,7 @@ static int fill_reality_app_cache(tls13_conn_t *c) {
 }
 
 int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
+    if (c->xmux_stream) return core_xmux_read(c->xmux_stream, buf, cap, out_len);
     *out_len = 0;
     if (cap == 0) {
         return 0;
@@ -6478,6 +6533,7 @@ int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len) {
             return -1;
         }
         if (rc > 0) {
+            if (c->xmux_stream && core_wait_socket(c->fd, POLLIN, -1) <= 0) return -1;
             continue;
         }
         if (got == 0) {
@@ -6487,3 +6543,213 @@ int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len) {
     }
     return 0;
 }
+
+static int xmux_transport_open(const vless_config_t *config, void **output, int *http2, char *error, size_t capacity) {
+    vless_config_t physical_config=*config;
+    physical_config.xmux.present=0; physical_config.xhttp_physical_only=1;
+    tls13_conn_t *connection=NULL;
+    if (tls13_reality_connect(&physical_config,&connection,error,capacity) != 0) return -1;
+    *output=connection; *http2=tls13_uses_h2(connection);
+    if (!*http2) connection->h2_next_stream_id=3;
+    int flags=fcntl(connection->fd,F_GETFL,0);
+    if (flags < 0 || fcntl(connection->fd,F_SETFL,flags|O_NONBLOCK) != 0) return -1;
+    if (connection->ssl) SSL_set_mode(connection->ssl,SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER|SSL_MODE_ENABLE_PARTIAL_WRITE);
+    connection->xmux_async=1;
+    return 0;
+}
+
+static void xmux_transport_close(void *opaque) { tls13_reality_close(opaque); }
+static int xmux_transport_fd(void *opaque) { return ((tls13_conn_t *)opaque)->fd; }
+static size_t xmux_transport_pending(void *opaque) {
+    tls13_conn_t *connection=opaque;
+    return connection->xmux_plain_output.len+connection->xmux_wire_output.len;
+}
+static uint64_t xmux_transport_enqueued(void *opaque) { return ((tls13_conn_t *)opaque)->xmux_enqueued; }
+static uint64_t xmux_transport_flushed(void *opaque) { return ((tls13_conn_t *)opaque)->xmux_flushed; }
+
+static short xmux_transport_events(void *opaque) {
+    tls13_conn_t *connection=opaque;
+    short input=tls13_uses_h2(connection) || (!connection->xmux_http1_eof && connection->h2_net_cache.len < 65536) ? POLLIN : 0;
+    return (short)(input|((xmux_transport_pending(connection) && !connection->xmux_write_wants_read) || connection->xmux_read_wants_write ? POLLOUT : 0));
+}
+
+static int xmux_transport_send_frame(void *opaque, uint8_t type, uint8_t flags, uint32_t stream, const uint8_t *data, size_t length) {
+    tls13_conn_t *connection=opaque;
+    if (tls13_uses_h2(connection)) return h2_send_frame(connection,type,flags,stream,data,length);
+    if (type == 8) return 0;
+    if (type == 3) { shutdown(connection->fd,SHUT_RDWR); return 0; }
+    if (type != 0 || stream != connection->xmux_http1_id || connection->xmux_plain_output.len+length+32 > 256U*1024U) return -1;
+    size_t before=connection->xmux_plain_output.len;
+    int result=0;
+    if (connection->xmux_http1_role == 1 || connection->xmux_http1_role == 2) {
+        char chunk[32]; int size=snprintf(chunk,sizeof(chunk),"%zx\r\n",length);
+        if (size < 0 || (size_t)size >= sizeof(chunk)) return -1;
+        result=db_append(&connection->xmux_plain_output,chunk,(size_t)size);
+    }
+    if (!result) result=db_append(&connection->xmux_plain_output,data,length);
+    if (!result && (connection->xmux_http1_role == 1 || connection->xmux_http1_role == 2)) result=db_append(&connection->xmux_plain_output,"\r\n",2);
+    if (!result) connection->xmux_enqueued+=connection->xmux_plain_output.len-before;
+    return result;
+}
+
+static int xmux_transport_flush(void *opaque) {
+    tls13_conn_t *connection=opaque;
+    if (connection->mode == CONN_MODE_XHTTP_PLAIN) {
+        if (!connection->xmux_plain_output.len) return 0;
+        ssize_t written=core_send(connection->fd,connection->xmux_plain_output.data,connection->xmux_plain_output.len,MSG_DONTWAIT);
+        if (written > 0) { db_consume(&connection->xmux_plain_output,(size_t)written); connection->xmux_flushed+=(size_t)written; }
+        else if (!written || (errno != EAGAIN && errno != EWOULDBLOCK)) return -1;
+        return 0;
+    }
+    if (connection->ssl) {
+        if (!connection->xmux_plain_output.len) return 0;
+        if (!connection->xmux_ssl_write_length) connection->xmux_ssl_write_length=connection->xmux_plain_output.len > 16384 ? 16384 : connection->xmux_plain_output.len;
+        ERR_clear_error();
+        int result=SSL_write(connection->ssl,connection->xmux_plain_output.data,(int)connection->xmux_ssl_write_length);
+        if (result > 0) { db_consume(&connection->xmux_plain_output,(size_t)result); connection->xmux_flushed+=(size_t)result; connection->xmux_ssl_write_length=0; connection->xmux_write_wants_read=0; return 0; }
+        int error=SSL_get_error(connection->ssl,result);
+        connection->xmux_write_wants_read=error == SSL_ERROR_WANT_READ;
+        return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ? 0 : -1;
+    }
+    if (!connection->xmux_wire_output.len && connection->xmux_plain_output.len) {
+        size_t limit=connection->c_app_record_bytes < 128U*1024U ? 1186 : 16384;
+        size_t length=connection->xmux_plain_output.len < limit ? connection->xmux_plain_output.len : limit;
+        uint8_t *record=NULL; size_t record_length=0;
+        if (encrypt_record(connection,connection->c_app_key,connection->c_app_iv,&connection->c_app_seq,0x17,
+                           connection->xmux_plain_output.data,length,&record,&record_length) != 0) return -1;
+        int result=db_append(&connection->xmux_wire_output,record,record_length); free(record);
+        if (result != 0) return -1;
+        connection->xmux_wire_plain_length=length;
+        db_consume(&connection->xmux_plain_output,length);
+    }
+    if (connection->xmux_wire_output.len) {
+        ssize_t written=core_send(connection->fd,connection->xmux_wire_output.data,connection->xmux_wire_output.len,MSG_DONTWAIT);
+        if (written > 0) {
+            db_consume(&connection->xmux_wire_output,(size_t)written); connection->c_app_record_bytes+=(size_t)written;
+            if (!connection->xmux_wire_output.len) { connection->xmux_flushed+=connection->xmux_wire_plain_length; connection->xmux_wire_plain_length=0; }
+        }
+        else if (!written || (errno != EAGAIN && errno != EWOULDBLOCK)) return -1;
+    }
+    return 0;
+}
+
+static int xmux_transport_collect(void *opaque) {
+    tls13_conn_t *connection=opaque;
+    if (!tls13_uses_h2(connection)) {
+        if (connection->h2_net_cache.len >= 65536 || connection->xmux_http1_eof) return 0;
+        uint8_t data[16384]; int size;
+        if (connection->ssl) {
+            ERR_clear_error();
+            size=SSL_read(connection->ssl,data,sizeof(data));
+            if (size <= 0) {
+                int error=SSL_get_error(connection->ssl,size);
+                connection->xmux_read_wants_write=error == SSL_ERROR_WANT_WRITE;
+                if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) return 0;
+                if (error != SSL_ERROR_ZERO_RETURN && !(error == SSL_ERROR_SYSCALL && !size)) {
+                    unsigned long detail=ERR_peek_last_error();
+                    const char *reason=detail ? ERR_reason_error_string(detail) : NULL;
+                    vc_log_warning("xhttp","HTTP/1.1 TLS receive error=%d errno=%d reason=%s",error,errno,reason ? reason : "none");
+                    return -1;
+                }
+            }
+        } else {
+            size=(int)core_recv(connection->fd,data,sizeof(data),MSG_DONTWAIT);
+            if (size < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
+        }
+        if (size > 0) return db_append(&connection->h2_net_cache,data,(size_t)size);
+        connection->xmux_http1_eof=1; return 0;
+    }
+    if (connection->ssl) return h2_collect_tls_available(connection,&connection->xmux_read_wants_write);
+    uint8_t input[16384];
+    for (unsigned reads=0;reads<64;reads++) {
+        while (connection->xmux_raw_input.len >= 5) {
+            const uint8_t *record=connection->xmux_raw_input.data;
+            size_t length=((size_t)record[3]<<8)|record[4];
+            if (length > 18432) return -1;
+            if (connection->xmux_raw_input.len < length+5) break;
+            if (record[0] == 0x17) {
+                uint8_t *plain=NULL,inner=0; size_t plain_length=0;
+                if (decrypt_record(connection,connection->s_app_key,connection->s_app_iv,&connection->s_app_seq,record[0],record+5,length,
+                                   &plain,&plain_length,&inner) != 0) return -1;
+                int result=inner == 0x17 ? db_append(&connection->h2_net_cache,plain,plain_length) : inner == 0x15 ? -1 : 0;
+                free(plain); if (result != 0) return -1;
+            }
+            db_consume(&connection->xmux_raw_input,length+5);
+            if (h2_cached_frame_ready(connection)) return 1;
+        }
+        ssize_t length=core_recv(connection->fd,input,sizeof(input),MSG_DONTWAIT);
+        if (length > 0) { if (db_append(&connection->xmux_raw_input,input,(size_t)length) != 0) return -1; }
+        else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        else return -1;
+    }
+    return 0;
+}
+
+static int xmux_transport_read_frame(void *opaque, core_xmux_frame_t *frame, size_t capacity) {
+    tls13_conn_t *connection=opaque;
+    memset(frame,0,sizeof(*frame));
+    if (!tls13_uses_h2(connection)) {
+        if (!connection->xmux_http1_id) return connection->xmux_http1_eof ? -1 : 1;
+        core_http1_event_t event;
+        int result=core_http1_next(&connection->xmux_http1_response,connection->h2_net_cache.data,connection->h2_net_cache.len,
+                                   connection->xmux_http1_eof,capacity,&event);
+        if (!result) {
+            frame->event=event.kind; frame->status=event.status; frame->close_connection=event.close_connection;
+            frame->id=connection->xmux_http1_id; frame->length=event.length;
+            if (event.length) {
+                frame->data=malloc(event.length);
+                if (!frame->data) return -1;
+                memcpy(frame->data,connection->h2_net_cache.data+event.offset,event.length);
+            }
+            if (event.kind == 3) connection->xmux_http1_id=0;
+        }
+        db_consume(&connection->h2_net_cache,event.consumed); return result;
+    }
+    if (!h2_cached_frame_ready(connection)) return 1;
+    if (connection->h2_net_cache.data[0] || (((unsigned)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2]) > 16384) return -1;
+    return h2_read_frame(connection,&frame->type,&frame->flags,&frame->id,&frame->data,&frame->length);
+}
+
+static int xmux_transport_request(void *opaque, const vless_config_t *config, const char *session, uint64_t sequence,
+                                  int role, const uint8_t *data, size_t length, uint32_t *id) {
+    (void)data;
+    tls13_conn_t *physical=opaque;
+    tls13_conn_t request=*physical;
+    request.h2_send_buf=(dynbuf_t){0}; request.xmux_owner=physical;
+    char error[160];
+    if (xhttp_configure(config,&request,error,sizeof(error)) != 0) return -1;
+    if (strlen(session) >= sizeof(request.xhttp_session_id)) return -1;
+    memcpy(request.xhttp_session_id,session,strlen(session)+1);
+    char path[2048],headers[4096],seq[32];
+    snprintf(seq,sizeof(seq),"%llu",(unsigned long long)sequence);
+    if (xhttp_prepare_request(&request,role == 3 ? seq : "",path,sizeof(path),headers,sizeof(headers)) != 0) return -1;
+    if (physical->h2_next_stream_id > 0x7ffffffdU) return -1;
+    *id=physical->h2_next_stream_id; physical->h2_next_stream_id+=2;
+    const char *method=role == 0 ? "GET" : role == 3 ? request.xhttp_uplink_method : "POST";
+    if (!tls13_uses_h2(physical)) {
+        if (physical->xmux_http1_id || physical->h2_net_cache.len || physical->xmux_http1_eof) return -1;
+        char framing[96],http[8192];
+        if (role == 1 || role == 2) snprintf(framing,sizeof(framing),"Content-Type: application/grpc\r\nTransfer-Encoding: chunked\r\n");
+        else if (role == 3) snprintf(framing,sizeof(framing),"Content-Type: application/octet-stream\r\nContent-Length: %zu\r\n",length);
+        else framing[0]=0;
+        int size=snprintf(http,sizeof(http),"%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: vless-core/1.0\r\nAccept: */*\r\n%s%sConnection: %s\r\n\r\n",method,path,request.xhttp_host,headers,framing,role == 1 || role == 2 ? "close" : "keep-alive");
+        if (size < 0 || (size_t)size >= sizeof(http) || db_append(&physical->xmux_plain_output,http,(size_t)size) != 0) return -1;
+        physical->xmux_enqueued+=(size_t)size;
+        physical->xmux_http1_response=(core_http1_response_t){0};
+        physical->xmux_http1_id=*id; physical->xmux_http1_role=role; return 0;
+    }
+    int result=h2_send_xhttp_request_headers(&request,*id,method,path,headers,length,role != 0,role != 0 && role != 3,error,sizeof(error));
+    db_free(&request.h2_send_buf); return result;
+}
+
+static int xmux_transport_session(const vless_config_t *config, char *session, size_t capacity) {
+    tls13_conn_t connection={0}; char error[160];
+    if (xhttp_configure(config,&connection,error,sizeof(error)) != 0 || strlen(connection.xhttp_session_id) >= capacity) return -1;
+    memcpy(session,connection.xhttp_session_id,strlen(connection.xhttp_session_id)+1); return 0;
+}
+
+static const core_xmux_backend_t xmux_backend={
+    .open=xmux_transport_open,.close=xmux_transport_close,.fd=xmux_transport_fd,.events=xmux_transport_events,.collect=xmux_transport_collect,
+    .read_frame=xmux_transport_read_frame,.send_frame=xmux_transport_send_frame,.flush=xmux_transport_flush,
+    .pending=xmux_transport_pending,.enqueued=xmux_transport_enqueued,.flushed=xmux_transport_flushed,.request=xmux_transport_request,.session=xmux_transport_session,
+};
