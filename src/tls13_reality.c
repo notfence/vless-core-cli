@@ -164,6 +164,9 @@ struct tls13_conn {
     const EVP_MD *tls_md;
     size_t tls_hash_len;
     size_t tls_key_len;
+    X509 *tls_peer_certificate;
+    dynbuf_t tls_certificate_message;
+    unsigned tls_auth_state;
 
     uint8_t hs_secret[64];
     uint8_t c_hs_traffic[64];
@@ -3944,7 +3947,7 @@ static int ext_ec_point_formats(dynbuf_t *exts) {
 }
 
 static int ext_sig_algs(dynbuf_t *exts) {
-    uint16_t sigs[] = {0x0403, 0x0804, 0x0503, 0x0805, 0x0806, 0x0601, 0x0501, 0x0401};
+    uint16_t sigs[] = {0x0403, 0x0804, 0x0503, 0x0805, 0x0806, 0x0807, 0x0601, 0x0501, 0x0401};
     uint8_t data[64];
     size_t off = 0;
     size_t slen = sizeof(sigs);
@@ -3959,7 +3962,7 @@ static int ext_sig_algs(dynbuf_t *exts) {
 
 static int ext_sig_algs_qq(dynbuf_t *exts) {
     /* Matches uTLS HelloQQ_11_1 signature algorithm ordering. */
-    uint16_t sigs[] = {0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601};
+    uint16_t sigs[] = {0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0807, 0x0601};
     uint8_t data[64];
     size_t off = 0;
     size_t slen = sizeof(sigs);
@@ -3973,7 +3976,7 @@ static int ext_sig_algs_qq(dynbuf_t *exts) {
 }
 
 static int ext_sig_algs_firefox(dynbuf_t *exts) {
-    uint16_t sigs[] = {0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201};
+    uint16_t sigs[] = {0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0807, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201};
     uint8_t data[64];
     size_t off = 0;
     size_t slen = sizeof(sigs);
@@ -5381,6 +5384,80 @@ static int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len
     return db_append(&c->transcript, msg, msg_len);
 }
 
+static int verify_server_signature(const vless_config_t *cfg, tls13_conn_t *c, const uint8_t *body, size_t length) {
+    if (!c->tls_peer_certificate || length < 4 || (((size_t)body[2]<<8)|body[3]) != length-4) return -1;
+    unsigned scheme=((unsigned)body[0]<<8)|body[1];
+    const EVP_MD *digest=NULL;
+    int expected_type=0,curve=0,pss=0;
+    switch (scheme) {
+    case 0x0403: digest=EVP_sha256(); expected_type=EVP_PKEY_EC; curve=NID_X9_62_prime256v1; break;
+    case 0x0503: digest=EVP_sha384(); expected_type=EVP_PKEY_EC; curve=NID_secp384r1; break;
+    case 0x0603:
+        if (cfg->fp_mode != FP_FIREFOX) return -1;
+        digest=EVP_sha512(); expected_type=EVP_PKEY_EC; curve=NID_secp521r1; break;
+    case 0x0804: digest=EVP_sha256(); expected_type=EVP_PKEY_RSA; pss=1; break;
+    case 0x0805: digest=EVP_sha384(); expected_type=EVP_PKEY_RSA; pss=1; break;
+    case 0x0806: digest=EVP_sha512(); expected_type=EVP_PKEY_RSA; pss=1; break;
+    case 0x0807: expected_type=EVP_PKEY_ED25519; break;
+    default: return -1;
+    }
+    EVP_PKEY *key=X509_get_pubkey(c->tls_peer_certificate);
+    if (!key || EVP_PKEY_base_id(key) != expected_type) { EVP_PKEY_free(key); return -1; }
+    if (curve) {
+        char group[80]; size_t size=0;
+        if (EVP_PKEY_get_utf8_string_param(key,OSSL_PKEY_PARAM_GROUP_NAME,group,sizeof(group),&size) != 1 ||
+            OBJ_txt2nid(group) != curve) { EVP_PKEY_free(key); return -1; }
+    }
+    uint8_t transcript[64],input[164];
+    const char context[]="TLS 1.3, server CertificateVerify";
+    memset(input,32,64); memcpy(input+64,context,sizeof(context));
+    if (transcript_hash(c,transcript)) { EVP_PKEY_free(key); return -1; }
+    memcpy(input+64+sizeof(context),transcript,c->tls_hash_len);
+    EVP_MD_CTX *verify=EVP_MD_CTX_new(); EVP_PKEY_CTX *parameters=NULL;
+    int ok=verify && EVP_DigestVerifyInit(verify,&parameters,digest,NULL,key) == 1;
+    if (ok && pss) ok=EVP_PKEY_CTX_set_rsa_padding(parameters,RSA_PKCS1_PSS_PADDING) == 1 &&
+        EVP_PKEY_CTX_set_rsa_pss_saltlen(parameters,EVP_MD_get_size(digest)) == 1 && EVP_PKEY_CTX_set_rsa_mgf1_md(parameters,digest) == 1;
+    if (ok) ok=EVP_DigestVerify(verify,body+4,length-4,input,64+sizeof(context)+c->tls_hash_len) == 1;
+    EVP_MD_CTX_free(verify); EVP_PKEY_free(key); return ok ? 0 : -1;
+}
+
+static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, const uint8_t *message, size_t length, char *err, size_t err_cap) {
+    if (length < 4) return -1;
+    unsigned type=message[0]; size_t body_length=length-4;
+    static const unsigned expected[]={8,11,15,20};
+    if (c->tls_auth_state >= 4 || type != expected[c->tls_auth_state]) {
+        set_err(err,err_cap,"unexpected TLS server handshake message"); return -1;
+    }
+    if (type == 8) {
+        if (body_length < 2 || (((size_t)message[4]<<8)|message[5]) != body_length-2) {
+            set_err(err,err_cap,"invalid TLS EncryptedExtensions"); return -1;
+        }
+    } else if (type == 11) {
+        const uint8_t *der=NULL; size_t der_length=0;
+        if (parse_first_cert_der(message,length,&der,&der_length)) { set_err(err,err_cap,"invalid TLS Certificate"); return -1; }
+        const unsigned char *cursor=der;
+        c->tls_peer_certificate=d2i_X509(NULL,&cursor,(long)der_length);
+        if (!c->tls_peer_certificate || cursor != der+der_length) { set_err(err,err_cap,"invalid TLS leaf certificate"); return -1; }
+        if (!strcmp(cfg->security,"reality")) {
+            if (verify_reality_cert(c->auth_key,der,der_length)) { set_err(err,err_cap,"REALITY cert verify failed"); return -1; }
+        } else if (c->tls_verify_policy == TLS_VERIFY_MODE_STRICT &&
+            verify_tls_cert_message(cfg->sni[0] ? cfg->sni : cfg->server_host,message,length,err,err_cap)) return -1;
+        if (db_append(&c->tls_certificate_message,message,length)) return -1;
+    } else if (type == 15) {
+        if (verify_server_signature(cfg,c,message+4,body_length)) { set_err(err,err_cap,"TLS CertificateVerify signature failed"); return -1; }
+    } else {
+        uint8_t transcript[64],finished[64];
+        if (body_length != c->tls_hash_len || transcript_hash(c,transcript) ||
+            calc_finished_verify(c,c->s_hs_traffic,transcript,finished) || CRYPTO_memcmp(finished,message+4,body_length)) {
+            set_err(err,err_cap,"server Finished mismatch"); return -1;
+        }
+        if (strcmp(cfg->security,"reality") && c->tls_verify_policy == TLS_VERIFY_MODE_TOFU &&
+            tcp_tls_tofu_verify_or_store(cfg,c->tls_certificate_message.data,c->tls_certificate_message.len,err,err_cap)) return -1;
+    }
+    if (append_transcript(c,message,length)) return -1;
+    c->tls_auth_state++; return type == 20 ? 1 : 0;
+}
+
 static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, EVP_PKEY *hybrid_key, const uint8_t *hybrid_pub, char *err, size_t err_cap) {
     int use_reality = (strcmp(cfg->security, "reality") == 0);
     tls_verify_mode_t verify_mode = tls_verify_mode_for_config(cfg);
@@ -5523,7 +5600,6 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
 
     dynbuf_t enc_hs = {0};
     int got_finished = 0;
-    int cert_verified = use_reality ? 0 : (verify_mode == TLS_VERIFY_MODE_INSECURE ? 1 : 0);
 
     while (!got_finished) {
         uint8_t rtype = 0;
@@ -5560,63 +5636,17 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
             free(dec);
 
             while (enc_hs.len >= 4) {
-                uint8_t htype = enc_hs.data[0];
                 size_t hlen = ((size_t)enc_hs.data[1] << 16) | ((size_t)enc_hs.data[2] << 8) | enc_hs.data[3];
                 if (enc_hs.len < 4 + hlen) {
                     break;
                 }
-                if (htype == 0x14) {
-                    uint8_t thash[64];
-                    uint8_t expect[64];
-                    if (transcript_hash(c, thash) != 0 || calc_finished_verify(c, c->s_hs_traffic, thash, expect) != 0) {
-                        db_free(&enc_hs);
-                        set_err(err, err_cap, "failed to verify server finished");
-                        return -1;
-                    }
-                    if (hlen != c->tls_hash_len || memcmp(expect, enc_hs.data + 4, c->tls_hash_len) != 0) {
-                        db_free(&enc_hs);
-                        set_err(err, err_cap, "server Finished mismatch");
-                        return -1;
-                    }
-                    if (append_transcript(c, enc_hs.data, 4 + hlen) != 0) {
-                        db_free(&enc_hs);
-                        return -1;
-                    }
-                    db_consume(&enc_hs, 4 + hlen);
-                    got_finished = 1;
-                    break;
-                }
-
-                if (htype == 0x0b) {
-                    if (use_reality) {
-                        const uint8_t *der = NULL;
-                        size_t der_len = 0;
-                        if (parse_first_cert_der(enc_hs.data, 4 + hlen, &der, &der_len) == 0) {
-                            if (verify_reality_cert(c->auth_key, der, der_len) == 0) {
-                                cert_verified = 1;
-                            }
-                        }
-                    } else if (verify_mode == TLS_VERIFY_MODE_TOFU) {
-                        if (tcp_tls_tofu_verify_or_store(cfg, enc_hs.data, 4 + hlen, err, err_cap) != 0) {
-                            db_free(&enc_hs);
-                            return -1;
-                        }
-                        cert_verified = 1;
-                    } else if (verify_mode == TLS_VERIFY_MODE_STRICT) {
-                        if (verify_tls_cert_message(cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host, enc_hs.data, 4 + hlen, err,
-                                                    err_cap) != 0) {
-                            db_free(&enc_hs);
-                            return -1;
-                        }
-                        cert_verified = 1;
-                    }
-                }
-
-                if (append_transcript(c, enc_hs.data, 4 + hlen) != 0) {
+                int result=server_handshake_message(cfg,c,enc_hs.data,4+hlen,err,err_cap);
+                if (result < 0) {
                     db_free(&enc_hs);
                     return -1;
                 }
                 db_consume(&enc_hs, 4 + hlen);
+                if (result > 0) { got_finished=1; break; }
             }
         } else {
             free(dec);
@@ -5624,11 +5654,6 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     }
 
     db_free(&enc_hs);
-
-    if (!cert_verified) {
-        set_err(err, err_cap, use_reality ? "REALITY cert verify failed" : "TLS certificate verify failed");
-        return -1;
-    }
 
     uint8_t thash[64];
     uint8_t client_verify[64];
@@ -5727,6 +5752,8 @@ static const char *tls_cipher_suite_name(uint16_t suite) {
 }
 
 static void reset_manual_tls_handshake(tls13_conn_t *c) {
+    X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL;
+    db_free(&c->tls_certificate_message); c->tls_auth_state=0;
     c->tls_cipher_suite = 0;
     c->tls_md = NULL;
     c->tls_hash_len = 0;
@@ -6307,6 +6334,8 @@ void tls13_reality_close(tls13_conn_t *c) {
         close(c->fd);
     }
     core_hpack_clear(&c->hpack);
+    X509_free(c->tls_peer_certificate);
+    db_free(&c->tls_certificate_message);
     db_free(&c->xhttp_net_cache);
     db_free(&c->ws_net_cache);
     db_free(&c->h2_net_cache);
