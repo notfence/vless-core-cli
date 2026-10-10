@@ -8,6 +8,7 @@
 
 #include "utils.h"
 #include "xhttp_config.h"
+#include "core_log.h"
 
 static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
@@ -278,10 +279,32 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
         char *equal = strchr(extra_cursor, '=');
         if (equal) {
             *equal = 0; char key[MAX_QUERY_KEY_LENGTH + 1];
-            if (normalize_query_key(extra_cursor, key, sizeof(key)) == 0 && !strcmp(key, "extra")) {
+            if (normalize_query_key(extra_cursor, key, sizeof(key)) == 0 && !strcmp(key,"transport")) {
+                char decoded[4096],value[4096];
+                if (percent_decode(equal+1,decoded,sizeof(decoded))) { set_err(err,err_cap,"invalid transport encoding"); free(scan); return -1; }
+                copy_lower_trunc(value,sizeof(value),decoded);
+                if (!strcmp(value,"tcp") || !strcmp(value,"raw") || !value[0]) cfg->transport_mode=TRANSPORT_VISION;
+                else if (!strcmp(value,"xhttp") || !strcmp(value,"splithttp")) cfg->transport_mode=TRANSPORT_XHTTP;
+                else if (!strcmp(value,"ws") || !strcmp(value,"websocket")) cfg->transport_mode=TRANSPORT_WS;
+                else if (!strcmp(value,"grpc")) cfg->transport_mode=TRANSPORT_GRPC;
+                else { set_err(err,err_cap,"unsupported transport"); free(scan); return -1; }
+            }
+        }
+        if (!next) break;
+        extra_cursor = next + 1;
+    }
+    memcpy(scan,query,strlen(query)+1); extra_cursor=scan;
+    while (*extra_cursor) {
+        char *next=strchr(extra_cursor,'&'); if (next) *next=0;
+        char *equal=strchr(extra_cursor,'=');
+        if (equal) {
+            *equal=0; char key[MAX_QUERY_KEY_LENGTH+1];
+            if (normalize_query_key(extra_cursor,key,sizeof(key)) == 0 && !strcmp(key,"extra")) {
                 char decoded[4096];
                 if (percent_decode(equal + 1, decoded, sizeof(decoded)) != 0) { set_err(err,err_cap,"invalid extra parameter encoding"); free(scan); return -1; }
-                if (core_xhttp_extra(cfg, decoded, err, err_cap) != 0) { free(scan); return -1; }
+                if (cfg->transport_mode == TRANSPORT_XHTTP) {
+                    if (core_xhttp_extra(cfg, decoded, err, err_cap) != 0) { free(scan); return -1; }
+                } else vc_log_warning("uri","field query.extra is not applied to this transport");
             }
         }
         if (!next) break;
@@ -310,7 +333,7 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
         }
         for (size_t i = 0; i < seen_count; i++) {
             if (strcmp(seen[i], key) == 0) {
-                set_err(err, err_cap, "duplicate query parameter");
+                if (err && err_cap) snprintf(err,err_cap,"duplicate query parameter: %s",key);
                 return -1;
             }
         }
@@ -322,19 +345,32 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
 
         char decoded[4096];
         if (percent_decode(eq + 1, decoded, sizeof(decoded)) != 0) {
-            set_err(err, err_cap, "invalid query parameter encoding");
+            if (err && err_cap) snprintf(err,err_cap,"invalid query parameter encoding: %s",key);
             return -1;
         }
         if (strcmp(key, "extra") && strcmp(key,"headers") && strcmp(key,"downloadsettings") && !query_value_is_valid_utf8((const unsigned char *)decoded)) {
-            set_err(err, err_cap, "invalid query parameter value");
+            if (err && err_cap) snprintf(err,err_cap,"invalid query parameter value: %s",key);
             return -1;
         }
         char decoded_lower[4096];
         copy_lower_trunc(decoded_lower, sizeof(decoded_lower), decoded);
 
-        int xhttp_parameter = core_xhttp_parameter(cfg, key, decoded, err, err_cap);
+        const struct { const char *key; size_t capacity; } capacities[]={
+            {"sni",sizeof(cfg->sni)},{"flow",sizeof(cfg->flow)},{"encryption",sizeof(cfg->encryption)},
+            {"security",sizeof(cfg->security)},{"alpn",sizeof(cfg->alpn)},{"path",sizeof(cfg->xhttp_path)},
+            {"host",sizeof(cfg->xhttp_host)},{"servicename",sizeof(cfg->grpc_service_name)},
+            {"authority",sizeof(cfg->grpc_authority)},{"mode",sizeof(cfg->xhttp_mode)},{"spx",sizeof(cfg->spider_x)}
+        };
+        for (size_t i=0;i<sizeof(capacities)/sizeof(*capacities);i++) if (!strcmp(key,capacities[i].key) && strlen(decoded) >= capacities[i].capacity) {
+            if (err && err_cap) snprintf(err,err_cap,"query field %s exceeds capacity",key);
+            return -1;
+        }
+        int common=!strcmp(key,"path") || !strcmp(key,"host") || !strcmp(key,"mode");
+        int xhttp_parameter = common ? 0 : core_xhttp_parameter(cfg, key, decoded, err, err_cap);
         if (xhttp_parameter < 0) return -1;
         if (xhttp_parameter > 0 || !strcmp(key, "extra")) {
+            if (xhttp_parameter > 0 && cfg->transport_mode != TRANSPORT_XHTTP)
+                vc_log_warning("uri","field query.%s is not applied to this transport",key);
             if (next == NULL) break;
             cursor = next + 1;
             if (*cursor == '\0') { set_err(err, err_cap, "invalid trailing query separator"); return -1; }
@@ -342,14 +378,12 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
         }
         if (strcmp(key, "pbk") == 0) {
             size_t n = 0;
-            if (base64url_decode(decoded, cfg->pbk, sizeof(cfg->pbk), &n) == 0) {
-                cfg->pbk_len = n;
-            }
+            if (base64url_decode(decoded,cfg->pbk,sizeof(cfg->pbk),&n) || n != 32) { set_err(err,err_cap,"pbk is required and must decode to 32 bytes"); return -1; }
+            cfg->pbk_len=n;
         } else if (strcmp(key, "sid") == 0) {
             size_t n = 0;
-            if (hex_to_bytes(decoded, cfg->short_id, sizeof(cfg->short_id), &n) == 0) {
-                cfg->short_id_len = n;
-            }
+            if (hex_to_bytes(decoded,cfg->short_id,8,&n)) { set_err(err,err_cap,"invalid sid"); return -1; }
+            cfg->short_id_len=n;
         } else if (strcmp(key, "sni") == 0) {
             copy_trunc(cfg->sni, sizeof(cfg->sni), decoded);
         } else if (strcmp(key, "fp") == 0) {
@@ -363,9 +397,9 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
                 cfg->fp_mode = FP_FIREFOX;
             } else if (strcmp(decoded_lower, "edge") == 0) {
                 cfg->fp_mode = FP_EDGE;
-            } else {
+            } else if (!strcmp(decoded_lower,"chrome")) {
                 cfg->fp_mode = FP_CHROME;
-            }
+            } else { set_err(err,err_cap,"unsupported fp"); return -1; }
         } else if (strcmp(key, "flow") == 0) {
             copy_trunc(cfg->flow, sizeof(cfg->flow), decoded_lower);
         } else if (strcmp(key, "encryption") == 0) {
@@ -375,6 +409,7 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
         } else if (strcmp(key, "alpn") == 0) {
             copy_trunc(cfg->alpn, sizeof(cfg->alpn), decoded);
         } else if (strcmp(key, "allowinsecure") == 0) {
+            if (strcmp(decoded_lower,"1") && strcmp(decoded_lower,"0") && strcmp(decoded_lower,"true") && strcmp(decoded_lower,"false")) { set_err(err,err_cap,"invalid allowInsecure"); return -1; }
             cfg->allow_insecure = (strcmp(decoded_lower, "1") == 0 || strcmp(decoded_lower, "true") == 0);
         } else if (strcmp(key, "transport") == 0) {
             if (strcmp(decoded_lower, "xhttp") == 0 || strcmp(decoded_lower, "splithttp") == 0) {
@@ -383,7 +418,7 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
                 cfg->transport_mode = TRANSPORT_WS;
             } else if (strcmp(decoded_lower, "grpc") == 0) {
                 cfg->transport_mode = TRANSPORT_GRPC;
-            } else if (decoded_lower[0] == '\0' || strcmp(decoded_lower, "tcp") == 0) {
+            } else if (decoded_lower[0] == '\0' || strcmp(decoded_lower, "tcp") == 0 || !strcmp(decoded_lower,"raw")) {
                 cfg->transport_mode = TRANSPORT_VISION;
             }
         } else if (strcmp(key, "path") == 0) {
@@ -398,7 +433,10 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
             copy_lower_trunc(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), decoded);
         } else if (strcmp(key, "spx") == 0) {
             copy_trunc(cfg->spider_x, sizeof(cfg->spider_x), decoded);
-        }
+        } else vc_log_warning("uri","unknown field query.%s ignored",key);
+        if (((!strcmp(key,"path") || !strcmp(key,"host") || !strcmp(key,"mode")) && cfg->transport_mode == TRANSPORT_VISION) ||
+            ((!strcmp(key,"servicename") || !strcmp(key,"authority")) && cfg->transport_mode != TRANSPORT_GRPC) ||
+            (!strcmp(key,"host") && cfg->transport_mode == TRANSPORT_GRPC) || !strcmp(key,"spx")) vc_log_warning("uri","field query.%s is not applied to this transport",key);
 
         if (next == NULL) break;
         cursor = next + 1;
@@ -609,6 +647,10 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     if (parse_vless_encryption(cfg, err, err_cap) != 0) {
         return -1;
     }
+    if (cfg->flow[0] && strcmp(cfg->flow,"xtls-rprx-vision")) { set_err(err,err_cap,"unsupported flow"); return -1; }
+    if (cfg->flow[0] && (cfg->transport_mode == TRANSPORT_WS || cfg->transport_mode == TRANSPORT_GRPC ||
+        (cfg->transport_mode == TRANSPORT_XHTTP && !cfg->encryption_enabled))) vc_log_warning("uri","field query.flow is not applied to this transport");
+    if (strcmp(cfg->security,"reality") && (cfg->pbk_len || cfg->short_id_len)) vc_log_warning("uri","fields query.pbk/query.sid are not applied without REALITY");
 
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
         int xhttp_tls = (strcmp(cfg->security, "tls") == 0);

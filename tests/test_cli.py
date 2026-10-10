@@ -11,6 +11,13 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_unknown_uri_fields_are_reported_without_values(self):
+        with cli(uri(1,"tcp","none",unknown="vless-core-private-value",host="vless-core-unused-host")) as core:
+            self.assertIn("unknown field query.unknown",core.log)
+            self.assertIn("field query.host",core.log)
+            self.assertNotIn("vless-core-private-value",core.log)
+            self.assertNotIn("vless-core-unused-host",core.log)
+
     def test_xhttp_option_warnings_do_not_expose_values(self):
         extra={"noSSEHeader":True,"scMaxBufferedPosts":30,"scStreamUpServerSecs":"20-80","serverMaxHeaderBytes":16384,"unknown":{"private":"vless-core-secret-value"}}
         with cli(uri(1,"xhttp","none",extra=json.dumps(extra))) as core:

@@ -140,6 +140,18 @@ int main(void) {
     check_session_identifiers();
     check_base64();
     CHECK("uri/tcp-defaults", parse(PREFIX "type=tcp") == 0 && strcmp(config.security, "none") == 0 && config.flow[0] == 0 && config.fp_mode == FP_CHROME);
+    const char *unsupported[]={"type=http","type=quic","type=not-a-transport","fp=safari","fp=not-a-fingerprint","allowInsecure=maybe","sid=zz","type=ws&flow=invalid","type=xhttp&flow=invalid"};
+    for (size_t i=0;i<sizeof(unsupported)/sizeof(*unsupported);i++) {
+        char value[512]; snprintf(value,sizeof(value),PREFIX "%s",unsupported[i]); CHECK("uri/unsupported-value-rejected",parse(value) != 0);
+    }
+    CHECK("uri/raw-alias",parse(PREFIX "type=raw") == 0 && config.transport_mode == TRANSPORT_VISION);
+    const char *bounded[]={"sni","flow","security","alpn","servicename","authority","spx"};
+    const size_t capacities[]={sizeof(config.sni),sizeof(config.flow),sizeof(config.security),sizeof(config.alpn),sizeof(config.grpc_service_name),sizeof(config.grpc_authority),sizeof(config.spider_x)};
+    for (size_t i=0;i<sizeof(bounded)/sizeof(*bounded);i++) {
+        char value[1024]; int prefix=snprintf(value,sizeof(value),PREFIX "%s=",bounded[i]);
+        memset(value+prefix,'a',capacities[i]); value[prefix+capacities[i]]=0;
+        CHECK("uri/field-overflow-rejected",parse(value) != 0 && strstr(error,bounded[i]));
+    }
     const char *types[] = {"tcp", "ws", "xhttp", "grpc"};
     const char *securities[] = {"none", "tls", "reality"};
     const char *flows[] = {"", "xtls-rprx-vision", "invalid"};
@@ -147,7 +159,7 @@ int main(void) {
         char uri[1024], name[160];
         snprintf(uri, sizeof(uri), PREFIX "type=%s&security=%s&flow=%s&pbk=" PBK "&sid=01", types[t], securities[s], flows[f]);
         snprintf(name, sizeof(name), "uri/matrix/%s/%s/flow%zu", types[t], securities[s], f);
-        int accepted = !(t == 1 && s == 2) && !(t == 0 && ((s == 0 && f != 0) || (s != 0 && f == 2)));
+        int accepted = f != 2 && !(t == 1 && s == 2) && !(t == 0 && s == 0 && f != 0);
         CHECK(name, (parse(uri) == 0) == accepted);
         if (accepted && t > 0) CHECK("uri/non-tcp-flow-cleared", config.flow[0] == 0);
     }

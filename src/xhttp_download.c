@@ -63,7 +63,7 @@ static int security_settings(const core_json_t *settings, int reality, vless_con
             if (config->pbk_len && memcmp(config->pbk,key,32)) return invalid("realitySettings.publicKey/password collision",error,capacity);
             memcpy(config->pbk,key,32); config->pbk_len=32;
         } else if (!strcasecmp(entry->key,"shortId") && reality) {
-            if (entry->type != CORE_JSON_STRING || hex_to_bytes(entry->text,config->short_id,sizeof(config->short_id),&config->short_id_len) != 0) return invalid("realitySettings.shortId",error,capacity);
+            if (entry->type != CORE_JSON_STRING || hex_to_bytes(entry->text,config->short_id,8,&config->short_id_len) != 0) return invalid("realitySettings.shortId",error,capacity);
         } else if (!strcasecmp(entry->key,"spiderX") && reality) {
             if (string(entry,config->spider_x,sizeof(config->spider_x),"realitySettings.spiderX",error,capacity) != 0) return -1;
         } else if (!strcasecmp(entry->key,"alpn") && !reality) {
