@@ -4,6 +4,8 @@
 #include "json.h"
 #include "utils.h"
 #include "vision.h"
+#include "xhttp_download.h"
+#include "xhttp_padding.h"
 
 static const char *const fuzz_names[] = {"uri", "hpack", "h2", "grpc", "http", "xhttp", "ws", "vision", "tls"};
 static size_t fuzz_target;
@@ -46,8 +48,28 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memcpy(text, data, size);
         text[size] = '\0';
         vless_config_t config;
-        (void)parse_core_uri(text, &config, error, sizeof(error));
+        if (parse_core_uri(text, &config, error, sizeof(error)) == 0 && config.xhttp_download_settings[0]) {
+            vless_config_t download;
+            (void)core_xhttp_download_config(&config,&download,error,sizeof(error));
+        }
         core_json_t *json = core_json_parse(text, error, sizeof(error));
+        if (json) {
+            core_config_defaults(&config); config.transport_mode=TRANSPORT_XHTTP;
+            if (core_xhttp_apply_object(&config,json,"extra",error,sizeof(error)) == 0 && core_xhttp_validate(&config,error,sizeof(error)) == 0) {
+                char session[256];
+                (void)core_xhttp_session(&config,session,sizeof(session));
+            }
+            (void)core_xhttp_download_parse(json,&config,error,sizeof(error));
+            const core_json_t *headers=core_json_get(json,"headers");
+            if (headers) {
+                char output[4096];
+                if (core_http_headers_parse(headers,output,sizeof(output),error,sizeof(error)) == 0) {
+                    (void)core_http_header_get(output,"Cookie",NULL);
+                    (void)core_http_header_set(output,sizeof(output),"X-Vless-Core",text);
+                    (void)core_http_header_append_cookie(output,sizeof(output),"vless-core=1");
+                }
+            }
+        }
         core_json_free(json);
         uint8_t decoded[256];
         size_t length = 0, capacity = size ? data[0] : 0;
@@ -65,6 +87,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         (void)core_hpack_decode(&decoder,data,split,&headers);
         (void)core_hpack_decode(&decoder,data+split,size-split,&headers);
         core_hpack_clear(&decoder);
+        (void)core_hpack_decode(&decoder,data,size,&headers);
+        (void)core_hpack_decode(&decoder,data,size,&headers);
+        core_hpack_clear(&decoder);
+        (void)core_hpack_huffman_bits(data,size);
         char decoded[256];
         size_t length = 0, capacity = size ? data[0] : 0;
         (void)core_hpack_decode_huffman(data, size, decoded, capacity, &length);
@@ -117,7 +143,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     case 5: {
         core_xhttp_payload_options_t options={.placement=size && (data[0]&1) ? "header" : "cookie",.key="vless-core",.chunks={64,256}};
         core_xhttp_payload_t packet;
-        if (core_xhttp_payload_build(&options,data,size,"X-Session: vless-core\r\n",size && (data[0]&2) ? 8192 : 65536,&packet,error,sizeof(error)) == 0) free(packet.headers);
+        if (core_xhttp_payload_build(&options,data,size,"X-Session: vless-core\r\n",size && (data[0]&2) ? 8192 : 65536,&packet,error,sizeof(error)) == 0) {
+            if (packet.consumed > size || packet.body_size || !packet.headers) abort();
+            free(packet.headers);
+        }
+        char padding[16384];
+        core_range_t range={size ? data[0]*16 : 0,size > 1 ? data[1]*32 : 0};
+        const char *methods[]={"repeat-x","tokenish","invalid"};
+        size_t capacity=size > 2 ? (size_t)data[2]*64 : 0;
+        if (core_xhttp_padding(range,methods[size ? data[0]%3 : 0],padding,capacity) == 0 && strlen(padding) >= capacity) abort();
         int pair[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0 || shutdown(pair[1], SHUT_WR) != 0) abort();
         c.fd = pair[0];

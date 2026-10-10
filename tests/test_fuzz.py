@@ -1,9 +1,11 @@
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
 import time
 import unittest
+from urllib.parse import quote
 
 BUILD = Path(os.environ.get("TEST_BUILD_DIR", Path(__file__).resolve().parents[1] / "build/host-tests"))
 
@@ -13,12 +15,37 @@ def frame(kind, flags, stream, payload):
 def seeds():
     prefix = b"vless://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=none&"
     hello = b"\x03\x03"+bytes(32)+b"\x00\x13\x01\x00\x00\x28\x00\x33\x00\x24\x00\x1d\x00\x20"+bytes(range(32))
+    download={"address":"127.0.0.2","port":8443,"network":"xhttp","security":"tls",
+              "tlsSettings":{"serverName":"vless-core.test","alpn":["h2","http/1.1"]},
+              "xhttpSettings":{"path":"/vless-core","extra":{"headers":{"Cookie":"vless-core=1"},"noGRPCHeader":True}}}
+    extras=[{"mode":"packet-up","uplinkDataPlacement":placement,"uplinkDataKey":"vless-core","uplinkChunkSize":"64-128",
+             "scMaxEachPostBytes":"1024-4096","scMinPostsIntervalMs":"10-30","headers":{"X-Vless-Core":"a\\b\"c","Cookie":"vless-core=1"},
+             "sessionIDPlacement":"header","sessionIDKey":"x-session","seqPlacement":"query","seqKey":"seq",
+             "sessionIDTable":"Base62","sessionIDLength":"16-32","xPaddingMethod":"tokenish",
+             "xPaddingObfsMode":True,"xPaddingPlacement":"cookie","xPaddingKey":"padding"}
+            for placement in ("body","header","cookie")]
+    extras.append({"mode":"stream-up","downloadSettings":download,
+                   "xmux":{"maxConnections":"1-3","maxConcurrency":"0","cMaxReuseTimes":"3-5",
+                           "hMaxRequestTimes":"10-20","hMaxReusableSecs":"1-3","hKeepAlivePeriod":-1}})
+    extras.append({"noSSEHeader":False,"scMaxBufferedPosts":30,"scStreamUpServerSecs":"20-80","serverMaxHeaderBytes":8192})
+    uri_extras=[]
+    for extra in extras:
+        encoded=json.dumps(extra,separators=(",",":"))
+        uri_extras.extend((encoded.encode(),prefix+b"security=none&type=xhttp&extra="+quote(encoded,safe="").encode()+b"#vless-core"))
+    uri_extras.extend((json.dumps(download,separators=(",",":")).encode(),
+                       b'{"headers":{"X-Vless-Core":"a","x-vless-core":"b"}}',
+                       b'{"sessionKey":"a","sessionIDKey":"b"}',
+                       b'{"headers":{"Cookie":"x_data_0=old"},"uplinkDataPlacement":"cookie"}',
+                       b'{"xmux":{"maxConnections":1,"maxConcurrency":1}}',
+                       b'{"mode":"packet-up","uplinkDataPlacement":"cookie","sessionIDPlacement":"cookie","sessionIDKey":"x_data_0"}'))
     return {
         "uri":[prefix+b"security=none&type=tcp#vless-core",prefix+b"security=tls&type=ws&host=vless-core.test&path=%2Fvless-core",
                prefix+b"security=tls&type=grpc&serviceName=vless-core",prefix+b"security=tls&type=xhttp&mode=stream-one&path=%2Fvless-core&extra=%7B%22xPaddingBytes%22%3A%22100-1000%22%7D",
-               b"socks5://vless-core:password@127.0.0.1:1080#vless-core",b"socks5://[::1]:1080#vless-core",b"AA==",b"%00%ff%2f"],
+               b"socks5://vless-core:password@127.0.0.1:1080#vless-core",b"socks5://[::1]:1080#vless-core",b"AA==",b"%00%ff%2f",*uri_extras],
         "hpack":[b"\x88",bytes.fromhex("48826402"),bytes.fromhex("4883680cff"),bytes.fromhex("488410000000"),
-                 b"\x00\x07:status\x03200",b"\x00\x0bgrpc-status\x010",b"\xff"*8],
+                 b"\x00\x07:status\x03200",b"\x00\x0bgrpc-status\x010",b"\xff"*8,
+                 bytes.fromhex("828684410f7777772e6578616d706c652e636f6d"),
+                 bytes.fromhex("828684be58086e6f2d6361636865"),bytes.fromhex("828684be5886a8eb10649cbf")],
         "h2":[frame(1,4,1,b"\x88"),frame(1,0,1,b"\x48")+frame(9,4,1,bytes.fromhex("826402")),
               frame(4,1,0,b""),frame(8,0,0,b"\x00\x00\x00\x01"),frame(3,0,1,bytes(4)),
               frame(0,1,1,b"\x00\x00\x00\x00\x0c\x0a\x0avless-core")],
