@@ -115,6 +115,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
     }
     case 5: {
+        core_xhttp_payload_options_t options={.placement=size && (data[0]&1) ? "header" : "cookie",.key="vless-core",.chunks={64,256}};
+        core_xhttp_payload_t packet;
+        if (core_xhttp_payload_build(&options,data,size,"X-Session: vless-core\r\n",size && (data[0]&2) ? 8192 : 65536,&packet,error,sizeof(error)) == 0) free(packet.headers);
         int pair[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0 || shutdown(pair[1], SHUT_WR) != 0) abort();
         c.fd = pair[0];

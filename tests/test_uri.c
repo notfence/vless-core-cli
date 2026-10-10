@@ -2,6 +2,7 @@
 #include "uri.h"
 #include "utils.h"
 #include "server_ips.h"
+#include "xhttp_config.h"
 #include <openssl/evp.h>
 #include <arpa/inet.h>
 
@@ -10,6 +11,28 @@
 static vless_config_t config;
 static char error[256];
 static int parse(const char *uri) { return parse_core_uri(uri, &config, error, sizeof(error)); }
+
+static void check_session_identifiers(void) {
+    vless_config_t settings={0}; char identifier[256];
+    strcpy(settings.xhttp_mode,"packet-up"); strcpy(settings.xhttp_session_placement,"header");
+    CHECK("xhttp/default-session-uuid", core_xhttp_session(&settings,identifier,sizeof(identifier)) == 0 && strlen(identifier) == 36 && identifier[14] == '4' && strchr("89ab",identifier[19]));
+    CHECK("xhttp/session-capacity-no-truncation", core_xhttp_session(&settings,identifier,36) != 0);
+    const char *names[]={"ALPHABET","Alphabet","BASE36","Base62","HEX","alphabet","base36","hex","number"};
+    const char *alphabets[]={"ABCDEFGHIJKLMNOPQRSTUVWXYZ","ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz","0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ","0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz","0123456789ABCDEF","abcdefghijklmnopqrstuvwxyz","0123456789abcdefghijklmnopqrstuvwxyz","0123456789abcdef","0123456789"};
+    settings.xhttp_session_id_length_min=16; settings.xhttp_session_id_length_max=32;
+    for (size_t i=0;i<sizeof(names)/sizeof(*names);i++) {
+        strcpy(settings.xhttp_session_id_table,names[i]);
+        for (int attempt=0;attempt<8;attempt++) {
+            REQUIRE("xhttp/session-table-generation", core_xhttp_session(&settings,identifier,sizeof(identifier)) == 0);
+            CHECK("xhttp/session-range-and-characters", strlen(identifier) >= 16 && strlen(identifier) <= 32 && strspn(identifier,alphabets[i]) == strlen(identifier));
+        }
+    }
+    settings.xhttp_session_id_length_min=settings.xhttp_session_id_length_max=255;
+    CHECK("xhttp/session-maximum-size", core_xhttp_session(&settings,identifier,sizeof(identifier)) == 0 && strlen(identifier) == 255);
+    CHECK("xhttp/session-too-small-buffer", core_xhttp_session(&settings,identifier,255) != 0);
+    strcpy(settings.xhttp_mode,"stream-one");
+    CHECK("xhttp/stream-one-no-session", core_xhttp_session(&settings,identifier,sizeof(identifier)) == 0 && !identifier[0]);
+}
 
 static void check_base64(void) {
     const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -71,6 +94,49 @@ static void check_base64(void) {
 }
 
 int main(void) {
+    const char *invalid_options[]={
+        "{\"sessionIDPlacement\":\"invalid\"}","{\"seqPlacement\":\"invalid\"}","{\"xPaddingPlacement\":\"invalid\"}","{\"xPaddingMethod\":\"invalid\"}",
+        "{\"sessionIDPlacement\":\"header\",\"sessionIDKey\":\"Host\"}","{\"seqPlacement\":\"header\",\"seqKey\":\"Content-Length\"}","{\"xPaddingHeader\":\"Transfer-Encoding\"}",
+        "{\"sessionIDPlacement\":\"cookie\",\"sessionIDKey\":\"bad key\"}","{\"seqPlacement\":\"cookie\",\"seqKey\":\"bad;key\"}",
+        "{\"sessionIDPlacement\":\"header\",\"sessionIDKey\":\"X-Same\",\"seqPlacement\":\"header\",\"seqKey\":\"x-same\"}",
+        "{\"sessionIDPlacement\":\"query\",\"sessionIDKey\":\"same\",\"seqPlacement\":\"query\",\"seqKey\":\"same\"}",
+        "{\"sessionIDPlacement\":\"header\",\"sessionIDKey\":\"Cookie\",\"seqPlacement\":\"cookie\"}",
+        "{\"uplinkDataPlacement\":\"header\",\"headers\":{\"X-Data-0\":\"vless-core\"}}",
+        "{\"uplinkHTTPMethod\":\"OPTIONS\"}","{\"noGRPCHeader\":1}","{\"noSSEHeader\":1}","{\"scMaxBufferedPosts\":true}","{\"scStreamUpServerSecs\":\"20-junk\"}","{\"serverMaxHeaderBytes\":-1}",
+        "{\"sessionIDPlacement\":\"cookie\",\"headers\":{\"Cookie\":\"x_session=old\"}}",
+        "{\"seqPlacement\":\"cookie\",\"headers\":{\"Cookie\":\"x_seq=old\"}}",
+        "{\"uplinkDataPlacement\":\"cookie\",\"headers\":{\"Cookie\":\"x_data_0=old\"}}",
+        "{\"xPaddingObfsMode\":true,\"xPaddingPlacement\":\"header\",\"xPaddingHeader\":\"X-Session\",\"sessionIDPlacement\":\"header\"}",
+        "{\"xPaddingObfsMode\":true,\"xPaddingPlacement\":\"query\",\"xPaddingKey\":\"x_session\",\"sessionIDPlacement\":\"query\"}",
+        "{\"xPaddingObfsMode\":true,\"xPaddingPlacement\":\"cookie\",\"xPaddingKey\":\"x_session\",\"sessionIDPlacement\":\"cookie\"}",
+        "{\"uplinkDataPlacement\":\"header\",\"sessionIDPlacement\":\"header\",\"sessionIDKey\":\"X-Data-0\"}",
+        "{\"uplinkDataPlacement\":\"header\",\"seqPlacement\":\"header\",\"seqKey\":\"X-Data-1\"}",
+        "{\"uplinkDataPlacement\":\"cookie\",\"sessionIDPlacement\":\"cookie\",\"sessionIDKey\":\"x_data_0\"}",
+        "{\"uplinkDataPlacement\":\"cookie\",\"seqPlacement\":\"cookie\",\"seqKey\":\"x_data_1\"}",
+        "{\"uplinkDataPlacement\":\"header\",\"xPaddingObfsMode\":true,\"xPaddingPlacement\":\"header\",\"xPaddingHeader\":\"X-Data-0\"}",
+        "{\"uplinkDataPlacement\":\"cookie\",\"xPaddingObfsMode\":true,\"xPaddingPlacement\":\"cookie\",\"xPaddingKey\":\"x_data_0\"}",
+    };
+    for (size_t i=0;i<sizeof(invalid_options)/sizeof(*invalid_options);i++) {
+        char encoded[4096],uri[4096]; size_t used=0; const char *hex="0123456789ABCDEF";
+        for (const unsigned char *p=(const unsigned char *)invalid_options[i];*p;p++) { encoded[used++]='%'; encoded[used++]=hex[*p>>4]; encoded[used++]=hex[*p&15]; } encoded[used]=0;
+        snprintf(uri,sizeof(uri),PREFIX "type=xhttp&mode=packet-up&extra=%s",encoded);
+        CHECK("uri/invalid-xhttp-options-fail-before-connect",parse(uri) != 0 && error[0]);
+    }
+    CHECK("uri/xhttp-nonindexed-header-metadata-allowed",parse(PREFIX "type=xhttp&mode=packet-up&uplinkDataPlacement=header&sessionIDPlacement=header&sessionIDKey=X-Data-Index") == 0);
+    CHECK("uri/xhttp-cookie-key-case-preserved",parse(PREFIX "type=xhttp&mode=packet-up&uplinkDataPlacement=cookie&sessionIDPlacement=cookie&sessionIDKey=x_DATA_0") == 0);
+    CHECK("uri/xhttp-custom-payload-key-independent",parse(PREFIX "type=xhttp&mode=packet-up&uplinkDataPlacement=header&uplinkDataKey=X-Segment&sessionIDPlacement=header&sessionIDKey=X-Data-0") == 0);
+    CHECK("uri/xhttp-body-does-not-reserve-payload-headers",parse(PREFIX "type=xhttp&mode=packet-up&uplinkDataPlacement=body&sessionIDPlacement=header&sessionIDKey=X-Data-0") == 0);
+    CHECK("uri/server-only-fields-recognized",parse(PREFIX "type=xhttp&extra=%7B%22noSSEHeader%22%3Atrue%2C%22scMaxBufferedPosts%22%3A30%2C%22scStreamUpServerSecs%22%3A%2220-80%22%2C%22serverMaxHeaderBytes%22%3A16384%7D") == 0);
+    uint64_t due;
+    CHECK("xhttp/first-packet-not-delayed",core_xhttp_post_due((core_range_t){100,100},0,1000,&due) == 0 && due == 1000);
+    CHECK("xhttp/default-packet-interval",core_xhttp_post_due((core_range_t){0,0},1000,1001,&due) == 0 && due == 1030);
+    CHECK("xhttp/explicit-packet-interval",core_xhttp_post_due((core_range_t){120,120},1000,1001,&due) == 0 && due == 1120);
+    CHECK("xhttp/zero-minimum-disables-pacing",core_xhttp_post_due((core_range_t){0,100},1000,1001,&due) == 0 && due == 1001);
+    CHECK("xhttp/elapsed-interval-not-restarted",core_xhttp_post_due((core_range_t){120,120},1000,2000,&due) == 0 && due == 2000);
+    CHECK("xhttp/interval-overflow-rejected",core_xhttp_post_due((core_range_t){120,120},UINT64_MAX-1,UINT64_MAX,&due) != 0);
+    vless_config_t sized={0}; sized.xhttp_max_each_post_min=64; sized.xhttp_max_each_post_max=256;
+    for (int attempt=0;attempt<100;attempt++) { int size=core_xhttp_post_limit(&sized); CHECK("xhttp/packet-limit-sampled-in-range",size >= 64 && size <= 256); }
+    check_session_identifiers();
     check_base64();
     CHECK("uri/tcp-defaults", parse(PREFIX "type=tcp") == 0 && strcmp(config.security, "none") == 0 && config.flow[0] == 0 && config.fp_mode == FP_CHROME);
     const char *types[] = {"tcp", "ws", "xhttp", "grpc"};
@@ -92,7 +158,7 @@ int main(void) {
         PREFIX "=x", PREFIX "sni=a&", PREFIX "a", PREFIX "type=ws&security=reality",
         PREFIX "type=xhttp&mode=bad", PREFIX "type=grpc&mode=bad", PREFIX "encryption=bad",
         PREFIX "type=xhttp&mode=stream-up&extra=%7B%22uplinkHTTPMethod%22%3A%22GET%22%7D",
-        PREFIX "type=xhttp&extra=%7B%22uplinkDataPlacement%22%3A%22header%22%7D", "socks5://host:0", "socks5://[::1"
+        PREFIX "type=xhttp&mode=stream-one&extra=%7B%22uplinkDataPlacement%22%3A%22header%22%7D", "socks5://host:0", "socks5://[::1"
     };
     for (size_t i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
         char name[80]; snprintf(name, sizeof(name), "uri/reject/%zu", i); CHECK(name, parse(invalid[i]) != 0);
@@ -117,6 +183,15 @@ int main(void) {
     CHECK("uri/extra-equal-aliases", parse(PREFIX "type=xhttp&extra=%7B%22sessionPlacement%22%3A%22header%22%2C%22sessionIDPlacement%22%3A%22header%22%7D") == 0);
     CHECK("uri/extra-xmux-defaults", parse(PREFIX "type=xhttp&extra=%7B%22xmux%22%3A%7B%7D%7D") == 0 && config.xmux.present && config.xmux.max_connections.min == 6 && config.xmux.request_times.min == 600);
     CHECK("uri/extra-xmux-absent", parse(PREFIX "type=xhttp") == 0 && !config.xmux.present);
+    CHECK("uri/custom-header-query-priority-before", parse(PREFIX "type=xhttp&headers=%7B%22X-vless-core%22%3A%22query%22%7D&noGRPCHeader=1&extra=%7B%22headers%22%3A%7B%22X-vless-core%22%3A%22extra%22%7D%2C%22noGRPCHeader%22%3Afalse%7D") == 0 && !strcmp(config.xhttp_headers,"x-vless-core: query\r\n") && config.xhttp_no_grpc_header);
+    CHECK("uri/custom-header-query-priority-after", parse(PREFIX "type=xhttp&extra=%7B%22headers%22%3A%7B%22X-vless-core%22%3A%22extra%22%7D%2C%22noGRPCHeader%22%3Afalse%7D&headers=%7B%22X-vless-core%22%3A%22query%22%7D&noGRPCHeader=1") == 0 && !strcmp(config.xhttp_headers,"x-vless-core: query\r\n") && config.xhttp_no_grpc_header);
+    CHECK("uri/custom-header-framing-rejected", parse(PREFIX "type=xhttp&extra=%7B%22headers%22%3A%7B%22Content-Length%22%3A%227%22%7D%7D") != 0);
+    CHECK("uri/custom-header-pseudo-rejected", parse(PREFIX "type=xhttp&extra=%7B%22headers%22%3A%7B%22%3Aauthority%22%3A%22vless-core%22%7D%7D") != 0);
+    CHECK("uri/custom-header-value-type", parse(PREFIX "type=xhttp&extra=%7B%22headers%22%3A%7B%22X-vless-core%22%3A7%7D%7D") != 0);
+    CHECK("uri/custom-header-case-conflict", parse(PREFIX "type=xhttp&extra=%7B%22headers%22%3A%7B%22X-vless-core%22%3A%22a%22%2C%22x-vless-core%22%3A%22b%22%7D%7D") != 0);
+    CHECK("uri/session-table-requires-positive-length", parse(PREFIX "type=xhttp&extra=%7B%22sessionIDTable%22%3A%22Base62%22%2C%22sessionIDLength%22%3A%220-16%22%7D") != 0);
+    CHECK("uri/session-table-too-little-room", parse(PREFIX "type=xhttp&extra=%7B%22sessionIDTable%22%3A%22number%22%2C%22sessionIDLength%22%3A2%7D") != 0);
+    CHECK("uri/session-table-known-type", parse(PREFIX "type=xhttp&extra=%7B%22sessionIDTable%22%3A7%2C%22sessionIDLength%22%3A16%7D") != 0);
     CHECK("uri/extra-xmux-conflict", parse(PREFIX "type=xhttp&extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A2%2C%22maxConnections%22%3A2%7D%7D") != 0);
     CHECK("uri/extra-xmux-types", parse(PREFIX "type=xhttp&extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A%222-5%22%2C%22cMaxReuseTimes%22%3A7%2C%22hKeepAlivePeriod%22%3A-1%7D%7D") == 0 && config.xmux.max_concurrency.min == 2 && config.xmux.max_concurrency.max == 5 && config.xmux.reuse_times.min == 7 && config.xmux.keep_alive_period == -1);
     const char *modes[] = {"native", "xorpub", "random"};

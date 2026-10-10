@@ -74,10 +74,16 @@ typedef struct {
     char grpc_authority[256];
     char xhttp_session_placement[16];
     char xhttp_session_key[64];
+    char xhttp_session_id_table[256];
+    int xhttp_session_id_length_min, xhttp_session_id_length_max;
     char xhttp_seq_placement[16];
     char xhttp_seq_key[64];
-    char xhttp_uplink_method[8];
+    char xhttp_uplink_method[32];
+    char xhttp_headers[4096];
+    int xhttp_no_grpc_header;
     char xhttp_uplink_data_placement[16];
+    char xhttp_uplink_data_key[64];
+    int xhttp_uplink_chunk_min, xhttp_uplink_chunk_max;
     char xhttp_padding_placement[16];
     char xhttp_padding_key[64];
     char xhttp_padding_header[64];
@@ -87,6 +93,7 @@ typedef struct {
     int xhttp_padding_max;
     int xhttp_max_each_post_min;
     int xhttp_max_each_post_max;
+    int xhttp_min_posts_interval_min, xhttp_min_posts_interval_max;
     core_xmux_config_t xmux;
     int xhttp_physical_only;
 

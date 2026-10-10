@@ -1,4 +1,5 @@
 import os
+import json
 import socket
 import struct
 import threading
@@ -10,6 +11,15 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_xhttp_option_warnings_do_not_expose_values(self):
+        extra={"noSSEHeader":True,"scMaxBufferedPosts":30,"scStreamUpServerSecs":"20-80","serverMaxHeaderBytes":16384,"unknown":{"private":"vless-core-secret-value"}}
+        with cli(uri(1,"xhttp","none",extra=json.dumps(extra))) as core:
+            for name in ("noSSEHeader","scMaxBufferedPosts","scStreamUpServerSecs","serverMaxHeaderBytes"):
+                self.assertIn(f"server-only field extra.{name}",core.log)
+                self.assertNotIn(f"unknown field extra.{name}",core.log)
+            self.assertIn("unknown field extra.unknown",core.log)
+            self.assertNotIn("vless-core-secret-value",core.log)
+
     def test_absolute_socks_handshake_budget(self):
         def slow(connection):
             exact(connection, 3)

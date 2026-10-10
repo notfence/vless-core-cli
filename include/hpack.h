@@ -25,5 +25,6 @@ int core_hpack_decode(core_hpack_decoder_t *decoder, const uint8_t *block, size_
 int core_hpack_status(const uint8_t *block, size_t length);
 int core_hpack_decode_int(const uint8_t *, size_t, size_t *, uint8_t, uint32_t *);
 int core_hpack_decode_huffman(const uint8_t *, size_t, char *, size_t, size_t *);
+size_t core_hpack_huffman_bits(const uint8_t *, size_t);
 int core_hpack_read_string(const uint8_t *, size_t, size_t *, char *, size_t, size_t *);
 #endif

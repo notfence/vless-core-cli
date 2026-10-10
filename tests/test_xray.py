@@ -28,6 +28,150 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_xhttp_tokenish_padding_and_existing_query_metadata(self):
+        for placement in ("header","queryInHeader","query","cookie"):
+            extra={"xPaddingObfsMode":True,"xPaddingPlacement":placement,"xPaddingMethod":"tokenish","xPaddingBytes":"200-300","sessionIDPlacement":"query","seqPlacement":"query"}
+            path="/vless-core?x_session=old&%78_session=second&fixed=vless-core"
+            for security in ("none","reality"):
+                for pooled in (False,True):
+                    options={**extra,**({"xmux":{"maxConnections":1}} if pooled else {})}
+                    with self.subTest(placement=placement,security=security,pooled=pooled), Server() as target, xray_server("xhttp",security,path=path,**extra) as reference:
+                        with cli(uri(reference.port,"xhttp",security,mode="packet-up",path=path,extra=json.dumps(options))) as core:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core tokenish padding"*1000)
+
+    def test_xhttp_packet_pacing(self):
+        for interval in (None,120):
+            for pooled in (False,True):
+                extra={"scMaxEachPostBytes":511}
+                if interval is not None: extra["scMinPostsIntervalMs"]=interval
+                if pooled: extra["xmux"]={"maxConnections":1}
+                with self.subTest(interval=interval,pooled=pooled), Server() as target, xray_server("xhttp","none",mode="packet-up") as reference, CountingProxy(reference.port) as proxy:
+                    with cli(uri(proxy.port,"xhttp","none",mode="packet-up",extra=json.dumps(extra))) as core:
+                        with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core paced packets"*150)
+                        posts=[]; channels={}
+                        for channel,instant,offset,size in proxy.client_reads:
+                            previous=channels.get(id(channel),b""); combined=previous+bytes(channel[offset:offset+size])
+                            start=0
+                            while True:
+                                index=combined.find(b"POST /vless-core/",start)
+                                if index < 0: break
+                                if index+len(b"POST /vless-core/") > len(previous): posts.append(instant)
+                                start=index+1
+                            channels[id(channel)]=combined
+                        self.assertGreaterEqual(len(posts),7)
+                        minimum=((interval if interval is not None else 30)-15)/1000
+                        self.assertTrue(all(right-left >= minimum for left,right in zip(posts,posts[1:])),posts)
+
+    def test_xhttp_custom_headers_and_grpc_policy(self):
+        for mode in ("stream-one","stream-up","packet-up"):
+            for no_grpc in (False,True):
+                for pooled in (False,True):
+                    extra={"headers":{"X-vless-core":"enabled","User-Agent":"vless-core/custom","Content-Type":"application/vless-core"},"noGRPCHeader":no_grpc}
+                    if pooled: extra["xmux"]={"maxConnections":1}
+                    with self.subTest(mode=mode,no_grpc=no_grpc,pooled=pooled), Server() as target, xray_server("xhttp","none") as reference, CountingProxy(reference.port) as proxy:
+                        with cli(uri(proxy.port,"xhttp","none",mode=mode,extra=json.dumps(extra))) as core:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core request headers"*1000)
+                            captured=b"\r\n".join(bytes(block).lower() for block in proxy.client_data)
+                            self.assertIn(b"x-vless-core: enabled\r\n",captured)
+                            self.assertIn(b"user-agent: vless-core/custom\r\n",captured)
+                            expected=b"content-type: application/vless-core\r\n" if no_grpc or mode == "packet-up" else b"content-type: application/grpc\r\n"
+                            self.assertIn(expected,captured)
+                            if no_grpc: self.assertNotIn(b"content-type: application/grpc\r\n",captured)
+
+    def test_xhttp_extended_uplink_methods(self):
+        for method in ("PUT","PATCH","DELETE"):
+            for placement in ("body","header","cookie"):
+                extra={"uplinkHTTPMethod":method,"uplinkDataPlacement":placement}
+                for pooled in (False,True):
+                    options={**extra,**({"xmux":{"maxConnections":1}} if pooled else {})}
+                    with self.subTest(method=method,placement=placement,pooled=pooled), Server() as target, xray_server("xhttp","none",mode="packet-up",**extra) as reference, CountingProxy(reference.port) as proxy:
+                        with cli(uri(proxy.port,"xhttp","none",mode="packet-up",extra=json.dumps(options))) as core:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core HTTP methods"*500)
+                            self.assertTrue(any(bytes(block).startswith(method.encode()+b" ") or b"\r\n"+method.encode()+b" " in bytes(block) for block in proxy.client_data))
+
+    def test_xhttp_secure_custom_headers_and_methods(self):
+        cert,_=certificate()
+        for security,alpn in (("tls",None),("tls","http/1.1"),("reality",None)):
+            for mode in ("stream-one","stream-up","packet-up"):
+                for pooled in (False,True):
+                    extra={"headers":{"X-vless-core":"enabled","Cookie":"vless-core=custom"},"noGRPCHeader":True,"uplinkHTTPMethod":"PUT","sessionIDPlacement":"cookie","seqPlacement":"cookie"}
+                    if pooled: extra["xmux"]={"maxConnections":1}
+                    options={"mode":mode,"extra":json.dumps(extra)}
+                    if alpn: options["alpn"]=alpn
+                    with self.subTest(security=security,alpn=alpn,mode=mode,pooled=pooled), Server() as target, xray_server("xhttp",security,sessionIDPlacement="cookie",seqPlacement="cookie") as reference:
+                        with cli(uri(reference.port,"xhttp",security,**options),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,bytes(range(256))*101)
+
+    def test_xhttp_http1_streams_without_pooling(self):
+        cert,_=certificate()
+        for mode,channels in (("stream-one",1),("stream-up",2)):
+            with self.subTest(mode=mode), Server() as target, xray_server("xhttp","tls") as reference, CountingProxy(reference.port) as proxy:
+                with cli(uri(proxy.port,"xhttp","tls",mode=mode,alpn="http/1.1"),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    for index in range(4):
+                        with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,f"vless-core unpooled {index}".encode())
+                    self.assertEqual(len(proxy.client_data),channels*4)
+
+    def test_xhttp_payload_placements(self):
+        cert,_=certificate()
+        for placement in ("body","auto","header","cookie"):
+            extra={"uplinkDataPlacement":placement,"uplinkDataKey":"vless-core-payload","uplinkChunkSize":64,"scMaxEachPostBytes":4093}
+            for security,alpn in (("none",None),("tls",None),("tls","http/1.1"),("reality",None)):
+                for pooled in (False,True):
+                    options={**extra,**({"xmux":{"maxConnections":1}} if pooled else {})}
+                    parameters={"mode":"packet-up","extra":json.dumps(options)}
+                    if alpn: parameters["alpn"]=alpn
+                    with self.subTest(placement=placement,security=security,alpn=alpn,pooled=pooled), Server() as target, xray_server("xhttp",security,mode="packet-up",**extra) as reference:
+                        with cli(uri(reference.port,"xhttp",security,**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                            with socks_connect(core.port,target.port) as tunnel:
+                                for size in (1023,1024,1025,12301): exchange(tunnel,(bytes(range(256))*49)[:size])
+
+    def test_xhttp_large_payload_headers(self):
+        cert,_=certificate()
+        for placement in ("header","cookie"):
+            extra={"uplinkDataPlacement":placement,"uplinkDataKey":"vless-core-payload","uplinkChunkSize":64000}
+            for security in ("tls","reality"):
+                for pooled in (False,True):
+                    options={**extra,**({"xmux":{"maxConnections":1}} if pooled else {})}
+                    with self.subTest(placement=placement,security=security,pooled=pooled), Server() as target, xray_server("xhttp",security,mode="packet-up",serverMaxHeaderBytes=65536,**extra) as reference:
+                        with cli(uri(reference.port,"xhttp",security,mode="packet-up",extra=json.dumps(options)),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,bytes(range(256))*193)
+
+    def test_xhttp_payload_and_metadata_placements(self):
+        for placement in ("header","cookie"):
+            for metadata in ("header","query","cookie"):
+                extra={"uplinkDataPlacement":placement,"uplinkChunkSize":128,"sessionIDPlacement":metadata,"seqPlacement":metadata}
+                for security in ("none","reality"):
+                    for pooled in (False,True):
+                        options={**extra,**({"xmux":{"maxConnections":1}} if pooled else {})}
+                        with self.subTest(placement=placement,metadata=metadata,security=security,pooled=pooled), Server() as target, xray_server("xhttp",security,mode="packet-up",**extra) as reference:
+                            with cli(uri(reference.port,"xhttp",security,mode="packet-up",extra=json.dumps(options))) as core:
+                                with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,bytes(range(256))*17)
+
+    def test_xhttp_custom_session_identifiers(self):
+        extra={"sessionIDTable":"Base62","sessionIDLength":"16-32","sessionIDPlacement":"header","sessionIDKey":"X-vless-core-session"}
+        for pooled in (False,True):
+            options={**extra,**({"xmux":{"maxConnections":1}} if pooled else {})}
+            with self.subTest(pooled=pooled), Server() as target, xray_server("xhttp","none",**extra) as reference, CountingProxy(reference.port) as proxy:
+                with cli(uri(proxy.port,"xhttp","none",mode="packet-up",extra=json.dumps(options))) as core:
+                    with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core session identifiers"*1000)
+                    identifiers=[]
+                    for captured in proxy.client_data:
+                        identifiers.extend(line.split(b": ",1)[1] for line in bytes(captured).split(b"\r\n") if line.startswith(b"X-vless-core-session: "))
+                    self.assertGreaterEqual(len(identifiers),2)
+                    self.assertEqual(len(set(identifiers)),1)
+                    self.assertTrue(16 <= len(identifiers[0]) <= 32)
+                    self.assertTrue(all(chr(byte).isalnum() and byte < 128 for byte in identifiers[0]))
+
+    def test_xhttp_session_metadata_url_encoding(self):
+        for placement in ("path","query"):
+            extra={"sessionIDTable":"!?%+&","sessionIDLength":16,"sessionIDPlacement":placement,"seqPlacement":placement}
+            for security in ("none","reality"):
+                for pooled in (False,True):
+                    options={**extra,**({"xmux":{"maxConnections":1}} if pooled else {})}
+                    with self.subTest(placement=placement,security=security,pooled=pooled), Server() as target, xray_server("xhttp",security,path="/vless-core?fixed=1",**extra) as reference:
+                        with cli(uri(reference.port,"xhttp",security,mode="packet-up",path="/vless-core?fixed=1",extra=json.dumps(options))) as core:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core escaped session metadata"*1000)
+
     def test_xmux_reuses_physical_http2_connection(self):
         with Server() as target, xray_server("xhttp","reality") as reference:
             with CountingProxy(reference.port) as proxy:

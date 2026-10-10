@@ -9,6 +9,7 @@
 #include "hpack.h"
 #include "core_log.h"
 #include "server_ips.h"
+#include "xhttp_config.h"
 #include <openssl/rand.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -44,6 +45,8 @@ struct core_xmux_stream {
     char session[256], error[160];
     uint64_t sequence, until_ms;
     uint64_t download_fence, upload_fence, write_fence;
+    uint64_t last_post_ms, next_post_ms;
+    int packet_limit;
     mux_queue_t tx, rx;
     uint32_t down_id, up_id;
     size_t consumed, reserved_upload;
@@ -72,7 +75,7 @@ struct mux_actor {
     uint64_t connect_until_ms, last_input_ms, ping_deadline_ms;
     uint8_t ping[8];
     int64_t send_window, receive_window;
-    uint32_t peer_window, peer_frame, peer_concurrency;
+    uint32_t peer_window, peer_frame, peer_concurrency, peer_header_limit;
     size_t net_accounted;
     uint64_t enqueued, flushed;
     uint64_t idle_pending_ms;
@@ -244,14 +247,17 @@ static int request_active(mux_actor_t *actor) {
 }
 
 static int start_request(mux_actor_t *actor, core_xmux_stream_t *stream, int role, size_t payload) {
-    if ((unsigned)request_active(actor) >= actor->peer_concurrency || upload_bytes > XMUX_TOTAL_LIMIT-16384 || actor->net_accounted >= 64U*1024U) return 1;
+    if ((unsigned)request_active(actor) >= actor->peer_concurrency || upload_bytes > XMUX_TOTAL_LIMIT-65536 || actor->net_accounted >= 64U*1024U) return 1;
     mux_request_t *request=calloc(1,sizeof(*request));
     if (!request) return -1;
     const uint8_t *data=payload ? stream->tx.data+stream->tx.start : NULL;
-    int result=actor->manager->backend->request(actor->physical,&stream->config,stream->session,stream->sequence,role,data,payload,&request->id);
+    size_t consumed=payload,body=payload;
+    int result=actor->manager->backend->request(actor->physical,&stream->config,stream->session,stream->sequence,role,data,payload,&request->id,actor->peer_header_limit,&consumed,&body);
+    if (!result && (consumed > payload || (payload && !consumed) || (body && body != consumed))) result=-1;
+    if (!result && role == 3 && !body) { queue_consume(&stream->tx,consumed); upload_bytes-=consumed; }
     account_output(actor);
     if (result) { free(request); return -1; }
-    request->stream=stream; request->role=role; request->remaining=payload;
+    request->stream=stream; request->role=role; request->remaining=body;
     request->send_window=actor->peer_window; request->receive_window=65535;
     if (role == 0 || role == 1) {
         int downloads=1;
@@ -269,7 +275,8 @@ static int start_request(mux_actor_t *actor, core_xmux_stream_t *stream, int rol
     if (role == 1 || role == 2) stream->up_id=request->id;
     if (role == 0 || role == 1) stream->download_fence=actor->enqueued;
     if (role == 1 || role == 2) stream->upload_fence=actor->enqueued;
-    if (role == 3) stream->sequence++;
+    if (role == 3 && !body) stream->write_fence=actor->enqueued;
+    if (role == 3) { stream->sequence++; stream->last_post_ms=core_now_ms(); stream->next_post_ms=0; }
     return 0;
 }
 
@@ -283,6 +290,7 @@ static mux_actor_t *new_actor(mux_group_t *group, int budget, core_xmux_stream_t
     actor->manager=manager; actor->group=group; actor->opening=1; actor->http2=1; actor->connect_until_ms=core_now_ms()+(unsigned)budget;
     actor->send_window=65535; actor->receive_window=65535;
     actor->peer_window=65535; actor->peer_frame=16384; actor->peer_concurrency=UINT32_MAX;
+    actor->peer_header_limit=8192;
     if (notification_pair(actor->wake) != 0) { free(actor); return NULL; }
     actor->alive_period=manager->config.xmux.keep_alive_period;
     if (!actor->alive_period) actor->alive_period=45;
@@ -306,6 +314,7 @@ static mux_group_t *choose_group(mux_manager_t *manager) {
     uint64_t now=core_now_ms();
     collect_stopped_actors();
     for (mux_group_t *group=manager->groups;group;group=group->next) {
+        if (!manager->config.xmux.present) continue;
         if (group->uses >= group->reuse_limit || group->requests >= group->request_limit || now >= group->expires_ms) group->retired=1;
         if (group->retired) {
             for (mux_actor_t *actor=manager->actors;actor;actor=actor->next) if (actor->group == group) wake_actor(actor);
@@ -453,6 +462,7 @@ static int process_frame(mux_actor_t *actor, const core_xmux_frame_t *frame) {
             unsigned id=((unsigned)data[i]<<8)|data[i+1];
             uint32_t value=((uint32_t)data[i+2]<<24)|((uint32_t)data[i+3]<<16)|((uint32_t)data[i+4]<<8)|data[i+5];
             if (id == 3) actor->peer_concurrency=value;
+            else if (id == 6) actor->peer_header_limit=value;
             else if (id == 4) {
                 if (value > INT_MAX) return -1;
                 int64_t delta=(int64_t)value-actor->peer_window; actor->peer_window=value;
@@ -554,6 +564,10 @@ static int advance_streams(mux_actor_t *actor) {
                 if (entry->stream == stream && entry->role == 3 && !entry->ended && (entry->remaining || !actor->http2)) request=entry;
             if (request && !request->remaining) continue;
             if (!request) {
+                if (stream->write_fence > actor->flushed) continue;
+                if (!stream->next_post_ms && core_xhttp_post_due((core_range_t){stream->config.xhttp_min_posts_interval_min,stream->config.xhttp_min_posts_interval_max},
+                    stream->last_post_ms,now,&stream->next_post_ms) != 0) { fail_stream(stream,"XHTTP packet interval sampling failed"); continue; }
+                if (now < stream->next_post_ms) continue;
                 if (actor->group->retired || actor->group->requests >= actor->group->request_limit || now >= actor->group->expires_ms) {
                     if (stream->write_fence > actor->flushed) continue;
                     actor->group->retired=1;
@@ -572,7 +586,7 @@ static int advance_streams(mux_actor_t *actor) {
                     stream->upload=replacement; stream->write_fence=stream->upload_fence=0; wake_actor(replacement); continue;
                 }
                 size_t packet=stream->tx.length;
-                if (packet > (size_t)stream->config.xhttp_max_each_post_max) packet=(size_t)stream->config.xhttp_max_each_post_max;
+                if (packet > (size_t)stream->packet_limit) packet=(size_t)stream->packet_limit;
                 if (packet > 128U*1024U) packet=128U*1024U;
                 int result=start_request(actor,stream,3,packet);
                 if (result < 0) return -1;
@@ -580,7 +594,7 @@ static int advance_streams(mux_actor_t *actor) {
                 request=actor->requests;
             }
         } else request=find_request(actor,stream->up_id);
-        if (!request || request->ended || actor->send_window <= 0 || request->send_window <= 0 || actor->net_accounted >= 64U*1024U) continue;
+        if (!request || request->ended || (request->role == 3 && !request->remaining) || actor->send_window <= 0 || request->send_window <= 0 || actor->net_accounted >= 64U*1024U) continue;
         size_t length=stream->tx.length;
         if (request->role == 3 && length > request->remaining) length=request->remaining;
         if (length > actor->peer_frame) length=actor->peer_frame;
@@ -708,6 +722,8 @@ core_xmux_stream_t *core_xmux_connect(const vless_config_t *config, const core_x
     core_xmux_stream_t *stream=calloc(1,sizeof(*stream));
     if (!stream) { if (error && capacity) snprintf(error,capacity,"XHTTP client allocation failed"); return NULL; }
     stream->config=*config; stream->references=1;
+    stream->packet_limit=core_xhttp_post_limit(config);
+    if (stream->packet_limit < 0) { if (error && capacity) snprintf(error,capacity,"XHTTP packet size sampling failed"); free(stream); return NULL; }
     stream->trace_present=core_trace_snapshot(&stream->trace);
     stream->until_ms=core_now_ms()+(unsigned)(core_deadline_active() ? core_deadline_remaining() : 30000);
     if (notification_pair(stream->notify) != 0) { if (error && capacity) snprintf(error,capacity,"XHTTP notification channel failed: %s",strerror(errno)); free(stream); return NULL; }

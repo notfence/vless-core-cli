@@ -6,4 +6,8 @@
 int core_xhttp_extra(vless_config_t *config, const char *json, char *error, size_t capacity);
 int core_xhttp_parameter(vless_config_t *config, const char *key, const char *text, char *error, size_t capacity);
 int core_xhttp_range(const core_json_t *value, core_range_t *range, int maximum);
+int core_xhttp_validate(const vless_config_t *, char *, size_t);
+int core_xhttp_session(const vless_config_t *, char *, size_t);
+int core_xhttp_post_due(core_range_t, uint64_t, uint64_t, uint64_t *);
+int core_xhttp_post_limit(const vless_config_t *);
 #endif

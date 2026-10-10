@@ -15,6 +15,21 @@ static int fixture_send(void *opaque, uint8_t type, uint8_t flags, uint32_t id, 
 }
 static const core_xmux_backend_t fixture_backend={.send_frame=fixture_send,.pending=fixture_pending,.session=fixture_session};
 
+static void paced_stream_isolation(void) {
+    wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend}; mux_group_t group={.manager=&manager};
+    mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.peer_frame=16384,.send_window=65535},downloading={0};
+    core_xmux_stream_t delayed={.download=&downloading,.upload=&actor,.ready=1,.down_id=1,.packet_limit=1024,.next_post_ms=core_now_ms()+10000};
+    core_xmux_stream_t active={.download=&downloading,.upload=&actor,.ready=1,.down_id=3,.up_id=5};
+    strcpy(delayed.config.xhttp_mode,"packet-up"); strcpy(active.config.xhttp_mode,"stream-up");
+    mux_request_t request={.stream=&active,.id=5,.role=2,.send_window=65535}; actor.requests=&request;
+    REQUIRE("xmux/pacing-notification-channels",notification_pair(delayed.notify) == 0 && notification_pair(active.notify) == 0);
+    REQUIRE("xmux/pacing-queued-payloads",queue_append(&delayed.tx,(uint8_t *)"delayed",7,XMUX_STREAM_LIMIT) == 0 && queue_append(&active.tx,(uint8_t *)"active",6,XMUX_STREAM_LIMIT) == 0);
+    delayed.next=&active; streams=&delayed; upload_bytes=13;
+    CHECK("xmux/pacing-does-not-block-another-stream",advance_streams(&actor) == 0 && delayed.tx.length == 7 && !active.tx.length && wire.frames == 1 && wire.last_id == 5);
+    free(delayed.tx.data); free(active.tx.data); close(delayed.notify[0]); close(delayed.notify[1]); close(active.notify[0]); close(active.notify[1]);
+    streams=NULL; upload_bytes=0;
+}
+
 static void cancelled_stream_cleanup(void) {
     wire_t wire={.pending=23}; mux_manager_t manager={.backend=&fixture_backend,.config.xmux.present=1};
     mux_group_t group={.manager=&manager,.running=1};
@@ -23,7 +38,7 @@ static void cancelled_stream_cleanup(void) {
     REQUIRE("xmux/cancelled-stream-allocation",stream && request);
     REQUIRE("xmux/cancelled-stream-notifications",notification_pair(stream->notify) == 0 && notification_pair(actor.wake) == 0);
     stream->download=stream->upload=&actor; stream->references=2; stream->ready=1; stream->down_id=stream->up_id=3;
-    strcpy(stream->config.xhttp_mode,"packet-up");
+    strcpy(stream->config.xhttp_mode,"packet-up"); stream->packet_limit=1024;
     request->stream=stream; request->role=3; request->id=3; request->remaining=10; request->headers=1;
     actor.requests=request; streams=stream; stream_count=1;
     REQUIRE("xmux/cancelled-stream-pending-upload",queue_append(&stream->tx,(uint8_t *)"vless-core",10,XMUX_STREAM_LIMIT) == 0);
@@ -43,12 +58,13 @@ static void cancelled_stream_cleanup(void) {
 
 int main(void) {
     cancelled_stream_cleanup();
+    paced_stream_isolation();
     mux_queue_t queue={0}; uint8_t bytes[4096]={0};
     for (size_t i=0;i<64;i++) REQUIRE("xmux/queue-fill", queue_append(&queue,bytes,sizeof(bytes),XMUX_STREAM_LIMIT) == 0);
     CHECK("xmux/queue-hard-limit", queue.length == XMUX_STREAM_LIMIT && queue_append(&queue,bytes,1,XMUX_STREAM_LIMIT) != 0);
     queue_consume(&queue,12345); CHECK("xmux/queue-reuse", queue_append(&queue,bytes,4096,XMUX_STREAM_LIMIT) == 0 && queue.length == XMUX_STREAM_LIMIT-12345+4096);
     free(queue.data);
-    wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend};
+    wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend,.config.xmux.present=1};
     mux_group_t group={.manager=&manager,.reuse_limit=4,.request_limit=8,.expires_ms=UINT64_MAX};
     mux_actor_t actor={.manager=&manager,.group=&group,.http2=1,.physical=&wire,.latest_stream=5,.send_window=65535,.receive_window=65535,.peer_window=65535,.peer_frame=16384};
     core_xmux_stream_t stream={.references=1,.down_id=3,.up_id=3,.until_ms=UINT64_MAX}; REQUIRE("xmux/notifications", notification_pair(stream.notify) == 0);

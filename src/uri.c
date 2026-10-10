@@ -280,8 +280,8 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
             *equal = 0; char key[MAX_QUERY_KEY_LENGTH + 1];
             if (normalize_query_key(extra_cursor, key, sizeof(key)) == 0 && !strcmp(key, "extra")) {
                 char decoded[4096];
-                if (percent_decode(equal + 1, decoded, sizeof(decoded)) != 0 ||
-                    core_xhttp_extra(cfg, decoded, err, err_cap) != 0) { free(scan); return -1; }
+                if (percent_decode(equal + 1, decoded, sizeof(decoded)) != 0) { set_err(err,err_cap,"invalid extra parameter encoding"); free(scan); return -1; }
+                if (core_xhttp_extra(cfg, decoded, err, err_cap) != 0) { free(scan); return -1; }
             }
         }
         if (!next) break;
@@ -325,7 +325,7 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
             set_err(err, err_cap, "invalid query parameter encoding");
             return -1;
         }
-        if (strcmp(key, "extra") && !query_value_is_valid_utf8((const unsigned char *)decoded)) {
+        if (strcmp(key, "extra") && strcmp(key,"headers") && !query_value_is_valid_utf8((const unsigned char *)decoded)) {
             set_err(err, err_cap, "invalid query parameter value");
             return -1;
         }
@@ -626,16 +626,9 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
             set_err(err, err_cap, "xhttp mode must be auto, packet-up, stream-one, or stream-up");
             return -1;
         }
-        if (strcmp(cfg->xhttp_uplink_method, "GET") != 0 && strcmp(cfg->xhttp_uplink_method, "POST") != 0) {
-            set_err(err, err_cap, "xhttp uplinkHTTPMethod must be GET or POST");
-            return -1;
-        }
+        if (core_xhttp_validate(cfg,err,err_cap) != 0) return -1;
         if (strcmp(cfg->xhttp_uplink_method, "GET") == 0 && strcmp(cfg->xhttp_mode, "packet-up") != 0) {
             set_err(err, err_cap, "xhttp uplinkHTTPMethod=GET requires mode=packet-up");
-            return -1;
-        }
-        if (strcmp(cfg->xhttp_uplink_data_placement, "body") != 0 && strcmp(cfg->xhttp_uplink_data_placement, "auto") != 0) {
-            set_err(err, err_cap, "only xhttp uplinkDataPlacement=body is supported");
             return -1;
         }
         if (!cfg->encryption_enabled) {

@@ -16,6 +16,40 @@ static void clear_conn(tls13_conn_t *c) {
     db_free(&c->h2_header_block);
     core_hpack_clear(&c->hpack);
 }
+
+static int request_header_value(const uint8_t *block, size_t length, const char *key, const char *expected) {
+    size_t offset=0; int found=0;
+    while (offset < length) {
+        uint32_t index; uint8_t first=block[offset];
+        if (first & 128) { if (core_hpack_decode_int(block,length,&offset,7,&index) != 0) return -1; continue; }
+        if (first != 0) return -1;
+        offset++; char name[128],value[1024]; size_t size;
+        if (core_hpack_read_string(block,length,&offset,name,sizeof(name),&size) != 0 || core_hpack_read_string(block,length,&offset,value,sizeof(value),&size) != 0) return -1;
+        if (!strcmp(name,key)) { if (strcmp(value,expected)) return -1; found++; }
+    }
+    return found;
+}
+
+static void custom_request_headers(void) {
+    char padding[2048];
+    CHECK("xhttp/tokenish-padding-is-not-repeat-x",random_xpadding_value(100,100,"tokenish",padding,sizeof(padding)) == 0 && strspn(padding,"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") == strlen(padding) && strspn(padding,"X") != strlen(padding));
+    CHECK("xhttp/padding-zero-minimum-preserved",random_xpadding_value(0,1,"repeat-x",padding,sizeof(padding)) == 0 && strlen(padding) <= 1);
+    core_deadline_t deadline; REQUIRE("xhttp/interval-deadline-attachment",core_deadline_attach(&deadline) == 0);
+    core_deadline_begin(5); tls13_conn_t delayed={.xhttp_post_intervals={100,100},.xhttp_last_post_ms=core_now_ms()}; char wait_error[160];
+    CHECK("xhttp/interval-shares-connection-budget",xhttp_wait_post(&delayed,wait_error,sizeof(wait_error)) != 0 && errno == ETIMEDOUT);
+    core_deadline_end(); core_deadline_detach();
+    for (int no_grpc=0;no_grpc<2;no_grpc++) {
+        tls13_conn_t connection={.mode=CONN_MODE_XHTTP_TLS_H2,.xmux_async=1,.xhttp_no_grpc_header=no_grpc};
+        strcpy(connection.xhttp_host,"vless-core.test"); char error[160];
+        REQUIRE("xhttp/custom-http2-request",h2_send_xhttp_request_headers(&connection,3,"PUT","/vless-core/","X-vless-core: enabled\r\nUser-Agent: custom\r\nContent-Type: application/vless-core\r\n",0,1,1,error,sizeof(error)) == 0);
+        const uint8_t *block=connection.xmux_plain_output.data+9; size_t length=connection.xmux_plain_output.len-9;
+        CHECK("xhttp/custom-http2-header-delivered",request_header_value(block,length,"x-vless-core","enabled") == 1);
+        CHECK("xhttp/custom-user-agent-not-duplicated",request_header_value(block,length,"user-agent","custom") == 1);
+        CHECK("xhttp/http2-method-delivered",request_header_value(block,length,":method","PUT") == 1);
+        CHECK("xhttp/http2-grpc-header-policy",request_header_value(block,length,"content-type",no_grpc ? "application/vless-core" : "application/grpc") == 1);
+        db_free(&connection.xmux_plain_output); db_free(&connection.h2_send_buf);
+    }
+}
 static void hpack_status_vectors(void) {
     static const struct { uint8_t data[5]; size_t size; int status; } cases[] = {
         {{0x48,0x82,0x10,0x01},4,200},
@@ -428,6 +462,15 @@ static void protocol_edges(void) {
     CHECK("xhttp/header-injection-rejected", xhttp_append_header_line(headers,sizeof(headers),"X-Session","a\r\nb") != 0);
     CHECK("xhttp/cookie-injection-rejected", xhttp_append_cookie_pair(cookies,sizeof(cookies),"x_session","a\nb") != 0);
     CHECK("xhttp/unknown-placement-rejected", xhttp_apply_meta_one(path,sizeof(path),headers,sizeof(headers),cookies,sizeof(cookies),"invalid","x_session","vless-core") != 0);
+    strcpy(path,"/vless-core/?fixed=1");
+    CHECK("xhttp/path-metadata-escaped-before-query", xhttp_append_path_segment(path,sizeof(path),"a?b#c%") == 0 && !strcmp(path,"/vless-core/a%3Fb%23c%25?fixed=1"));
+    strcpy(path,"/vless-core/");
+    CHECK("xhttp/query-metadata-encoded", xhttp_append_query_param(path,sizeof(path),"vless core&x","a+b%/#") == 0 && !strcmp(path,"/vless-core/?vless%20core%26x=a%2Bb%25%2F%23"));
+    strcpy(path,"/vless-core/?x_session=old&fixed=1&%78_session=second");
+    CHECK("xhttp/query-metadata-replaces-existing-key",xhttp_append_query_param(path,sizeof(path),"x_session","vless-core") == 0 && !strcmp(path,"/vless-core/?fixed=1&x_session=vless-core"));
+    strcpy(path,"/vless-core/?fixed=1"); char previous[128]; strcpy(previous,path);
+    CHECK("xhttp/query-capacity-error-preserves-input",xhttp_append_query_param(path,strlen(path)+4,"key","value") != 0 && !strcmp(path,previous));
+    CHECK("xhttp/path-trailing-slash-before-query", normalize_xhttp_path("/vless-core?fixed=1",path,sizeof(path)) == 0 && !strcmp(path,"/vless-core/?fixed=1"));
 }
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--xhttp-chunks") == 0) return live_xhttp_chunks(argv[2]);
@@ -444,6 +487,7 @@ int main(int argc, char **argv) {
         return test_result();
     }
     hpack_status_vectors();
+    custom_request_headers();
     hpack_huffman_vectors();
     hpack_continuation_vectors();
     hpack_response_phases();
@@ -455,6 +499,24 @@ int main(int argc, char **argv) {
     memset(&response,0xff,sizeof(response));
     CHECK("xmux/h2-events-reset-on-reused-thread", xmux_transport_read_frame(&multiplexed,&response,65535) == 0 && !response.event && response.type == 4 && response.flags == 1 && !response.id && !response.length);
     free(response.data); db_free(&multiplexed.h2_net_cache);
+    tls13_conn_t outbound={.mode=CONN_MODE_XHTTP_TLS_H2,.xmux_async=1};
+    strcpy(outbound.xhttp_host,"vless-core.test");
+    char *large_headers=malloc(32032);
+    REQUIRE("xhttp/large-header-fixture", large_headers != NULL);
+    strcpy(large_headers,"X-vless-core: "); size_t prefix_size=strlen(large_headers);
+    memset(large_headers+prefix_size,'A',32000); memcpy(large_headers+prefix_size+32000,"\r\n",3);
+    char header_error[160];
+    REQUIRE("xhttp/large-header-encoding", h2_send_xhttp_request_headers(&outbound,3,"POST","/vless-core/",large_headers,0,0,0,header_error,sizeof(header_error)) == 0);
+    size_t frame_offset=0,frame_count=0;
+    while (frame_offset < outbound.xmux_plain_output.len) {
+        const uint8_t *frame=outbound.xmux_plain_output.data+frame_offset;
+        size_t size=((size_t)frame[0]<<16)|((size_t)frame[1]<<8)|frame[2];
+        CHECK("xhttp/request-header-fragments-bounded", size <= 16384 && frame_offset+9+size <= outbound.xmux_plain_output.len && frame[3] == (frame_count ? H2_FRAME_CONTINUATION : H2_FRAME_HEADERS));
+        CHECK("xhttp/request-header-flags", (!!(frame[4]&H2_FLAG_END_HEADERS) == (frame_offset+9+size == outbound.xmux_plain_output.len)) && (!!(frame[4]&H2_FLAG_END_STREAM) == !frame_count));
+        frame_offset+=9+size; frame_count++;
+    }
+    CHECK("xhttp/request-header-continuation-used", frame_count > 1);
+    free(large_headers); db_free(&outbound.xmux_plain_output); db_free(&outbound.h2_send_buf);
     SSL_CTX *asynchronous_context=SSL_CTX_new(TLS_client_method());
     REQUIRE("xmux/tls-context", asynchronous_context != NULL);
     SSL *asynchronous_ssl=SSL_new(asynchronous_context);

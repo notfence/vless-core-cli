@@ -72,6 +72,9 @@ $(HOST_BUILD_DIR)/test_dialer: $(HOST_BUILD_DIR)/test_dialer.o $(filter-out $(HO
 $(HOST_BUILD_DIR)/test_xmux: $(HOST_BUILD_DIR)/test_xmux.o $(filter-out $(HOST_BUILD_DIR)/src/xmux.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
+$(HOST_BUILD_DIR)/test_xhttp_payload: $(HOST_BUILD_DIR)/test_xhttp_payload.o $(BASE_OBJ) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes
+
 $(HOST_BUILD_DIR)/test_encryption: $(HOST_BUILD_DIR)/test_encryption.o $(HOST_BUILD_DIR)/src/blake3.o
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS)
 

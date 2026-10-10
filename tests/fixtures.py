@@ -197,9 +197,13 @@ class Server:
 class CountingProxy(Server):
     def __init__(self, upstream_port, address="127.0.0.1"):
         self.upstream_port=upstream_port
+        self.client_data=[]
+        self.client_reads=[]
         super().__init__(self.forward,address=address)
 
     def forward(self, connection):
+        captured=bytearray()
+        with self.lock: self.client_data.append(captured)
         with socket.create_connection(("127.0.0.1",self.upstream_port),timeout=10) as upstream, selectors.DefaultSelector() as selector:
             selector.register(connection,selectors.EVENT_READ,upstream)
             selector.register(upstream,selectors.EVENT_READ,connection)
@@ -207,6 +211,10 @@ class CountingProxy(Server):
                 for key,_ in selector.select(timeout=0.1):
                     block=key.fileobj.recv(65536)
                     if not block: return
+                    if key.fileobj is connection:
+                        with self.lock:
+                            start=len(captured); captured.extend(block)
+                            self.client_reads.append((captured,time.monotonic(),start,len(block)))
                     key.data.sendall(block)
 
 @contextlib.contextmanager
