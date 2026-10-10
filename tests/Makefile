@@ -60,6 +60,9 @@ $(HOST_BUILD_DIR)/test_tls: $(HOST_BUILD_DIR)/test_tls.o $(filter-out $(HOST_BUI
 $(HOST_BUILD_DIR)/test_tls_handshake: $(HOST_BUILD_DIR)/test_tls_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
+$(HOST_BUILD_DIR)/test_tls_state: $(HOST_BUILD_DIR)/test_tls_state.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
+
 $(HOST_BUILD_DIR)/test_socket: $(HOST_BUILD_DIR)/test_socket.o $(HOST_BUILD_DIR)/src/connection_trace.o $(HOST_BUILD_DIR)/src/core_log.o $(HOST_BUILD_DIR)/src/deadline.o $(HOST_BUILD_DIR)/src/resolver.o
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=connect,--wrap=poll,--wrap=getsockopt
 

@@ -19,6 +19,7 @@
 #include "http1.h"
 #include "connection_trace.h"
 #include "tls13_reality.h"
+#include "tls_hello.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -167,6 +168,13 @@ struct tls13_conn {
     X509 *tls_peer_certificate;
     dynbuf_t tls_certificate_message;
     unsigned tls_auth_state;
+    dynbuf_t tls_post_handshake;
+    char tls_offered_alpn[128], tls_selected_alpn[128];
+    int tls_h2_required, tls_is_reality;
+    dynbuf_t tls_client_hello;
+    EVP_PKEY *tls_retry_key;
+    unsigned tls_retry_group;
+    int tls_retry_seen;
 
     uint8_t hs_secret[64];
     uint8_t c_hs_traffic[64];
@@ -1021,26 +1029,19 @@ static int append_alpn_token(unsigned char *out, unsigned int cap, unsigned int 
 }
 
 static int build_xhttp_tls_alpn(const char *cfg_alpn, unsigned char *out, unsigned int cap, unsigned int *out_len) {
-    int want_h2 = 0;
-    int want_h1 = 0;
-    if (cfg_alpn == NULL || cfg_alpn[0] == '\0') {
-        want_h2 = 1;
-        want_h1 = 1;
-    } else {
-        want_h2 = alpn_csv_has_token(cfg_alpn, "h2");
-        want_h1 = alpn_csv_has_token(cfg_alpn, "http/1.1");
-        if (!want_h2 && !want_h1) {
-            want_h2 = 1;
-            want_h1 = 1;
-        }
-    }
-
     *out_len = 0;
-    if (want_h2 && append_alpn_token(out, cap, out_len, "h2") != 0) {
-        return -1;
-    }
-    if (want_h1 && append_alpn_token(out, cap, out_len, "http/1.1") != 0) {
-        return -1;
+    if (!cfg_alpn || !*cfg_alpn) cfg_alpn="h2,http/1.1";
+    while (*cfg_alpn) {
+        const char *end=strchr(cfg_alpn,','); if (!end) end=cfg_alpn+strlen(cfg_alpn);
+        while (cfg_alpn < end && (*cfg_alpn == ' ' || *cfg_alpn == '\t')) cfg_alpn++;
+        const char *last=end; while (last > cfg_alpn && (last[-1] == ' ' || last[-1] == '\t')) last--;
+        size_t length=(size_t)(last-cfg_alpn); char token[256];
+        if (!length || length > 255) return -1;
+        for (size_t i=0;i<length;i++) if ((unsigned char)cfg_alpn[i] <= 0x20 || (unsigned char)cfg_alpn[i] >= 0x7f) return -1;
+        memcpy(token,cfg_alpn,length); token[length]=0;
+        if (append_alpn_token(out,cap,out_len,token)) return -1;
+        if (!*end) break;
+        cfg_alpn=end+1; if (!*cfg_alpn) return -1;
     }
     return *out_len > 0 ? 0 : -1;
 }
@@ -3927,7 +3928,7 @@ static int ext_supported_groups(dynbuf_t *exts, uint16_t grease, int random_mode
 }
 
 static int ext_supported_groups_firefox(dynbuf_t *exts, int hybrid) {
-    uint16_t groups[] = {TLS_GROUP_X25519MLKEM768, 0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101};
+    uint16_t groups[] = {TLS_GROUP_X25519MLKEM768, 0x001d, 0x0017, 0x0018, 0x0019};
     uint8_t data[32];
     size_t off = 0;
     size_t start = hybrid ? 0 : 1;
@@ -4435,6 +4436,23 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
         }
     }
 
+    if (cfg->alpn[0]) {
+        dynbuf_t replaced={0}; unsigned char protocols[128]; unsigned int protocol_length=0;
+        if (build_xhttp_tls_alpn(cfg->alpn,protocols,sizeof(protocols),&protocol_length) != 0) { db_free(&exts); db_free(&hs); return -1; }
+        for (size_t offset=0;offset+4 <= exts.len;) {
+            unsigned type=((unsigned)exts.data[offset]<<8)|exts.data[offset+1];
+            size_t count=4+((size_t)exts.data[offset+2]<<8)+exts.data[offset+3];
+            if (count > exts.len-offset) { db_free(&replaced); db_free(&exts); db_free(&hs); return -1; }
+            int result;
+            if (type == 16) {
+                uint8_t value[130]={(uint8_t)(protocol_length>>8),(uint8_t)protocol_length};
+                memcpy(value+2,protocols,protocol_length); result=add_ext(&replaced,16,value,protocol_length+2);
+            } else result=db_append(&replaced,exts.data+offset,count);
+            if (result) { db_free(&replaced); db_free(&exts); db_free(&hs); return -1; }
+            offset+=count;
+        }
+        db_free(&exts); exts=replaced;
+    }
     uint8_t elen[2] = {(uint8_t)(exts.len >> 8), (uint8_t)(exts.len & 0xFF)};
     if (db_append(&hs, elen, 2) != 0 || db_append(&hs, exts.data, exts.len) != 0) {
         db_free(&exts);
@@ -4641,7 +4659,7 @@ static int parse_server_hello_for_keyshare(const uint8_t *msg, size_t msg_len, u
             const uint8_t *k = p + eoff;
             uint16_t group = ((uint16_t)k[0] << 8) | k[1];
             uint16_t klen = ((uint16_t)k[2] << 8) | k[3];
-            if (!((group == 0x001d && klen == 32) ||
+            if (!((group == 0x001d && klen == 32) || (group == 23 && klen == 65) || (group == 24 && klen == 97) || (group == 25 && klen == 133) ||
                   (group == TLS_GROUP_X25519MLKEM768 && klen == TLS_HYBRID_SERVER_SHARE_SIZE)) || el != 4 + klen) {
                 return -1;
             }
@@ -5384,6 +5402,72 @@ static int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len
     return db_append(&c->transcript, msg, msg_len);
 }
 
+static int tls_update_keys(tls13_conn_t *c, int sending) {
+    uint8_t next[64];
+    uint8_t *secret=sending ? c->c_app_traffic : c->s_app_traffic;
+    uint8_t *key=sending ? c->c_app_key : c->s_app_key;
+    uint8_t *iv=sending ? c->c_app_iv : c->s_app_iv;
+    if (hkdf_expand_label_md(c->tls_md,secret,c->tls_hash_len,"traffic upd",NULL,0,next,c->tls_hash_len) ||
+        derive_key_iv_md(c->tls_md,next,c->tls_hash_len,c->tls_key_len,key,iv)) { OPENSSL_cleanse(next,sizeof(next)); return -1; }
+    memcpy(secret,next,c->tls_hash_len); OPENSSL_cleanse(next,sizeof(next));
+    if (sending) c->c_app_seq=0; else c->s_app_seq=0;
+    return 0;
+}
+
+static int tls_key_update_reply(tls13_conn_t *c) {
+    const uint8_t message[]={24,0,0,1,0}; uint8_t *record=NULL; size_t length=0;
+    if (encrypt_record(c,c->c_app_key,c->c_app_iv,&c->c_app_seq,22,message,sizeof(message),&record,&length)) return -1;
+    int result;
+    if (c->xmux_async) result=length > 256U*1024U-c->xmux_wire_output.len ? -1 : db_append(&c->xmux_wire_output,record,length);
+    else result=write_exact(c->fd,record,length);
+    free(record);
+    return result ? -1 : tls_update_keys(c,1);
+}
+
+static int tls_post_handshake(tls13_conn_t *c, const uint8_t *data, size_t length) {
+    if (c->tls_auth_state != 4 || length > 256U*1024U-c->tls_post_handshake.len || db_append(&c->tls_post_handshake,data,length)) return -1;
+    while (c->tls_post_handshake.len >= 4) {
+        const uint8_t *message=c->tls_post_handshake.data;
+        size_t size=((size_t)message[1]<<16)|((size_t)message[2]<<8)|message[3];
+        if (size > 256U*1024U-4 || (message[0] == 24 && size != 1) || (message[0] != 4 && message[0] != 24)) return -1;
+        if (c->tls_post_handshake.len < size+4) return 0;
+        if (message[0] == 24) {
+            unsigned request=message[4];
+            if (request > 1 || tls_update_keys(c,0) || (request && tls_key_update_reply(c))) return -1;
+        }
+        db_consume(&c->tls_post_handshake,size+4);
+    }
+    return 0;
+}
+
+static int tls_application_plain(tls13_conn_t *c, unsigned type, const uint8_t *data, size_t length, dynbuf_t *cache) {
+    if (type == 22) return tls_post_handshake(c,data,length);
+    if (c->tls_post_handshake.len) return -1;
+    if (type == 23) return db_append(cache,data,length);
+    if (type == 21 && length == 2 && data[1] == 0) return 1;
+    return -1;
+}
+
+static int tls_encrypted_extensions(tls13_conn_t *c, const uint8_t *data, size_t length) {
+    if (length < 2 || (((size_t)data[0]<<8)|data[1]) != length-2) return -1;
+    unsigned seen[32]; size_t count=0;
+    for (size_t offset=2;offset < length;) {
+        if (length-offset < 4 || count == 32) return -1;
+        unsigned type=((unsigned)data[offset]<<8)|data[offset+1]; size_t size=((size_t)data[offset+2]<<8)|data[offset+3]; offset+=4;
+        if (size > length-offset) return -1;
+        for (size_t i=0;i<count;i++) if (seen[i] == type) return -1;
+        seen[count++]=type;
+        if (type == 16) {
+            if (size < 3 || (((size_t)data[offset]<<8)|data[offset+1]) != size-2 || data[offset+2] != size-3 || size-3 >= sizeof(c->tls_selected_alpn)) return -1;
+            memcpy(c->tls_selected_alpn,data+offset+3,size-3); c->tls_selected_alpn[size-3]=0;
+            if (strlen(c->tls_selected_alpn) != size-3 || !alpn_csv_has_token(c->tls_offered_alpn,c->tls_selected_alpn)) return -1;
+        }
+        offset+=size;
+    }
+    return c->tls_h2_required && strcmp(c->tls_selected_alpn,"h2") &&
+        !(c->tls_is_reality && !c->tls_selected_alpn[0]) ? -1 : 0;
+}
+
 static int verify_server_signature(const vless_config_t *cfg, tls13_conn_t *c, const uint8_t *body, size_t length) {
     if (!c->tls_peer_certificate || length < 4 || (((size_t)body[2]<<8)|body[3]) != length-4) return -1;
     unsigned scheme=((unsigned)body[0]<<8)|body[1];
@@ -5429,7 +5513,7 @@ static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, 
         set_err(err,err_cap,"unexpected TLS server handshake message"); return -1;
     }
     if (type == 8) {
-        if (body_length < 2 || (((size_t)message[4]<<8)|message[5]) != body_length-2) {
+        if (tls_encrypted_extensions(c,message+4,body_length)) {
             set_err(err,err_cap,"invalid TLS EncryptedExtensions"); return -1;
         }
     } else if (type == 11) {
@@ -5464,6 +5548,11 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     c->tls_verify_policy = verify_mode;
     snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "%s",
              use_reality ? "reality" : tls_verify_mode_name(verify_mode));
+    snprintf(c->tls_offered_alpn,sizeof(c->tls_offered_alpn),"%s",cfg->alpn[0] ? cfg->alpn :
+        (cfg->fp_mode == FP_RANDOM || cfg->fp_mode == FP_RANDOMIZED ? "http/1.1,h2" : "h2,http/1.1"));
+    c->tls_h2_required=cfg->transport_mode == TRANSPORT_GRPC || cfg->transport_mode == TRANSPORT_XHTTP;
+    c->tls_is_reality=use_reality;
+    if (c->tls_h2_required && !alpn_csv_has_token(c->tls_offered_alpn,"h2")) { set_err(err,err_cap,"HTTP/2 transport requires h2 ALPN"); return -1; }
 
     uint8_t client_priv[32];
     uint8_t client_pub[32];
@@ -5498,7 +5587,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     }
     free(ch_record);
 
-    if (append_transcript(c, ch, ch_len) != 0) {
+    if (append_transcript(c, ch, ch_len) != 0 || db_append(&c->tls_client_hello,ch,ch_len)) {
         free(ch);
         set_err(err, err_cap, "transcript append failed");
         return -1;
@@ -5535,6 +5624,31 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
                     break;
                 }
                 if (plain_hs.data[0] == 0x02) {
+                    core_tls_hello_t server;
+                    if (core_tls_hello_parse(plain_hs.data,4+mlen,c->tls_client_hello.data,c->tls_client_hello.len,&server)) {
+                        db_free(&plain_hs); set_err(err,err_cap,"invalid TLS ServerHello parameters"); return -1;
+                    }
+                    if (server.retry) {
+                        if (c->tls_retry_seen || use_reality) { db_free(&plain_hs); set_err(err,err_cap,c->tls_retry_seen ? "repeated TLS HelloRetryRequest" : "REALITY HelloRetryRequest is unsupported"); return -1; }
+                        uint8_t hash[64],*retry=NULL; size_t retry_length=0;
+                        if (configure_tls_cipher(c,server.cipher) || transcript_hash(c,hash) ||
+                            core_tls_hello_retry(c->tls_client_hello.data,c->tls_client_hello.len,&server,&retry,&retry_length,&c->tls_retry_key)) {
+                            db_free(&plain_hs); set_err(err,err_cap,"unsupported TLS HelloRetryRequest"); return -1;
+                        }
+                        c->transcript.len=0; uint8_t message_hash[]={254,0,0,(uint8_t)c->tls_hash_len};
+                        int result=append_transcript(c,message_hash,4) || append_transcript(c,hash,c->tls_hash_len) ||
+                            append_transcript(c,plain_hs.data,4+mlen) || append_transcript(c,retry,retry_length);
+                        db_free(&c->tls_client_hello);
+                        if (!result) result=db_append(&c->tls_client_hello,retry,retry_length);
+                        uint8_t header[]={22,3,3,(uint8_t)(retry_length>>8),(uint8_t)retry_length};
+                        if (!result) result=write_exact(c->fd,header,5) || write_exact(c->fd,retry,retry_length);
+                        free(retry); c->tls_retry_seen=1; c->tls_retry_group=server.group;
+                        if (result) { db_free(&plain_hs); set_err(err,err_cap,"failed to send retry ClientHello"); return -1; }
+                        db_consume(&plain_hs,4+mlen); break;
+                    }
+                    if (c->tls_retry_seen && (server.cipher != c->tls_cipher_suite || (c->tls_retry_group && server.group != c->tls_retry_group))) {
+                        db_free(&plain_hs); set_err(err,err_cap,"ServerHello changed HelloRetryRequest parameters"); return -1;
+                    }
                     if (parse_server_hello_for_keyshare(plain_hs.data, 4 + mlen, &server_cipher, server_share, &share_len) != 0) {
                         db_free(&plain_hs);
                         set_err(err, err_cap, "invalid ServerHello");
@@ -5553,7 +5667,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
                     db_consume(&plain_hs, 4 + mlen);
                     break;
                 }
-                db_consume(&plain_hs, 4 + mlen);
+                db_free(&plain_hs); set_err(err,err_cap,"unexpected message before ServerHello"); return -1;
             }
         } else {
             free(pl);
@@ -5567,7 +5681,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         return -1;
     }
 
-    uint8_t shared[64];
+    uint8_t shared[96];
     size_t shared_len = 32;
     if (share_len == TLS_HYBRID_SERVER_SHARE_SIZE) {
 #if OPENSSL_VERSION_NUMBER >= 0x30500000L
@@ -5587,7 +5701,12 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         return -1;
 #endif
     }
-    if (x25519_shared(client_priv, server_share + share_len - 32, shared + shared_len - 32) != 0) {
+    int exchange_result;
+    if (c->tls_retry_key) {
+        shared_len=sizeof(shared);
+        exchange_result=core_tls_ecdh(c->tls_retry_key,(uint16_t)c->tls_retry_group,server_share,share_len,shared,&shared_len);
+    } else exchange_result=x25519_shared(client_priv, server_share + share_len - 32, shared + shared_len - 32);
+    if (exchange_result != 0) {
         set_err(err, err_cap, "ECDH failed");
         return -1;
     }
@@ -5596,7 +5715,8 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         set_err(err, err_cap, "failed to derive handshake keys");
         return -1;
     }
-    vc_log_debug("tls", "selected key exchange=%s", shared_len == 64 ? "X25519MLKEM768" : "X25519");
+    vc_log_debug("tls", "selected key exchange=%s",c->tls_retry_group == 23 ? "P-256" : c->tls_retry_group == 24 ? "P-384" :
+        c->tls_retry_group == 25 ? "P-521" : shared_len == 64 ? "X25519MLKEM768" : "X25519");
 
     dynbuf_t enc_hs = {0};
     int got_finished = 0;
@@ -5754,6 +5874,8 @@ static const char *tls_cipher_suite_name(uint16_t suite) {
 static void reset_manual_tls_handshake(tls13_conn_t *c) {
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL;
     db_free(&c->tls_certificate_message); c->tls_auth_state=0;
+    db_free(&c->tls_post_handshake); c->tls_selected_alpn[0]=0;
+    db_free(&c->tls_client_hello); EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL; c->tls_retry_seen=0; c->tls_retry_group=0;
     c->tls_cipher_suite = 0;
     c->tls_md = NULL;
     c->tls_hash_len = 0;
@@ -5866,7 +5988,7 @@ static int tcp_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err
     }
 
     vc_log_info("tls", "connected mode=vision alpn=%s verify=%s",
-                cfg->alpn[0] != '\0' ? cfg->alpn : "default",
+                c->tls_selected_alpn[0] ? c->tls_selected_alpn : "none",
                 c->tls_verify_mode[0] != '\0' ? c->tls_verify_mode : (cfg->allow_insecure ? "insecure" : "strict"));
     return 0;
 }
@@ -6336,6 +6458,8 @@ void tls13_reality_close(tls13_conn_t *c) {
     core_hpack_clear(&c->hpack);
     X509_free(c->tls_peer_certificate);
     db_free(&c->tls_certificate_message);
+    db_free(&c->tls_post_handshake);
+    db_free(&c->tls_client_hello); EVP_PKEY_free(c->tls_retry_key);
     db_free(&c->xhttp_net_cache);
     db_free(&c->ws_net_cache);
     db_free(&c->h2_net_cache);
@@ -6474,6 +6598,7 @@ static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
         size_t pl_len = 0;
         int record_result = read_record(c->fd, &rtype, &pl, &pl_len);
         if (record_result > 0) {
+            if (c->tls_post_handshake.len) { vc_log_error("tls","truncated post-handshake message"); return -1; }
             vc_log_debug("tls", "peer EOF in app phase fd=%d", c->fd);
             return 0;
         }
@@ -6492,55 +6617,14 @@ static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
         size_t dec_len = 0;
         uint8_t inner = 0;
         if (decrypt_record(c, c->s_app_key, c->s_app_iv, &c->s_app_seq, rtype, pl, pl_len, &dec, &dec_len, &inner) != 0) {
-            if (rtype == 0x17 && pl_len > 0 && pl_len <= 18432) {
-                uint8_t hdr[5] = {0x17, 0x03, 0x03, (uint8_t)(pl_len >> 8), (uint8_t)(pl_len & 0xFF)};
-                int rc = db_append(cache, hdr, sizeof(hdr));
-                if (rc == 0) {
-                    rc = db_append(cache, pl, pl_len);
-                }
-                free(pl);
-                if (rc != 0) {
-                    return -1;
-                }
-                c->reality_raw_direct = 1;
-                vc_log_warning("tls", "decrypt_record failed in app phase; switching to raw direct fallback");
-                return 0;
-            }
             vc_log_error("tls", "decrypt_record failed in app phase");
             free(pl);
             return -1;
         }
         free(pl);
-
-        if (inner == 0x17) {
-            int rc = db_append(cache, dec, dec_len);
-            free(dec);
-            if (rc != 0) {
-                return -1;
-            }
-            if (cache->len > 0) {
-                return 0;
-            }
-        } else {
-            if (inner == 0x15) {
-                if (dec_len == 2 && dec[1] == 0) {
-                    vc_log_debug("tls", "close_notify in app phase fd=%d", c->fd);
-                    free(dec);
-                    return 0;
-                }
-                if (dec_len >= 2) {
-                    vc_log_error("tls", "alert level=%u desc=%u", (unsigned)dec[0], (unsigned)dec[1]);
-                } else {
-                    vc_log_error("tls", "alert with short payload len=%zu", dec_len);
-                }
-            } else {
-                vc_log_warning("tls", "inner content type=0x%02x in app phase", inner);
-            }
-            free(dec);
-            if (inner == 0x15) {
-                return -1;
-            }
-        }
+        int result=tls_application_plain(c,inner,dec,dec_len,cache); free(dec);
+        if (result < 0) return -1;
+        if (result > 0 || cache->len) return 0;
     }
 }
 
@@ -6750,7 +6834,7 @@ static int xmux_transport_collect(void *opaque) {
                 uint8_t *plain=NULL,inner=0; size_t plain_length=0;
                 if (decrypt_record(connection,connection->s_app_key,connection->s_app_iv,&connection->s_app_seq,record[0],record+5,length,
                                    &plain,&plain_length,&inner) != 0) return -1;
-                int result=inner == 0x17 ? db_append(&connection->h2_net_cache,plain,plain_length) : inner == 0x15 ? -1 : 0;
+                int result=tls_application_plain(connection,inner,plain,plain_length,&connection->h2_net_cache);
                 free(plain); if (result != 0) return -1;
             }
             db_consume(&connection->xmux_raw_input,length+5);

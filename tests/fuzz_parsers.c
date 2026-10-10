@@ -25,6 +25,8 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
 }
 
 static void fuzz_clear(tls13_conn_t *c) {
+    db_free(&c->tls_post_handshake); db_free(&c->tls_client_hello); db_free(&c->tls_certificate_message);
+    X509_free(c->tls_peer_certificate); EVP_PKEY_free(c->tls_retry_key);
     db_free(&c->h2_net_cache);
     db_free(&c->h2_header_block);
     core_hpack_clear(&c->hpack);
@@ -204,6 +206,20 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         const uint8_t *certificate = NULL;
         size_t certificate_length = 0;
         (void)parse_first_cert_der(data, size, &certificate, &certificate_length);
+        static uint8_t *hello; static size_t hello_length;
+        if (!hello) {
+            vless_config_t config; core_config_defaults(&config); strcpy(config.sni,"vless-core.test"); config.fp_mode=FP_FIREFOX;
+            uint8_t private_key[32],public_key[32],random[32],auth[32]; size_t sid;
+            if (build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&hello_length,&sid,NULL)) abort();
+        }
+        core_tls_hello_t server;
+        if (!core_tls_hello_parse(data,size,hello,hello_length,&server) && server.retry) {
+            uint8_t *retry=NULL; size_t retry_length=0; EVP_PKEY *key=NULL;
+            (void)core_tls_hello_retry(hello,hello_length,&server,&retry,&retry_length,&key);
+            free(retry); EVP_PKEY_free(key);
+        }
+        configure_tls_cipher(&c,0x1303); c.tls_auth_state=4;
+        (void)tls_post_handshake(&c,data,size);
         int pair[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) abort();
         if (write_exact(pair[1], data, size) != 0 || shutdown(pair[1], SHUT_WR) != 0) abort();

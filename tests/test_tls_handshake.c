@@ -135,6 +135,7 @@ int main(void) {
             if (variant && mode == 2) CHECK("auth/failed-handshake-no-tofu-pin",access(pins,F_OK) != 0);
             shutdown(pair[0],SHUT_RDWR); close(pair[0]); pthread_join(thread,NULL); db_free(&connection.transcript);
             X509_free(connection.tls_peer_certificate); db_free(&connection.tls_certificate_message);
+            db_free(&connection.tls_client_hello); EVP_PKEY_free(connection.tls_retry_key); db_free(&connection.tls_post_handshake);
         }
         OPENSSL_free(der); X509_free(certificate); EVP_PKEY_free(key);
     }

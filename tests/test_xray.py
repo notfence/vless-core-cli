@@ -28,6 +28,16 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_manual_tls_hello_retry(self):
+        cert,key=certificate()
+        for group,fingerprint in (("P-256","chrome"),("P-384","chrome"),("P-521","firefox")):
+            with self.subTest(group=group):
+                listen=port()
+                command=[str(OPENSSL),"s_server","-accept",f"127.0.0.1:{listen}","-cert",str(cert),"-key",str(key),"-tls1_3","-groups",group,"-ciphersuites","TLS_CHACHA20_POLY1305_SHA256","-www"]
+                with Process(command,"retry-server",{"OPENSSL_CONF":"/dev/null"},ready="ACCEPT") as server:
+                    result=subprocess.run([str(BUILD/"test_tls_state"),uri(listen,"tcp","tls",fp=fingerprint)],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=15)
+                    self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
+
     def test_xhttp_download_does_not_inherit_insecure_tls(self):
         shared={"sessionIDPlacement":"header","seqPlacement":"header"}
         for pooled in (False,True):

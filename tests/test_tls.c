@@ -11,6 +11,8 @@ ssize_t __wrap_write(int fd, const void *data, size_t size) { if (io_failure == 
 int __wrap_fsync(int fd) { if (io_failure == 2) { io_failure = 0; errno = EIO; return -1; } return __real_fsync(fd); }
 int __wrap_rename(const char *source, const char *destination) { if (io_failure == 3) { io_failure = 0; errno = EIO; return -1; } return __real_rename(source, destination); }
 static void clear_conn(tls13_conn_t *c) {
+    db_free(&c->tls_post_handshake); db_free(&c->tls_client_hello); db_free(&c->tls_certificate_message);
+    X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL; EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL;
     db_free(&c->h2_net_cache); db_free(&c->h2_send_buf); db_free(&c->app_cache); db_free(&c->grpc_recv_cache); db_free(&c->transcript);
     db_free(&c->ws_net_cache); db_free(&c->xhttp_net_cache);
     db_free(&c->h2_header_block);
