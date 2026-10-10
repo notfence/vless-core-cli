@@ -11,6 +11,7 @@
 #include "xhttp_payload.h"
 #include "http_headers.h"
 #include "xhttp_padding.h"
+#include "xhttp_download.h"
 #include "utils.h"
 #include "socket_util.h"
 #include "deadline.h"
@@ -148,9 +149,10 @@ struct tls13_conn {
     int xmux_read_wants_write, xmux_write_wants_read;
     core_http1_response_t xmux_http1_response;
     uint32_t xmux_http1_id;
-    int xmux_http1_role, xmux_http1_eof;
+    int xmux_http1_role, xmux_http1_eof, xmux_http1_eof_notified;
     core_hpack_decoder_t hpack;
     int fd;
+    int ignore_server_ips;
     conn_mode_t mode;
     int xhttp_upload_fd;
     pthread_t xhttp_upload_reader;
@@ -477,8 +479,8 @@ static int read_exact(int fd, void *buf, size_t len) {
     return 0;
 }
 
-static int tcp_connect_host(const char *host, uint16_t port) {
-    return core_dial_host(host, port, 1, CORE_CONNECT_TIMEOUT_MS);
+static int tcp_connect_host(const char *host, uint16_t port, int use_server_ips) {
+    return core_dial_host(host, port, use_server_ips, CORE_CONNECT_TIMEOUT_MS);
 }
 
 static int tcp_connect_address(int family, int socktype, int protocol, const struct sockaddr *address, socklen_t address_len) {
@@ -1047,7 +1049,7 @@ static int ssl_selected_alpn_is_h2(SSL *ssl) {
     return selected != NULL && selected_len == 2 && memcmp(selected, "h2", 2) == 0;
 }
 
-static int open_tls_socket_once(const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
+static int open_tls_socket_once(int use_server_ips, const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
                                 const unsigned char *alpn_protos, unsigned int alpn_protos_len, tls_cipher_offer_t cipher_offer,
                                 SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd, int *retry_with_aes, char *err, size_t err_cap) {
     *out_ctx = NULL;
@@ -1055,7 +1057,7 @@ static int open_tls_socket_once(const char *connect_host, uint16_t connect_port,
     *out_fd = -1;
     *retry_with_aes = 0;
 
-    int fd = tcp_connect_host(connect_host, connect_port);
+    int fd = tcp_connect_host(connect_host, connect_port, use_server_ips);
     if (fd < 0) {
         set_connect_err(err, err_cap, "tcp connect failed");
         return -1;
@@ -1205,7 +1207,7 @@ static int open_tls_socket_once(const char *connect_host, uint16_t connect_port,
     return 0;
 }
 
-static int open_tls_socket(const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
+static int open_tls_socket(int use_server_ips, const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
                            const unsigned char *alpn_protos, unsigned int alpn_protos_len, SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd,
                            int *use_aes_fallback, char *err, size_t err_cap) {
     if (!*use_aes_fallback && tls_aes_fallback_cached(connect_host, connect_port, sni)) {
@@ -1213,13 +1215,13 @@ static int open_tls_socket(const char *connect_host, uint16_t connect_port, cons
     }
     tls_cipher_offer_t offer = *use_aes_fallback ? TLS_CIPHER_OFFER_AES : TLS_CIPHER_OFFER_CHACHA;
     int retry_with_aes = 0;
-    if (open_tls_socket_once(connect_host, connect_port, sni, verify_peer, alpn_protos, alpn_protos_len, offer, out_ctx, out_ssl, out_fd,
+    if (open_tls_socket_once(use_server_ips, connect_host, connect_port, sni, verify_peer, alpn_protos, alpn_protos_len, offer, out_ctx, out_ssl, out_fd,
                              &retry_with_aes, err, err_cap) != 0) {
         if (offer != TLS_CIPHER_OFFER_CHACHA || !retry_with_aes) {
             return -1;
         }
         *use_aes_fallback = 1;
-        if (open_tls_socket_once(connect_host, connect_port, sni, verify_peer, alpn_protos, alpn_protos_len, TLS_CIPHER_OFFER_AES, out_ctx,
+        if (open_tls_socket_once(use_server_ips, connect_host, connect_port, sni, verify_peer, alpn_protos, alpn_protos_len, TLS_CIPHER_OFFER_AES, out_ctx,
                                  out_ssl, out_fd, &retry_with_aes, err, err_cap) != 0) {
             return -1;
         }
@@ -3440,7 +3442,7 @@ static int xhttp_http1_packet_request(tls13_conn_t *connection, const char *path
 
 static int xhttp_post_packet_plain(tls13_conn_t *c, const uint8_t *buf, size_t *length, char *err, size_t err_cap) {
     if (xhttp_wait_post(c,err,err_cap) != 0) return -1;
-    int fd = tcp_connect_host(c->remote_host, c->remote_port);
+    int fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
     if (fd < 0) {
         set_err(err, err_cap, "tcp connect failed");
         return -1;
@@ -3507,7 +3509,7 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length
             set_err(err, err_cap, "failed to build TOFU pin key");
             return -1;
         }
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd, &c->tls_use_aes_fallback, err,
+        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd, &c->tls_use_aes_fallback, err,
                             err_cap) != 0) {
             return -1;
         }
@@ -3521,7 +3523,7 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length
         c->xhttp_tls_insecure = 1;
     } else {
         int verify_peer = c->xhttp_tls_insecure ? 0 : tls_verify_peer(mode);
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &ctx, &ssl, &fd,
+        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &ctx, &ssl, &fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
         }
@@ -5803,7 +5805,7 @@ static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *
     struct sockaddr_storage cached_address;
     socklen_t cached_length = 0;
     int cached = get_cached_tls_endpoint(cfg, sni, &cached_address, &cached_length);
-    core_dialer_t *dialer = core_dialer_start(cfg->server_host, cfg->server_port, 1, CORE_CONNECT_TIMEOUT_MS,
+    core_dialer_t *dialer = core_dialer_start(cfg->server_host, cfg->server_port, !cfg->ignore_server_ips, CORE_CONNECT_TIMEOUT_MS,
         cached ? (const struct sockaddr *)&cached_address : NULL, cached_length);
     if (!dialer) { set_connect_err(err, err_cap, "tcp resolve failed"); return -1; }
     char last_err[256] = {0};
@@ -5863,7 +5865,7 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
         tls_verify_mode_t mode = tls_verify_mode_for_config(cfg);
         c->tls_verify_policy = mode;
         verify_peer = tls_verify_peer(mode);
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, h1_alpn, sizeof(h1_alpn), &c->ssl_ctx, &c->ssl,
+        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, verify_peer, h1_alpn, sizeof(h1_alpn), &c->ssl_ctx, &c->ssl,
                             &c->fd, &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
         }
@@ -5874,7 +5876,7 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
             }
         }
     } else {
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port);
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;
@@ -6005,7 +6007,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
 
     if (strcmp(cfg->security, "none") == 0) {
         c->mode = CONN_MODE_XHTTP_PLAIN;
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port);
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;
@@ -6020,7 +6022,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
             return -1;
         }
         if (strcmp(c->xhttp_transport_mode, "stream-up") == 0) {
-            c->xhttp_upload_fd = tcp_connect_host(c->remote_host, c->remote_port);
+            c->xhttp_upload_fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
             if (c->xhttp_upload_fd < 0) {
                 set_err(err, err_cap, "xhttp upload tcp connect failed");
                 return -1;
@@ -6068,7 +6070,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
     c->tls_verify_policy = mode;
     vc_log_info("xhttp", "tls_mode=%s", tls_verify_mode_name(mode));
     if (mode == TLS_VERIFY_MODE_TOFU) {
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
+        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, 0, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
         }
@@ -6078,7 +6080,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
         c->xhttp_tls_insecure = 1;
     } else {
         int verify_peer = tls_verify_peer(mode);
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl,
+        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, verify_peer, xhttp_alpn, xhttp_alpn_len, &c->ssl_ctx, &c->ssl,
                             &c->fd, &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
         }
@@ -6126,7 +6128,7 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
     c->tls_verify_policy = mode;
     if (mode == TLS_VERIFY_MODE_TOFU) {
         vc_log_info("grpc", "tls_mode=tofu");
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
+        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, 0, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0 ||
             xhttp_tofu_verify_or_store(c->ssl, c->xhttp_pin_key, 1, err, err_cap) != 0) {
             return -1;
@@ -6135,7 +6137,7 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
     } else {
         int verify_peer = tls_verify_peer(mode);
         vc_log_info("grpc", "tls_mode=%s", tls_verify_mode_name(mode));
-        if (open_tls_socket(c->remote_host, c->remote_port, c->remote_sni, verify_peer, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
+        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, verify_peer, alpn, alpn_len, &c->ssl_ctx, &c->ssl, &c->fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
         }
@@ -6170,7 +6172,7 @@ static int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, s
 
     if (strcmp(cfg->security, "none") == 0) {
         c->mode = CONN_MODE_GRPC_PLAIN;
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port);
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;
@@ -6201,11 +6203,12 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
         return -1;
     }
     c->fd = -1;
+    c->ignore_server_ips=cfg->ignore_server_ips;
     c->xhttp_upload_fd = -1;
     c->mode = CONN_MODE_REALITY;
 
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
-        if (cfg->xmux.present || (!cfg->xhttp_physical_only && !strcmp(cfg->security,"tls") &&
+        if ((!cfg->xhttp_physical_only && cfg->xhttp_download_settings[0]) || cfg->xmux.present || (!cfg->xhttp_physical_only && !strcmp(cfg->security,"tls") &&
             !strcmp(cfg->alpn,"http/1.1") && strcmp(cfg->xhttp_mode,"packet-up"))) {
             c->xmux_stream = core_xmux_connect(cfg, &xmux_backend, err, err_cap);
             if (!c->xmux_stream) { free(c); return -1; }
@@ -6240,7 +6243,7 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
 
     if (strcmp(cfg->security, "none") == 0) {
         c->mode = CONN_MODE_PLAIN;
-        c->fd = tcp_connect_host(cfg->server_host, cfg->server_port);
+        c->fd = tcp_connect_host(cfg->server_host, cfg->server_port, !cfg->ignore_server_ips);
         if (c->fd < 0) {
             tls13_reality_close(c);
             set_err(err, err_cap, "tcp connect failed");
@@ -6736,7 +6739,10 @@ static int xmux_transport_read_frame(void *opaque, core_xmux_frame_t *frame, siz
     tls13_conn_t *connection=opaque;
     memset(frame,0,sizeof(*frame));
     if (!tls13_uses_h2(connection)) {
-        if (!connection->xmux_http1_id) return connection->xmux_http1_eof ? -1 : 1;
+        if (!connection->xmux_http1_id) {
+            if (connection->xmux_http1_eof && !connection->xmux_http1_eof_notified) { connection->xmux_http1_eof_notified=1; frame->event=4; return 0; }
+            return 1;
+        }
         core_http1_event_t event;
         int result=core_http1_next(&connection->xmux_http1_response,connection->h2_net_cache.data,connection->h2_net_cache.len,
                                    connection->xmux_http1_eof,capacity,&event);
@@ -6780,7 +6786,7 @@ static int xmux_transport_request(void *opaque, const vless_config_t *config, co
         if (physical->xmux_http1_id || physical->h2_net_cache.len || physical->xmux_http1_eof) { free(packet.headers); return -1; }
         if (role == 3) {
             dynbuf_t message={0};
-            int result=xhttp_http1_packet_request(&request,path,packet.headers,packet.body_size,"keep-alive",&message);
+            int result=xhttp_http1_packet_request(&request,path,packet.headers,packet.body_size,config->xmux.present ? "keep-alive" : "close",&message);
             if (!result) { result=db_append(&physical->xmux_plain_output,message.data,message.len); if (!result) physical->xmux_enqueued+=message.len; }
             db_free(&message); free(packet.headers);
             if (result) return -1;

@@ -3,6 +3,7 @@
 #include "core_log.h"
 #include "xhttp_payload.h"
 #include "http_headers.h"
+#include "xhttp_download.h"
 #include <stddef.h>
 #include <ctype.h>
 #include <string.h>
@@ -13,7 +14,7 @@
 #include <errno.h>
 #include <openssl/rand.h>
 
-typedef enum { FIELD_STRING, FIELD_LOWER, FIELD_UPPER, FIELD_BOOL, FIELD_RANGE, FIELD_HEADERS } field_kind_t;
+typedef enum { FIELD_STRING, FIELD_LOWER, FIELD_UPPER, FIELD_BOOL, FIELD_RANGE, FIELD_HEADERS, FIELD_DOWNLOAD } field_kind_t;
 typedef struct { const char *key; size_t offset, size; field_kind_t kind; int maximum; } config_field_t;
 #define STRING_FIELD(key,member,kind) {key,offsetof(vless_config_t,member),sizeof(((vless_config_t *)0)->member),kind,0}
 #define RANGE_FIELD(key,member,maximum) {key,offsetof(vless_config_t,member),sizeof(int)*2,FIELD_RANGE,maximum}
@@ -26,6 +27,7 @@ static const config_field_t fields[] = {
     STRING_FIELD("uplinkHTTPMethod",xhttp_uplink_method,FIELD_UPPER), STRING_FIELD("uplinkDataPlacement",xhttp_uplink_data_placement,FIELD_LOWER),
     STRING_FIELD("uplinkDataKey",xhttp_uplink_data_key,FIELD_STRING), RANGE_FIELD("uplinkChunkSize",xhttp_uplink_chunk_min,INT_MAX),
     STRING_FIELD("headers",xhttp_headers,FIELD_HEADERS), STRING_FIELD("noGRPCHeader",xhttp_no_grpc_header,FIELD_BOOL),
+    STRING_FIELD("downloadSettings",xhttp_download_settings,FIELD_DOWNLOAD),
     STRING_FIELD("xPaddingPlacement",xhttp_padding_placement,FIELD_LOWER), STRING_FIELD("xPaddingKey",xhttp_padding_key,FIELD_STRING),
     STRING_FIELD("xPaddingHeader",xhttp_padding_header,FIELD_STRING), STRING_FIELD("xPaddingMethod",xhttp_padding_method,FIELD_LOWER),
     STRING_FIELD("xPaddingObfsMode",xhttp_padding_obfs,FIELD_BOOL),
@@ -66,6 +68,17 @@ static const config_field_t *find_field(const char *key) {
 
 static int apply_field(vless_config_t *config, const config_field_t *field, const core_json_t *value, int query, const char *path, char *error, size_t capacity) {
     unsigned char *destination=(unsigned char *)config+field->offset;
+    if (field->kind == FIELD_DOWNLOAD) {
+        if (config->xhttp_download_only) return invalid("recursive downloadSettings",error,capacity);
+        core_json_t *owned=query && value->type == CORE_JSON_STRING ? core_json_parse(value->text,error,capacity) : NULL;
+        if (query && value->type == CORE_JSON_STRING && !owned) return -1;
+        const core_json_t *object=owned ? owned : value;
+        vless_config_t *download=malloc(sizeof(*download));
+        int result=download ? core_xhttp_download_parse(object,download,error,capacity) : invalid("downloadSettings allocation",error,capacity);
+        if (!result && (!object->source || !object->source_length || object->source_length >= field->size)) result=invalid("downloadSettings capacity",error,capacity);
+        if (!result) { memset(destination,0,field->size); memcpy(destination,object->source,object->source_length); }
+        free(download); core_json_free(owned); return result;
+    }
     if (field->kind == FIELD_HEADERS) {
         if (query && value->type == CORE_JSON_STRING) {
             core_json_t *object=core_json_parse(value->text,error,capacity);
@@ -105,11 +118,11 @@ static void warning(const char *prefix, const char *key, int server) {
     else vc_log_warning("xhttp","unknown field %s ignored",path);
 }
 
-static int server_field(const core_json_t *entry, int query, int *index, int64_t values[2], char *error, size_t capacity) {
+static int server_field(const core_json_t *entry, int query, const char *scope, int *index, int64_t values[2], char *error, size_t capacity) {
     const char *names[]={"noSSEHeader","scMaxBufferedPosts","scStreamUpServerSecs","serverMaxHeaderBytes"};
     for (*index=0;*index<4;(*index)++) if (!strcasecmp(entry->key,names[*index])) break;
     if (*index == 4) return 0;
-    char path[80]; snprintf(path,sizeof(path),"extra.%s",names[*index]);
+    char path[192]; snprintf(path,sizeof(path),"%s.%s",scope,names[*index]);
     if (*index == 0) {
         if (entry->type != CORE_JSON_BOOL && (!query || entry->type != CORE_JSON_STRING)) return invalid(path,error,capacity);
         if (!strcmp(entry->text,"true") || (query && !strcmp(entry->text,"1"))) values[0]=values[1]=1;
@@ -131,10 +144,21 @@ static int server_field(const core_json_t *entry, int query, int *index, int64_t
     return 1;
 }
 
-static int parse_xmux(vless_config_t *config, const core_json_t *value, char *error, size_t capacity) {
-    if (value->type != CORE_JSON_OBJECT) return invalid("extra.xmux",error,capacity);
+static int parse_xmux(vless_config_t *config, const core_json_t *value, const char *scope, char *error, size_t capacity) {
+    if (value->type != CORE_JSON_OBJECT) return invalid(scope,error,capacity);
     core_xmux_config_t parsed={.present=1};
+    const char *names[]={"maxConcurrency","maxConnections","cMaxReuseTimes","hMaxRequestTimes","hMaxReusableSecs","hKeepAlivePeriod"};
+    core_range_t values[6]; unsigned seen=0;
     for (const core_json_t *entry=value->child;entry;entry=entry->next) {
+        size_t index=0;
+        while (index<6 && strcasecmp(entry->key,names[index])) index++;
+        if (index == 6) { warning(scope,entry->key,0); continue; }
+        char path[192]; snprintf(path,sizeof(path),"%s.%s",scope,names[index]);
+        core_range_t number;
+        if (index == 5 && entry->type == CORE_JSON_NUMBER && !strcmp(entry->text,"-1")) number=(core_range_t){-1,-1};
+        else if (core_xhttp_range(entry,&number,INT_MAX) != 0 || (index == 5 && (number.min != number.max || entry->type != CORE_JSON_NUMBER))) return invalid(path,error,capacity);
+        if ((seen&(1U<<index)) && memcmp(&values[index],&number,sizeof(number))) return invalid(path,error,capacity);
+        values[index]=number; seen|=1U<<index;
         core_range_t *range=NULL;
         if (!strcasecmp(entry->key,"maxConcurrency")) range=&parsed.max_concurrency;
         else if (!strcasecmp(entry->key,"maxConnections")) range=&parsed.max_connections;
@@ -142,55 +166,64 @@ static int parse_xmux(vless_config_t *config, const core_json_t *value, char *er
         else if (!strcasecmp(entry->key,"hMaxRequestTimes")) range=&parsed.request_times;
         else if (!strcasecmp(entry->key,"hMaxReusableSecs")) range=&parsed.reusable_secs;
         else if (!strcasecmp(entry->key,"hKeepAlivePeriod")) {
-            core_range_t keep;
-            if (entry->type == CORE_JSON_NUMBER && !strcmp(entry->text,"-1")) { parsed.keep_alive_period=-1; continue; }
-            if (core_xhttp_range(entry,&keep,INT_MAX) != 0 || keep.min != keep.max || entry->type != CORE_JSON_NUMBER) return invalid("extra.xmux.hKeepAlivePeriod",error,capacity);
-            parsed.keep_alive_period=keep.min; continue;
-        } else { warning("extra.xmux",entry->key,0); continue; }
-        char path[160]; snprintf(path,sizeof(path),"extra.xmux.%s",entry->key);
-        if (core_xhttp_range(entry,range,INT_MAX) != 0) return invalid(path,error,capacity);
+            parsed.keep_alive_period=number.min; continue;
+        }
+        *range=number;
     }
-    if (parsed.max_connections.max && parsed.max_concurrency.max) return invalid("extra.xmux.maxConnections/maxConcurrency",error,capacity);
+    if (parsed.max_connections.max && parsed.max_concurrency.max) { char path[192]; snprintf(path,sizeof(path),"%s.maxConnections/maxConcurrency",scope); return invalid(path,error,capacity); }
     if (!parsed.max_connections.max && !parsed.max_concurrency.max && !parsed.reuse_times.max && !parsed.request_times.max && !parsed.reusable_secs.max && !parsed.keep_alive_period) {
         parsed.max_connections=(core_range_t){6,6}; parsed.request_times=(core_range_t){600,900}; parsed.reusable_secs=(core_range_t){1800,3000};
     }
     config->xmux=parsed; return 0;
 }
 
-int core_xhttp_extra(vless_config_t *config, const char *json, char *error, size_t capacity) {
-    core_json_t *root=core_json_parse(json,error,capacity);
-    if (!root) return -1;
-    if (root->type != CORE_JSON_OBJECT) { core_json_free(root); return invalid("extra",error,capacity); }
+int core_xhttp_apply_object(vless_config_t *config, const core_json_t *root, const char *prefix, char *error, size_t capacity) {
+    if (!root || root->type != CORE_JSON_OBJECT) return invalid(prefix,error,capacity);
     size_t applied[sizeof(fields)/sizeof(*fields)],count=0; int result=0, xmux_seen=0;
     int server_seen[4]={0}; int64_t server_values[4][2];
     for (const core_json_t *entry=root->child;entry;entry=entry->next) {
-        char path[160]; snprintf(path,sizeof(path),"extra.%s",entry->key);
+        char path[160]; snprintf(path,sizeof(path),"%s.%s",prefix,entry->key);
+        if (config->xhttp_download_only && !strcmp(prefix,"extra.downloadSettings.xhttpSettings") && !strcasecmp(entry->key,"extra")) continue;
         if (!strcasecmp(entry->key,"xmux")) {
             core_xmux_config_t previous=config->xmux;
-            result=parse_xmux(config,entry,error,capacity);
+            result=parse_xmux(config,entry,path,error,capacity);
             if (!result && xmux_seen && memcmp(&previous,&config->xmux,sizeof(previous))) result=invalid("extra.xmux duplicate",error,capacity);
             if (result) break;
             xmux_seen=1; continue;
         }
         const config_field_t *field=find_field(entry->key);
         if (!field) {
-            int index; int64_t values[2]; int server=server_field(entry,0,&index,values,error,capacity);
+            int index; int64_t values[2]; int server=server_field(entry,0,prefix,&index,values,error,capacity);
             if (server < 0) { result=-1; break; }
             if (server) {
                 if (server_seen[index] && memcmp(server_values[index],values,sizeof(values))) { result=invalid(path,error,capacity); break; }
                 server_seen[index]=1; memcpy(server_values[index],values,sizeof(values));
             }
-            warning("extra",entry->key,server); continue;
+            warning(prefix,entry->key,server); continue;
         }
         vless_config_t candidate=*config;
         result=apply_field(&candidate,field,entry,0,path,error,capacity);
         if (result) break;
         int duplicate=0;
         for (size_t i=0;i<count;i++) if (applied[i] == field->offset) duplicate=1;
-        if (duplicate && memcmp((unsigned char *)&candidate+field->offset,(unsigned char *)config+field->offset,field->size)) { result=invalid(path,error,capacity); break; }
+        if (duplicate && memcmp((unsigned char *)&candidate+field->offset,(unsigned char *)config+field->offset,field->size)) {
+            int equivalent=0;
+            if (field->kind == FIELD_DOWNLOAD) {
+                core_json_t *a=core_json_parse((char *)config+field->offset,NULL,0),*b=core_json_parse((char *)&candidate+field->offset,NULL,0);
+                equivalent=a && b && core_json_equal(a,b); core_json_free(a); core_json_free(b);
+            }
+            if (!equivalent) { result=invalid(path,error,capacity); break; }
+        }
         if (!duplicate) applied[count++]=field->offset;
         *config=candidate;
     }
+    return result;
+}
+
+int core_xhttp_extra(vless_config_t *config, const char *json, char *error, size_t capacity) {
+    core_json_t *root=core_json_parse(json,error,capacity);
+    if (!root) return -1;
+    int result=core_xhttp_apply_object(config,root,"extra",error,capacity);
     core_json_free(root); return result;
 }
 
@@ -198,7 +231,7 @@ int core_xhttp_parameter(vless_config_t *config, const char *key, const char *te
     const config_field_t *field=find_field(key);
     core_json_t value={.type=CORE_JSON_STRING,.text=(char *)text};
     if (!field) {
-        value.key=(char *)key; int index; int64_t values[2]; int result=server_field(&value,1,&index,values,error,capacity);
+        value.key=(char *)key; int index; int64_t values[2]; int result=server_field(&value,1,"query",&index,values,error,capacity);
         if (result > 0) warning("query",key,1);
         return result;
     }

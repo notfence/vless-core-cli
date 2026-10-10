@@ -79,7 +79,7 @@ static int starts_with_ci(const char *s, const char *prefix) {
     return 1;
 }
 
-static void init_config_defaults(vless_config_t *cfg) {
+void core_config_defaults(vless_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->protocol = CORE_PROTOCOL_VLESS;
     cfg->fp_mode = FP_CHROME;
@@ -325,7 +325,7 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
             set_err(err, err_cap, "invalid query parameter encoding");
             return -1;
         }
-        if (strcmp(key, "extra") && strcmp(key,"headers") && !query_value_is_valid_utf8((const unsigned char *)decoded)) {
+        if (strcmp(key, "extra") && strcmp(key,"headers") && strcmp(key,"downloadsettings") && !query_value_is_valid_utf8((const unsigned char *)decoded)) {
             set_err(err, err_cap, "invalid query parameter value");
             return -1;
         }
@@ -491,7 +491,7 @@ static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, siz
         return -1;
     }
 
-    init_config_defaults(cfg);
+    core_config_defaults(cfg);
     cfg->protocol = CORE_PROTOCOL_SOCKS5;
     cfg->flow[0] = '\0';
     snprintf(cfg->security, sizeof(cfg->security), "none");
@@ -556,7 +556,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         return -1;
     }
 
-    init_config_defaults(cfg);
+    core_config_defaults(cfg);
 
     if (!starts_with_ci(uri, "vless://")) {
         set_err(err, err_cap, "URI must start with vless://");
@@ -619,7 +619,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
             return -1;
         }
         if (strcmp(cfg->xhttp_mode, "auto") == 0 || cfg->xhttp_mode[0] == '\0') {
-            snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "%s", xhttp_reality ? "stream-one" : "packet-up");
+            snprintf(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), "%s", xhttp_reality ? (cfg->xhttp_download_settings[0] ? "stream-up" : "stream-one") : "packet-up");
         }
         if (strcmp(cfg->xhttp_mode, "packet-up") != 0 && strcmp(cfg->xhttp_mode, "stream-one") != 0 &&
             strcmp(cfg->xhttp_mode, "stream-up") != 0) {
@@ -627,6 +627,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
             return -1;
         }
         if (core_xhttp_validate(cfg,err,err_cap) != 0) return -1;
+        if (cfg->xhttp_download_settings[0] && !strcmp(cfg->xhttp_mode,"stream-one")) { set_err(err,err_cap,"downloadSettings cannot be used with stream-one"); return -1; }
         if (strcmp(cfg->xhttp_uplink_method, "GET") == 0 && strcmp(cfg->xhttp_mode, "packet-up") != 0) {
             set_err(err, err_cap, "xhttp uplinkHTTPMethod=GET requires mode=packet-up");
             return -1;

@@ -110,11 +110,12 @@ static core_json_t *read_value(json_reader_t *reader, unsigned depth) {
     if (reader->cursor == reader->end || depth > 16 || reader->nodes++ >= 1024) { fail(reader,"missing value or capacity exceeded"); return NULL; }
     core_json_t *value=calloc(1,sizeof(*value));
     if (!value) { fail(reader,"allocation failed"); return NULL; }
+    value->source=reader->cursor;
     char ch=*reader->cursor;
     if (ch == '{' || ch == '[') {
         value->type=ch == '{' ? CORE_JSON_OBJECT : CORE_JSON_ARRAY;
         char close=ch == '{' ? '}' : ']'; reader->cursor++; whitespace(reader);
-        if (reader->cursor < reader->end && *reader->cursor == close) { reader->cursor++; return value; }
+        if (reader->cursor < reader->end && *reader->cursor == close) { reader->cursor++; goto success; }
         core_json_t **tail=&value->child;
         for (;;) {
             char *key=NULL;
@@ -133,7 +134,7 @@ static core_json_t *read_value(json_reader_t *reader, unsigned depth) {
             } else { *tail=entry; tail=&entry->next; }
             whitespace(reader);
             if (reader->cursor == reader->end) { fail(reader,"unterminated container"); goto failure; }
-            if (*reader->cursor == close) { reader->cursor++; return value; }
+            if (*reader->cursor == close) { reader->cursor++; goto success; }
             if (*reader->cursor++ != ',') { fail(reader,"expected comma"); goto failure; }
             whitespace(reader);
         }
@@ -141,7 +142,7 @@ static core_json_t *read_value(json_reader_t *reader, unsigned depth) {
     if (ch == '"') {
         value->type=CORE_JSON_STRING; value->text=read_string(reader);
         if (!value->text) goto failure;
-        return value;
+        goto success;
     }
     const char *start=reader->cursor;
     if (ch == '-' || (ch >= '0' && ch <= '9')) {
@@ -172,7 +173,8 @@ static core_json_t *read_value(json_reader_t *reader, unsigned depth) {
     value->text=malloc((size_t)(reader->cursor-start)+1);
     if (!value->text) { fail(reader,"allocation failed"); goto failure; }
     memcpy(value->text,start,(size_t)(reader->cursor-start)); value->text[reader->cursor-start]=0;
-    return value;
+success:
+    value->source_length=(size_t)(reader->cursor-value->source); return value;
 invalid_number:
     fail(reader,"invalid number");
 failure:

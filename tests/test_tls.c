@@ -488,6 +488,9 @@ int main(int argc, char **argv) {
     }
     hpack_status_vectors();
     custom_request_headers();
+    tls13_conn_t completed_http1={.mode=CONN_MODE_XHTTP_PLAIN,.xmux_http1_eof=1}; core_xmux_frame_t closed_http1;
+    CHECK("xmux/http1-clean-idle-eof-notification",xmux_transport_read_frame(&completed_http1,&closed_http1,65535) == 0 && closed_http1.event == 4 && !closed_http1.id);
+    CHECK("xmux/http1-clean-eof-reported-once",xmux_transport_read_frame(&completed_http1,&closed_http1,65535) == 1);
     hpack_huffman_vectors();
     hpack_continuation_vectors();
     hpack_response_phases();

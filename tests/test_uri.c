@@ -103,6 +103,7 @@ int main(void) {
         "{\"sessionIDPlacement\":\"header\",\"sessionIDKey\":\"Cookie\",\"seqPlacement\":\"cookie\"}",
         "{\"uplinkDataPlacement\":\"header\",\"headers\":{\"X-Data-0\":\"vless-core\"}}",
         "{\"uplinkHTTPMethod\":\"OPTIONS\"}","{\"noGRPCHeader\":1}","{\"noSSEHeader\":1}","{\"scMaxBufferedPosts\":true}","{\"scStreamUpServerSecs\":\"20-junk\"}","{\"serverMaxHeaderBytes\":-1}",
+        "{\"xmux\":{\"maxConnections\":1,\"MaxConnections\":2}}",
         "{\"sessionIDPlacement\":\"cookie\",\"headers\":{\"Cookie\":\"x_session=old\"}}",
         "{\"seqPlacement\":\"cookie\",\"headers\":{\"Cookie\":\"x_seq=old\"}}",
         "{\"uplinkDataPlacement\":\"cookie\",\"headers\":{\"Cookie\":\"x_data_0=old\"}}",
@@ -117,7 +118,7 @@ int main(void) {
         "{\"uplinkDataPlacement\":\"cookie\",\"xPaddingObfsMode\":true,\"xPaddingPlacement\":\"cookie\",\"xPaddingKey\":\"x_data_0\"}",
     };
     for (size_t i=0;i<sizeof(invalid_options)/sizeof(*invalid_options);i++) {
-        char encoded[4096],uri[4096]; size_t used=0; const char *hex="0123456789ABCDEF";
+        char encoded[2048],uri[4096]; size_t used=0; const char *hex="0123456789ABCDEF";
         for (const unsigned char *p=(const unsigned char *)invalid_options[i];*p;p++) { encoded[used++]='%'; encoded[used++]=hex[*p>>4]; encoded[used++]=hex[*p&15]; } encoded[used]=0;
         snprintf(uri,sizeof(uri),PREFIX "type=xhttp&mode=packet-up&extra=%s",encoded);
         CHECK("uri/invalid-xhttp-options-fail-before-connect",parse(uri) != 0 && error[0]);

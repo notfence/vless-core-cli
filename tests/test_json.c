@@ -7,6 +7,9 @@ int main(void) {
     REQUIRE("json/nested-and-escaped", value && value->type == CORE_JSON_OBJECT);
     CHECK("json/unicode-and-escapes", !strcmp(core_json_get(value,"escaped")->text,"a\"b\\cА🚀"));
     CHECK("json/scoped-field-lookup", !core_json_get(value,"n") && !strcmp(core_json_get(core_json_get(value,"nested"),"n")->text,"12"));
+    const core_json_t *nested=core_json_get(value,"nested");
+    CHECK("json/exact-container-source-span",nested->source_length > 1 && nested->source[0] == '{' && nested->source[nested->source_length-1] == '}');
+    CHECK("json/scalar-source-preserves-escaping",core_json_get(value,"escaped")->source[0] == '"' && strstr(core_json_get(value,"escaped")->source,"\\u0410"));
     const core_json_t *array=core_json_get(core_json_get(value,"nested"),"a");
     CHECK("json/typed-values", array->type == CORE_JSON_ARRAY && array->child->type == CORE_JSON_BOOL && array->child->next->next->type == CORE_JSON_NULL && array->child->next->next->next->type == CORE_JSON_NUMBER);
     core_json_free(value);

@@ -10,6 +10,7 @@
 #include "core_log.h"
 #include "server_ips.h"
 #include "xhttp_config.h"
+#include "xhttp_download.h"
 #include <openssl/rand.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -252,7 +253,8 @@ static int start_request(mux_actor_t *actor, core_xmux_stream_t *stream, int rol
     if (!request) return -1;
     const uint8_t *data=payload ? stream->tx.data+stream->tx.start : NULL;
     size_t consumed=payload,body=payload;
-    int result=actor->manager->backend->request(actor->physical,&stream->config,stream->session,stream->sequence,role,data,payload,&request->id,actor->peer_header_limit,&consumed,&body);
+    const vless_config_t *config=role == 0 ? &actor->manager->config : &stream->config;
+    int result=actor->manager->backend->request(actor->physical,config,stream->session,stream->sequence,role,data,payload,&request->id,actor->peer_header_limit,&consumed,&body);
     if (!result && (consumed > payload || (payload && !consumed) || (body && body != consumed))) result=-1;
     if (!result && role == 3 && !body) { queue_consume(&stream->tx,consumed); upload_bytes-=consumed; }
     account_output(actor);
@@ -295,7 +297,7 @@ static mux_actor_t *new_actor(mux_group_t *group, int budget, core_xmux_stream_t
     actor->alive_period=manager->config.xmux.keep_alive_period;
     if (!actor->alive_period) actor->alive_period=45;
     if (actor->alive_period < 0) actor->alive_period=0;
-    actor->progress_stage=core_server_ip_count() ? CORE_TRACE_TCP : CORE_TRACE_DNS;
+    actor->progress_stage=core_server_ip_count() && !manager->config.ignore_server_ips ? CORE_TRACE_TCP : CORE_TRACE_DNS;
     core_trace_stage(actor->progress_stage);
     actor->trace_present=core_trace_snapshot(&actor->trace);
     if (!actor->trace_present && source && source->trace_present) { actor->trace=source->trace; actor->trace_present=1; }
@@ -393,6 +395,10 @@ static int finish_headers(mux_actor_t *actor, uint32_t id, uint8_t flags, const 
 }
 
 static int process_frame(mux_actor_t *actor, const core_xmux_frame_t *frame) {
+    if (frame->event == 4) {
+        if (actor->http2 || request_active(actor)) return -1;
+        actor->draining=1; return 0;
+    }
     if (frame->event) {
         mux_request_t *request=find_request(actor,frame->id);
         if (!request) return -1;
@@ -719,6 +725,9 @@ static void *actor_worker(void *opaque) {
 }
 
 core_xmux_stream_t *core_xmux_connect(const vless_config_t *config, const core_xmux_backend_t *backend, char *error, size_t capacity) {
+    vless_config_t download_config;
+    int independent=config->xhttp_download_settings[0] != 0;
+    if (independent && core_xhttp_download_config(config,&download_config,error,capacity) != 0) return NULL;
     core_xmux_stream_t *stream=calloc(1,sizeof(*stream));
     if (!stream) { if (error && capacity) snprintf(error,capacity,"XHTTP client allocation failed"); return NULL; }
     stream->config=*config; stream->references=1;
@@ -732,16 +741,20 @@ core_xmux_stream_t *core_xmux_connect(const vless_config_t *config, const core_x
     mux_manager_t *manager=stream_count < 256 ? get_manager(config,backend) : NULL;
     if (stream_count >= 256) errno=EAGAIN;
     mux_actor_t *actor=manager ? choose_actor(manager,core_deadline_active() ? core_deadline_remaining() : 30000,stream) : NULL;
-    if (actor) {
-        stream->download=stream->upload=actor; actor->group->running++;
-        stream->next=streams; streams=stream; stream_count++; wake_actor(actor);
+    mux_manager_t *down_manager=actor && independent ? get_manager(&download_config,backend) : manager;
+    mux_actor_t *down_actor=actor && independent ? (down_manager ? choose_actor(down_manager,core_deadline_active() ? core_deadline_remaining() : 30000,stream) : NULL) : actor;
+    if (actor && down_actor) {
+        stream->download=down_actor; stream->upload=actor; actor->group->running++;
+        if (down_actor->group != actor->group) down_actor->group->running++;
+        stream->next=streams; streams=stream; stream_count++; wake_actor(actor); wake_actor(down_actor);
     }
     pthread_mutex_unlock(&mux_lock);
-    if (!actor) { if (error && capacity) snprintf(error,capacity,"XHTTP channel allocation failed: %s",strerror(errno)); close(stream->notify[0]); close(stream->notify[1]); free(stream); return NULL; }
+    if (!actor || !down_actor) { if (error && capacity) snprintf(error,capacity,"XHTTP channel allocation failed: %s",strerror(errno)); close(stream->notify[0]); close(stream->notify[1]); free(stream); return NULL; }
     for (;;) {
         pthread_mutex_lock(&mux_lock);
         int ready=stream->ready == 1,failed=stream->failed;
         actor=stream->download;
+        if (failed && !actor->failed && stream->upload->failed) actor=stream->upload;
         if (stream->trace_present && actor->trace.id != stream->trace.id && stream->upload->trace.id == stream->trace.id) actor=stream->upload;
         if (stream->first_actor && actor->opening) core_trace_stage(actor->progress_stage);
         if (stream->first_actor && !actor->opening && actor->trace.id == stream->trace.id && (ready || failed)) core_trace_restore(&actor->trace);

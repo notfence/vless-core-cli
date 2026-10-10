@@ -96,6 +96,8 @@ typedef struct {
     int xhttp_min_posts_interval_min, xhttp_min_posts_interval_max;
     core_xmux_config_t xmux;
     int xhttp_physical_only;
+    char xhttp_download_settings[4096];
+    int xhttp_download_only, ignore_server_ips;
 
     int encryption_enabled;
     int encryption_xor_mode;

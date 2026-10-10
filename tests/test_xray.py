@@ -28,6 +28,66 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_xhttp_download_does_not_inherit_insecure_tls(self):
+        shared={"sessionIDPlacement":"header","seqPlacement":"header"}
+        for pooled in (False,True):
+            with self.subTest(pooled=pooled), Server() as target, xray_server("xhttp","tls",path="/",**shared) as reference, CountingProxy(reference.port) as upload, CountingProxy(reference.port,address="127.0.0.2") as download:
+                settings={"address":"127.0.0.2","port":download.port,"network":"xhttp","security":"tls","tlsSettings":{"serverName":"wrong-vless-core.test"},"xhttpSettings":{"path":"/download",**shared}}
+                extra={"downloadSettings":settings,**shared}
+                if pooled: extra["xmux"]={"maxConnections":1}
+                cert,_=certificate()
+                with cli(uri(upload.port,"xhttp","tls",mode="packet-up",allowInsecure=1,extra=json.dumps(extra)),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    with self.assertRaises(AssertionError):
+                        with socks_connect(core.port,target.port): pass
+                    self.assertEqual(len(target.connections),0)
+
+    def test_xhttp_download_independent_security(self):
+        cert,_=certificate()
+        shared={"sessionIDPlacement":"header","seqPlacement":"header"}
+        for upload_tls,download_tls in ((True,False),(False,True)):
+            for pooled in (False,True):
+                with self.subTest(upload_tls=upload_tls,download_tls=download_tls,pooled=pooled), Server() as target, xray_server("xhttp","none",path="/",**shared) as reference, CountingProxy(reference.port,tls=upload_tls) as upload, CountingProxy(reference.port,address="127.0.0.2",tls=download_tls) as download:
+                    settings={"address":"127.0.0.2","port":download.port,"network":"xhttp","security":"tls" if download_tls else "none","xhttpSettings":{"path":"/download",**shared}}
+                    if download_tls: settings["tlsSettings"]={"serverName":"vless-core.test","alpn":["http/1.1"]}
+                    extra={"downloadSettings":settings,**shared}
+                    if pooled: extra["xmux"]={"maxConnections":1}
+                    parameters={"mode":"packet-up","path":"/upload","extra":json.dumps(extra)}
+                    if upload_tls: parameters["alpn"]="http/1.1"
+                    with cli(uri(upload.port,"xhttp","tls" if upload_tls else "none",**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                        try:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core separate security policies"*30)
+                        except (EOFError,TimeoutError,AssertionError) as error:
+                            raise AssertionError(f"{error}\n{core.log}\n{reference.log}") from error
+                        self.assertGreaterEqual(len(upload.client_data),1)
+                        self.assertGreaterEqual(len(download.client_data),1)
+
+    def test_xhttp_independent_download_channel(self):
+        cert,_=certificate()
+        for security,alpn in (("none",None),("tls",None),("tls","http/1.1"),("reality",None)):
+            for mode in ("packet-up","stream-up"):
+                for pooled in (False,True):
+                    shared={"sessionIDPlacement":"header","sessionIDKey":"X-vless-core-session","seqPlacement":"header"}
+                    with self.subTest(security=security,alpn=alpn,mode=mode,pooled=pooled), Server() as target, xray_server("xhttp",security,path="/",**shared) as reference, CountingProxy(reference.port) as upload, CountingProxy(reference.port,address="127.0.0.2") as download:
+                        settings={"address":"127.0.0.2","port":download.port,"network":"xhttp","security":security,"xhttpSettings":{"path":"/download","host":"vless-core-down.test","headers":{"X-vless-core-channel":"download"},"sessionIDTable":"HEX","sessionIDLength":8,**shared}}
+                        if security == "tls": settings["tlsSettings"]={"serverName":"vless-core.test",**({"alpn":[alpn]} if alpn else {})}
+                        if security == "reality": settings["realitySettings"]={"serverName":"vless-core.test","publicKey":PUBLIC_KEY,"shortId":"01020304","fingerprint":"firefox"}
+                        extra={"headers":{"X-vless-core-channel":"upload"},"downloadSettings":settings,"sessionIDTable":"Base62","sessionIDLength":24,**shared}
+                        if pooled: extra["xmux"]={"maxConnections":1}
+                        parameters={"mode":mode,"path":"/upload","host":"vless-core-up.test","extra":json.dumps(extra)}
+                        if alpn: parameters["alpn"]=alpn
+                        with cli(uri(upload.port,"xhttp",security,**parameters),extra=["--server-ips","127.0.0.1"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                            for index in range(3):
+                                with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core independent download"*1000+bytes([index]))
+                            self.assertGreaterEqual(len(upload.client_data),1)
+                            self.assertGreaterEqual(len(download.client_data),1)
+                            if security == "none":
+                                up_data=b"\r\n".join(bytes(block).lower() for block in upload.client_data)
+                                down_data=b"\r\n".join(bytes(block).lower() for block in download.client_data)
+                                self.assertIn(b"host: vless-core-up.test\r\n",up_data)
+                                self.assertIn(b"host: vless-core-down.test\r\n",down_data)
+                                self.assertIn(b"x-vless-core-channel: download\r\n",down_data)
+                                self.assertIn(b"get /download/",down_data)
+
     def test_xhttp_tokenish_padding_and_existing_query_metadata(self):
         for placement in ("header","queryInHeader","query","cookie"):
             extra={"xPaddingObfsMode":True,"xPaddingPlacement":placement,"xPaddingMethod":"tokenish","xPaddingBytes":"200-300","sessionIDPlacement":"query","seqPlacement":"query"}

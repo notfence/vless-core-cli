@@ -6,6 +6,8 @@ typedef enum { CORE_JSON_OBJECT, CORE_JSON_ARRAY, CORE_JSON_STRING, CORE_JSON_NU
 typedef struct core_json {
     core_json_type_t type;
     char *key, *text;
+    const char *source;
+    size_t source_length;
     struct core_json *child, *next;
 } core_json_t;
 

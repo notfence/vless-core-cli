@@ -195,11 +195,11 @@ class Server:
         self.close()
 
 class CountingProxy(Server):
-    def __init__(self, upstream_port, address="127.0.0.1"):
+    def __init__(self, upstream_port, address="127.0.0.1", tls=False):
         self.upstream_port=upstream_port
         self.client_data=[]
         self.client_reads=[]
-        super().__init__(self.forward,address=address)
+        super().__init__(self.forward,address=address,tls=tls)
 
     def forward(self, connection):
         captured=bytearray()
@@ -208,9 +208,16 @@ class CountingProxy(Server):
             selector.register(connection,selectors.EVENT_READ,upstream)
             selector.register(upstream,selectors.EVENT_READ,connection)
             while not self.stop.is_set():
-                for key,_ in selector.select(timeout=0.1):
+                pending=isinstance(connection,ssl.SSLSocket) and connection.pending()
+                ready=selector.select(timeout=0 if pending else 0.1)
+                if pending and not any(key.fileobj is connection for key,_ in ready): ready.append((selector.get_key(connection),selectors.EVENT_READ))
+                for key,_ in ready:
                     block=key.fileobj.recv(65536)
-                    if not block: return
+                    if not block:
+                        if key.fileobj is upstream and isinstance(connection,ssl.SSLSocket):
+                            try: connection.unwrap().close()
+                            except (ssl.SSLError,OSError): pass
+                        return
                     if key.fileobj is connection:
                         with self.lock:
                             start=len(captured); captured.extend(block)
