@@ -942,6 +942,7 @@ static void *client_worker_run(void *arg) {
     int forwarded_client_payload = (first_payload_len > 0) ? 1 : 0;
 
     while (1) {
+        if (tls13_tick(tls)) break;
         int client_ready = 0;
         int client_writable = tls13_write_capacity(tls) >= 128U*1024U;
         int upstream_ready = !downstream_direct &&
@@ -955,10 +956,11 @@ static void *client_worker_run(void *arg) {
         } else {
             struct pollfd fds[2] = {{.fd=client_writable ? cfd : -1,.events=POLLIN},
                 {.fd=tfd,.events=(short)(POLLIN | (tls13_needs_write(tls) ? POLLOUT : 0))}};
-            int s = core_poll(fds, 2, -1);
-            if (s <= 0) {
+            int s = core_poll(fds, 2, tls13_idle_timeout(tls));
+            if (s < 0 || tls13_tick(tls)) {
                 break;
             }
+            if (s == 0) continue;
             client_ready = (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0;
             upstream_ready = (fds[1].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR)) != 0;
         }

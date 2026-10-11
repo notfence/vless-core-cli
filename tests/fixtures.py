@@ -282,7 +282,7 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
     with contextlib.ExitStack() as stack:
         stream = {"network": "raw" if transport == "tcp" else transport, "security": security}
         if transport == "ws":
-            stream["wsSettings"] = {"path":"/vless-core"}
+            stream["wsSettings"] = {"path":"/vless-core",**transport_parameters}
         elif transport == "xhttp":
             stream["xhttpSettings"] = {"path":"/vless-core", "mode":mode or "auto", **transport_parameters}
         elif transport == "grpc":

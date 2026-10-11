@@ -172,16 +172,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         close(pair[1]);
         break;
     }
-    case 6:
-        c.mode = CONN_MODE_WS;
-        if (db_append(&c.ws_net_cache, data, size) != 0) abort();
-        while (c.ws_net_cache.len > 0) {
-            size_t before = c.ws_net_cache.len;
-            int result = ws_fill_app_cache(&c);
-            c.app_cache.len = 0;
-            if (result != 0 || c.ws_net_cache.len == before) break;
+    case 6: {
+        core_ws_decoder_t decoder={0}; size_t offset=0;
+        while (offset < size) {
+            size_t chunk=1+(data[offset]%32),consumed=0;
+            if (chunk > size-offset) chunk=size-offset;
+            core_ws_event_t event;
+            int result=core_ws_decode(&decoder,data+offset,chunk,&consumed,&event);
+            if (consumed > chunk || event.length > size) abort();
+            if (result < 0 || !consumed) break;
+            offset+=consumed;
         }
         break;
+    }
     case 7: {
         uint8_t uuid[16] = {0};
         vision_unpad_t unpad;

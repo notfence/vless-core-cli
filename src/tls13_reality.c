@@ -20,6 +20,7 @@
 #include "connection_trace.h"
 #include "tls13_reality.h"
 #include "tls_hello.h"
+#include "websocket.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -237,6 +238,10 @@ struct tls13_conn {
     int tls_use_aes_fallback;
     char ws_path[512];
     char ws_host[320];
+    char ws_headers[4096];
+    core_ws_decoder_t ws_decoder;
+    int ws_upgraded, ws_early_data, ws_want_write, ws_close_sent;
+    uint64_t ws_heartbeat_ms, ws_next_heartbeat;
     char grpc_service_name[256];
     char grpc_authority[320];
     int grpc_transport;
@@ -1409,7 +1414,25 @@ static int ws_conn_read_some(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *
         return 0;
     }
     if (c->ssl != NULL) {
+        if (c->ws_upgraded) {
+            int result=SSL_read(c->ssl,buf,(int)cap);
+            c->ws_want_write=0;
+            if (result > 0) { *out_len=(size_t)result; return 0; }
+            int error=SSL_get_error(c->ssl,result);
+            if (error == SSL_ERROR_SYSCALL && errno == EINTR) return 1;
+            if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+                c->ws_want_write=error == SSL_ERROR_WANT_WRITE; return 1;
+            }
+            return -1;
+        }
         return ssl_read_some(c->ssl, buf, cap, out_len);
+    }
+    if (c->ws_upgraded) {
+        ssize_t result;
+        do { result=recv(c->fd,buf,cap,MSG_DONTWAIT); } while (result < 0 && errno == EINTR);
+        if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
+        if (result <= 0) return -1;
+        *out_len=(size_t)result; return 0;
     }
     ssize_t n = core_recv(c->fd, buf, cap, 0);
     if (n <= 0) {
@@ -1420,10 +1443,30 @@ static int ws_conn_read_some(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *
 }
 
 static int ws_conn_write_all(tls13_conn_t *c, const void *buf, size_t len) {
-    if (c->ssl != NULL) {
-        return ssl_write_all(c->ssl, buf, len);
+    const uint8_t *bytes=buf;
+    for (size_t offset=0;offset<len;) {
+        int result;
+        if (c->ssl) {
+            result=SSL_write(c->ssl,bytes+offset,(int)(len-offset));
+            if (result <= 0) {
+                int error=SSL_get_error(c->ssl,result);
+                if (error == SSL_ERROR_SYSCALL && errno == EINTR) continue;
+                if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) return -1;
+                if (core_wait_socket(c->fd,error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT,-1) <= 0) return -1;
+                continue;
+            }
+        } else {
+            ssize_t sent=core_send(c->fd,bytes+offset,len-offset,0);
+            if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (core_wait_socket(c->fd,POLLOUT,-1) <= 0) return -1;
+                continue;
+            }
+            if (sent <= 0) return -1;
+            result=(int)sent;
+        }
+        offset+=(size_t)result;
     }
-    return write_exact(c->fd, buf, len);
+    return 0;
 }
 
 static int parse_ws_upgrade_response(tls13_conn_t *c, dynbuf_t *cache, int *status_code, char *accept, size_t accept_cap, int *has_upgrade,
@@ -1494,161 +1537,52 @@ static int parse_ws_upgrade_response(tls13_conn_t *c, dynbuf_t *cache, int *stat
     }
 }
 
-static int ws_stream_read_some(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
-    *out_len = 0;
-    if (cap == 0) {
-        return 0;
+static int ws_write_frame(tls13_conn_t *c, uint8_t opcode, const uint8_t *buf, size_t len) {
+    if (len > CORE_WS_MESSAGE_LIMIT || (opcode >= 8 && len > 125)) return -1;
+    uint8_t header[14],mask[4],chunk[8192];
+    size_t size=0;
+    header[size++]=(uint8_t)(0x80|opcode);
+    if (len <= 125) header[size++]=(uint8_t)(0x80|len);
+    else if (len <= 65535) {
+        header[size++]=0xfe; header[size++]=(uint8_t)(len>>8); header[size++]=(uint8_t)len;
+    } else {
+        header[size++]=0xff;
+        for (int i=7;i>=0;i--) header[size++]=(uint8_t)((uint64_t)len>>(i*8));
     }
-    if (c->ws_net_cache.len > 0) {
-        size_t take = c->ws_net_cache.len;
-        if (take > cap) {
-            take = cap;
-        }
-        memcpy(buf, c->ws_net_cache.data, take);
-        db_consume(&c->ws_net_cache, take);
-        *out_len = take;
-        return 0;
-    }
-    return ws_conn_read_some(c, buf, cap, out_len);
-}
-
-static int ws_stream_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        size_t got = 0;
-        if (ws_stream_read_some(c, buf + off, len - off, &got) != 0 || got == 0) {
-            return -1;
-        }
-        off += got;
+    if (RAND_bytes(mask,sizeof(mask)) != 1) return -1;
+    memcpy(header+size,mask,4); size+=4;
+    if (ws_conn_write_all(c,header,size)) return -1;
+    for (size_t offset=0;offset<len;) {
+        size_t take=len-offset < sizeof(chunk) ? len-offset : sizeof(chunk);
+        for (size_t i=0;i<take;i++) chunk[i]=buf[offset+i]^mask[(offset+i)%4];
+        if (ws_conn_write_all(c,chunk,take)) return -1;
+        offset+=take;
     }
     return 0;
 }
 
-static int ws_write_frame(tls13_conn_t *c, uint8_t opcode, const uint8_t *buf, size_t len) {
-    uint8_t hdr[14];
-    size_t hdr_len = 0;
-    hdr[hdr_len++] = (uint8_t)(0x80 | (opcode & 0x0F));
-    if (len <= 125) {
-        hdr[hdr_len++] = (uint8_t)(0x80 | len);
-    } else if (len <= 0xFFFFU) {
-        hdr[hdr_len++] = 0x80 | 126;
-        hdr[hdr_len++] = (uint8_t)(len >> 8);
-        hdr[hdr_len++] = (uint8_t)len;
-    } else {
-        hdr[hdr_len++] = 0x80 | 127;
-        uint64_t n = (uint64_t)len;
-        for (int i = 7; i >= 0; i--) {
-            hdr[hdr_len++] = (uint8_t)(n >> (i * 8));
-        }
-    }
-
-    uint8_t mask[4];
-    if (RAND_bytes(mask, sizeof(mask)) != 1) {
-        return -1;
-    }
-    memcpy(hdr + hdr_len, mask, sizeof(mask));
-    hdr_len += sizeof(mask);
-
-    if (ws_conn_write_all(c, hdr, hdr_len) != 0) {
-        return -1;
-    }
-    if (len == 0) {
-        return 0;
-    }
-
-    uint8_t *masked = (uint8_t *)malloc(len);
-    if (masked == NULL) {
-        return -1;
-    }
-    for (size_t i = 0; i < len; i++) {
-        masked[i] = (uint8_t)(buf[i] ^ mask[i % 4]);
-    }
-    int rc = ws_conn_write_all(c, masked, len);
-    free(masked);
-    return rc;
-}
-
 static int ws_fill_app_cache(tls13_conn_t *c) {
     for (;;) {
-        uint8_t hdr[2];
-        if (ws_stream_read_exact(c, hdr, sizeof(hdr)) != 0) {
-            return -1;
+        if (c->ws_decoder.closed) return 0;
+        if (c->ws_net_cache.len) {
+            core_ws_event_t event; size_t consumed=0;
+            int result=core_ws_decode(&c->ws_decoder,c->ws_net_cache.data,c->ws_net_cache.len,&consumed,&event);
+            if (result < 0) return -1;
+            if (result && event.opcode < 8 && db_append(&c->app_cache,event.data,event.length)) return -1;
+            if (result && event.opcode == 9 && ws_write_frame(c,10,event.data,event.length)) return -1;
+            if (result && event.opcode == 8 && !c->ws_close_sent) {
+                if (ws_write_frame(c,8,event.data,event.length)) return -1;
+                c->ws_close_sent=1;
+            }
+            db_consume(&c->ws_net_cache,consumed);
+            if (c->app_cache.len || c->ws_decoder.closed) return 0;
+            if (c->ws_net_cache.len) continue;
         }
-
-        int fin = (hdr[0] & 0x80) != 0;
-        uint8_t opcode = hdr[0] & 0x0F;
-        int masked = (hdr[1] & 0x80) != 0;
-        uint64_t len = hdr[1] & 0x7F;
-        if (len == 126) {
-            uint8_t ext[2];
-            if (ws_stream_read_exact(c, ext, sizeof(ext)) != 0) {
-                return -1;
-            }
-            len = ((uint64_t)ext[0] << 8) | (uint64_t)ext[1];
-        } else if (len == 127) {
-            uint8_t ext[8];
-            if (ws_stream_read_exact(c, ext, sizeof(ext)) != 0) {
-                return -1;
-            }
-            len = 0;
-            for (size_t i = 0; i < sizeof(ext); i++) {
-                len = (len << 8) | (uint64_t)ext[i];
-            }
-            if ((ext[0] & 0x80) != 0) {
-                return -1;
-            }
-        }
-        if (len > 16ULL * 1024ULL * 1024ULL) {
-            return -1;
-        }
-
-        uint8_t mask[4] = {0};
-        if (masked && ws_stream_read_exact(c, mask, sizeof(mask)) != 0) {
-            return -1;
-        }
-
-        uint8_t *payload = NULL;
-        if (len > 0) {
-            payload = (uint8_t *)malloc((size_t)len);
-            if (payload == NULL) {
-                return -1;
-            }
-            if (ws_stream_read_exact(c, payload, (size_t)len) != 0) {
-                free(payload);
-                return -1;
-            }
-            if (masked) {
-                for (uint64_t i = 0; i < len; i++) {
-                    payload[i] = (uint8_t)(payload[i] ^ mask[i % 4]);
-                }
-            }
-        }
-
-        int rc = 0;
-        if (opcode == 0x0 || opcode == 0x1 || opcode == 0x2) {
-            if (len > 0 && db_append(&c->app_cache, payload, (size_t)len) != 0) {
-                rc = -1;
-            }
-        } else if (opcode == 0x8) {
-            (void)ws_write_frame(c, 0x8, payload, (size_t)len);
-            rc = -1;
-        } else if (opcode == 0x9) {
-            if (!fin || len > 125 || ws_write_frame(c, 0xA, payload, (size_t)len) != 0) {
-                rc = -1;
-            }
-        } else if (opcode == 0xA) {
-            rc = 0;
-        } else {
-            rc = -1;
-        }
-        free(payload);
-
-        if (rc != 0) {
-            return -1;
-        }
-        if (c->app_cache.len > 0) {
-            return 0;
-        }
+        uint8_t input[8192]; size_t received=0;
+        int result=ws_conn_read_some(c,input,sizeof(input),&received);
+        if (result) return result;
+        if (!received) return -1;
+        if (db_append(&c->ws_net_cache,input,received)) return -1;
     }
 }
 
@@ -5250,7 +5184,24 @@ int tls13_reality_is_raw_direct(const tls13_conn_t *c) {
 }
 
 int tls13_needs_write(const tls13_conn_t *c) {
+    if (c && c->mode == CONN_MODE_WS) return c->ws_want_write;
     return c != NULL && c->mode == CONN_MODE_XHTTP_TLS && c->ssl != NULL && SSL_want_write(c->ssl);
+}
+
+int tls13_idle_timeout(const tls13_conn_t *c) {
+    if (!c || c->mode != CONN_MODE_WS || !c->ws_next_heartbeat || c->ws_close_sent || c->ws_decoder.closed) return -1;
+    uint64_t now=core_now_ms();
+    if (now >= c->ws_next_heartbeat) return 0;
+    uint64_t remaining=c->ws_next_heartbeat-now;
+    return remaining > INT_MAX ? INT_MAX : (int)remaining;
+}
+
+int tls13_tick(tls13_conn_t *c) {
+    if (tls13_idle_timeout(c) == 0) {
+        if (ws_write_frame(c,9,NULL,0)) return -1;
+        c->ws_next_heartbeat=core_now_ms()+c->ws_heartbeat_ms;
+    }
+    return 0;
 }
 
 int tls13_has_pending_app(const tls13_conn_t *c) {
@@ -5993,6 +5944,61 @@ static int tcp_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err
     return 0;
 }
 
+static int ws_upgrade(tls13_conn_t *c, const uint8_t *early, size_t early_length, char *err, size_t err_cap) {
+    char key[25],expected[29];
+    if (ws_make_key(key) || ws_make_accept(key,expected)) { set_err(err,err_cap,"failed to build WebSocket key"); return -1; }
+    char headers[8192]=
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36\r\n"
+        "Accept: */*\r\nAccept-Language: en-US,en;q=0.9\r\nCache-Control: no-cache\r\nPragma: no-cache\r\nDNT: 1\r\n"
+        "Sec-Fetch-Dest: empty\r\nSec-Fetch-Mode: websocket\r\nSec-Fetch-Site: same-origin\r\n"
+        "Sec-CH-UA: \"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"\r\n"
+        "Sec-CH-UA-Mobile: ?0\r\nSec-CH-UA-Platform: \"Windows\"\r\n";
+    for (const char *line=c->ws_headers;*line;) {
+        const char *end=strstr(line,"\r\n"),*colon=end ? memchr(line,':',(size_t)(end-line)) : NULL;
+        if (!colon) return -1;
+        char name[128],value[4096];
+        size_t length=(size_t)(colon-line),value_length=(size_t)(end-colon-1);
+        if (length >= sizeof(name) || value_length >= sizeof(value)) return -1;
+        memcpy(name,line,length); name[length]=0;
+        memcpy(value,colon+1,value_length); value[value_length]=0; trim_ascii(value);
+        if (core_http_header_set(headers,sizeof(headers),name,value)) return -1;
+        line=end+2;
+    }
+    size_t encoded_capacity=4*((early_length+2)/3)+1;
+    char *encoded=calloc(1,encoded_capacity);
+    if (!encoded) return -1;
+    if (early_length) {
+        if (base64_encode(early,early_length,encoded,encoded_capacity)) { free(encoded); return -1; }
+        for (char *byte=encoded;*byte;byte++) {
+            if (*byte == '+') *byte='-';
+            else if (*byte == '/') *byte='_';
+            else if (*byte == '=') { *byte=0; break; }
+        }
+    }
+    size_t capacity=strlen(headers)+strlen(c->ws_path)+strlen(c->ws_host)+strlen(encoded)+256;
+    char *request=malloc(capacity);
+    if (!request) { free(encoded); return -1; }
+    int length=snprintf(request,capacity,
+        "GET %s HTTP/1.1\r\nHost: %s\r\n%sConnection: Upgrade\r\nUpgrade: websocket\r\n"
+        "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n%s%s%s\r\n",
+        c->ws_path,c->ws_host,headers,key,early_length ? "Sec-WebSocket-Protocol: " : "",
+        early_length ? encoded : "",early_length ? "\r\n" : "");
+    free(encoded);
+    int result=length > 0 && (size_t)length < capacity ? ws_conn_write_all(c,request,(size_t)length) : -1;
+    free(request);
+    if (result) { set_err(err,err_cap,"failed to send WebSocket upgrade request"); return -1; }
+    int status=0,upgrade=0,connection=0; char accept[96];
+    if (parse_ws_upgrade_response(c,&c->ws_net_cache,&status,accept,sizeof(accept),&upgrade,&connection,err,err_cap)) return -1;
+    if (status != 101 || !upgrade || !connection || strcmp(accept,expected)) {
+        set_err(err,err_cap,"invalid WebSocket upgrade response"); return -1;
+    }
+    int flags=fcntl(c->fd,F_GETFL,0);
+    if (flags < 0 || fcntl(c->fd,F_SETFL,flags|O_NONBLOCK)) return -1;
+    c->ws_upgraded=1;
+    c->ws_next_heartbeat=c->ws_heartbeat_ms ? core_now_ms()+c->ws_heartbeat_ms : 0;
+    return 0;
+}
+
 static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
     c->mode = CONN_MODE_WS;
     snprintf(c->remote_host, sizeof(c->remote_host), "%s", cfg->server_host);
@@ -6010,13 +6016,22 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
 
     int verify_peer = 0;
     if (ws_tls) {
-        static const unsigned char h1_alpn[] = {0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+        unsigned char h1_alpn[256]; unsigned int h1_alpn_length=0;
+        const char *protocols=cfg->alpn[0] ? cfg->alpn : "http/1.1";
+        if (!alpn_csv_has_token(protocols,"http/1.1") || build_xhttp_tls_alpn(protocols,h1_alpn,sizeof(h1_alpn),&h1_alpn_length)) {
+            set_err(err,err_cap,"WebSocket requires http/1.1 ALPN"); return -1;
+        }
         tls_verify_mode_t mode = tls_verify_mode_for_config(cfg);
         c->tls_verify_policy = mode;
         verify_peer = tls_verify_peer(mode);
-        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, verify_peer, h1_alpn, sizeof(h1_alpn), &c->ssl_ctx, &c->ssl,
+        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, verify_peer, h1_alpn, h1_alpn_length, &c->ssl_ctx, &c->ssl,
                             &c->fd, &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
+        }
+        const unsigned char *selected=NULL; unsigned int selected_length=0;
+        SSL_get0_alpn_selected(c->ssl,&selected,&selected_length);
+        if (selected_length && (selected_length != 8 || memcmp(selected,"http/1.1",8))) {
+            set_err(err,err_cap,"WebSocket server selected incompatible ALPN"); return -1;
         }
         if (mode == TLS_VERIFY_MODE_TOFU) {
             if (xhttp_make_pin_key(c->remote_sni, c->remote_port, c->xhttp_pin_key, sizeof(c->xhttp_pin_key)) != 0 ||
@@ -6032,67 +6047,11 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
         }
     }
 
-    char sec_key[25];
-    char expected_accept[29];
-    if (ws_make_key(sec_key) != 0 || ws_make_accept(sec_key, expected_accept) != 0) {
-        set_err(err, err_cap, "failed to build WebSocket key");
-        return -1;
-    }
-
-    char req[4096];
-    int req_len = snprintf(
-        req, sizeof(req),
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36\r\n"
-        "Accept: */*\r\n"
-        "Accept-Language: en-US,en;q=0.9\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Pragma: no-cache\r\n"
-        "DNT: 1\r\n"
-        "Connection: Upgrade\r\n"
-        "Upgrade: websocket\r\n"
-        "Sec-WebSocket-Key: %s\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "Sec-Fetch-Dest: empty\r\n"
-        "Sec-Fetch-Mode: websocket\r\n"
-        "Sec-Fetch-Site: same-origin\r\n"
-        "Sec-CH-UA: \"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"\r\n"
-        "Sec-CH-UA-Mobile: ?0\r\n"
-        "Sec-CH-UA-Platform: \"Windows\"\r\n"
-        "\r\n",
-        c->ws_path, c->ws_host, sec_key);
-    if (req_len <= 0 || (size_t)req_len >= sizeof(req)) {
-        set_err(err, err_cap, "WebSocket upgrade request too large");
-        return -1;
-    }
-    if (ws_conn_write_all(c, req, (size_t)req_len) != 0) {
-        set_err(err, err_cap, "failed to send WebSocket upgrade request");
-        return -1;
-    }
-
-    int status = 0;
-    int has_upgrade = 0;
-    int has_connection_upgrade = 0;
-    char accept[96];
-    if (parse_ws_upgrade_response(c, &c->ws_net_cache, &status, accept, sizeof(accept), &has_upgrade, &has_connection_upgrade, err,
-                                  err_cap) != 0) {
-        return -1;
-    }
-    if (status != 101) {
-        if (err != NULL && err_cap > 0) {
-            snprintf(err, err_cap, "WebSocket upgrade returned HTTP %d", status);
-        }
-        return -1;
-    }
-    if (!has_upgrade || !has_connection_upgrade || strcmp(accept, expected_accept) != 0) {
-        set_err(err, err_cap, "invalid WebSocket upgrade response");
-        return -1;
-    }
-
-    vc_log_info("ws", "connected path=%s host=%s security=%s verify=%s",
-                c->ws_path, c->ws_host, cfg->security,
-                ws_tls ? tls_verify_mode_name(c->tls_verify_policy) : "none");
+    memcpy(c->ws_headers,cfg->ws_headers,sizeof(c->ws_headers));
+    c->ws_early_data=cfg->ws_early_data;
+    c->ws_heartbeat_ms=(uint64_t)cfg->ws_heartbeat_period*1000;
+    if (!c->ws_early_data && ws_upgrade(c,NULL,0,err,err_cap)) return -1;
+    vc_log_info("ws","connected security=%s early_data=%d",cfg->security,c->ws_early_data);
     return 0;
 }
 
@@ -6516,6 +6475,14 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     }
 
     if (c->mode == CONN_MODE_WS) {
+        if (!c->ws_upgraded) {
+            char error[160]="WebSocket upgrade failed";
+            int early=len && len <= (size_t)c->ws_early_data;
+            if (ws_upgrade(c,early ? buf : NULL,early ? len : 0,error,sizeof(error))) {
+                vc_log_error("ws","%s",error); return -1;
+            }
+            if (early) return 0;
+        }
         return ws_write_frame(c, 0x2, buf, len);
     }
 
@@ -6645,9 +6612,8 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
 
     if (c->app_cache.len == 0) {
         if (c->mode == CONN_MODE_WS) {
-            if (ws_fill_app_cache(c) != 0) {
-                return -1;
-            }
+            int result=ws_fill_app_cache(c);
+            if (result) return result;
         } else if (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_PLAIN) {
             int rc = xhttp_fill_app_cache(c);
             if (rc < 0) {
@@ -6696,7 +6662,7 @@ int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len) {
             return -1;
         }
         if (rc > 0) {
-            if (c->xmux_stream && core_wait_socket(c->fd, POLLIN, -1) <= 0) return -1;
+            if ((c->xmux_stream || c->mode == CONN_MODE_WS) && core_wait_socket(c->fd,tls13_needs_write(c) ? POLLOUT : POLLIN,-1) <= 0) return -1;
             continue;
         }
         if (got == 0) {

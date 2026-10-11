@@ -5,6 +5,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <stdint.h>
+struct addrinfo;
 
 uint64_t core_now_ms(void);
 int core_poll(struct pollfd *fds, nfds_t count, int timeout_ms);

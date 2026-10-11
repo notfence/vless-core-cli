@@ -9,6 +9,7 @@
 #include "utils.h"
 #include "xhttp_config.h"
 #include "core_log.h"
+#include "websocket.h"
 
 static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
@@ -263,6 +264,8 @@ static int normalize_query_key(const char *encoded, char *normalized, size_t nor
         alias = "sessionplacement";
     } else if (strcmp(normalized, "sessionidkey") == 0) {
         alias = "sessionkey";
+    } else if (!strcmp(normalized,"maxearlydata")) {
+        alias = "ed";
     }
     if (alias != NULL) copy_trunc(normalized, normalized_cap, alias);
     return 0;
@@ -366,9 +369,11 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
             return -1;
         }
         int common=!strcmp(key,"path") || !strcmp(key,"host") || !strcmp(key,"mode");
-        int xhttp_parameter = common ? 0 : core_xhttp_parameter(cfg, key, decoded, err, err_cap);
+        int ws_parameter=cfg->transport_mode == TRANSPORT_WS ? core_ws_parameter(cfg,key,decoded,err,err_cap) : 0;
+        if (ws_parameter < 0) return -1;
+        int xhttp_parameter = ws_parameter || common ? 0 : core_xhttp_parameter(cfg, key, decoded, err, err_cap);
         if (xhttp_parameter < 0) return -1;
-        if (xhttp_parameter > 0 || !strcmp(key, "extra")) {
+        if (ws_parameter > 0 || xhttp_parameter > 0 || !strcmp(key, "extra")) {
             if (xhttp_parameter > 0 && cfg->transport_mode != TRANSPORT_XHTTP)
                 vc_log_warning("uri","field query.%s is not applied to this transport",key);
             if (next == NULL) break;
@@ -647,6 +652,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     if (parse_vless_encryption(cfg, err, err_cap) != 0) {
         return -1;
     }
+    if (cfg->transport_mode == TRANSPORT_WS && core_ws_configure(cfg,err,err_cap)) return -1;
     if (cfg->flow[0] && strcmp(cfg->flow,"xtls-rprx-vision")) { set_err(err,err_cap,"unsupported flow"); return -1; }
     if (cfg->flow[0] && (cfg->transport_mode == TRANSPORT_WS || cfg->transport_mode == TRANSPORT_GRPC ||
         (cfg->transport_mode == TRANSPORT_XHTTP && !cfg->encryption_enabled))) vc_log_warning("uri","field query.flow is not applied to this transport");

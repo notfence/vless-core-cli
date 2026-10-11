@@ -72,6 +72,8 @@ typedef struct {
     char xhttp_mode[32];
     char grpc_service_name[256];
     char grpc_authority[256];
+    char ws_headers[4096];
+    int ws_early_data, ws_early_explicit, ws_heartbeat_period;
     char xhttp_session_placement[16];
     char xhttp_session_key[64];
     char xhttp_session_id_table[256];

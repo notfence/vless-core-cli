@@ -391,7 +391,12 @@ static void protocol_edges(void) {
         REQUIRE("ws/truncation-fixture", write_exact(pair[1], ws_frame, cut) == 0 && shutdown(pair[1], SHUT_WR) == 0);
         c = (tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_WS};
         int result = ws_fill_app_cache(&c);
-        if (cut < sizeof(ws_frame)) CHECK("ws/truncated-frame-rejected", result != 0 && c.app_cache.len == 0);
+        if (cut < sizeof(ws_frame)) {
+            size_t available=cut > 4 ? cut-4 : 0;
+            CHECK("ws/partial-frame-streamed",c.app_cache.len == available && (!available || memcmp(c.app_cache.data,ws_frame+4,available) == 0));
+            if (result == 0) { c.app_cache.len=0; result=ws_fill_app_cache(&c); }
+            CHECK("ws/truncated-frame-rejected",result < 0);
+        }
         else CHECK("ws/complete-frame-before-eof", result == 0 && c.app_cache.len == 126 && memcmp(c.app_cache.data, ws_frame+4, 126) == 0);
         clear_conn(&c); close(pair[0]); close(pair[1]);
     }
@@ -454,6 +459,16 @@ static void protocol_edges(void) {
     CHECK("ws/extended-length", wire[0] == 0x82 && wire[1] == 0xfe && wire[2] == 1 && wire[3] == 44);
     for (size_t i = 0; i < sizeof(ws_data); i++) CHECK("ws/masked-payload", (wire[i+8]^wire[4+i%4]) == 42);
     clear_conn(&c); close(pair[0]); close(pair[1]);
+    const uint8_t invalid_ws[][7] = {{0x82,0x81,0,0,0,0,'x'},{0xc2,1,'x'},{0x80,1,'x'}};
+    const size_t invalid_ws_sizes[] = {7,3,3};
+    const char *invalid_ws_names[] = {"ws/server-mask-rejected","ws/reserved-bits-rejected","ws/orphan-continuation-rejected"};
+    for (size_t i=0;i<3;i++) {
+        REQUIRE("ws/invalid-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        c=(tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_WS};
+        REQUIRE("ws/invalid-fixture",db_append(&c.ws_net_cache,invalid_ws[i],invalid_ws_sizes[i]) == 0);
+        CHECK(invalid_ws_names[i],ws_fill_app_cache(&c) < 0 && c.app_cache.len == 0);
+        clear_conn(&c); close(pair[0]); close(pair[1]);
+    }
     REQUIRE("xhttp/chunk-pair", socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
     c = (tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_XHTTP_PLAIN,.xhttp_chunk_rem=-1,.xhttp_content_rem=-1};
     const char *chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;vless-core=yes\r\nabc\r\n0\r\n\r\n";

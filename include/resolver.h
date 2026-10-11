@@ -1,6 +1,7 @@
 #ifndef CORE_RESOLVER_H
 #define CORE_RESOLVER_H
 #include <netdb.h>
+struct addrinfo;
 
 typedef struct core_resolver_query core_resolver_query_t;
 int core_resolver_init(void);
