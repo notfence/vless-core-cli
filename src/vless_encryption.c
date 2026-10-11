@@ -7,8 +7,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <limits.h>
+#include <errno.h>
 
 #include "blake3.h"
+#include "socket_util.h"
+#include "deadline.h"
+#include "server_ips.h"
 
 typedef struct {
     uint8_t key[32];
@@ -32,7 +38,72 @@ struct vless_encryption_conn {
     uint8_t *input;
     size_t input_len;
     size_t input_off;
+    uint8_t cache_identity[32];
+    uint64_t cache_generation;
+    int incoming_deferred;
+    uint8_t *prewrite;
+    size_t prewrite_length;
 };
+
+typedef struct {
+    uint8_t identity[32],pfs[64],ticket[16];
+    uint64_t until_ms,used,generation;
+} encryption_cache_t;
+static encryption_cache_t encryption_cache[64];
+static pthread_mutex_t encryption_cache_lock=PTHREAD_MUTEX_INITIALIZER;
+static uint64_t encryption_cache_sequence;
+
+static void cache_identity(const vless_config_t *config, uint8_t identity[32]) {
+    blake3_hash((const uint8_t *)config,sizeof(*config),identity);
+    for (size_t i=0;i<core_server_ip_count();i++) {
+        struct sockaddr_storage address={0}; socklen_t length=0;
+        if (!core_server_address_at(i,config->server_port,&address,&length)) {
+            uint8_t material[32+sizeof(address)];
+            memcpy(material,identity,32); memcpy(material+32,&address,length);
+            blake3_hash(material,32+length,identity);
+        }
+    }
+}
+
+static uint64_t cache_load(const uint8_t identity[32], uint8_t pfs[64], uint8_t ticket[16]) {
+    uint64_t generation=0,now=core_now_ms();
+    pthread_mutex_lock(&encryption_cache_lock);
+    for (size_t i=0;i<64;i++) {
+        encryption_cache_t *entry=&encryption_cache[i];
+        if (entry->until_ms && entry->until_ms <= now) OPENSSL_cleanse(entry,sizeof(*entry));
+        if (entry->until_ms && !memcmp(entry->identity,identity,32)) {
+            memcpy(pfs,entry->pfs,64); memcpy(ticket,entry->ticket,16);
+            generation=entry->generation; entry->used=++encryption_cache_sequence; break;
+        }
+    }
+    pthread_mutex_unlock(&encryption_cache_lock);
+    return generation;
+}
+
+static void cache_store(const uint8_t identity[32], const uint8_t pfs[64], const uint8_t ticket[16], unsigned seconds) {
+    if (!seconds) return;
+    pthread_mutex_lock(&encryption_cache_lock);
+    encryption_cache_t *chosen=&encryption_cache[0]; uint64_t now=core_now_ms();
+    for (size_t i=0;i<64;i++) {
+        encryption_cache_t *entry=&encryption_cache[i];
+        if (entry->until_ms && entry->until_ms <= now) OPENSSL_cleanse(entry,sizeof(*entry));
+        if (entry->until_ms && !memcmp(entry->identity,identity,32)) { chosen=entry; break; }
+        if (!entry->until_ms || entry->used < chosen->used) chosen=entry;
+    }
+    OPENSSL_cleanse(chosen,sizeof(*chosen));
+    memcpy(chosen->identity,identity,32); memcpy(chosen->pfs,pfs,64); memcpy(chosen->ticket,ticket,16);
+    chosen->until_ms=now+(uint64_t)seconds*1000; chosen->used=chosen->generation=++encryption_cache_sequence;
+    pthread_mutex_unlock(&encryption_cache_lock);
+}
+
+static void cache_invalidate(vless_encryption_conn_t *connection) {
+    if (!connection->cache_generation) return;
+    pthread_mutex_lock(&encryption_cache_lock);
+    for (size_t i=0;i<64;i++) if (encryption_cache[i].generation == connection->cache_generation &&
+        !memcmp(encryption_cache[i].identity,connection->cache_identity,32)) OPENSSL_cleanse(&encryption_cache[i],sizeof(encryption_cache[i]));
+    pthread_mutex_unlock(&encryption_cache_lock);
+    connection->cache_generation=0;
+}
 
 static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
@@ -40,19 +111,47 @@ static void set_err(char *err, size_t cap, const char *msg) {
     }
 }
 
-static uint32_t random_u32(void) {
-    uint32_t value = 0;
-    if (RAND_bytes((unsigned char *)&value, sizeof(value)) != 1) {
-        return 0;
-    }
-    return value;
+static int random_range(int min, int max) {
+    if (min > max) { int temporary=min; min=max; max=temporary; }
+    if (min == max) return min;
+    uint32_t value,span=(uint32_t)(max-min),threshold=(uint32_t)(-span)%span;
+    do { if (RAND_bytes((unsigned char *)&value,sizeof(value)) != 1) return -1; } while (value < threshold);
+    return min+(int)(value%span);
 }
 
-static int random_range(int min, int max) {
-    if (max <= min) {
-        return min;
+static int padding_create(const vless_config_t *config, int lengths[14], int gaps[14], size_t *count) {
+    static const vless_encryption_padding_t defaults[]={{100,111,1111},{75,0,111},{50,0,3333}};
+    const vless_encryption_padding_t *parameters=config->encryption_padding_count ? config->encryption_padding : defaults;
+    size_t size=config->encryption_padding_count ? config->encryption_padding_count : 3;
+    if (size > VLESS_ENCRYPTION_MAX_PADDING) return -1;
+    memset(lengths,0,14*sizeof(*lengths)); memset(gaps,0,14*sizeof(*gaps));
+    int total=0;
+    for (size_t i=0;i<size;i++) {
+        int choice=random_range(0,100),selected=0;
+        if (choice < 0) return -1;
+        if (parameters[i].probability >= choice) selected=random_range(parameters[i].min,parameters[i].max);
+        if (selected < 0) return -1;
+        if (i%2) gaps[i/2]=selected;
+        else { if (selected > 65553-total) return -1; lengths[i/2]=selected; total+=selected; }
     }
-    return min + (int)(random_u32() % (uint32_t)(max - min + 1));
+    *count=(size+1)/2;
+    return total >= 35 ? total : -1;
+}
+
+static int padding_write(tls13_conn_t *transport, const uint8_t *hello, size_t length, size_t prefix,
+                         const int lengths[14], const int gaps[14], size_t count) {
+    size_t offset=0;
+    for (size_t i=0;i<count;i++) {
+        size_t part=(size_t)lengths[i]+(i ? 0 : prefix);
+        if (part > length-offset || (part && tls13_write_app(transport,hello+offset,part))) return -1;
+        offset+=part;
+        if (gaps[i]) {
+            if (core_poll(NULL,0,gaps[i]) < 0 || (core_deadline_active() && !core_deadline_remaining())) {
+                errno=ETIMEDOUT; return -1;
+            }
+        }
+    }
+    return offset == length ? 0 : -1;
 }
 
 static void increase_nonce(uint8_t nonce[12]) {
@@ -407,10 +506,9 @@ int vless_encryption_connect(const vless_config_t *cfg, tls13_conn_t *transport,
         }
     }
 
-    int padding_len = random_range(111, 1111);
-    if ((random_u32() % 100U) < 50U) {
-        padding_len += random_range(0, 3333);
-    }
+    int padding_lengths[14],padding_gaps[14]; size_t padding_count=0;
+    int padding_len=padding_create(cfg,padding_lengths,padding_gaps,&padding_count);
+    if (padding_len < 0) { set_err(err,err_cap,"invalid VLESS encryption padding"); return -1; }
     const size_t pfs_exchange_len = 18 + 1184 + 32 + 16;
     size_t hello_len = 16 + relays_len + pfs_exchange_len +
                        (size_t)padding_len;
@@ -432,6 +530,32 @@ int vless_encryption_connect(const vless_config_t *cfg, tls13_conn_t *transport,
 
     vless_aead_t nfs_aead;
     aead_init(&nfs_aead, hello, 16, nfs_key, sizeof(nfs_key));
+
+    uint8_t identity[32],cached_pfs[64],cached_ticket[16];
+    cache_identity(cfg,identity);
+    uint64_t generation=cfg->encryption_zero_rtt ? cache_load(identity,cached_pfs,cached_ticket) : 0;
+    if (generation) {
+        vless_encryption_conn_t *connection=calloc(1,sizeof(*connection));
+        size_t offset=16+relays_len,written=0;
+        uint8_t length[2]={0,32};
+        if (!connection || aead_seal(&nfs_aead,NULL,length,2,NULL,0,hello+offset,&written) || written != 18 ||
+            aead_seal(&nfs_aead,NULL,cached_ticket,16,NULL,0,hello+offset+18,&written) || written != 32) {
+            free(connection); free(hello); OPENSSL_cleanse(cached_pfs,sizeof(cached_pfs));
+            OPENSSL_cleanse(cached_ticket,sizeof(cached_ticket)); set_err(err,err_cap,"failed to resume VLESS encryption"); return -1;
+        }
+        connection->transport=transport;
+        memcpy(connection->united_key,cached_pfs,64); memcpy(connection->united_key+64,nfs_key,32);
+        connection->united_key_len=96;
+        memcpy(connection->cache_identity,identity,32); connection->cache_generation=generation;
+        aead_init(&connection->outgoing,hello+offset+18,32,connection->united_key,96);
+        connection->incoming_deferred=1; connection->prewrite=hello; connection->prewrite_length=offset+50;
+        OPENSSL_cleanse(cached_pfs,sizeof(cached_pfs)); OPENSSL_cleanse(cached_ticket,sizeof(cached_ticket));
+        if (cfg->encryption_xor_mode == 2 && aes_ctr_init(&connection->outgoing_header_ctr,connection->united_key,96,client_iv)) {
+            vless_encryption_close(connection); set_err(err,err_cap,"failed to initialize resumed VLESS encryption"); return -1;
+        }
+        OPENSSL_cleanse(nfs_key,sizeof(nfs_key)); OPENSSL_cleanse(&nfs_aead,sizeof(nfs_aead));
+        *out=connection; return 0;
+    }
 
     uint8_t client_pfs_public[1216];
     EVP_PKEY *mlkem_key = mlkem_generate(client_pfs_public);
@@ -484,7 +608,7 @@ int vless_encryption_connect(const vless_config_t *cfg, tls13_conn_t *transport,
     }
     off += written;
     if (off != hello_len ||
-        tls13_write_app(transport, hello, hello_len) != 0) {
+        padding_write(transport,hello,hello_len,16+relays_len+pfs_exchange_len,padding_lengths,padding_gaps,padding_count) != 0) {
         goto handshake_error;
     }
     free(hello);
@@ -588,6 +712,10 @@ int vless_encryption_connect(const vless_config_t *cfg, tls13_conn_t *transport,
         goto cleanup_keys;
     }
 
+    if (cfg->encryption_zero_rtt) cache_store(identity,pfs_key,ticket,((unsigned)ticket[0]<<8)|ticket[1]);
+    OPENSSL_cleanse(pfs_key,sizeof(pfs_key)); OPENSSL_cleanse(ticket,sizeof(ticket));
+    OPENSSL_cleanse(nfs_key,sizeof(nfs_key));
+
     EVP_PKEY_free(mlkem_key);
     EVP_PKEY_free(x25519_key);
     *out = conn;
@@ -607,11 +735,13 @@ void vless_encryption_close(vless_encryption_conn_t *conn) {
         return;
     }
     free(conn->input);
+    free(conn->prewrite);
     EVP_CIPHER_CTX_free(conn->outgoing_header_ctr);
     EVP_CIPHER_CTX_free(conn->incoming_header_ctr);
     OPENSSL_cleanse(conn->united_key, sizeof(conn->united_key));
     OPENSSL_cleanse(&conn->outgoing, sizeof(conn->outgoing));
     OPENSSL_cleanse(&conn->incoming, sizeof(conn->incoming));
+    OPENSSL_cleanse(conn,sizeof(*conn));
     free(conn);
 }
 
@@ -624,10 +754,12 @@ int vless_encryption_write(vless_encryption_conn_t *conn,
             chunk = 8192;
         }
         size_t record_len = 5 + chunk + 16;
-        uint8_t *record = (uint8_t *)malloc(record_len);
-        if (record == NULL) {
+        uint8_t *packet = (uint8_t *)malloc(conn->prewrite_length+record_len);
+        if (packet == NULL) {
             return -1;
         }
+        if (conn->prewrite_length) memcpy(packet,conn->prewrite,conn->prewrite_length);
+        uint8_t *record=packet+conn->prewrite_length;
         size_t encrypted_len = chunk + 16;
         record[0] = 23;
         record[1] = 3;
@@ -642,10 +774,11 @@ int vless_encryption_write(vless_encryption_conn_t *conn,
             ok = aes_ctr_xor(conn->outgoing_header_ctr, record, 5) == 0;
         }
         if (ok) {
-            ok = tls13_write_app(conn->transport, record, record_len) == 0;
+            ok = tls13_write_app(conn->transport,packet,conn->prewrite_length+record_len) == 0;
         }
-        free(record);
+        free(packet); free(conn->prewrite); conn->prewrite=NULL; conn->prewrite_length=0;
         if (!ok) {
+            cache_invalidate(conn);
             return -1;
         }
         off += chunk;
@@ -678,19 +811,32 @@ int vless_encryption_write_raw(vless_encryption_conn_t *conn,
 }
 
 static int read_record(vless_encryption_conn_t *conn) {
+    if (conn->incoming_deferred) {
+        uint8_t random[16];
+        if (transport_read_exact(conn->transport,random,sizeof(random))) { cache_invalidate(conn); return -1; }
+        aead_init(&conn->incoming,random,sizeof(random),conn->united_key,conn->united_key_len);
+        if (conn->outgoing_header_ctr && aes_ctr_init(&conn->incoming_header_ctr,conn->united_key,conn->united_key_len,random)) {
+            cache_invalidate(conn); return -1;
+        }
+        conn->incoming_deferred=0;
+    }
     uint8_t header[5];
     if (transport_read_exact(conn->transport, header, sizeof(header)) != 0) {
+        cache_invalidate(conn);
         return -1;
     }
     if (conn->incoming_header_ctr != NULL &&
         aes_ctr_xor(conn->incoming_header_ctr, header, sizeof(header)) != 0) {
+        cache_invalidate(conn);
         return -1;
     }
     if (header[0] != 23 || header[1] != 3 || header[2] != 3) {
+        cache_invalidate(conn);
         return -1;
     }
     size_t encrypted_len = ((size_t)header[3] << 8) | header[4];
     if (encrypted_len < 17 || encrypted_len > 16640) {
+        cache_invalidate(conn);
         return -1;
     }
     uint8_t *encrypted = (uint8_t *)malloc(encrypted_len);
@@ -698,6 +844,7 @@ static int read_record(vless_encryption_conn_t *conn) {
     if (encrypted == NULL || plain == NULL ||
         transport_read_exact(conn->transport, encrypted,
                              encrypted_len) != 0) {
+        cache_invalidate(conn);
         free(encrypted);
         free(plain);
         return -1;
@@ -707,6 +854,7 @@ static int read_record(vless_encryption_conn_t *conn) {
                        header, sizeof(header), plain, &plain_len);
     free(encrypted);
     if (rc != 0) {
+        cache_invalidate(conn);
         free(plain);
         return -1;
     }
@@ -714,6 +862,7 @@ static int read_record(vless_encryption_conn_t *conn) {
     conn->input = plain;
     conn->input_len = plain_len;
     conn->input_off = 0;
+    conn->cache_generation=0;
     return 0;
 }
 

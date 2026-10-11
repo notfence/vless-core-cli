@@ -1,7 +1,18 @@
 #include "check.h"
 #include "../src/vless_encryption.c"
+#include "uri.h"
 static uint8_t transport_data[131072];
 static size_t transport_length, transport_position;
+static void *cache_worker(void *opaque) {
+    unsigned index=(unsigned)(uintptr_t)opaque;
+    uint8_t identity[32]={0},pfs[64],ticket[16],loaded_pfs[64],loaded_ticket[16];
+    identity[0]=(uint8_t)index; memset(pfs,(int)index,sizeof(pfs)); memset(ticket,(int)index,sizeof(ticket));
+    for (unsigned i=0;i<100;i++) {
+        cache_store(identity,pfs,ticket,60);
+        if (!cache_load(identity,loaded_pfs,loaded_ticket) || memcmp(pfs,loaded_pfs,64) || memcmp(ticket,loaded_ticket,16)) return (void *)1;
+    }
+    return NULL;
+}
 int tls13_write_app(tls13_conn_t *c, const uint8_t *data, size_t length) {
     (void)c; if (transport_length + length > sizeof(transport_data)) return -1;
     memcpy(transport_data + transport_length, data, length); transport_length += length; return 0;
@@ -70,5 +81,74 @@ int main(void) {
     }
     vless_config_t cfg = {0}; vless_encryption_conn_t *conn = (void *)1; char error[128];
     CHECK("encryption/not-configured", vless_encryption_connect(&cfg, NULL, &conn, error, sizeof(error)) != 0 && conn == NULL);
+    core_config_defaults(&cfg); cfg.encryption_enabled=1; cfg.encryption_zero_rtt=1;
+    cfg.encryption_relay_count=1; cfg.encryption_relays[0].key_len=32;
+    memcpy(cfg.encryption_relays[0].key,a_public,32);
+    uint8_t identity[32],pfs[64],ticket[16],loaded_pfs[64],loaded_ticket[16];
+    memset(pfs,7,sizeof(pfs)); memset(ticket,8,sizeof(ticket)); cache_identity(&cfg,identity);
+    cache_store(identity,pfs,ticket,60);
+    uint64_t generation=cache_load(identity,loaded_pfs,loaded_ticket);
+    CHECK("encryption/cache-material",generation && !memcmp(pfs,loaded_pfs,64) && !memcmp(ticket,loaded_ticket,16));
+    transport_length=transport_position=0;
+    REQUIRE("encryption/cached-handshake-does-not-read",vless_encryption_connect(&cfg,NULL,&conn,error,sizeof(error)) == 0 && conn->incoming_deferred && conn->cache_generation == generation && !transport_length);
+    REQUIRE("encryption/resume-first-write",vless_encryption_write(conn,payload,1) == 0);
+    CHECK("encryption/resume-prewrite-once",transport_length == 16+32+18+32+22 && !conn->prewrite && !conn->prewrite_length);
+    REQUIRE("encryption/resume-second-write",vless_encryption_write(conn,payload,1) == 0);
+    CHECK("encryption/resume-second-write-no-prefix",transport_length == 16+32+18+32+44);
+    cache_store(identity,pfs,ticket,60); cache_invalidate(conn);
+    CHECK("encryption/rejection-does-not-delete-new-ticket",cache_load(identity,loaded_pfs,loaded_ticket) != 0);
+    vless_encryption_close(conn);
+    for (size_t i=0;i<64;i++) if (!memcmp(encryption_cache[i].identity,identity,32) && encryption_cache[i].until_ms) encryption_cache[i].until_ms=core_now_ms()-1;
+    CHECK("encryption/cache-expiry",!cache_load(identity,loaded_pfs,loaded_ticket));
+    CHECK("encryption/expired-secret-cleared",!memcmp(encryption_cache[63].pfs,(uint8_t[64]){0},64));
+    cache_store(identity,pfs,ticket,60);
+    REQUIRE("encryption/rejected-ticket-fixture",vless_encryption_connect(&cfg,NULL,&conn,error,sizeof(error)) == 0);
+    memset(transport_data,0,21); transport_length=21; transport_position=0; size_t received=0;
+    CHECK("encryption/rejected-ticket-read",vless_encryption_read(conn,output,sizeof(output),&received) < 0);
+    CHECK("encryption/rejected-ticket-invalidated",!cache_load(identity,loaded_pfs,loaded_ticket));
+    vless_encryption_close(conn);
+    for (int random=0;random<2;random++) {
+        vless_encryption_conn_t *reader=calloc(1,sizeof(*reader)),*writer=calloc(1,sizeof(*writer));
+        REQUIRE("encryption/deferred-reader-fixture",reader && writer);
+        memcpy(reader->united_key,pfs,64); memcpy(reader->united_key+64,secret,32); reader->united_key_len=96;
+        uint8_t server_random[16]; memset(server_random,39,sizeof(server_random));
+        reader->incoming_deferred=1;
+        aead_init(&writer->outgoing,server_random,16,reader->united_key,96);
+        writer->prewrite=malloc(16); REQUIRE("encryption/server-random-fixture",writer->prewrite != NULL);
+        memcpy(writer->prewrite,server_random,16); writer->prewrite_length=16;
+        if (random) {
+            REQUIRE("encryption/deferred-random-mode",aes_ctr_init(&reader->outgoing_header_ctr,reader->united_key,96,server_random) == 0 &&
+                aes_ctr_init(&writer->outgoing_header_ctr,reader->united_key,96,server_random) == 0);
+        }
+        transport_length=transport_position=0;
+        REQUIRE("encryption/deferred-server-write",vless_encryption_write(writer,payload,sizeof(payload)) == 0);
+        CHECK("encryption/deferred-incoming-key",vless_encryption_read_exact(reader,output,sizeof(output)) == 0 && !memcmp(output,payload,sizeof(payload)) && !reader->incoming_deferred);
+        vless_encryption_close(reader); vless_encryption_close(writer);
+    }
+    const size_t identity_offsets[]={offsetof(vless_config_t,server_host),offsetof(vless_config_t,server_port),offsetof(vless_config_t,security),
+        offsetof(vless_config_t,sni),offsetof(vless_config_t,uuid),offsetof(vless_config_t,fp_mode),offsetof(vless_config_t,encryption_xor_mode),
+        offsetof(vless_config_t,encryption_relays),offsetof(vless_config_t,transport_mode),offsetof(vless_config_t,allow_insecure)};
+    for (size_t i=0;i<sizeof(identity_offsets)/sizeof(*identity_offsets);i++) {
+        vless_config_t other=cfg; ((uint8_t *)&other)[identity_offsets[i]]^=1;
+        uint8_t different[32]; cache_identity(&other,different);
+        CHECK("encryption/cache-identity-isolated",memcmp(identity,different,32) != 0);
+    }
+    OPENSSL_cleanse(encryption_cache,sizeof(encryption_cache));
+    for (unsigned i=0;i<64;i++) { identity[0]=(uint8_t)i; cache_store(identity,pfs,ticket,60); }
+    identity[0]=0; CHECK("encryption/lru-touch",cache_load(identity,loaded_pfs,loaded_ticket) != 0);
+    identity[0]=64; cache_store(identity,pfs,ticket,60);
+    identity[0]=1; CHECK("encryption/lru-eviction",!cache_load(identity,loaded_pfs,loaded_ticket));
+    identity[0]=0; CHECK("encryption/lru-preserves-recent",cache_load(identity,loaded_pfs,loaded_ticket) != 0);
+    OPENSSL_cleanse(encryption_cache,sizeof(encryption_cache));
+    pthread_t workers[16];
+    for (unsigned i=0;i<16;i++) REQUIRE("encryption/cache-concurrency-start",pthread_create(&workers[i],NULL,cache_worker,(void *)(uintptr_t)i) == 0);
+    for (unsigned i=0;i<16;i++) { void *result=NULL; pthread_join(workers[i],&result); CHECK("encryption/cache-concurrency",result == NULL); }
+    OPENSSL_cleanse(encryption_cache,sizeof(encryption_cache));
+    char uri[1024];
+    const char *invalid_padding[]={"bad","100-34-35","99-35-35","100-35","100--35","100-65554-65554","100-35-35.100-2147483648-1","100-35-35.100-0-0.100-65553-65553"};
+    for (size_t i=0;i<sizeof(invalid_padding)/sizeof(*invalid_padding);i++) {
+        snprintf(uri,sizeof(uri),"vless://00000000-0000-0000-0000-000000000001@127.0.0.1:1?encryption=mlkem768x25519plus.native.0rtt.%s.7yEo4KXNFHjDGOeL5a-4RTYsbP9p3Tc032CBVdrluQ8",invalid_padding[i]);
+        CHECK("encryption/invalid-padding-rejected",parse_core_uri(uri,&cfg,error,sizeof(error)) < 0);
+    }
     return test_result();
 }

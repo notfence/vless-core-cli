@@ -58,6 +58,7 @@ def seeds():
               b"\x01\x02\xf0\x9f\x89\x00\x80\x02\x98\x80",b"\xc2\x00",b"\x80\x00",b"\x82\x80"+bytes(4),b"\x88\x03\x03\xe8\xff"],
         "vision":[bytes(16)+bytes([command,0,10,0,0])+b"vless-core" for command in (0,1,2)],
         "tls":[b"\x02"+len(hello).to_bytes(3,"big")+hello,b"\x16\x03\x03\x00\x0avless-core",b"\x0b\x00\x00\x05\x00\x00\x00\x01\x00"],
+        "encryption":[b"\x02vless-core",b"\x03vless-core",b"\x06vless-core",b"\x07vless-core",b"\x0bvless-core",bytes(21)],
     }
 
 class FuzzTests(unittest.TestCase):
@@ -68,6 +69,8 @@ class FuzzTests(unittest.TestCase):
         self.assertTrue(binary.is_file(),f"missing mandatory fuzzer: {binary}")
         for parser, samples in seeds().items():
             with self.subTest(parser=parser), tempfile.TemporaryDirectory(prefix=f"fuzz-{parser}-",dir=os.environ["TEST_PRIVATE_ROOT"]) as directory:
+                binary=BUILD/("fuzz-encryption" if parser == "encryption" else "fuzz-parsers")
+                self.assertTrue(binary.is_file(),f"missing mandatory fuzzer: {binary}")
                 corpus = Path(directory)
                 for index, sample in enumerate(samples):
                     (corpus/str(index)).write_bytes(sample)

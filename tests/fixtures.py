@@ -195,14 +195,16 @@ class Server:
         self.close()
 
 class CountingProxy(Server):
-    def __init__(self, upstream_port, address="127.0.0.1", tls=False):
+    def __init__(self, upstream_port, address="127.0.0.1", tls=False, first_response_delay=0):
         self.upstream_port=upstream_port
+        self.first_response_delay=first_response_delay
         self.client_data=[]
         self.client_reads=[]
         super().__init__(self.forward,address=address,tls=tls)
 
     def forward(self, connection):
         captured=bytearray()
+        response_delayed=False
         with self.lock: self.client_data.append(captured)
         with socket.create_connection(("127.0.0.1",self.upstream_port),timeout=10) as upstream, selectors.DefaultSelector() as selector:
             selector.register(connection,selectors.EVENT_READ,upstream)
@@ -222,6 +224,9 @@ class CountingProxy(Server):
                         with self.lock:
                             start=len(captured); captured.extend(block)
                             self.client_reads.append((captured,time.monotonic(),start,len(block)))
+                    elif not response_delayed:
+                        response_delayed=True
+                        if self.first_response_delay: time.sleep(self.first_response_delay)
                     key.data.sendall(block)
 
 @contextlib.contextmanager

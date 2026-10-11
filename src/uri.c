@@ -457,6 +457,8 @@ static int parse_vless_encryption(vless_config_t *cfg, char *err, size_t err_cap
     cfg->encryption_enabled = 0;
     cfg->encryption_xor_mode = 0;
     cfg->encryption_relay_count = 0;
+    cfg->encryption_zero_rtt=0;
+    cfg->encryption_padding_count=0;
 
     if (cfg->encryption[0] == '\0' || strcmp(cfg->encryption, "none") == 0) {
         return 0;
@@ -499,9 +501,36 @@ static int parse_vless_encryption(vless_config_t *cfg, char *err, size_t err_cap
         set_err(err, err_cap, "unsupported VLESS encryption handshake");
         return -1;
     }
+    cfg->encryption_zero_rtt=!strcmp(parts[2],"0rtt");
 
+    unsigned maximum_padding=0;
     for (size_t i = 3; i < count; i++) {
         if (strlen(parts[i]) < 20) {
+            if (cfg->encryption_relay_count || cfg->encryption_padding_count == VLESS_ENCRYPTION_MAX_PADDING) {
+                set_err(err,err_cap,"invalid VLESS encryption padding order"); return -1;
+            }
+            vless_encryption_padding_t *padding=&cfg->encryption_padding[cfg->encryption_padding_count];
+            int *values[]={&padding->probability,&padding->min,&padding->max};
+            char *item=parts[i];
+            for (size_t field=0;field<3;field++) {
+                unsigned value=0;
+                if (!*item || *item < '0' || *item > '9') { set_err(err,err_cap,"invalid VLESS encryption padding"); return -1; }
+                while (*item >= '0' && *item <= '9') {
+                    if (value > 214748364U || (value == 214748364U && *item > '7')) { set_err(err,err_cap,"invalid VLESS encryption padding range"); return -1; }
+                    value=value*10+(unsigned)(*item++-'0');
+                }
+                *values[field]=(int)value;
+                if ((field < 2 && *item++ != '-') || (field == 2 && *item)) { set_err(err,err_cap,"invalid VLESS encryption padding"); return -1; }
+            }
+            if (!cfg->encryption_padding_count && (padding->probability < 100 || padding->min < 35 || padding->max < 35)) {
+                set_err(err,err_cap,"first VLESS encryption padding must be at least 35 bytes"); return -1;
+            }
+            if (!(cfg->encryption_padding_count%2)) {
+                unsigned largest=(unsigned)(padding->min > padding->max ? padding->min : padding->max);
+                if (largest > 65553-maximum_padding) { set_err(err,err_cap,"VLESS encryption padding exceeds 65553 bytes"); return -1; }
+                maximum_padding+=largest;
+            }
+            cfg->encryption_padding_count++;
             continue;
         }
 

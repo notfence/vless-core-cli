@@ -28,6 +28,59 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_encryption_resumption_wire(self):
+        payload=b"vless-core resumed encrypted connection"*64
+        with Server() as target, xray_server("tcp","none",decryption=f"mlkem768x25519plus.native.60s.{KEY}") as reference, CountingProxy(reference.port) as proxy:
+            with cli(uri(proxy.port,"tcp","none",encryption=f"mlkem768x25519plus.native.0rtt.{PUBLIC_KEY}")) as core:
+                for index in range(3):
+                    with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,payload+bytes([index]))
+                self.assertEqual(len(proxy.client_data),3)
+                first,second,third=map(len,proxy.client_data)
+                self.assertGreater(first,1300+len(payload))
+                self.assertLess(second,len(payload)+200)
+                self.assertLess(third,len(payload)+200)
+                self.assertNotEqual(proxy.client_data[1][:48],proxy.client_data[2][:48])
+
+    def test_encryption_resumption_skips_server_handshake_wait(self):
+        for rtt in ("0rtt","1rtt"):
+            with self.subTest(rtt=rtt), Server() as target, xray_server("tcp","none",decryption=f"mlkem768x25519plus.native.60s.{KEY}") as reference, CountingProxy(reference.port,first_response_delay=0.3) as proxy:
+                with cli(uri(proxy.port,"tcp","none",encryption=f"mlkem768x25519plus.native.{rtt}.{PUBLIC_KEY}")) as core:
+                    times=[]
+                    for index in range(2):
+                        started=time.monotonic()
+                        with socks_connect(core.port,target.port) as tunnel:
+                            times.append(time.monotonic()-started)
+                            exchange(tunnel,b"vless-core delayed reference reply")
+                    self.assertGreater(times[0],0.25)
+                    if rtt == "0rtt": self.assertLess(times[1],0.2)
+                    else: self.assertGreater(times[1],0.25)
+
+    def test_encryption_resumption_modes_transports_and_parallel_clients(self):
+        cert,_=certificate()
+        for transport,security,mode in (("tcp","none","native"),("tcp","none","xorpub"),("tcp","none","random"),("ws","tls","random"),("xhttp","reality","native"),("grpc","tls","random")):
+            with self.subTest(transport=transport,security=security,mode=mode), Server() as target, xray_server(transport,security,decryption=f"mlkem768x25519plus.{mode}.60s.{KEY}") as reference:
+                with cli(uri(reference.port,transport,security,encryption=f"mlkem768x25519plus.{mode}.0rtt.{PUBLIC_KEY}"),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core warm resumption cache")
+                    def transfer(index):
+                        with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core concurrent resumption"*200+bytes([index]))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                        list(executor.map(transfer,range(12)))
+
+    def test_encryption_padding_chunks_and_deadline(self):
+        padding="100-35-35.100-80-80.100-100-100"
+        with Server() as target, xray_server("tcp","none",decryption=f"mlkem768x25519plus.native.0s.{KEY}") as reference, CountingProxy(reference.port) as proxy:
+            with cli(uri(proxy.port,"tcp","none",encryption=f"mlkem768x25519plus.native.1rtt.{padding}.{PUBLIC_KEY}")) as core:
+                with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core padding chunks")
+                reads=[entry for entry in proxy.client_reads if entry[0] is proxy.client_data[0]]
+                self.assertEqual(reads[0][3],16+32+18+1216+16+35)
+                self.assertGreater(reads[1][1]-reads[0][1],0.065)
+                self.assertEqual(reads[1][3],100)
+            with cli(uri(proxy.port,"tcp","none",encryption=f"mlkem768x25519plus.native.1rtt.100-35-35.100-1000-1000.{PUBLIC_KEY}"),extra=["--connect-timeout-ms","100"]) as core:
+                started=time.monotonic()
+                with self.assertRaises(AssertionError):
+                    with socks_connect(core.port,target.port): pass
+                self.assertLess(time.monotonic()-started,0.4)
+
     def test_manual_tls_hello_retry(self):
         cert,key=certificate()
         for group,fingerprint in (("P-256","chrome"),("P-384","chrome"),("P-521","firefox")):

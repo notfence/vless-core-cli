@@ -26,11 +26,13 @@ typedef enum {
 } core_protocol_t;
 
 #define VLESS_ENCRYPTION_MAX_RELAYS 4
+#define VLESS_ENCRYPTION_MAX_PADDING 28
 
 typedef struct {
     uint8_t key[1184];
     size_t key_len;
 } vless_encryption_relay_t;
+typedef struct { int probability, min, max; } vless_encryption_padding_t;
 
 typedef struct { int min, max; } core_range_t;
 typedef struct {
@@ -103,6 +105,9 @@ typedef struct {
 
     int encryption_enabled;
     int encryption_xor_mode;
+    int encryption_zero_rtt;
+    vless_encryption_padding_t encryption_padding[VLESS_ENCRYPTION_MAX_PADDING];
+    size_t encryption_padding_count;
     vless_encryption_relay_t encryption_relays[VLESS_ENCRYPTION_MAX_RELAYS];
     size_t encryption_relay_count;
 } vless_config_t;
