@@ -110,10 +110,10 @@ def start_listener(command, label, ready, environment=None, pass_fds=()):
         return process
 
 class Server:
-    def __init__(self, handler=None, tls=False, address="127.0.0.1"):
+    def __init__(self, handler=None, tls=False, address="127.0.0.1", listen_port=0):
         self.listener = socket.socket(socket.AF_INET6 if ":" in address else socket.AF_INET)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listener.bind((address, 0))
+        self.listener.bind((address, listen_port))
         self.listener.listen(128)
         self.listener.settimeout(0.1)
         self.port = self.listener.getsockname()[1]
@@ -195,12 +195,12 @@ class Server:
         self.close()
 
 class CountingProxy(Server):
-    def __init__(self, upstream_port, address="127.0.0.1", tls=False, first_response_delay=0):
+    def __init__(self, upstream_port, address="127.0.0.1", tls=False, first_response_delay=0, listen_port=0):
         self.upstream_port=upstream_port
         self.first_response_delay=first_response_delay
         self.client_data=[]
         self.client_reads=[]
-        super().__init__(self.forward,address=address,tls=tls)
+        super().__init__(self.forward,address=address,tls=tls,listen_port=listen_port)
 
     def forward(self, connection):
         captured=bytearray()

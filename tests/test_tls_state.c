@@ -199,6 +199,21 @@ static void incoming_record_vectors(void) {
     db_free(&connection.tls_client_hello);
 }
 
+static void address_cipher_cache_vectors(void) {
+    struct sockaddr_in first={.sin_family=AF_INET,.sin_port=htons(443)},second=first;
+    REQUIRE("tls/address-cipher-cache-fixture",inet_pton(AF_INET,"127.0.0.1",&first.sin_addr) == 1 && inet_pton(AF_INET,"127.0.0.2",&second.sin_addr) == 1);
+    REQUIRE("tls/address-cipher-cache-isolated",g_tls_aes_fallback_count == 0);
+    cache_tls_address_aes("vless-core.test",443,"vless-core.test",(const struct sockaddr *)&first,sizeof(first));
+    CHECK("tls/address-cipher-cache-successful-address",tls_address_aes_cached("vless-core.test",443,"vless-core.test",(const struct sockaddr *)&first,sizeof(first)));
+    CHECK("tls/address-cipher-cache-other-address-unaffected",!tls_address_aes_cached("vless-core.test",443,"vless-core.test",(const struct sockaddr *)&second,sizeof(second)));
+    CHECK("tls/address-cipher-cache-sni-isolated",!tls_address_aes_cached("vless-core.test",443,"other.test",(const struct sockaddr *)&first,sizeof(first)));
+    CHECK("tls/address-cipher-cache-does-not-change-manual-policy",!tls_aes_fallback_cached("vless-core.test",443,"vless-core.test"));
+    cache_tls_aes_fallback("vless-core.test",443,"vless-core.test");
+    CHECK("tls/manual-cipher-cache-retained",tls_aes_fallback_cached("vless-core.test",443,"vless-core.test"));
+    CHECK("tls/manual-cipher-cache-does-not-poison-other-address",!tls_address_aes_cached("vless-core.test",443,"vless-core.test",(const struct sockaddr *)&second,sizeof(second)));
+    memset(g_tls_aes_fallback_cache,0,sizeof(g_tls_aes_fallback_cache)); g_tls_aes_fallback_count=0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
         vless_config_t config; char error[256]={0}; tls13_conn_t *connection=NULL;
@@ -210,6 +225,7 @@ int main(int argc, char **argv) {
     record_limit_vectors();
     automatic_update_vectors();
     incoming_record_vectors();
+    address_cipher_cache_vectors();
     vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); strcpy(config.alpn,"http/1.1");
     uint8_t private_key[32],public_key[32],random[32],auth[32],*hello=NULL;
     size_t length=0,sid=0,extension_length=0; const uint8_t *extension=NULL;

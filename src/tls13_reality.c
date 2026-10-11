@@ -132,6 +132,8 @@ typedef struct {
     char host[256];
     uint16_t port;
     char sni[256];
+    struct sockaddr_storage address;
+    socklen_t address_len;
 } tls_aes_fallback_entry_t;
 
 typedef struct {
@@ -318,7 +320,7 @@ static int tls_aes_fallback_cached(const char *host, uint16_t port, const char *
     int found = 0;
     pthread_mutex_lock(&g_tls_state_lock);
     for (size_t i = 0; i < g_tls_aes_fallback_count; i++) {
-        if (tls_aes_fallback_entry_matches(&g_tls_aes_fallback_cache[i], host, port, sni)) {
+        if (!g_tls_aes_fallback_cache[i].address_len && tls_aes_fallback_entry_matches(&g_tls_aes_fallback_cache[i], host, port, sni)) {
             found = 1;
             break;
         }
@@ -330,7 +332,7 @@ static int tls_aes_fallback_cached(const char *host, uint16_t port, const char *
 static void cache_tls_aes_fallback(const char *host, uint16_t port, const char *sni) {
     pthread_mutex_lock(&g_tls_state_lock);
     for (size_t i = 0; i < g_tls_aes_fallback_count; i++) {
-        if (tls_aes_fallback_entry_matches(&g_tls_aes_fallback_cache[i], host, port, sni)) {
+        if (!g_tls_aes_fallback_cache[i].address_len && tls_aes_fallback_entry_matches(&g_tls_aes_fallback_cache[i], host, port, sni)) {
             pthread_mutex_unlock(&g_tls_state_lock);
             return;
         }
@@ -378,6 +380,33 @@ static int sockaddr_equal(const struct sockaddr *a, socklen_t a_len, const struc
                memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr)) == 0;
     }
     return 0;
+}
+
+static int tls_address_aes_cached(const char *host, uint16_t port, const char *sni, const struct sockaddr *address, socklen_t length) {
+    int found=0; pthread_mutex_lock(&g_tls_state_lock);
+    for (size_t i=0;i<g_tls_aes_fallback_count;i++) {
+        const tls_aes_fallback_entry_t *entry=g_tls_aes_fallback_cache+i;
+        if (tls_aes_fallback_entry_matches(entry,host,port,sni) && sockaddr_equal((const struct sockaddr *)&entry->address,entry->address_len,address,length)) { found=1; break; }
+    }
+    pthread_mutex_unlock(&g_tls_state_lock); return found;
+}
+
+static void cache_tls_address_aes(const char *host, uint16_t port, const char *sni, const struct sockaddr *address, socklen_t length) {
+    if (!address || length > sizeof(struct sockaddr_storage)) return;
+    pthread_mutex_lock(&g_tls_state_lock);
+    for (size_t i=0;i<g_tls_aes_fallback_count;i++) {
+        const tls_aes_fallback_entry_t *entry=g_tls_aes_fallback_cache+i;
+        if (tls_aes_fallback_entry_matches(entry,host,port,sni) && sockaddr_equal((const struct sockaddr *)&entry->address,entry->address_len,address,length)) {
+            pthread_mutex_unlock(&g_tls_state_lock); return;
+        }
+    }
+    if (g_tls_aes_fallback_count < TLS_AES_FALLBACK_CACHE_SIZE) {
+        tls_aes_fallback_entry_t *entry=g_tls_aes_fallback_cache+g_tls_aes_fallback_count++;
+        snprintf(entry->host,sizeof(entry->host),"%s",host); entry->port=port;
+        snprintf(entry->sni,sizeof(entry->sni),"%s",sni ? sni : "");
+        memcpy(&entry->address,address,length); entry->address_len=length;
+    }
+    pthread_mutex_unlock(&g_tls_state_lock);
 }
 
 static int get_cached_tls_endpoint(const vless_config_t *cfg, const char *sni, struct sockaddr_storage *address,
@@ -1157,7 +1186,7 @@ static int tls_identity_parameters(X509_VERIFY_PARAM *parameters, const char *id
             X509_VERIFY_PARAM_set1_host(parameters,identity,0)) == 1 ? 0 : -1;
 }
 
-static int open_tls_socket_once(int use_server_ips, const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
+static int open_tls_socket_once(int fd, const char *connect_host, const char *sni, int verify_peer,
                                 const unsigned char *alpn_protos, unsigned int alpn_protos_len, tls_cipher_offer_t cipher_offer,
                                 SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd, int *retry_with_aes, char *err, size_t err_cap) {
     *out_ctx = NULL;
@@ -1165,7 +1194,6 @@ static int open_tls_socket_once(int use_server_ips, const char *connect_host, ui
     *out_fd = -1;
     *retry_with_aes = 0;
 
-    int fd = tcp_connect_host(connect_host, connect_port, use_server_ips);
     if (fd < 0) {
         set_connect_err(err, err_cap, "tcp connect failed");
         return -1;
@@ -1318,29 +1346,33 @@ static int open_tls_socket_once(int use_server_ips, const char *connect_host, ui
 static int open_tls_socket(int use_server_ips, const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
                            const unsigned char *alpn_protos, unsigned int alpn_protos_len, SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd,
                            int *use_aes_fallback, char *err, size_t err_cap) {
-    if (!*use_aes_fallback && tls_aes_fallback_cached(connect_host, connect_port, sni)) {
-        *use_aes_fallback = 1;
-    }
-    tls_cipher_offer_t offer = *use_aes_fallback ? TLS_CIPHER_OFFER_AES : TLS_CIPHER_OFFER_CHACHA;
-    int retry_with_aes = 0;
-    if (open_tls_socket_once(use_server_ips, connect_host, connect_port, sni, verify_peer, alpn_protos, alpn_protos_len, offer, out_ctx, out_ssl, out_fd,
-                             &retry_with_aes, err, err_cap) != 0) {
-        if (offer != TLS_CIPHER_OFFER_CHACHA || !retry_with_aes) {
-            return -1;
+    *out_ctx=NULL; *out_ssl=NULL; *out_fd=-1;
+    core_dialer_t *dialer=core_dialer_start(connect_host,connect_port,use_server_ips,CORE_CONNECT_TIMEOUT_MS,NULL,0);
+    if (!dialer) { set_connect_err(err,err_cap,"tcp address resolution failed"); return -1; }
+    struct sockaddr_storage address; socklen_t length=0;
+    int fd,first=1,failed_handshake=0;
+    while ((fd=core_dialer_next(dialer,&address,&length)) >= 0) {
+        int aes=(first && *use_aes_fallback) || tls_address_aes_cached(connect_host,connect_port,sni,(const struct sockaddr *)&address,length);
+        first=0;
+        tls_cipher_offer_t offer=aes ? TLS_CIPHER_OFFER_AES : TLS_CIPHER_OFFER_CHACHA;
+        for (unsigned attempt=0;attempt<2;attempt++) {
+            int retry=0;
+            if (open_tls_socket_once(fd,connect_host,sni,verify_peer,alpn_protos,alpn_protos_len,offer,out_ctx,out_ssl,out_fd,&retry,err,err_cap) == 0) {
+                *use_aes_fallback=offer == TLS_CIPHER_OFFER_AES;
+                if (*use_aes_fallback) cache_tls_address_aes(connect_host,connect_port,sni,(const struct sockaddr *)&address,length);
+                if (err && err_cap) *err=0;
+                core_dialer_free(dialer); log_tls_cipher_once(SSL_get_cipher_name(*out_ssl)); return 0;
+            }
+            failed_handshake=1;
+            if (attempt || !retry || (core_deadline_active() && !core_deadline_remaining())) break;
+            offer=offer == TLS_CIPHER_OFFER_CHACHA ? TLS_CIPHER_OFFER_AES : TLS_CIPHER_OFFER_CHACHA;
+            fd=tcp_connect_address(address.ss_family,SOCK_STREAM,IPPROTO_TCP,(const struct sockaddr *)&address,length);
+            if (fd < 0) break;
         }
-        *use_aes_fallback = 1;
-        if (open_tls_socket_once(use_server_ips, connect_host, connect_port, sni, verify_peer, alpn_protos, alpn_protos_len, TLS_CIPHER_OFFER_AES, out_ctx,
-                                 out_ssl, out_fd, &retry_with_aes, err, err_cap) != 0) {
-            return -1;
-        }
-        offer = TLS_CIPHER_OFFER_AES;
     }
-    if (offer == TLS_CIPHER_OFFER_AES) {
-        cache_tls_aes_fallback(connect_host, connect_port, sni);
-    }
-
-    log_tls_cipher_once(SSL_get_cipher_name(*out_ssl));
-    return 0;
+    int saved=errno; core_dialer_free(dialer); errno=saved;
+    if (!failed_handshake || saved == ETIMEDOUT) set_connect_err(err,err_cap,saved == ETIMEDOUT ? "TLS connection budget exhausted" : "tcp connect failed");
+    return -1;
 }
 
 static size_t find_double_crlf(const uint8_t *buf, size_t len) {

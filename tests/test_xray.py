@@ -1018,6 +1018,29 @@ class XrayTests(unittest.TestCase):
             result=subprocess.run([str(BUILD/"test_tls_state"),uri(listen_port,"tcp","tls",fp="qq")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=10)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
 
+    def test_tls_failure_advances_to_next_pinned_address(self):
+        cert,_=certificate()
+        def broken(connection):
+            connection.recv(4096); connection.sendall(b"not a TLS server"); connection.shutdown(socket.SHUT_WR)
+        for transport,pooled in (("ws",False),("xhttp",False),("xhttp",True),("grpc",True)):
+            parameters={"extra":json.dumps({"xmux":{"maxConnections":1}})} if pooled and transport == "xhttp" else {}
+            with self.subTest(transport=transport,pooled=pooled), Server() as target, xray_server(transport,"tls") as reference, Server(broken) as bad, CountingProxy(reference.port,address="127.0.0.2",listen_port=bad.port) as good:
+                with cli(uri(bad.port,transport,"tls",**parameters),extra=["--server-ips","127.0.0.1,127.0.0.2"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core TLS address fallback")
+                    self.assertTrue(bad.connections); self.assertTrue(good.connections)
+
+    def test_tls_address_fallback_does_not_extend_deadline(self):
+        cert,_=certificate()
+        def stalled(connection):
+            connection.recv(4096); time.sleep(0.3)
+        with Server() as target, xray_server("ws","tls") as reference, Server(stalled) as bad, CountingProxy(reference.port,address="127.0.0.2",listen_port=bad.port) as good:
+            with cli(uri(bad.port,"ws","tls"),extra=["--server-ips","127.0.0.1,127.0.0.2","--connect-timeout-ms","100"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                started=time.monotonic()
+                with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                    with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core bounded TLS fallback")
+                self.assertLess(time.monotonic()-started,0.6)
+                self.assertFalse(good.connections)
+
     def test_required_tls_client_certificate_is_not_supported(self):
         cert,key=certificate(); listen_port=port()
         command=[str(OPENSSL),"s_server","-accept",f"127.0.0.1:{listen_port}","-cert",str(cert),"-key",str(key),"-tls1_3","-groups","X25519","-Verify","1","-www"]
