@@ -932,7 +932,8 @@ static void *client_worker_run(void *arg) {
         close(cfd);
         return NULL;
     }
-    core_deadline_end();
+    int waiting_initial_payload=first_payload_len == 0;
+    if (waiting_initial_payload) core_deadline_pause();
     uint8_t tbuf[8192];
     int got_vless_response = 0;
     int received_reply = 0;
@@ -945,6 +946,7 @@ static void *client_worker_run(void *arg) {
     vless_response_t response={0};
 
     while (1) {
+        if (!got_vless_response && core_deadline_active() && !core_deadline_remaining()) break;
         if (tls13_flush(tls) || tls13_tick(tls)) break;
         if (output_length) {
             ssize_t sent=core_send(cfd,output,output_length,MSG_DONTWAIT);
@@ -981,6 +983,7 @@ static void *client_worker_run(void *arg) {
         }
 
         if (client_ready && tls13_reserve_write(tls, 128U*1024U)) {
+            if (waiting_initial_payload) { core_deadline_resume(); waiting_initial_payload=0; }
             ssize_t n = recv_coalesced(cfd, cbuf, cbuf_cap, cbuf_cap > 8192 ? 2000 : 0);
             if (n <= 0) {
                 tls13_release_write(tls);
@@ -1078,13 +1081,14 @@ static void *client_worker_run(void *arg) {
                 continue;
             }
             if (!got_vless_response) {
+                if (waiting_initial_payload) { core_deadline_resume(); waiting_initial_payload=0; }
                 size_t consumed=0;
                 int parsed=vless_consume_response(&response,tbuf,got,&consumed);
                 if (parsed < 0) { vc_log_error("connection","VLESS response read failed: invalid version"); break; }
                 got-=consumed;
                 if (got) memmove(tbuf,tbuf+consumed,got);
                 if (!parsed) continue;
-                got_vless_response=1; core_trace_stage(CORE_TRACE_CARRY);
+                got_vless_response=1; core_deadline_end(); core_trace_stage(CORE_TRACE_CARRY);
                 if (!got) continue;
             }
 
@@ -1127,6 +1131,9 @@ static void *client_worker_run(void *arg) {
         }
     }
 
+    if (!got_vless_response && core_deadline_active() && !core_deadline_remaining()) {
+        vc_log_error("connection","VLESS response deadline expired"); core_trace_failure(CORE_TRACE_PROTOCOL);
+    }
     if (use_vision) {
         vision_unpad_free(&vunpad);
     }

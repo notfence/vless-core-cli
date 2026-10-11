@@ -11,6 +11,56 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_vless_response_header_uses_remaining_connection_budget(self):
+        for initial in ("payload", "server", "fin", "addons"):
+            def handler(connection):
+                exact(connection,26)
+                if initial in ("payload","addons"):
+                    self.assertEqual(exact(connection,1),b"A")
+                if initial == "fin":
+                    self.assertEqual(connection.recv(1),b"")
+                connection.sendall(b"\x00\x20" if initial == "addons" else b"\x00")
+                if initial == "addons":
+                    for _ in range(32):
+                        time.sleep(0.03); connection.sendall(b"\x00")
+                else:
+                    time.sleep(0.8)
+            with self.subTest(initial=initial), Server(handler) as target, cli(uri(target.port,"tcp","none"),["--connect-timeout-ms","200"]) as core:
+                with socks_connect(core.port,80) as tunnel:
+                    tunnel.settimeout(0.65); started=time.monotonic()
+                    if initial in ("payload","addons"): tunnel.sendall(b"A")
+                    if initial == "fin": tunnel.shutdown(socket.SHUT_WR)
+                    self.assertEqual(tunnel.recv(1),b"")
+                    self.assertLess(time.monotonic()-started,0.6)
+                self.wait_for_probe(core,"protocol")
+                self.assertIn("VLESS response deadline expired",core.log)
+
+    def test_vless_initial_local_idle_pauses_remaining_budget(self):
+        def handler(connection):
+            exact(connection,26); self.assertEqual(exact(connection,1),b"A")
+            connection.sendall(b"\x00\x00A")
+        with Server(handler) as target, cli(uri(target.port,"tcp","none"),["--connect-timeout-ms","200"]) as core:
+            with socks_connect(core.port,80) as tunnel:
+                time.sleep(0.45); tunnel.sendall(b"A"); self.assertEqual(exact(tunnel,1),b"A")
+
+    def test_complete_vless_header_disables_connection_budget_without_payload(self):
+        def handler(connection):
+            exact(connection,26); self.assertEqual(exact(connection,1),b"A")
+            connection.sendall(b"\x00\x00"); time.sleep(0.45); connection.sendall(b"A")
+        with Server(handler) as target, cli(uri(target.port,"tcp","none"),["--connect-timeout-ms","200"]) as core:
+            with socks_connect(core.port,80) as tunnel:
+                tunnel.sendall(b"A"); self.assertEqual(exact(tunnel,1),b"A")
+
+    def test_complete_vless_header_ends_paused_budget(self):
+        ready=threading.Event()
+        def handler(connection):
+            exact(connection,26); connection.sendall(b"\x00\x00"); ready.set()
+            self.assertEqual(exact(connection,1),b"A"); time.sleep(0.3); connection.sendall(b"A")
+        with Server(handler) as target, cli(uri(target.port,"tcp","none"),["--connect-timeout-ms","200"]) as core:
+            with socks_connect(core.port,80) as tunnel:
+                self.assertTrue(ready.wait(1)); time.sleep(0.3)
+                tunnel.sendall(b"A"); self.assertEqual(exact(tunnel,1),b"A")
+
     def test_vless_half_close_preserves_response(self):
         payload=bytes(range(251))*521
         def handler(connection):
@@ -197,6 +247,7 @@ class CliTests(unittest.TestCase):
             def reject(connection):
                 exact(connection,26)
                 if stage == "carry": connection.sendall(b"\x00\x00")
+                self.assertEqual(exact(connection,len(b"vless-core probe")),b"vless-core probe")
             with self.subTest(stage=stage), Server(reject) as upstream, cli(uri(upstream.port)) as core:
                 with socks_connect(core.port,8080) as tunnel:
                     tunnel.sendall(b"vless-core probe")
