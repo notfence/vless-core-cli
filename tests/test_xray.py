@@ -958,6 +958,27 @@ class XrayTests(unittest.TestCase):
                         with socks_connect(core.port,target.port) as tunnel:
                             exchange(tunnel,b"vless-core")
 
+    def test_certificate_purpose_and_ip_identity(self):
+        _,key=certificate()
+        cases=(("DNS:vless-core.test","serverAuth","vless-core.test",True),
+               ("DNS:vless-core.test","clientAuth","vless-core.test",False),
+               ("IP:127.0.0.1","serverAuth","127.0.0.1",True),
+               ("IP:::1","serverAuth","::1",True),
+               ("IP:127.0.0.2","serverAuth","127.0.0.1",False))
+        for index,(san,purpose,identity,accepted) in enumerate(cases):
+            cert=PRIVATE/f"identity-{index}.pem"
+            result=subprocess.run([str(OPENSSL),"req","-config","/dev/null","-new","-x509","-key",str(key),"-days","2","-subj","/CN=wrong-cn.test","-addext",f"subjectAltName={san}","-addext",f"extendedKeyUsage={purpose}","-addext","keyUsage=digitalSignature","-out",str(cert)],capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            for transport in ("tcp","ws","xhttp","grpc"):
+                parameters={"sni":identity}
+                if transport == "xhttp" and identity == "::1": parameters["host"]="[::1]"
+                with self.subTest(transport=transport,identity=identity,purpose=purpose), Server() as target, xray_server(transport,"tls",tls_certificate=cert) as reference, cli(uri(reference.port,transport,"tls",**parameters),environment={"VLESS_CA_BUNDLE":str(cert),"VLESS_TLS_MODE":"strict"}) as core:
+                    if accepted:
+                        with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core identity")
+                    else:
+                        with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core identity")
+
     def test_expired_certificate(self):
         cert,key = certificate(); expired = PRIVATE/"expired.pem"
         result = subprocess.run([str(OPENSSL),"x509","-in",str(cert),"-signkey",str(key),"-not_before","20000101000000Z","-not_after","20010101000000Z","-out",str(expired)],capture_output=True,text=True,timeout=5)

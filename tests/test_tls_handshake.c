@@ -16,6 +16,52 @@ static int peer_message(dynbuf_t *buffer, uint8_t type, const uint8_t *body, siz
     return db_append(buffer,header,4) || db_append(buffer,body,length);
 }
 
+static void certificate_identity_cases(void) {
+    const char *root=getenv("TEST_PRIVATE_ROOT");
+    EVP_PKEY *key=EVP_PKEY_Q_keygen(NULL,NULL,"EC","P-256");
+    REQUIRE("identity/private-key",root && key);
+    static const struct { const char *san,*purpose,*host; int accepted; } cases[]={
+        {"DNS:vless-core.test","serverAuth","vless-core.test",1},
+        {"DNS:vless-core.test","clientAuth","vless-core.test",0},
+        {"IP:127.0.0.1","serverAuth","127.0.0.1",1},
+        {"IP:::1","serverAuth","::1",1},
+        {"IP:127.0.0.2","serverAuth","127.0.0.1",0},
+        {"DNS:vless-core.test","serverAuth","wrong.test",0},
+    };
+    for (size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+        X509 *certificate=X509_new(); REQUIRE("identity/certificate",certificate);
+        X509_set_version(certificate,2); ASN1_INTEGER_set(X509_get_serialNumber(certificate),(long)i+1);
+        X509_gmtime_adj(X509_getm_notBefore(certificate),-60); X509_gmtime_adj(X509_getm_notAfter(certificate),3600);
+        X509_NAME *name=X509_get_subject_name(certificate);
+        X509_NAME_add_entry_by_txt(name,"CN",MBSTRING_ASC,(const unsigned char *)"wrong-cn.test",-1,-1,0);
+        X509_set_issuer_name(certificate,name); X509_set_pubkey(certificate,key);
+        const int types[]={NID_subject_alt_name,NID_ext_key_usage,NID_key_usage};
+        const char *values[]={cases[i].san,cases[i].purpose,"digitalSignature"};
+        for (unsigned extension=0;extension<3;extension++) {
+            X509_EXTENSION *value=X509V3_EXT_conf_nid(NULL,NULL,types[extension],(char *)values[extension]);
+            REQUIRE("identity/certificate-extension",value && X509_add_ext(certificate,value,-1)); X509_EXTENSION_free(value);
+        }
+        REQUIRE("identity/certificate-signature",X509_sign(certificate,key,EVP_sha256()) > 0);
+        char path[PATH_MAX]; snprintf(path,sizeof(path),"%s/identity-ca.pem",root);
+        FILE *file=fopen(path,"w"); REQUIRE("identity/ca-file",file && PEM_write_X509(file,certificate)); fclose(file);
+        setenv("VLESS_CA_BUNDLE",path,1);
+        unsigned char *der=NULL; int size=i2d_X509(certificate,&der); REQUIRE("identity/der",size > 0);
+        size_t list_size=(size_t)size+5;
+        uint8_t header[]={0,(uint8_t)(list_size>>16),(uint8_t)(list_size>>8),(uint8_t)list_size,(uint8_t)(size>>16),(uint8_t)(size>>8),(uint8_t)size};
+        dynbuf_t body={0},message={0}; uint8_t empty[]={0,0};
+        REQUIRE("identity/certificate-message",!db_append(&body,header,sizeof(header)) && !db_append(&body,der,(size_t)size) && !db_append(&body,empty,2) && !peer_message(&message,11,body.data,body.len));
+        char error[256]={0}; int result=verify_tls_cert_message(cases[i].host,message.data,message.len,error,sizeof(error));
+        CHECK("identity/server-certificate-purpose-and-san",cases[i].accepted ? result == 0 : result != 0);
+        OPENSSL_free(der); db_free(&body); db_free(&message); X509_free(certificate);
+    }
+    for (unsigned i=0;i<3;i++) {
+        dynbuf_t extensions={0}; const char *host=(const char *[]){"127.0.0.1","::1","vless-core.test"}[i];
+        CHECK("identity/numeric-sni-omitted",ext_server_name(&extensions,host) == 0 && (i == 2 ? extensions.len > 0 : extensions.len == 0));
+        db_free(&extensions);
+    }
+    EVP_PKEY_free(key);
+}
+
 static void *peer_run(void *opaque) {
     peer_t *peer=opaque;
     tls13_conn_t server={.fd=peer->fd};
@@ -106,6 +152,7 @@ done:
 
 int main(void) {
     const char *root=getenv("TEST_PRIVATE_ROOT"); REQUIRE("auth/private-root",root != NULL);
+    certificate_identity_cases();
     for (int kind=0;kind<3;kind++) {
         int ed=kind == 1;
         EVP_PKEY *key=kind == 2 ? EVP_PKEY_Q_keygen(NULL,NULL,"RSA",2048) : ed ? EVP_PKEY_Q_keygen(NULL,NULL,"ED25519") : EVP_PKEY_Q_keygen(NULL,NULL,"EC","P-256");
@@ -130,6 +177,7 @@ int main(void) {
             tls13_conn_t connection={.fd=pair[0]}; char error[256]={0};
             core_set_socket_io_timeout(pair[0],1000);
             int result=run_tls_handshake(&config,&connection,TLS_CIPHER_OFFER_CHACHA,error,sizeof(error));
+            if (!variant && result) fprintf(stderr,"valid handshake %d/%s: %s\n",kind,modes[mode],error);
             if (variant == 0) CHECK("auth/valid-signature",result == 0);
             else CHECK("auth/malformed-handshake-rejected",result != 0);
             if (variant && mode == 2) CHECK("auth/failed-handshake-no-tofu-pin",access(pins,F_OK) != 0);

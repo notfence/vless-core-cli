@@ -1072,6 +1072,17 @@ static int ssl_selected_alpn_is_h2(SSL *ssl) {
     return selected != NULL && selected_len == 2 && memcmp(selected, "h2", 2) == 0;
 }
 
+static int tls_identity_is_ip(const char *identity) {
+    unsigned char address[16];
+    return identity && (inet_pton(AF_INET,identity,address) == 1 || inet_pton(AF_INET6,identity,address) == 1);
+}
+
+static int tls_identity_parameters(X509_VERIFY_PARAM *parameters, const char *identity) {
+    if (!parameters || !identity || !*identity) return -1;
+    return (tls_identity_is_ip(identity) ? X509_VERIFY_PARAM_set1_ip_asc(parameters,identity) :
+            X509_VERIFY_PARAM_set1_host(parameters,identity,0)) == 1 ? 0 : -1;
+}
+
 static int open_tls_socket_once(int use_server_ips, const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
                                 const unsigned char *alpn_protos, unsigned int alpn_protos_len, tls_cipher_offer_t cipher_offer,
                                 SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd, int *retry_with_aes, char *err, size_t err_cap) {
@@ -1148,7 +1159,7 @@ static int open_tls_socket_once(int use_server_ips, const char *connect_host, ui
     }
 
     const char *servername = (sni != NULL && sni[0] != '\0') ? sni : connect_host;
-    if (SSL_set_tlsext_host_name(ssl, servername) != 1) {
+    if (!tls_identity_is_ip(servername) && SSL_set_tlsext_host_name(ssl, servername) != 1) {
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(fd);
@@ -1156,7 +1167,7 @@ static int open_tls_socket_once(int use_server_ips, const char *connect_host, ui
         return -1;
     }
     if (verify_peer) {
-        if (SSL_set1_host(ssl, servername) != 1) {
+        if (tls_identity_parameters(SSL_get0_param(ssl),servername) != 0) {
             SSL_free(ssl);
             SSL_CTX_free(ctx);
             close(fd);
@@ -3789,6 +3800,7 @@ static int add_ext(dynbuf_t *b, uint16_t etype, const uint8_t *edata, size_t ele
 }
 
 static int ext_server_name(dynbuf_t *exts, const char *sni) {
+    if (tls_identity_is_ip(sni)) return 0;
     uint8_t data[512];
     size_t sni_len = strlen(sni);
     if (sni_len == 0 || sni_len > 255) {
@@ -4844,7 +4856,7 @@ static int verify_tls_cert_message(const char *servername, const uint8_t *cert_m
     }
 
     const char *host = (servername != NULL && servername[0] != '\0') ? servername : NULL;
-    if (host == NULL || X509_check_host(leaf, host, 0, 0, NULL) != 1) {
+    if (host == NULL) {
         set_err(err, err_cap, "TLS certificate hostname mismatch");
         goto out;
     }
@@ -4861,7 +4873,9 @@ static int verify_tls_cert_message(const char *servername, const uint8_t *cert_m
     }
 
     ctx = X509_STORE_CTX_new();
-    if (ctx == NULL || X509_STORE_CTX_init(ctx, store, leaf, untrusted) != 1) {
+    if (ctx == NULL || X509_STORE_CTX_init(ctx, store, leaf, untrusted) != 1 ||
+        X509_STORE_CTX_set_default(ctx,"ssl_server") != 1 ||
+        tls_identity_parameters(X509_STORE_CTX_get0_param(ctx),host) != 0) {
         set_err(err, err_cap, "failed to initialize TLS certificate verification");
         goto out;
     }
