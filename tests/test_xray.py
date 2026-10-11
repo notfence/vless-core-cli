@@ -28,6 +28,51 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_grpc_reuses_physical_connection(self):
+        with Server() as target, xray_server("grpc","none") as reference, CountingProxy(reference.port) as proxy:
+            with cli(uri(proxy.port,"grpc","none")) as core:
+                for index in range(6):
+                    try:
+                        with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core pooled gRPC"*20+bytes([index]))
+                    except (EOFError,TimeoutError,AssertionError) as error:
+                        raise AssertionError(f"{error}\n{core.log}\n{reference.log}\n{proxy.client_data}") from error
+                self.assertEqual(len(proxy.client_data),1)
+
+    def test_grpc_pool_parallel_and_small_windows(self):
+        cert,_=certificate()
+        for security,mode in (("none","gun"),("tls","gun"),("tls","multi"),("reality","gun")):
+            with self.subTest(security=security,mode=mode), Server() as target, xray_server("grpc",security,mode=mode) as reference, CountingProxy(reference.port) as proxy:
+                with cli(uri(proxy.port,"grpc",security,mode=mode,userAgent="vless-core/grpc"),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core warm gRPC pool")
+                    def transfer(index):
+                        with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,bytes(range(251))*1045+bytes([index]))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor: list(executor.map(transfer,range(16)))
+                    self.assertEqual(len(proxy.client_data),1)
+        for window in (1,1024,262144):
+            with self.subTest(window=window), Server() as target, xray_server("grpc","none") as reference:
+                with cli(uri(reference.port,"grpc","none",initialWindowsSize=window)) as core:
+                    with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core")
+
+    def test_grpc_slow_rpc_does_not_block_sibling(self):
+        started=threading.Event()
+        def handler(connection):
+            command=exact(connection,1)
+            if command == b"S":
+                started.set(); connection.sendall(b"vless-core slow gRPC"*524288)
+            else:
+                connection.sendall(command); Server.echo(connection)
+        with Server(handler) as target, xray_server("grpc","none") as reference, CountingProxy(reference.port) as proxy:
+            with cli(uri(proxy.port,"grpc","none")) as core:
+                with socks_connect(core.port,target.port) as slow:
+                    slow.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4096); slow.sendall(b"S")
+                    self.assertTrue(started.wait(2)); self.assertEqual(exact(slow,1),b"v")
+                    time.sleep(0.2)
+                    with socks_connect(core.port,target.port) as healthy:
+                        for _ in range(3):
+                            before=time.monotonic(); exchange(healthy,b"F"+bytes(range(251))*260)
+                            self.assertLess(time.monotonic()-before,2)
+                    self.assertEqual(len(proxy.client_data),1)
+
     def test_encryption_resumption_wire(self):
         payload=b"vless-core resumed encrypted connection"*64
         with Server() as target, xray_server("tcp","none",decryption=f"mlkem768x25519plus.native.60s.{KEY}") as reference, CountingProxy(reference.port) as proxy:

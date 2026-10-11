@@ -32,7 +32,6 @@ static void fuzz_clear(tls13_conn_t *c) {
     core_hpack_clear(&c->hpack);
     db_free(&c->h2_send_buf);
     db_free(&c->app_cache);
-    db_free(&c->grpc_recv_cache);
     db_free(&c->ws_net_cache);
     db_free(&c->xhttp_net_cache);
 }
@@ -114,8 +113,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
     }
     case 3: {
-        (void)grpc_append_hunk_payload(&c, data, size);
-        c.app_cache.len = 0;
         size_t step = size ? 1 + data[0] % 64 : 1;
         for (size_t off = 0; off < size; off += step) {
             size_t length = size - off < step ? size - off : step;

@@ -77,7 +77,7 @@ $(HOST_BUILD_DIR)/test_resolver: $(HOST_BUILD_DIR)/test_resolver.o $(filter-out 
 $(HOST_BUILD_DIR)/test_dialer: $(HOST_BUILD_DIR)/test_dialer.o $(filter-out $(HOST_BUILD_DIR)/src/dialer.o,$(BASE_OBJ))
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=getaddrinfo,--wrap=connect,--wrap=poll
 
-$(HOST_BUILD_DIR)/test_xmux: $(HOST_BUILD_DIR)/test_xmux.o $(filter-out $(HOST_BUILD_DIR)/src/xmux.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+$(HOST_BUILD_DIR)/test_xmux: $(HOST_BUILD_DIR)/test_xmux.o $(filter-out $(HOST_BUILD_DIR)/src/http2_pool.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
 $(HOST_BUILD_DIR)/test_xhttp_payload: $(HOST_BUILD_DIR)/test_xhttp_payload.o $(BASE_OBJ) $(NETWORK_GUARD)

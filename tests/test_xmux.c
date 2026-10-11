@@ -1,4 +1,5 @@
-#include "../src/xmux.c"
+#include "xmux.h"
+#include "../src/http2_pool.c"
 #include "check.h"
 
 typedef struct { size_t pending; int frames, last_type; uint32_t last_id; } wire_t;
@@ -14,6 +15,49 @@ static int fixture_send(void *opaque, uint8_t type, uint8_t flags, uint32_t id, 
     wire_t *wire=opaque; wire->pending+=length+9; wire->frames++; wire->last_type=type; wire->last_id=id; return 0;
 }
 static const core_xmux_backend_t fixture_backend={.send_frame=fixture_send,.pending=fixture_pending,.session=fixture_session};
+
+static void grpc_pool_policy(void) {
+    wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend};
+    manager.config.transport_mode=TRANSPORT_GRPC; manager.config.grpc_initial_window=262144;
+    manager.config.grpc_health_timeout=2;
+    mux_group_t group={.manager=&manager}; mux_actor_t actors[4]={0}; mux_request_t requests[4]={0};
+    manager.actors=actors;
+    for (unsigned i=0;i<4;i++) {
+        actors[i].manager=&manager; actors[i].group=&group; actors[i].http2=1;
+        actors[i].peer_concurrency=1;
+        actors[i].requests=&requests[i]; actors[i].next=i<3 ? &actors[i+1] : NULL;
+    }
+    errno=0;
+    CHECK("grpc/pool-four-physical-limit",!group_channel(&group,100,NULL,1) && errno == EAGAIN);
+    actors[0].peer_concurrency=2;
+    CHECK("grpc/pool-server-stream-capacity",group_channel(&group,100,NULL,1) == &actors[0]);
+    actors[0].requests=NULL; actors[0].physical=&wire; actors[0].alive_period=1; actors[0].last_input_ms=1000;
+    CHECK("grpc/keepalive-disabled-without-stream",maintain_ping(&actors[0],2000) == 0 && !wire.frames);
+    manager.config.grpc_permit_without_stream=1;
+    CHECK("grpc/keepalive-explicit-idle-permission",maintain_ping(&actors[0],2000) == 0 && wire.frames == 1 && actors[0].ping_deadline_ms == 4000);
+    CHECK("grpc/keepalive-ack-budget",maintain_ping(&actors[0],4000) < 0);
+    core_xmux_frame_t acknowledgement={.type=6,.flags=1,.length=8,.data=actors[0].ping};
+    CHECK("grpc/keepalive-acknowledged",process_frame(&actors[0],&acknowledgement) == 0 && !actors[0].ping_deadline_ms);
+    CHECK("grpc/idle-pool-retained",stop_idle_actor(&actors[0],0,5000) == 0 && stop_idle_actor(&actors[0],0,64999) == 0);
+    CHECK("grpc/idle-pool-closed-at-sixty-seconds",stop_idle_actor(&actors[0],0,65000) == 1);
+    actors[0].draining=0; actors[0].receive_window=262144; actors[0].latest_stream=3;
+    core_xmux_stream_t first={.download=&actors[0],.upload=&actors[0],.down_id=1,.up_id=1,.ready=1},second={.download=&actors[0],.upload=&actors[0],.down_id=3,.up_id=3,.ready=1};
+    REQUIRE("grpc/policy-notification-channels",notification_pair(first.notify) == 0 && notification_pair(second.notify) == 0 && notification_pair(actors[0].wake) == 0);
+    mux_request_t request_a={.stream=&first,.id=1,.role=1,.receive_window=262144},request_b={.stream=&second,.id=3,.role=1,.headers=1,.receive_window=262144};
+    request_a.next=&request_b; actors[0].requests=&request_a;
+    uint8_t status[]={0x88,0,11,'g','r','p','c','-','s','t','a','t','u','s',1,'7'};
+    core_xmux_frame_t trailer={.type=1,.flags=5,.id=1,.data=status,.length=sizeof(status)};
+    CHECK("grpc/nonzero-status-isolated",process_frame(&actors[0],&trailer) == 0 && first.failed && !second.failed);
+    actors[0].requests=&request_b; streams=&second;
+    core_xmux_frame_t data={.type=0,.id=3,.data=(uint8_t *)"abc",.length=3};
+    CHECK("grpc/window-not-replenished-before-consumption",process_frame(&actors[0],&data) == 0 && !second.consumed && request_b.receive_window == 262141);
+    uint8_t output[3]; size_t received=0;
+    CHECK("grpc/window-consumption-accounted",core_http2_read(&second,output,3,&received) == 0 && received == 3 && second.consumed == 3);
+    CHECK("grpc/window-update-after-consumption",advance_streams(&actors[0]) == 0 && !second.consumed && request_b.receive_window == 262144);
+    streams=NULL; free(second.rx.data); core_hpack_clear(&actors[0].hpack);
+    close(first.notify[0]); close(first.notify[1]); close(second.notify[0]); close(second.notify[1]); close(actors[0].wake[0]); close(actors[0].wake[1]);
+    upload_bytes=download_bytes=0;
+}
 
 static void paced_stream_isolation(void) {
     wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend}; mux_group_t group={.manager=&manager};
@@ -154,5 +198,6 @@ int main(void) {
     session_failure=0; stream_count=256;
     CHECK("xmux/client-limit-reported", !core_xmux_connect(&config,&fixture_backend,error,sizeof(error)) && errno == EAGAIN && strstr(error,"channel allocation"));
     stream_count=0;
+    grpc_pool_policy();
     return test_result();
 }

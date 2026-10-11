@@ -21,6 +21,7 @@
 #include "tls13_reality.h"
 #include "tls_hello.h"
 #include "websocket.h"
+#include "grpc.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -244,6 +245,10 @@ struct tls13_conn {
     uint64_t ws_heartbeat_ms, ws_next_heartbeat;
     char grpc_service_name[256];
     char grpc_authority[320];
+    char grpc_user_agent[256];
+    core_grpc_decoder_t grpc_decoder;
+    int grpc_physical_only;
+    unsigned grpc_initial_window;
     int grpc_transport;
     int grpc_multi_mode;
 
@@ -252,7 +257,6 @@ struct tls13_conn {
     dynbuf_t h2_net_cache;
     dynbuf_t h2_send_buf;
     dynbuf_t h2_header_block;
-    dynbuf_t grpc_recv_cache;
     dynbuf_t transcript;
     dynbuf_t app_cache;
     int reality_raw_direct;
@@ -2362,7 +2366,7 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
         return -1;
     }
 
-    uint32_t initial_window = c->xmux_physical ? 65535 : H2_CLIENT_INITIAL_WINDOW;
+    uint32_t initial_window = c->grpc_physical_only ? c->grpc_initial_window : c->xmux_physical ? 65535 : H2_CLIENT_INITIAL_WINDOW;
     uint8_t settings[18] = {
         0x00,
         0x04,
@@ -2374,7 +2378,7 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
         0,6,0,1,0,0,
     };
     if (h2_send_frame(c, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings)) != 0 ||
-        (!c->xmux_physical && h2_send_window_update(c, 0, H2_CONNECTION_WINDOW_INC) != 0)) {
+        (!c->xmux_physical && !c->grpc_physical_only && h2_send_window_update(c, 0, H2_CONNECTION_WINDOW_INC) != 0)) {
         set_err(err, err_cap, "failed to send h2 settings");
         return -1;
     }
@@ -2444,87 +2448,32 @@ static size_t protobuf_write_varint(uint8_t *out, size_t value) {
     return n;
 }
 
-static int protobuf_read_varint(const uint8_t *buf, size_t len, size_t *off, uint64_t *value) {
-    uint64_t v = 0;
-    unsigned int shift = 0;
-    while (*off < len && shift < 64) {
-        uint8_t ch = buf[(*off)++];
-        v |= (uint64_t)(ch & 0x7f) << shift;
-        if ((ch & 0x80) == 0) {
-            *value = v;
-            return 0;
-        }
-        shift += 7;
-    }
-    return -1;
-}
 
-static int grpc_append_hunk_payload(tls13_conn_t *c, const uint8_t *msg, size_t msg_len) {
-    size_t off = 0;
-    int found = 0;
-
-    while (off < msg_len) {
-        uint64_t key = 0;
-        if (protobuf_read_varint(msg, msg_len, &off, &key) != 0 || key == 0) {
-            return -1;
-        }
-        uint32_t field = (uint32_t)(key >> 3);
-        uint32_t wire = (uint32_t)(key & 7);
-
-        if (wire == 0) {
-            uint64_t ignored = 0;
-            if (protobuf_read_varint(msg, msg_len, &off, &ignored) != 0) {
-                return -1;
-            }
-        } else if (wire == 1) {
-            if (msg_len - off < 8) {
-                return -1;
-            }
-            off += 8;
-        } else if (wire == 2) {
-            uint64_t field_len = 0;
-            if (protobuf_read_varint(msg, msg_len, &off, &field_len) != 0 || field_len > msg_len - off) {
-                return -1;
-            }
-            if (field == 1) {
-                if (db_append(&c->app_cache, msg + off, (size_t)field_len) != 0) {
-                    return -1;
-                }
-                found = 1;
-            }
-            off += (size_t)field_len;
-        } else if (wire == 5) {
-            if (msg_len - off < 4) {
-                return -1;
-            }
-            off += 4;
-        } else {
-            return -1;
-        }
-    }
-    return found || msg_len == 0 ? 0 : -1;
-}
-
-static int grpc_feed_data(tls13_conn_t *c, const uint8_t *data, size_t len) {
-    if (db_append(&c->grpc_recv_cache, data, len) != 0) {
-        return -1;
-    }
-
-    while (c->grpc_recv_cache.len >= 5) {
-        const uint8_t *frame = c->grpc_recv_cache.data;
-        uint32_t msg_len = ((uint32_t)frame[1] << 24) | ((uint32_t)frame[2] << 16) | ((uint32_t)frame[3] << 8) | (uint32_t)frame[4];
-        if (frame[0] != 0 || msg_len > 16U * 1024U * 1024U) {
-            return -1;
-        }
-        if (c->grpc_recv_cache.len < 5U + (size_t)msg_len) {
-            break;
-        }
-        if (grpc_append_hunk_payload(c, frame + 5, msg_len) != 0) {
-            return -1;
-        }
-        db_consume(&c->grpc_recv_cache, 5U + (size_t)msg_len);
+static int grpc_feed_data(tls13_conn_t *c, const uint8_t *data, size_t length) {
+    size_t offset=0;
+    while (offset < length) {
+        size_t consumed=0,payload_length=0; const uint8_t *payload=NULL;
+        int result=core_grpc_decode(&c->grpc_decoder,data+offset,length-offset,&consumed,&payload,&payload_length);
+        if (result < 0 || !consumed || (payload_length && db_append(&c->app_cache,payload,payload_length))) return -1;
+        offset+=consumed;
     }
     return 0;
+}
+
+static int grpc_pool_read(tls13_conn_t *c, uint8_t *buffer, size_t capacity, size_t *length) {
+    *length=0;
+    if (!capacity) return 0;
+    if (!c->app_cache.len) {
+        uint8_t input[8192]; size_t received=0;
+        int result=core_http2_read(c->xmux_stream,input,sizeof(input),&received);
+        if (result < 0) return core_grpc_complete(&c->grpc_decoder) ? result : -1;
+        if (result > 0) return result;
+        if (grpc_feed_data(c,input,received)) return -1;
+        if (!c->app_cache.len) return 1;
+    }
+    size_t take=c->app_cache.len < capacity ? c->app_cache.len : capacity;
+    memcpy(buffer,c->app_cache.data,take); db_consume(&c->app_cache,take);
+    *length=take; return 0;
 }
 
 static int grpc_write_hunk(tls13_conn_t *c, const uint8_t *buf, size_t len) {
@@ -2548,7 +2497,7 @@ static int grpc_write_hunk(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     size_t written = protobuf_write_varint(frame + 6, len);
     memcpy(frame + 6 + written, buf, len);
 
-    int rc = h2_write_data(c, frame, frame_len);
+    int rc = c->xmux_stream ? core_http2_write(c->xmux_stream,frame,frame_len) : h2_write_data(c, frame, frame_len);
     free(frame);
     return rc;
 }
@@ -3225,7 +3174,7 @@ static int h2_send_grpc_request_headers(tls13_conn_t *c, char *err, size_t err_c
     }
     if (rc == 0) {
         rc = hpack_append_literal_new_name(&block, "user-agent",
-                                           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                                           c->grpc_user_agent[0] ? c->grpc_user_agent : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                                            "Chrome/149.0.0.0 Safari/537.36");
     }
     if (rc == 0) {
@@ -3250,7 +3199,8 @@ static int grpc_h2_start(tls13_conn_t *c, char *err, size_t err_cap) {
     if (xhttp_h2_begin(c, err, err_cap) != 0) {
         return -1;
     }
-    return h2_send_grpc_request_headers(c, err, err_cap);
+    if (c->grpc_physical_only) c->h2_next_stream_id=1;
+    return c->grpc_physical_only ? 0 : h2_send_grpc_request_headers(c, err, err_cap);
 }
 
 static int xhttp_conn_write_all(tls13_conn_t *c, const void *buf, size_t len) {
@@ -5205,7 +5155,7 @@ int tls13_tick(tls13_conn_t *c) {
 }
 
 int tls13_has_pending_app(const tls13_conn_t *c) {
-    if (c && c->xmux_stream) return core_xmux_pending(c->xmux_stream);
+    if (c && c->xmux_stream) return c->app_cache.len || core_xmux_pending(c->xmux_stream);
     if (tls13_uses_h2(c)) {
         return c->app_cache.len > 0 || c->h2_stream_eof;
     }
@@ -5216,7 +5166,7 @@ int tls13_has_pending_input(const tls13_conn_t *c) {
     if (c == NULL) {
         return 0;
     }
-    if (c->xmux_stream) return core_xmux_pending(c->xmux_stream);
+    if (c->xmux_stream) return c->app_cache.len || core_xmux_pending(c->xmux_stream);
     if (c->app_cache.len > 0) {
         return 1;
     }
@@ -6262,6 +6212,9 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
 
 static int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
     c->grpc_transport = 1;
+    c->grpc_physical_only=cfg->grpc_physical_only;
+    c->grpc_initial_window=cfg->grpc_initial_window ? (unsigned)cfg->grpc_initial_window : 256U*1024U;
+    memcpy(c->grpc_user_agent,cfg->grpc_user_agent,sizeof(c->grpc_user_agent));
     snprintf(c->remote_host, sizeof(c->remote_host), "%s", cfg->server_host);
     c->remote_port = cfg->server_port;
     snprintf(c->remote_sni, sizeof(c->remote_sni), "%s", cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host);
@@ -6332,6 +6285,12 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
     }
 
     if (cfg->transport_mode == TRANSPORT_GRPC) {
+        if (!cfg->grpc_physical_only) {
+            c->grpc_transport=1;
+            c->xmux_stream=core_http2_connect(cfg,&xmux_backend,err,err_cap);
+            if (!c->xmux_stream) { free(c); return -1; }
+            c->fd=core_http2_fd(c->xmux_stream); *out=c; return 0;
+        }
         if (grpc_connect(cfg, c, err, err_cap) != 0) {
             tls13_reality_close(c);
             return -1;
@@ -6384,14 +6343,14 @@ void tls13_reality_close(tls13_conn_t *c) {
     if (c == NULL) {
         return;
     }
-    if (c->xmux_stream) { core_xmux_close(c->xmux_stream); free(c); return; }
+    if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); free(c); return; }
     if (c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
         int upload_fd = strcmp(c->xhttp_transport_mode, "stream-one") == 0 ? c->fd : c->xhttp_upload_fd;
         if (upload_fd >= 0) {
             (void)write_exact(upload_fd, "0\r\n\r\n", 5);
         }
     }
-    if (c->grpc_transport && c->h2_stream_id != 0 && c->fd >= 0) {
+    if (c->grpc_transport && !c->grpc_physical_only && c->h2_stream_id != 0 && c->fd >= 0) {
         (void)h2_send_frame(c, H2_FRAME_DATA, H2_FLAG_END_STREAM, c->h2_stream_id, NULL, 0);
     }
     if (c->xhttp_upload_fd >= 0) {
@@ -6424,7 +6383,6 @@ void tls13_reality_close(tls13_conn_t *c) {
     db_free(&c->h2_net_cache);
     db_free(&c->h2_send_buf);
     db_free(&c->h2_header_block);
-    db_free(&c->grpc_recv_cache);
     db_free(&c->transcript);
     db_free(&c->app_cache);
     db_free(&c->xmux_raw_input); db_free(&c->xmux_plain_output); db_free(&c->xmux_wire_output);
@@ -6465,7 +6423,7 @@ static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t
 }
 
 int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
-    if (c->xmux_stream) return core_xmux_write(c->xmux_stream, buf, len);
+    if (c->xmux_stream && !c->grpc_transport) return core_xmux_write(c->xmux_stream, buf, len);
     if (c->grpc_transport) {
         return grpc_write_hunk(c, buf, len);
     }
@@ -6600,6 +6558,7 @@ static int fill_reality_app_cache(tls13_conn_t *c) {
 }
 
 int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
+    if (c->xmux_stream && c->grpc_transport) return grpc_pool_read(c,buf,cap,out_len);
     if (c->xmux_stream) return core_xmux_read(c->xmux_stream, buf, cap, out_len);
     *out_len = 0;
     if (cap == 0) {
@@ -6676,6 +6635,7 @@ int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len) {
 static int xmux_transport_open(const vless_config_t *config, void **output, int *http2, char *error, size_t capacity) {
     vless_config_t physical_config=*config;
     physical_config.xmux.present=0; physical_config.xhttp_physical_only=1;
+    physical_config.grpc_physical_only=config->transport_mode == TRANSPORT_GRPC;
     tls13_conn_t *connection=NULL;
     if (tls13_reality_connect(&physical_config,&connection,error,capacity) != 0) return -1;
     *output=connection; *http2=tls13_uses_h2(connection);
@@ -6723,7 +6683,7 @@ static int xmux_transport_send_frame(void *opaque, uint8_t type, uint8_t flags, 
 
 static int xmux_transport_flush(void *opaque) {
     tls13_conn_t *connection=opaque;
-    if (connection->mode == CONN_MODE_XHTTP_PLAIN) {
+    if (connection->mode == CONN_MODE_XHTTP_PLAIN || connection->mode == CONN_MODE_GRPC_PLAIN) {
         if (!connection->xmux_plain_output.len) return 0;
         ssize_t written=core_send(connection->fd,connection->xmux_plain_output.data,connection->xmux_plain_output.len,MSG_DONTWAIT);
         if (written > 0) { db_consume(&connection->xmux_plain_output,(size_t)written); connection->xmux_flushed+=(size_t)written; }
@@ -6764,6 +6724,13 @@ static int xmux_transport_flush(void *opaque) {
 
 static int xmux_transport_collect(void *opaque) {
     tls13_conn_t *connection=opaque;
+    if (connection->mode == CONN_MODE_GRPC_PLAIN) {
+        if (h2_cached_frame_ready(connection)) return 1;
+        uint8_t input[8192];
+        ssize_t received=core_recv(connection->fd,input,sizeof(input),MSG_DONTWAIT);
+        if (received > 0) return db_append(&connection->h2_net_cache,input,(size_t)received);
+        return received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+    }
     if (!tls13_uses_h2(connection)) {
         if (connection->h2_net_cache.len >= 65536 || connection->xmux_http1_eof) return 0;
         uint8_t data[16384]; int size;
@@ -6838,6 +6805,10 @@ static int xmux_transport_read_frame(void *opaque, core_xmux_frame_t *frame, siz
         db_consume(&connection->h2_net_cache,event.consumed); return result;
     }
     if (!h2_cached_frame_ready(connection)) return 1;
+    if (!connection->h2_net_cache.data[3]) {
+        size_t length=((size_t)connection->h2_net_cache.data[0]<<16)|((size_t)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2];
+        if (length > capacity) return 1;
+    }
     if (connection->h2_net_cache.data[0] || (((unsigned)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2]) > 16384) return -1;
     return h2_read_frame(connection,&frame->type,&frame->flags,&frame->id,&frame->data,&frame->length);
 }
@@ -6847,6 +6818,13 @@ static int xmux_transport_request(void *opaque, const vless_config_t *config, co
     tls13_conn_t *physical=opaque;
     tls13_conn_t request=*physical;
     request.h2_send_buf=(dynbuf_t){0}; request.xmux_owner=physical;
+    if (config->transport_mode == TRANSPORT_GRPC) {
+        if (role != 1 || physical->h2_next_stream_id > 0x7ffffffdU) return -1;
+        *id=request.h2_stream_id=physical->h2_next_stream_id; physical->h2_next_stream_id+=2;
+        char error[160]={0};
+        int result=h2_send_grpc_request_headers(&request,error,sizeof(error));
+        db_free(&request.h2_send_buf); *consumed=0; *body_size=0; return result;
+    }
     char error[160];
     if (xhttp_configure(config,&request,error,sizeof(error)) != 0) return -1;
     if (strlen(session) >= sizeof(request.xhttp_session_id)) return -1;

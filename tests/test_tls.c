@@ -13,7 +13,7 @@ int __wrap_rename(const char *source, const char *destination) { if (io_failure 
 static void clear_conn(tls13_conn_t *c) {
     db_free(&c->tls_post_handshake); db_free(&c->tls_client_hello); db_free(&c->tls_certificate_message);
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL; EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL;
-    db_free(&c->h2_net_cache); db_free(&c->h2_send_buf); db_free(&c->app_cache); db_free(&c->grpc_recv_cache); db_free(&c->transcript);
+    db_free(&c->h2_net_cache); db_free(&c->h2_send_buf); db_free(&c->app_cache); db_free(&c->transcript);
     db_free(&c->ws_net_cache); db_free(&c->xhttp_net_cache);
     db_free(&c->h2_header_block);
     core_hpack_clear(&c->hpack);
@@ -614,7 +614,7 @@ int main(int argc, char **argv) {
     c.grpc_transport = 1; uint8_t grpc[] = {0,0,0,0,5,10,3,'a','b','c'};
     for (size_t i = 0; i < sizeof(grpc); i++) REQUIRE("grpc/fragmented-frame", grpc_feed_data(&c, grpc+i, 1) == 0);
     CHECK("grpc/decoded-hunk", c.app_cache.len == 3 && memcmp(c.app_cache.data, "abc", 3) == 0);
-    uint8_t compressed[] = {1,0,0,0,0}; CHECK("grpc/compressed-reject", grpc_feed_data(&c, compressed, 5) != 0); c.grpc_recv_cache.len = 0;
+    uint8_t compressed[] = {1,0,0,0,0}; CHECK("grpc/compressed-reject", grpc_feed_data(&c, compressed, 5) != 0); c.grpc_decoder=(core_grpc_decoder_t){0};
     CHECK("batch/grpc", tls13_write_batch_size(&c) == 65536); c.grpc_transport = 0;
     strcpy(c.xhttp_transport_mode, "packet-up"); c.mode = CONN_MODE_XHTTP_PLAIN; c.xhttp_max_each_post_bytes = 2000000;
     CHECK("batch/xhttp-cap", tls13_write_batch_size(&c) == 1048576); c.xhttp_max_each_post_bytes = 1000; CHECK("batch/xhttp-small", tls13_write_batch_size(&c) == 1000);

@@ -10,6 +10,7 @@
 #include "xhttp_config.h"
 #include "core_log.h"
 #include "websocket.h"
+#include "grpc.h"
 
 static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
@@ -91,6 +92,8 @@ void core_config_defaults(vless_config_t *cfg) {
     snprintf(cfg->security, sizeof(cfg->security), "none");
     cfg->alpn[0] = '\0';
     cfg->allow_insecure = 0;
+    cfg->grpc_initial_window=256*1024;
+    cfg->grpc_health_timeout=20;
     snprintf(cfg->spider_x, sizeof(cfg->spider_x), "/");
     snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
     cfg->xhttp_host[0] = '\0';
@@ -371,9 +374,11 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
         int common=!strcmp(key,"path") || !strcmp(key,"host") || !strcmp(key,"mode");
         int ws_parameter=cfg->transport_mode == TRANSPORT_WS ? core_ws_parameter(cfg,key,decoded,err,err_cap) : 0;
         if (ws_parameter < 0) return -1;
-        int xhttp_parameter = ws_parameter || common ? 0 : core_xhttp_parameter(cfg, key, decoded, err, err_cap);
+        int grpc_parameter=cfg->transport_mode == TRANSPORT_GRPC ? core_grpc_parameter(cfg,key,decoded,err,err_cap) : 0;
+        if (grpc_parameter < 0) return -1;
+        int xhttp_parameter = ws_parameter || grpc_parameter || common ? 0 : core_xhttp_parameter(cfg, key, decoded, err, err_cap);
         if (xhttp_parameter < 0) return -1;
-        if (ws_parameter > 0 || xhttp_parameter > 0 || !strcmp(key, "extra")) {
+        if (ws_parameter > 0 || grpc_parameter > 0 || xhttp_parameter > 0 || !strcmp(key, "extra")) {
             if (xhttp_parameter > 0 && cfg->transport_mode != TRANSPORT_XHTTP)
                 vc_log_warning("uri","field query.%s is not applied to this transport",key);
             if (next == NULL) break;
