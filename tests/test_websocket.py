@@ -37,6 +37,26 @@ def upgrade(connection):
     return lines[0],headers
 
 class WebSocketTests(unittest.TestCase):
+    def test_close_handshake_drains_existing_message(self):
+        closed=threading.Event(); payload=b"vless-core upload before Close"*5000
+        def handler(connection):
+            upgrade(connection); opcode,request=client_frame(connection)
+            self.assertEqual(opcode,2); self.assertEqual(request[26:],b"init")
+            connection.sendall(frame(2,b"\x00\x00init")+frame(2,b"vless-core ",final=False))
+            received=bytearray()
+            while True:
+                opcode,data=client_frame(connection)
+                if opcode == 8:
+                    self.assertEqual(bytes(received),payload)
+                    connection.sendall(frame(0,b"final message")+frame(8,data)); closed.set(); return
+                self.assertEqual(opcode,2); received.extend(data)
+        with Server(handler) as server, cli(uri(server.port,"ws","none")) as core:
+            with socks_connect(core.port,80) as tunnel:
+                exchange(tunnel,b"init")
+                tunnel.sendall(payload); tunnel.shutdown(1)
+                self.assertEqual(exact(tunnel,len(b"vless-core final message")),b"vless-core final message")
+                self.assertEqual(tunnel.recv(1),b"")
+            self.assertTrue(closed.wait(1))
     def test_xray_early_data_and_headers(self):
         cert,_=certificate()
         for security in ("none","tls"):

@@ -28,6 +28,100 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_duplex_backpressure_does_not_block_reply(self):
+        payload=bytes(range(251))*66842; failures=[]; cert,_=certificate()
+        def handler(connection):
+            connection.settimeout(5); connection.sendall(payload[::-1])
+            self.assertEqual(exact(connection,len(payload)),payload); connection.sendall(b"done")
+        for transport,security in (("tcp","none"),("tcp","tls"),("ws","tls"),("xhttp","none"),("xhttp","tls"),("xhttp","reality")):
+            with self.subTest(transport=transport,security=security), Server(handler) as target, xray_server(transport,security) as reference:
+                with cli(uri(reference.port,transport,security),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    with socks_connect(core.port,target.port) as tunnel:
+                        tunnel.settimeout(5)
+                        def upload():
+                            try: tunnel.sendall(payload)
+                            except OSError as error: failures.append(error)
+                        sender=threading.Thread(target=upload); sender.start()
+                        try:
+                            self.assertEqual(exact(tunnel,len(payload)),payload[::-1]); self.assertEqual(exact(tunnel,4),b"done")
+                        finally: sender.join(timeout=6)
+                        self.assertFalse(sender.is_alive()); self.assertFalse(failures)
+
+    def test_transport_finish_write_preserves_response(self):
+        payload=bytes(range(251))*521
+        def handler(connection):
+            self.assertEqual(exact(connection,len(payload)),payload)
+            time.sleep(0.05)
+            connection.sendall(payload[::-1])
+        cert,_=certificate()
+        cases=[("tcp","none",None,None),("tcp","tls",None,None),("tcp","reality",None,None),
+               ("grpc","none",None,None),("grpc","tls",None,None),("grpc","reality",None,None),
+               ("xhttp","none","stream-one",None),("xhttp","none","stream-up",None),
+               ("xhttp","tls","stream-one",None),("xhttp","reality","stream-one",None),
+               ("xhttp","tls","stream-one","http/1.1"),("xhttp","tls","stream-up","http/1.1")]
+        for transport,security,mode,alpn in cases:
+            with self.subTest(transport=transport,security=security,mode=mode,alpn=alpn), Server(handler) as target, xray_server(transport,security,mode=mode) as reference:
+                parameters={}
+                if mode: parameters["mode"]=mode
+                if alpn: parameters["alpn"]=alpn
+                with cli(uri(reference.port,transport,security,**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    try:
+                        with socks_connect(core.port,target.port) as tunnel:
+                            tunnel.settimeout(3); tunnel.sendall(payload); tunnel.shutdown(socket.SHUT_WR)
+                            self.assertEqual(exact(tunnel,len(payload)),payload[::-1])
+                            self.assertEqual(tunnel.recv(1),b"")
+                    except (EOFError,TimeoutError,AssertionError) as error:
+                        raise AssertionError(f"{error}\n{core.log}\n{reference.log}") from error
+
+    def test_encryption_fin_preserves_response(self):
+        payload=bytes(range(251))*521
+        def handler(connection):
+            self.assertEqual(exact(connection,len(payload)),payload)
+            time.sleep(0.05); connection.sendall(payload[::-1])
+        for transport,security,mode,rtt in (("tcp","none",None,"0rtt"),("tcp","none",None,"1rtt"),
+                                            ("grpc","none",None,"0rtt"),("xhttp","none","stream-one","0rtt"),
+                                            ("xhttp","none","packet-up","1rtt")):
+            with self.subTest(transport=transport,mode=mode,rtt=rtt), Server(handler) as target, xray_server(transport,security,mode=mode,decryption=f"mlkem768x25519plus.random.600s.{KEY}") as reference:
+                parameters={"encryption":f"mlkem768x25519plus.random.{rtt}.{PUBLIC_KEY}"}
+                if mode: parameters["mode"]=mode
+                with cli(uri(reference.port,transport,security,**parameters)) as core:
+                    for _ in range(2):
+                        with socks_connect(core.port,target.port) as tunnel:
+                            tunnel.sendall(payload); tunnel.shutdown(socket.SHUT_WR)
+                            self.assertEqual(exact(tunnel,len(payload)),payload[::-1])
+
+    def test_vision_fin_preserves_tls_response(self):
+        payload=bytes(range(251))*521; cert,_=certificate()
+        def handler(connection):
+            self.assertEqual(exact(connection,len(payload)),payload)
+            time.sleep(0.05); connection.sendall(payload[::-1])
+        for security,encrypted in (("tls",False),("reality",False),("reality",True)):
+            with self.subTest(security=security,encrypted=encrypted), Server(handler,tls=True) as target, xray_server("tcp",security,flow="xtls-rprx-vision",decryption=f"mlkem768x25519plus.random.0s.{KEY}" if encrypted else "none") as reference:
+                parameters={"flow":"xtls-rprx-vision"}
+                if encrypted: parameters["encryption"]=f"mlkem768x25519plus.random.1rtt.{PUBLIC_KEY}"
+                with cli(uri(reference.port,"tcp",security,**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    with socks_connect(core.port,target.port) as tunnel:
+                        context=ssl.create_default_context(cafile=str(cert))
+                        with context.wrap_socket(tunnel,server_hostname="vless-core.test") as secured:
+                            secured.sendall(payload)
+                            with socket.socket(fileno=os.dup(secured.fileno())) as ending: ending.shutdown(socket.SHUT_WR)
+                            self.assertEqual(exact(secured,len(payload)),payload[::-1])
+
+    def test_packet_upload_fin_keeps_download_channel(self):
+        payload=bytes(range(251))*521
+        def handler(connection):
+            self.assertEqual(exact(connection,len(payload)),payload)
+            connection.sendall(payload[::-1])
+        cert,_=certificate()
+        for security,pooled in (("none",False),("none",True),("tls",False),("tls",True),("reality",False),("reality",True)):
+            with self.subTest(security=security,pooled=pooled), Server(handler) as target, xray_server("xhttp",security,mode="packet-up") as reference:
+                parameters={"mode":"packet-up"}
+                if pooled: parameters["extra"]=json.dumps({"xmux":{"maxConnections":1}})
+                with cli(uri(reference.port,"xhttp",security,**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    with socks_connect(core.port,target.port) as tunnel:
+                        tunnel.settimeout(3); tunnel.sendall(payload); tunnel.shutdown(socket.SHUT_WR)
+                        self.assertEqual(exact(tunnel,len(payload)),payload[::-1])
+
     def test_grpc_reuses_physical_connection(self):
         with Server() as target, xray_server("grpc","none") as reference, CountingProxy(reference.port) as proxy:
             with cli(uri(proxy.port,"grpc","none")) as core:
@@ -115,11 +209,12 @@ class XrayTests(unittest.TestCase):
         padding="100-35-35.100-80-80.100-100-100"
         with Server() as target, xray_server("tcp","none",decryption=f"mlkem768x25519plus.native.0s.{KEY}") as reference, CountingProxy(reference.port) as proxy:
             with cli(uri(proxy.port,"tcp","none",encryption=f"mlkem768x25519plus.native.1rtt.{padding}.{PUBLIC_KEY}")) as core:
-                with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core padding chunks")
-                reads=[entry for entry in proxy.client_reads if entry[0] is proxy.client_data[0]]
-                self.assertEqual(reads[0][3],16+32+18+1216+16+35)
-                self.assertGreater(reads[1][1]-reads[0][1],0.065)
-                self.assertEqual(reads[1][3],100)
+                started=time.monotonic()
+                with socks_connect(core.port,target.port) as tunnel:
+                    self.assertGreaterEqual(time.monotonic()-started,0.075)
+                    exchange(tunnel,b"vless-core padding chunks")
+                padding_end=16+32+18+1216+16+35+100
+                self.assertEqual(proxy.client_data[0][padding_end:padding_end+3],b"\x17\x03\x03")
             with cli(uri(proxy.port,"tcp","none",encryption=f"mlkem768x25519plus.native.1rtt.100-35-35.100-1000-1000.{PUBLIC_KEY}"),extra=["--connect-timeout-ms","100"]) as core:
                 started=time.monotonic()
                 with self.assertRaises(AssertionError):
@@ -128,10 +223,11 @@ class XrayTests(unittest.TestCase):
 
     def test_manual_tls_hello_retry(self):
         cert,key=certificate()
-        for group,fingerprint in (("P-256","chrome"),("P-384","chrome"),("P-521","firefox")):
-            with self.subTest(group=group):
+        for group,fingerprint,stateless in (("P-256","chrome",False),("P-256","firefox",False),("P-384","chrome",False),("P-384","firefox",False),("P-521","firefox",False),("P-256","firefox",True)):
+            with self.subTest(group=group,fingerprint=fingerprint,stateless=stateless):
                 listen=port()
                 command=[str(OPENSSL),"s_server","-accept",f"127.0.0.1:{listen}","-cert",str(cert),"-key",str(key),"-tls1_3","-groups",group,"-ciphersuites","TLS_CHACHA20_POLY1305_SHA256","-www"]
+                if stateless: command.append("-stateless")
                 with Process(command,"retry-server",{"OPENSSL_CONF":"/dev/null"},ready="ACCEPT") as server:
                     result=subprocess.run([str(BUILD/"test_tls_state"),uri(listen,"tcp","tls",fp=fingerprint)],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=15)
                     self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)

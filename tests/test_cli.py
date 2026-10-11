@@ -11,6 +11,50 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_vless_half_close_preserves_response(self):
+        payload=bytes(range(251))*521
+        def handler(connection):
+            exact(connection,26); request=bytearray()
+            while True:
+                block=connection.recv(65536)
+                if not block: break
+                request.extend(block)
+            self.assertEqual(bytes(request),payload)
+            connection.sendall(b"\x00\x00"+payload[::-1])
+        with Server(handler) as target, cli(uri(target.port,"tcp","none")) as core:
+            with socks_connect(core.port,80) as tunnel:
+                tunnel.sendall(payload); tunnel.shutdown(socket.SHUT_WR)
+                self.assertEqual(exact(tunnel,len(payload)),payload[::-1])
+                self.assertEqual(tunnel.recv(1),b"")
+
+    def test_vless_remote_fin_preserves_upload(self):
+        payload=bytes(range(251))*521; completed=threading.Event()
+        def handler(connection):
+            exact(connection,26); self.assertEqual(exact(connection,5),b"start")
+            connection.sendall(b"\x00\x00"+payload); connection.shutdown(socket.SHUT_WR)
+            request=bytearray()
+            while True:
+                block=connection.recv(65536)
+                if not block: break
+                request.extend(block)
+            self.assertEqual(bytes(request),payload[::-1]); completed.set()
+        with Server(handler) as target, cli(uri(target.port,"tcp","none")) as core:
+            with socks_connect(core.port,80) as tunnel:
+                tunnel.sendall(b"start"); self.assertEqual(exact(tunnel,len(payload)),payload)
+                self.assertEqual(tunnel.recv(1),b""); tunnel.sendall(payload[::-1]); tunnel.shutdown(socket.SHUT_WR)
+                self.assertTrue(completed.wait(2))
+
+    def test_fragmented_vless_response_does_not_block_upload(self):
+        first=threading.Event()
+        def handler(connection):
+            exact(connection,26); connection.sendall(b"\x00")
+            self.assertEqual(exact(connection,1),b"A"); first.set()
+            self.assertEqual(exact(connection,1),b"B"); connection.sendall(b"\x00AB")
+        with Server(handler) as target, cli(uri(target.port,"tcp","none")) as core:
+            with socks_connect(core.port,80) as tunnel:
+                tunnel.settimeout(2); tunnel.sendall(b"A"); self.assertTrue(first.wait(1))
+                time.sleep(0.05); tunnel.sendall(b"B"); self.assertEqual(exact(tunnel,2),b"AB")
+
     def test_unknown_uri_fields_are_reported_without_values(self):
         with cli(uri(1,"tcp","none",unknown="vless-core-private-value",host="vless-core-unused-host")) as core:
             self.assertIn("unknown field query.unknown",core.log)

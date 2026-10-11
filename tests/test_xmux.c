@@ -2,7 +2,7 @@
 #include "../src/http2_pool.c"
 #include "check.h"
 
-typedef struct { size_t pending; int frames, last_type; uint32_t last_id; } wire_t;
+typedef struct { size_t pending; int frames, last_type, flags[16]; uint32_t last_id, ids[16]; uint64_t enqueued, flushed; } wire_t;
 static int session_failure;
 static int fixture_session(const vless_config_t *config, char *session, size_t capacity) {
     (void)config;
@@ -11,10 +11,60 @@ static int fixture_session(const vless_config_t *config, char *session, size_t c
 }
 static size_t fixture_pending(void *opaque) { return ((wire_t *)opaque)->pending; }
 static int fixture_send(void *opaque, uint8_t type, uint8_t flags, uint32_t id, const uint8_t *data, size_t length) {
-    (void)flags; (void)data;
-    wire_t *wire=opaque; wire->pending+=length+9; wire->frames++; wire->last_type=type; wire->last_id=id; return 0;
+    (void)data;
+    wire_t *wire=opaque; wire->pending+=length+9; wire->enqueued+=length+9;
+    if (wire->frames < 16) { wire->flags[wire->frames]=flags; wire->ids[wire->frames]=id; }
+    wire->frames++; wire->last_type=type; wire->last_id=id; return 0;
 }
 static const core_xmux_backend_t fixture_backend={.send_frame=fixture_send,.pending=fixture_pending,.session=fixture_session};
+
+static uint64_t fixture_enqueued(void *opaque) { return ((wire_t *)opaque)->enqueued; }
+static uint64_t fixture_flushed(void *opaque) { return ((wire_t *)opaque)->flushed; }
+static const core_http2_backend_t finish_backend={.send_frame=fixture_send,.pending=fixture_pending,.enqueued=fixture_enqueued,.flushed=fixture_flushed};
+
+static void directional_finish(void) {
+    wire_t wire={0}; mux_manager_t manager={.backend=&finish_backend}; manager.config.transport_mode=TRANSPORT_GRPC;
+    mux_group_t group={.manager=&manager};
+    mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.peer_frame=2,.send_window=65535};
+    core_http2_stream_t stream={.upload=&actor,.download=&actor,.ready=1,.down_id=1,.up_id=1,.references=2};
+    core_http2_stream_t sibling={.upload=&actor,.download=&actor,.ready=1,.down_id=3,.up_id=3,.references=2};
+    mux_request_t *request=calloc(1,sizeof(*request)),*other=calloc(1,sizeof(*other));
+    REQUIRE("h2/finish-fixture-requests",request && other);
+    *request=(mux_request_t){.stream=&stream,.id=1,.role=1,.send_window=65535,.headers=1};
+    *other=(mux_request_t){.stream=&sibling,.id=3,.role=1,.send_window=65535,.headers=1};
+    request->next=other; actor.requests=request;
+    REQUIRE("h2/finish-fixture-notifications",notification_pair(actor.wake) == 0 && notification_pair(stream.notify) == 0 && notification_pair(sibling.notify) == 0);
+    REQUIRE("h2/finish-queued-payload",queue_append(&stream.tx,(const uint8_t *)"vless-core",10,XMUX_STREAM_LIMIT) == 0);
+    stream.next=&sibling; streams=&stream; upload_bytes=10;
+    CHECK("h2/finish-idempotent-request",core_http2_finish_write(&stream) == 0 && core_http2_finish_write(&stream) == 0 && !wire.frames);
+    CHECK("h2/finish-rejects-new-writes",!core_http2_write_capacity(&stream) && !core_http2_reserve_write(&stream,1) && core_http2_write(&stream,(const uint8_t *)"x",1) < 0);
+    for (int i=0;i<5;i++) {
+        REQUIRE("h2/finish-drains-before-end-stream",advance_streams(&actor) == 0);
+        CHECK("h2/finish-payload-order",wire.flags[i] == 0 && wire.ids[i] == 1);
+        CHECK("h2/finish-awaits-complete-drain",i == 4 ? wire.frames == 6 && wire.flags[5] == 1 && stream.finish_sent : wire.frames == i+1 && !stream.finish_sent);
+    }
+    CHECK("h2/finish-awaits-wire-flush",core_http2_finish_pending(&stream) == 1);
+    REQUIRE("h2/finish-remains-idempotent",advance_streams(&actor) == 0 && wire.frames == 6);
+    wire.pending=0; wire.flushed=wire.enqueued; account_output(&actor);
+    CHECK("h2/finish-flush-completes",core_http2_finish_pending(&stream) == 0);
+    CHECK("h2/finish-keeps-sibling-open",!other->send_ended && !sibling.finish_requested && !sibling.failed && !stream.eof);
+    stream.eof=1; request->ended=1;
+    uint8_t output[3]; size_t received=99;
+    REQUIRE("h2/finish-final-buffer",queue_append(&stream.rx,(const uint8_t *)"end",3,XMUX_STREAM_LIMIT) == 0); download_bytes=3;
+    CHECK("h2/finish-final-buffer-before-eof",core_http2_read(&stream,output,sizeof(output),&received) == 0 && received == 3 && !memcmp(output,"end",3));
+    CHECK("h2/finish-clean-eof",core_http2_read(&stream,output,sizeof(output),&received) == 0 && !received);
+    stream.failed=1;
+    CHECK("h2/finish-error-not-clean-eof",core_http2_read(&stream,output,sizeof(output),&received) < 0);
+    stream.failed=0; stream.consumed=0;
+    CHECK("h2/finish-does-not-reset-complete-stream",advance_streams(&actor) == 0 && actor.requests == other && wire.frames == 6);
+    other->ended=1; sibling.eof=1;
+    CHECK("h2/half-closed-stream-counts-toward-peer-limit",request_active(&actor) == 1);
+    REQUIRE("h2/finish-upload-after-server-end",queue_append(&sibling.tx,(const uint8_t *)"up",2,XMUX_STREAM_LIMIT) == 0); upload_bytes=2;
+    CHECK("h2/finish-server-end-preserves-upload",advance_streams(&actor) == 0 && !sibling.tx.length && wire.frames == 7 && wire.ids[6] == 3 && !wire.flags[6]);
+    free(other); free(stream.tx.data); free(stream.rx.data); free(sibling.tx.data);
+    close(actor.wake[0]); close(actor.wake[1]); close(stream.notify[0]); close(stream.notify[1]); close(sibling.notify[0]); close(sibling.notify[1]);
+    streams=NULL; upload_bytes=download_bytes=0;
+}
 
 static void grpc_pool_policy(void) {
     wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend};
@@ -199,5 +249,6 @@ int main(void) {
     CHECK("xmux/client-limit-reported", !core_xmux_connect(&config,&fixture_backend,error,sizeof(error)) && errno == EAGAIN && strstr(error,"channel allocation"));
     stream_count=0;
     grpc_pool_policy();
+    directional_finish();
     return test_result();
 }

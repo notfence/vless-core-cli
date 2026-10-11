@@ -4,6 +4,7 @@
 #include "json.h"
 #include "utils.h"
 #include "vision.h"
+#include "vless.h"
 #include "xhttp_download.h"
 #include "xhttp_padding.h"
 
@@ -34,6 +35,7 @@ static void fuzz_clear(tls13_conn_t *c) {
     db_free(&c->app_cache);
     db_free(&c->ws_net_cache);
     db_free(&c->xhttp_net_cache);
+    db_free(&c->xmux_raw_input); db_free(&c->xmux_wire_output); db_free(&c->xmux_plain_output);
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -194,8 +196,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             int result = vision_unpad_feed(&unpad, data + off, count, &plain, &length, &direct);
             free(plain);
             if (result != 0) break;
+            (void)vision_unpad_complete(&unpad);
         }
+        (void)vision_unpad_complete(&unpad);
         vision_unpad_free(&unpad);
+        vless_response_t response={0}; size_t offset=0;
+        while (offset < size) {
+            size_t chunk=size-offset < step ? size-offset : step, consumed=0;
+            int result=vless_consume_response(&response,data+offset,chunk,&consumed);
+            if (consumed > chunk) abort();
+            offset+=consumed;
+            if (result || !consumed) break;
+        }
         break;
     }
     case 8: {
@@ -210,7 +222,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (!hello) {
             vless_config_t config; core_config_defaults(&config); strcpy(config.sni,"vless-core.test"); config.fp_mode=FP_FIREFOX;
             uint8_t private_key[32],public_key[32],random[32],auth[32]; size_t sid;
-            if (build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&hello_length,&sid,NULL)) abort();
+            if (build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&hello_length,&sid,NULL,NULL)) abort();
         }
         core_tls_hello_t server;
         if (!core_tls_hello_parse(data,size,hello,hello_length,&server) && server.retry) {
@@ -229,6 +241,24 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         free(payload);
         close(pair[0]);
         close(pair[1]);
+        if (socketpair(AF_UNIX,SOCK_STREAM,0,pair)) abort();
+        c.fd=pair[0]; c.mode=CONN_MODE_TLS; c.tls_post_handshake.len=0;
+        if (tls13_start_relay(&c)) abort();
+        uint8_t *record=NULL; size_t record_length=0; uint64_t sequence=0;
+        if (encrypt_record(&c,c.s_app_key,c.s_app_iv,&sequence,size && (data[0]&1) ? 22 : 23,data,size < 16384 ? size : 16384,&record,&record_length)) abort();
+        if (size && (data[0]&2)) record[record_length-1]^=1;
+        size_t cut=size ? data[0]%record_length : 0;
+        if (write_exact(pair[1],record,cut)) abort();
+        uint8_t output[256]; size_t received=0;
+        (void)tls13_read_app(&c,output,sizeof(output),&received);
+        if (write_exact(pair[1],record+cut,record_length-cut) || shutdown(pair[1],SHUT_WR)) abort();
+        free(record);
+        for (size_t i=0;i<32;i++) {
+            int result=tls13_read_app(&c,output,sizeof(output),&received);
+            if (result < 0 || (!result && !received)) break;
+        }
+        (void)tls13_finish_write(&c,0); (void)tls13_flush(&c);
+        close(pair[0]); close(pair[1]);
         break;
     }
     }

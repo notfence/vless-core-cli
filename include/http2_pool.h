@@ -37,5 +37,7 @@ int core_http2_reserve_write(core_http2_stream_t *, size_t);
 void core_http2_release_write(core_http2_stream_t *);
 int core_http2_write(core_http2_stream_t *, const uint8_t *, size_t);
 int core_http2_read(core_http2_stream_t *, uint8_t *, size_t, size_t *);
+int core_http2_finish_write(core_http2_stream_t *);
+int core_http2_finish_pending(const core_http2_stream_t *);
 void core_http2_close(core_http2_stream_t *);
 #endif

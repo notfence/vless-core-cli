@@ -287,6 +287,11 @@ void vision_unpad_init(vision_unpad_t *ctx, const uint8_t uuid[16]) {
     ctx->remaining_padding = -1;
 }
 
+int vision_unpad_complete(const vision_unpad_t *ctx) {
+    return ctx && !ctx->stash_len && ctx->remaining_content <= 0 && ctx->remaining_padding <= 0 &&
+        (ctx->remaining_command == -1 || (ctx->remaining_command == 5 && ctx->completed_block));
+}
+
 void vision_unpad_free(vision_unpad_t *ctx) {
     if (ctx->stash != NULL) {
         free(ctx->stash);
@@ -316,10 +321,10 @@ int vision_unpad_feed(vision_unpad_t *ctx, const uint8_t *in, size_t in_len, uin
         if (ctx->remaining_command == -1 && ctx->remaining_content == -1 && ctx->remaining_padding == -1) {
             size_t remain = ctx->stash_len - i;
             int padding_ended = ctx->current_command == CMD_END || ctx->current_command == CMD_DIRECT;
-            if (!padding_ended && remain < 16) {
+            if (!padding_ended && remain < 16 && !memcmp(ctx->stash+i,ctx->uuid,remain)) {
                 break;
             }
-            if (padding_ended || memcmp(ctx->stash + i, ctx->uuid, 16) != 0) {
+            if (padding_ended || remain < 16 || memcmp(ctx->stash + i, ctx->uuid, 16) != 0) {
                 if (append_bytes(&plain, &plain_len, &plain_cap, ctx->stash + i, remain) != 0) {
                     free(plain);
                     return -1;
@@ -386,6 +391,7 @@ int vision_unpad_feed(vision_unpad_t *ctx, const uint8_t *in, size_t in_len, uin
         }
 
         if (ctx->remaining_command <= 0 && ctx->remaining_content <= 0 && ctx->remaining_padding <= 0) {
+            ctx->completed_block=1;
             if (ctx->current_command == CMD_CONTINUE) {
                 ctx->remaining_command = 5;
                 ctx->remaining_content = 0;

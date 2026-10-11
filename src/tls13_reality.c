@@ -145,6 +145,7 @@ struct tls13_conn {
     core_xmux_stream_t *xmux_stream;
     struct tls13_conn *xmux_owner;
     int xmux_physical, xmux_async;
+    int relay_async,relay_raw_finish;
     dynbuf_t xmux_raw_input, xmux_plain_output, xmux_wire_output;
     size_t xmux_ssl_write_length;
     uint64_t xmux_enqueued, xmux_flushed;
@@ -175,7 +176,7 @@ struct tls13_conn {
     int tls_h2_required, tls_is_reality;
     dynbuf_t tls_client_hello;
     EVP_PKEY *tls_retry_key;
-    unsigned tls_retry_group;
+    unsigned tls_retry_group,tls_exchange_group;
     int tls_retry_seen;
 
     uint8_t hs_secret[64];
@@ -260,6 +261,7 @@ struct tls13_conn {
     dynbuf_t transcript;
     dynbuf_t app_cache;
     int reality_raw_direct;
+    int send_closed, receive_closed;
 
     uint32_t h2_stream_id;
     uint32_t h2_header_stream_id;
@@ -281,6 +283,7 @@ struct tls13_conn {
 
 static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len);
 static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache);
+static int write_exact(int fd, const void *buf, size_t len);
 static int h2_pump_one_frame(tls13_conn_t *c);
 static int h2_cached_frame_ready(const tls13_conn_t *c);
 static const core_xmux_backend_t xmux_backend;
@@ -453,6 +456,12 @@ static int db_append(dynbuf_t *b, const void *src, size_t n) {
     return 0;
 }
 
+static int relay_write_wire(tls13_conn_t *c, const void *data, size_t length) {
+    if (!c->relay_async) return write_exact(c->fd,data,length);
+    if (length > 256U*1024U-c->xmux_wire_output.len) { errno=EAGAIN; return -1; }
+    return db_append(&c->xmux_wire_output,data,length);
+}
+
 static void db_consume(dynbuf_t *b, size_t n) {
     if (n >= b->len) {
         b->len = 0;
@@ -582,7 +591,8 @@ static int fd_read_some(int fd, uint8_t *buf, size_t cap, size_t *out_len) {
         return 0;
     }
     ssize_t n = core_recv(fd, buf, cap, 0);
-    if (n <= 0) {
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
     }
     *out_len = (size_t)n;
@@ -1447,6 +1457,7 @@ static int ws_conn_read_some(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *
 }
 
 static int ws_conn_write_all(tls13_conn_t *c, const void *buf, size_t len) {
+    if (c->relay_async) return relay_write_wire(c,buf,len);
     const uint8_t *bytes=buf;
     for (size_t offset=0;offset<len;) {
         int result;
@@ -2468,6 +2479,7 @@ static int grpc_pool_read(tls13_conn_t *c, uint8_t *buffer, size_t capacity, siz
         int result=core_http2_read(c->xmux_stream,input,sizeof(input),&received);
         if (result < 0) return core_grpc_complete(&c->grpc_decoder) ? result : -1;
         if (result > 0) return result;
+        if (!received) return core_grpc_complete(&c->grpc_decoder) ? 0 : -1;
         if (grpc_feed_data(c,input,received)) return -1;
         if (!c->app_cache.len) return 1;
     }
@@ -3708,7 +3720,7 @@ static int x25519_shared(const uint8_t priv[32], const uint8_t peer_pub[32], uin
 }
 
 #if !defined(OPENSSL_VERSION_MAJOR) || OPENSSL_VERSION_MAJOR < 3
-static int p256_generate_public_legacy(uint8_t pub[65]) {
+static int p256_generate_public_legacy(uint8_t pub[65], EVP_PKEY **retained) {
     EC_KEY *key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
     if (key == NULL) {
         return -1;
@@ -3720,12 +3732,17 @@ static int p256_generate_public_legacy(uint8_t pub[65]) {
         ok = group != NULL && point != NULL &&
              EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, pub, 65, NULL) == 65;
     }
+    if (ok && retained) {
+        *retained=EVP_PKEY_new();
+        if (!*retained || EVP_PKEY_assign_EC_KEY(*retained,key) != 1) { EVP_PKEY_free(*retained); *retained=NULL; ok=0; }
+        else key=NULL;
+    }
     EC_KEY_free(key);
     return ok ? 0 : -1;
 }
 #endif
 
-static int p256_generate_public(uint8_t pub[65]) {
+static int p256_generate_public(uint8_t pub[65], EVP_PKEY **retained) {
 #if defined(OPENSSL_VERSION_MAJOR) && OPENSSL_VERSION_MAJOR >= 3
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
     EVP_PKEY *key = NULL;
@@ -3746,11 +3763,12 @@ static int p256_generate_public(uint8_t pub[65]) {
         ok = 1;
     }
 
+    if (ok && retained) { *retained=key; key=NULL; }
     EVP_PKEY_free(key);
     EVP_PKEY_CTX_free(ctx);
     return ok ? 0 : -1;
 #else
-    return p256_generate_public_legacy(pub);
+    return p256_generate_public_legacy(pub,retained);
 #endif
 }
 
@@ -3972,9 +3990,9 @@ static int ext_key_share(dynbuf_t *exts, uint16_t grease, const uint8_t pubkey[3
     return add_ext(exts, 0x0033, data, off);
 }
 
-static int ext_key_share_firefox(dynbuf_t *exts, const uint8_t x25519_pub[32], const uint8_t *hybrid_pub) {
+static int ext_key_share_firefox(dynbuf_t *exts, const uint8_t x25519_pub[32], const uint8_t *hybrid_pub, EVP_PKEY **retained) {
     uint8_t p256_pub[65];
-    if (p256_generate_public(p256_pub) != 0) {
+    if (p256_generate_public(p256_pub,retained) != 0) {
         return -1;
     }
 
@@ -4118,7 +4136,7 @@ static int shuffle_indices(size_t *idx, size_t n) {
 
 static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_offer_t cipher_offer, uint8_t client_priv[32],
                               uint8_t client_pub[32], uint8_t client_random[32], uint8_t auth_key[32], uint8_t **out, size_t *out_len,
-                              size_t *sid_pos, const uint8_t *hybrid_pub) {
+                              size_t *sid_pos, const uint8_t *hybrid_pub, EVP_PKEY **retained) {
     dynbuf_t hs = {0};
 
     if (x25519_generate(client_priv, client_pub) != 0) {
@@ -4245,7 +4263,7 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
             ext_renegotiation_info(&exts) != 0 || ext_supported_groups_firefox(&exts, hybrid_pub != NULL) != 0 ||
             ext_ec_point_formats(&exts) != 0 || ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 ||
             ext_status_request(&exts) != 0 || ext_delegated_credentials_firefox(&exts) != 0 ||
-            ext_key_share_firefox(&exts, client_pub, hybrid_pub) != 0 || ext_supported_versions_firefox(&exts) != 0 ||
+            ext_key_share_firefox(&exts, client_pub, hybrid_pub,retained) != 0 || ext_supported_versions_firefox(&exts) != 0 ||
             ext_sig_algs_firefox(&exts) != 0 || ext_psk_modes(&exts) != 0 || ext_record_size_limit_firefox(&exts) != 0 ||
             ext_ech_grease_firefox(&exts) != 0) {
             db_free(&exts);
@@ -5134,6 +5152,7 @@ int tls13_reality_is_raw_direct(const tls13_conn_t *c) {
 }
 
 int tls13_needs_write(const tls13_conn_t *c) {
+    if (c && c->relay_async && c->xmux_wire_output.len && !c->xmux_write_wants_read) return 1;
     if (c && c->mode == CONN_MODE_WS) return c->ws_want_write;
     return c != NULL && c->mode == CONN_MODE_XHTTP_TLS && c->ssl != NULL && SSL_want_write(c->ssl);
 }
@@ -5154,6 +5173,55 @@ int tls13_tick(tls13_conn_t *c) {
     return 0;
 }
 
+int tls13_start_relay(tls13_conn_t *c) {
+    if (!c || c->xmux_stream || (c->mode != CONN_MODE_PLAIN && c->mode != CONN_MODE_TLS && c->mode != CONN_MODE_REALITY && c->mode != CONN_MODE_WS)) return 0;
+    int flags=fcntl(c->fd,F_GETFL,0);
+    if (flags < 0 || fcntl(c->fd,F_SETFL,flags|O_NONBLOCK)) return -1;
+    if (c->ssl) SSL_set_mode(c->ssl,SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER|SSL_MODE_ENABLE_PARTIAL_WRITE);
+    c->relay_async=1; return 0;
+}
+
+int tls13_flush(tls13_conn_t *c) {
+    if (!c || !c->relay_async) return 0;
+    if (c->xmux_wire_output.len) {
+        ssize_t sent;
+        if (c->ssl) {
+            if (!c->xmux_ssl_write_length) c->xmux_ssl_write_length=c->xmux_wire_output.len > 16384 ? 16384 : c->xmux_wire_output.len;
+            ERR_clear_error(); sent=SSL_write(c->ssl,c->xmux_wire_output.data,(int)c->xmux_ssl_write_length);
+            if (sent <= 0) {
+                int error=SSL_get_error(c->ssl,(int)sent);
+                c->xmux_write_wants_read=error == SSL_ERROR_WANT_READ;
+                return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE || (error == SSL_ERROR_SYSCALL && errno == EINTR) ? 0 : -1;
+            }
+            c->xmux_ssl_write_length=0; c->xmux_write_wants_read=0;
+        } else {
+            sent=core_send(c->fd,c->xmux_wire_output.data,c->xmux_wire_output.len,MSG_DONTWAIT);
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+            if (sent <= 0) return -1;
+        }
+        db_consume(&c->xmux_wire_output,(size_t)sent);
+    }
+    if (c->relay_raw_finish && !c->xmux_wire_output.len) {
+        c->relay_raw_finish=0;
+        return shutdown(c->fd,SHUT_WR);
+    }
+    return 0;
+}
+
+int tls13_write_raw(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    return !c || c->send_closed ? -1 : relay_write_wire(c,buf,len);
+}
+
+int tls13_has_pending_raw(const tls13_conn_t *c) { return c && c->xmux_raw_input.len; }
+
+int tls13_read_raw(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
+    *out_len=0;
+    if (!c || !cap) return c ? 0 : -1;
+    if (!c->xmux_raw_input.len) return fd_read_some(c->fd,buf,cap,out_len);
+    size_t take=c->xmux_raw_input.len < cap ? c->xmux_raw_input.len : cap;
+    memcpy(buf,c->xmux_raw_input.data,take); db_consume(&c->xmux_raw_input,take); *out_len=take; return 0;
+}
+
 int tls13_has_pending_app(const tls13_conn_t *c) {
     if (c && c->xmux_stream) return c->app_cache.len || core_xmux_pending(c->xmux_stream);
     if (tls13_uses_h2(c)) {
@@ -5169,6 +5237,13 @@ int tls13_has_pending_input(const tls13_conn_t *c) {
     if (c->xmux_stream) return c->app_cache.len || core_xmux_pending(c->xmux_stream);
     if (c->app_cache.len > 0) {
         return 1;
+    }
+    if (c->relay_async && (c->mode == CONN_MODE_TLS || c->mode == CONN_MODE_REALITY)) {
+        if (c->receive_closed) return 1;
+        if (c->xmux_raw_input.len >= 5) {
+            size_t length=((size_t)c->xmux_raw_input.data[3]<<8)|c->xmux_raw_input.data[4];
+            if (length > 18432 || c->xmux_raw_input.len >= length+5) return 1;
+        }
     }
     if (tls13_uses_h2(c) && c->h2_stream_eof) {
         return 1;
@@ -5282,6 +5357,7 @@ size_t tls13_write_batch_size(const tls13_conn_t *c) {
 }
 
 size_t tls13_write_capacity(const tls13_conn_t *c) {
+    if (c && c->relay_async) return c->send_closed ? 0 : 256U*1024U-c->xmux_wire_output.len;
     return c && c->xmux_stream ? core_xmux_write_capacity(c->xmux_stream) : SIZE_MAX;
 }
 
@@ -5316,11 +5392,12 @@ static int tls_update_keys(tls13_conn_t *c, int sending) {
 }
 
 static int tls_key_update_reply(tls13_conn_t *c) {
+    if (c->send_closed) return -1;
     const uint8_t message[]={24,0,0,1,0}; uint8_t *record=NULL; size_t length=0;
     if (encrypt_record(c,c->c_app_key,c->c_app_iv,&c->c_app_seq,22,message,sizeof(message),&record,&length)) return -1;
     int result;
     if (c->xmux_async) result=length > 256U*1024U-c->xmux_wire_output.len ? -1 : db_append(&c->xmux_wire_output,record,length);
-    else result=write_exact(c->fd,record,length);
+    else result=relay_write_wire(c,record,length);
     free(record);
     return result ? -1 : tls_update_keys(c,1);
 }
@@ -5342,10 +5419,11 @@ static int tls_post_handshake(tls13_conn_t *c, const uint8_t *data, size_t lengt
 }
 
 static int tls_application_plain(tls13_conn_t *c, unsigned type, const uint8_t *data, size_t length, dynbuf_t *cache) {
+    if (c->receive_closed) return -1;
     if (type == 22) return tls_post_handshake(c,data,length);
     if (c->tls_post_handshake.len) return -1;
     if (type == 23) return db_append(cache,data,length);
-    if (type == 21 && length == 2 && data[1] == 0) return 1;
+    if (type == 21 && length == 2 && data[1] == 0) { c->receive_closed=1; return 1; }
     return -1;
 }
 
@@ -5462,11 +5540,13 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     size_t ch_len = 0;
     size_t sid_pos = 0;
 
-    if (build_client_hello(cfg, use_reality, cipher_offer, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos, hybrid_pub) !=
+    EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL;
+    if (build_client_hello(cfg, use_reality, cipher_offer, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos, hybrid_pub,&c->tls_retry_key) !=
         0) {
         set_err(err, err_cap, "failed to build ClientHello");
         return -1;
     }
+    if (c->tls_retry_key) c->tls_exchange_group=23;
 
     uint8_t *ch_record = (uint8_t *)malloc(5 + ch_len);
     if (ch_record == NULL) {
@@ -5499,6 +5579,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     uint8_t server_share[TLS_HYBRID_SERVER_SHARE_SIZE];
     size_t share_len = 0;
     uint16_t server_cipher = 0;
+    uint16_t server_group = 0;
     int got_server_hello = 0;
 
     for (int attempts = 0; attempts < 16 && !got_server_hello; attempts++) {
@@ -5532,10 +5613,12 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
                     if (server.retry) {
                         if (c->tls_retry_seen || use_reality) { db_free(&plain_hs); set_err(err,err_cap,c->tls_retry_seen ? "repeated TLS HelloRetryRequest" : "REALITY HelloRetryRequest is unsupported"); return -1; }
                         uint8_t hash[64],*retry=NULL; size_t retry_length=0;
+                        EVP_PKEY *retry_key=NULL;
                         if (configure_tls_cipher(c,server.cipher) || transcript_hash(c,hash) ||
-                            core_tls_hello_retry(c->tls_client_hello.data,c->tls_client_hello.len,&server,&retry,&retry_length,&c->tls_retry_key)) {
+                            core_tls_hello_retry(c->tls_client_hello.data,c->tls_client_hello.len,&server,&retry,&retry_length,&retry_key)) {
                             db_free(&plain_hs); set_err(err,err_cap,"unsupported TLS HelloRetryRequest"); return -1;
                         }
+                        if (retry_key) { EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=retry_key; c->tls_exchange_group=server.group; }
                         c->transcript.len=0; uint8_t message_hash[]={254,0,0,(uint8_t)c->tls_hash_len};
                         int result=append_transcript(c,message_hash,4) || append_transcript(c,hash,c->tls_hash_len) ||
                             append_transcript(c,plain_hs.data,4+mlen) || append_transcript(c,retry,retry_length);
@@ -5564,6 +5647,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
                         db_free(&plain_hs);
                         return -1;
                     }
+                    server_group=server.group;
                     got_server_hello = 1;
                     db_consume(&plain_hs, 4 + mlen);
                     break;
@@ -5603,9 +5687,9 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
 #endif
     }
     int exchange_result;
-    if (c->tls_retry_key) {
+    if (c->tls_retry_key && server_group == c->tls_exchange_group) {
         shared_len=sizeof(shared);
-        exchange_result=core_tls_ecdh(c->tls_retry_key,(uint16_t)c->tls_retry_group,server_share,share_len,shared,&shared_len);
+        exchange_result=core_tls_ecdh(c->tls_retry_key,server_group,server_share,share_len,shared,&shared_len);
     } else exchange_result=x25519_shared(client_priv, server_share + share_len - 32, shared + shared_len - 32);
     if (exchange_result != 0) {
         set_err(err, err_cap, "ECDH failed");
@@ -5616,8 +5700,8 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         set_err(err, err_cap, "failed to derive handshake keys");
         return -1;
     }
-    vc_log_debug("tls", "selected key exchange=%s",c->tls_retry_group == 23 ? "P-256" : c->tls_retry_group == 24 ? "P-384" :
-        c->tls_retry_group == 25 ? "P-521" : shared_len == 64 ? "X25519MLKEM768" : "X25519");
+    vc_log_debug("tls", "selected key exchange=%s",server_group == 23 ? "P-256" : server_group == 24 ? "P-384" :
+        server_group == 25 ? "P-521" : shared_len == 64 ? "X25519MLKEM768" : "X25519");
 
     dynbuf_t enc_hs = {0};
     int got_finished = 0;
@@ -5776,7 +5860,7 @@ static void reset_manual_tls_handshake(tls13_conn_t *c) {
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL;
     db_free(&c->tls_certificate_message); c->tls_auth_state=0;
     db_free(&c->tls_post_handshake); c->tls_selected_alpn[0]=0;
-    db_free(&c->tls_client_hello); EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL; c->tls_retry_seen=0; c->tls_retry_group=0;
+    db_free(&c->tls_client_hello); EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL; c->tls_retry_seen=0; c->tls_retry_group=0; c->tls_exchange_group=0;
     c->tls_cipher_suite = 0;
     c->tls_md = NULL;
     c->tls_hash_len = 0;
@@ -6344,13 +6428,13 @@ void tls13_reality_close(tls13_conn_t *c) {
         return;
     }
     if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); free(c); return; }
-    if (c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
+    if (!c->send_closed && c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
         int upload_fd = strcmp(c->xhttp_transport_mode, "stream-one") == 0 ? c->fd : c->xhttp_upload_fd;
         if (upload_fd >= 0) {
             (void)write_exact(upload_fd, "0\r\n\r\n", 5);
         }
     }
-    if (c->grpc_transport && !c->grpc_physical_only && c->h2_stream_id != 0 && c->fd >= 0) {
+    if (!c->send_closed && c->grpc_transport && !c->grpc_physical_only && c->h2_stream_id != 0 && c->fd >= 0) {
         (void)h2_send_frame(c, H2_FRAME_DATA, H2_FLAG_END_STREAM, c->h2_stream_id, NULL, 0);
     }
     if (c->xhttp_upload_fd >= 0) {
@@ -6411,7 +6495,7 @@ static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t
         if (encrypt_record(c, c->c_app_key, c->c_app_iv, &c->c_app_seq, 0x17, buf + off, chunk, &rec, &rec_len) != 0) {
             return -1;
         }
-        if (write_exact(c->fd, rec, rec_len) != 0) {
+        if (relay_write_wire(c, rec, rec_len) != 0) {
             free(rec);
             return -1;
         }
@@ -6423,13 +6507,14 @@ static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t
 }
 
 int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    if (c->send_closed || (c->mode == CONN_MODE_WS && (c->ws_close_sent || c->ws_decoder.closed))) return -1;
     if (c->xmux_stream && !c->grpc_transport) return core_xmux_write(c->xmux_stream, buf, len);
     if (c->grpc_transport) {
         return grpc_write_hunk(c, buf, len);
     }
 
     if (c->mode == CONN_MODE_PLAIN) {
-        return write_exact(c->fd, buf, len);
+        return relay_write_wire(c,buf,len);
     }
 
     if (c->mode == CONN_MODE_WS) {
@@ -6516,16 +6601,37 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     return reality_write_app_records(c, buf, len);
 }
 
+static int relay_read_record(tls13_conn_t *c, uint8_t *type, uint8_t **payload, size_t *length) {
+    for (;;) {
+        if (c->xmux_raw_input.len >= 5) {
+            size_t size=((size_t)c->xmux_raw_input.data[3]<<8)|c->xmux_raw_input.data[4];
+            if (size > 18432) return -1;
+            if (c->xmux_raw_input.len >= size+5) {
+                *payload=malloc(size ? size : 1); if (!*payload) return -1;
+                *type=c->xmux_raw_input.data[0]; *length=size;
+                memcpy(*payload,c->xmux_raw_input.data+5,size); db_consume(&c->xmux_raw_input,size+5); return 0;
+            }
+        }
+        uint8_t input[16384]; ssize_t received=core_recv(c->fd,input,sizeof(input),MSG_DONTWAIT);
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 2;
+        if (received < 0 && errno == EINTR) continue;
+        if (received <= 0) return received < 0 || c->xmux_raw_input.len ? -1 : 1;
+        if (db_append(&c->xmux_raw_input,input,(size_t)received)) return -1;
+    }
+}
+
 static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
+    if (c->receive_closed) return 0;
     for (;;) {
         uint8_t rtype = 0;
         uint8_t *pl = NULL;
         size_t pl_len = 0;
-        int record_result = read_record(c->fd, &rtype, &pl, &pl_len);
+        int record_result = c->relay_async ? relay_read_record(c,&rtype,&pl,&pl_len) : read_record(c->fd, &rtype, &pl, &pl_len);
+        if (record_result == 2) return 1;
         if (record_result > 0) {
             if (c->tls_post_handshake.len) { vc_log_error("tls","truncated post-handshake message"); return -1; }
-            vc_log_debug("tls", "peer EOF in app phase fd=%d", c->fd);
-            return 0;
+            vc_log_error("tls", "peer EOF without close_notify fd=%d", c->fd);
+            return -1;
         }
         if (record_result < 0) {
             vc_log_error("tls", "read_record failed in app phase fd=%d errno=%d (%s)", c->fd, errno, strerror(errno));
@@ -6576,7 +6682,7 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
         } else if (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_PLAIN) {
             int rc = xhttp_fill_app_cache(c);
             if (rc < 0) {
-                return -1;
+                return c->xhttp_eof ? 0 : -1;
             }
             if (rc > 0) {
                 return 1;
@@ -6584,7 +6690,7 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
         } else if (c->mode == CONN_MODE_XHTTP_TLS_H2 || c->mode == CONN_MODE_GRPC_PLAIN) {
             int rc = h2_fill_app_cache(c);
             if (rc < 0) {
-                return -1;
+                return c->h2_stream_eof ? 0 : -1;
             }
             if (rc > 0) {
                 return 1;
@@ -6592,13 +6698,14 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
         } else if (c->mode == CONN_MODE_XHTTP_REALITY) {
             int rc = h2_fill_app_cache(c);
             if (rc < 0) {
-                return -1;
+                return c->h2_stream_eof ? 0 : -1;
             }
             if (rc > 0) {
                 return 1;
             }
-        } else if (fill_reality_app_cache(c) != 0) {
-            return -1;
+        } else {
+            int result=fill_reality_app_cache(c);
+            if (result) return result;
         }
     }
 
@@ -6612,7 +6719,7 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
     return 0;
 }
 
-int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len) {
+int tls13_read_exact_or_eof(tls13_conn_t *c, uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
         size_t got = 0;
@@ -6621,15 +6728,60 @@ int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len) {
             return -1;
         }
         if (rc > 0) {
-            if ((c->xmux_stream || c->mode == CONN_MODE_WS) && core_wait_socket(c->fd,tls13_needs_write(c) ? POLLOUT : POLLIN,-1) <= 0) return -1;
+            if (tls13_flush(c) || core_wait_socket(c->fd,tls13_needs_write(c) ? POLLOUT : POLLIN,-1) <= 0) return -1;
             continue;
         }
         if (got == 0) {
-            return -1;
+            return off ? -1 : 1;
         }
         off += got;
     }
     return 0;
+}
+
+int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len) {
+    return tls13_read_exact_or_eof(c,buf,len) == 0 ? 0 : -1;
+}
+
+int tls13_finish_pending(const tls13_conn_t *c) {
+    return !c ? -1 : c->xmux_stream ? core_http2_finish_pending(c->xmux_stream) : c->send_closed && (c->xmux_wire_output.len || c->relay_raw_finish);
+}
+
+int tls13_full_close(const tls13_conn_t *c) {
+    return c && c->mode == CONN_MODE_WS && c->ws_decoder.closed;
+}
+
+int tls13_finish_write(tls13_conn_t *c, int raw) {
+    if (!c) return -1;
+    if (c->send_closed) return 0;
+    int result=0;
+    if (c->xmux_stream) result=core_http2_finish_write(c->xmux_stream);
+    else if (c->mode == CONN_MODE_PLAIN || raw) {
+        if (c->relay_async) c->relay_raw_finish=1;
+        else result=shutdown(c->fd,SHUT_WR);
+    }
+    else if (c->mode == CONN_MODE_WS) {
+        const uint8_t code[]={3,0xe8};
+        if (!c->ws_close_sent) result=ws_write_frame(c,8,code,sizeof(code));
+        if (!result) c->ws_close_sent=1;
+    } else if (c->mode == CONN_MODE_XHTTP_PLAIN) {
+        if (strcmp(c->xhttp_transport_mode,"packet-up")) {
+            int fd=!strcmp(c->xhttp_transport_mode,"stream-up") ? c->xhttp_upload_fd : c->fd;
+            result=fd < 0 ? -1 : write_exact(fd,"0\r\n\r\n",5);
+        }
+    } else if (c->grpc_transport || tls13_uses_h2(c)) {
+        if (strcmp(c->xhttp_transport_mode,"packet-up")) {
+            uint32_t stream=!strcmp(c->xhttp_transport_mode,"stream-up") ? c->h2_upload_stream_id : c->h2_stream_id;
+            result=stream ? h2_send_frame(c,H2_FRAME_DATA,H2_FLAG_END_STREAM,stream,NULL,0) : -1;
+        }
+    } else if (c->mode == CONN_MODE_TLS || c->mode == CONN_MODE_REALITY) {
+        const uint8_t alert[]={1,0}; uint8_t *record=NULL; size_t length=0;
+        result=encrypt_record(c,c->c_app_key,c->c_app_iv,&c->c_app_seq,21,alert,sizeof(alert),&record,&length);
+        if (!result) result=relay_write_wire(c,record,length);
+        free(record);
+    }
+    if (!result) c->send_closed=1;
+    return result;
 }
 
 static int xmux_transport_open(const vless_config_t *config, void **output, int *http2, char *error, size_t capacity) {
@@ -6804,12 +6956,13 @@ static int xmux_transport_read_frame(void *opaque, core_xmux_frame_t *frame, siz
         }
         db_consume(&connection->h2_net_cache,event.consumed); return result;
     }
+    if (connection->h2_net_cache.len >= 9 && (connection->h2_net_cache.data[0] ||
+        (((unsigned)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2]) > 16384)) return -1;
     if (!h2_cached_frame_ready(connection)) return 1;
     if (!connection->h2_net_cache.data[3]) {
         size_t length=((size_t)connection->h2_net_cache.data[0]<<16)|((size_t)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2];
         if (length > capacity) return 1;
     }
-    if (connection->h2_net_cache.data[0] || (((unsigned)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2]) > 16384) return -1;
     return h2_read_frame(connection,&frame->type,&frame->flags,&frame->id,&frame->data,&frame->length);
 }
 

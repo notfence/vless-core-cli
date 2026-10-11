@@ -19,6 +19,14 @@ int tls13_has_pending_input(const tls13_conn_t *c);
 int tls13_needs_write(const tls13_conn_t *c);
 int tls13_idle_timeout(const tls13_conn_t *c);
 int tls13_tick(tls13_conn_t *c);
+int tls13_start_relay(tls13_conn_t *c);
+int tls13_flush(tls13_conn_t *c);
+int tls13_write_raw(tls13_conn_t *c, const uint8_t *buf, size_t len);
+int tls13_read_raw(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len);
+int tls13_has_pending_raw(const tls13_conn_t *c);
+int tls13_finish_write(tls13_conn_t *c, int raw);
+int tls13_finish_pending(const tls13_conn_t *c);
+int tls13_full_close(const tls13_conn_t *c);
 int tls13_uses_h2(const tls13_conn_t *c);
 int tls13_uses_async_io(const tls13_conn_t *c);
 int tls13_drain_h2_input(tls13_conn_t *c);
@@ -32,5 +40,6 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len);
 /* Returns 1 after consuming a transport control frame without app data. */
 int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len);
 int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len);
+int tls13_read_exact_or_eof(tls13_conn_t *c, uint8_t *buf, size_t len);
 
 #endif

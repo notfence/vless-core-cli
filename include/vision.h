@@ -22,6 +22,7 @@ typedef struct {
     int32_t remaining_content;
     int32_t remaining_padding;
     int current_command;
+    int completed_block;
 
     uint8_t *stash;
     size_t stash_len;
@@ -34,6 +35,7 @@ int vision_wrap_payload(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, ui
 
 void vision_unpad_init(vision_unpad_t *ctx, const uint8_t uuid[16]);
 void vision_unpad_free(vision_unpad_t *ctx);
+int vision_unpad_complete(const vision_unpad_t *ctx);
 int vision_unpad_feed(vision_unpad_t *ctx, const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len, int *switch_to_direct);
 
 #endif

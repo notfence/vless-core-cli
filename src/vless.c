@@ -4,6 +4,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+int vless_consume_response(vless_response_t *state, const uint8_t *data, size_t length, size_t *consumed) {
+    if (!state || !consumed || (!data && length)) return -1;
+    *consumed=0;
+    while (state->header_bytes < 2 && *consumed < length) {
+        uint8_t byte=data[(*consumed)++];
+        if (!state->header_bytes && byte) return -1;
+        if (state->header_bytes == 1) state->addon_bytes=byte;
+        state->header_bytes++;
+    }
+    if (state->header_bytes < 2) return 0;
+    size_t skip=state->addon_bytes;
+    if (skip > length-*consumed) skip=length-*consumed;
+    *consumed+=skip; state->addon_bytes-=(unsigned)skip;
+    state->complete=!state->addon_bytes;
+    return (int)state->complete;
+}
+
 static int append(uint8_t *buf, size_t cap, size_t *off, const void *src, size_t n) {
     if (*off + n > cap) {
         return -1;

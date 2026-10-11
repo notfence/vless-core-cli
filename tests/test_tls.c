@@ -15,6 +15,7 @@ static void clear_conn(tls13_conn_t *c) {
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL; EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL;
     db_free(&c->h2_net_cache); db_free(&c->h2_send_buf); db_free(&c->app_cache); db_free(&c->transcript);
     db_free(&c->ws_net_cache); db_free(&c->xhttp_net_cache);
+    db_free(&c->xmux_raw_input); db_free(&c->xmux_wire_output); db_free(&c->xmux_plain_output);
     db_free(&c->h2_header_block);
     core_hpack_clear(&c->hpack);
 }
@@ -266,7 +267,7 @@ static int live_xhttp_chunks(const char *uri) {
     CHECK("xhttp/tls-chunk-ending-not-pending", !tls13_has_pending_app(c));
     REQUIRE("xhttp/tls-end-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
     wait_tls_fixture(c);
-    CHECK("xhttp/tls-chunked-eof", tls13_read_app(c, data, sizeof(data), &length) < 0 && c->xhttp_eof);
+    CHECK("xhttp/tls-chunked-eof", tls13_read_app(c, data, sizeof(data), &length) == 0 && !length && c->xhttp_eof);
     CHECK("xhttp/tls-final-flags-restored", fcntl(c->fd, F_GETFL, 0) == flags);
     tls13_reality_close(c);
     return test_result();
@@ -277,7 +278,7 @@ static void hybrid_vectors(void) {
     for (size_t i = 0; i < sizeof(public_key); i++) public_key[i] = (uint8_t)i;
     memset(point, 0x42, sizeof(point));
     dynbuf_t extension = {0};
-    REQUIRE("tls/hybrid-share-build", ext_key_share_firefox(&extension, point, public_key) == 0);
+    REQUIRE("tls/hybrid-share-build", ext_key_share_firefox(&extension, point, public_key,NULL) == 0);
     CHECK("tls/hybrid-share-size", extension.len == 4 + 2 + 4 + 1216 + 4 + 32 + 4 + 65);
     CHECK("tls/hybrid-share-group", extension.data[6] == 0x11 && extension.data[7] == 0xec && extension.data[8] == 4 && extension.data[9] == 0xc0);
     CHECK("tls/hybrid-share-public-key", memcmp(extension.data + 10, public_key, sizeof(public_key)) == 0);
@@ -324,6 +325,94 @@ static void *flow_peer(void *opaque) {
     }
     return NULL;
 }
+static void directional_finish(void) {
+    int pair[2]; uint8_t buffer[128]; size_t length;
+    for (int raw=0;raw<2;raw++) {
+        REQUIRE("tls/finish-socket-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        tls13_conn_t c={.fd=pair[0],.mode=CONN_MODE_TLS};
+        REQUIRE("tls/finish-cipher",configure_tls_cipher(&c,0x1303) == 0);
+        REQUIRE("tls/finish-write",tls13_finish_write(&c,raw) == 0);
+        CHECK("tls/finish-idempotent",tls13_finish_write(&c,raw) == 0 && c.send_closed && c.c_app_seq == (raw ? 0 : 1));
+        CHECK("tls/finish-rejects-new-payload",tls13_write_app(&c,(const uint8_t *)"x",1) < 0);
+        if (raw) CHECK("tls/finish-raw-direction-only",recv(pair[1],buffer,sizeof(buffer),0) == 0);
+        else {
+            uint8_t type=0,*encoded=NULL,*plain=NULL,inner=0; size_t encoded_length=0,plain_length=0; uint64_t sequence=0;
+            REQUIRE("tls/finish-close-notify-record",read_record(pair[1],&type,&encoded,&encoded_length) == 0);
+            CHECK("tls/finish-authenticated-close-notify",decrypt_record(&c,c.c_app_key,c.c_app_iv,&sequence,type,encoded,encoded_length,&plain,&plain_length,&inner) == 0 && inner == 21 && plain_length == 2 && plain[0] == 1 && !plain[1]);
+            free(encoded); free(plain);
+            CHECK("tls/finish-close-notify-sent-once",recv(pair[1],buffer,sizeof(buffer),MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        }
+        uint64_t sequence=0; uint8_t *record=NULL; size_t record_length=0;
+        REQUIRE("tls/finish-peer-can-respond",encrypt_record(&c,c.s_app_key,c.s_app_iv,&sequence,23,(const uint8_t *)"vless-core",10,&record,&record_length) == 0 && write_exact(pair[1],record,record_length) == 0); free(record);
+        CHECK("tls/finish-retains-incoming-payload",tls13_read_app(&c,buffer,sizeof(buffer),&length) == 0 && length == 10 && !memcmp(buffer,"vless-core",10));
+        const uint8_t alert[]={1,0};
+        REQUIRE("tls/finish-peer-close-notify",encrypt_record(&c,c.s_app_key,c.s_app_iv,&sequence,21,alert,sizeof(alert),&record,&record_length) == 0 && write_exact(pair[1],record,record_length) == 0); free(record);
+        CHECK("tls/finish-clean-peer-eof",tls13_read_app(&c,buffer,sizeof(buffer),&length) == 0 && !length);
+        clear_conn(&c); close(pair[0]); close(pair[1]);
+    }
+    for (int upload=0;upload<2;upload++) {
+        REQUIRE("http1/finish-socket-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        tls13_conn_t c={.fd=pair[0],.xhttp_upload_fd=pair[0],.mode=CONN_MODE_XHTTP_PLAIN};
+        strcpy(c.xhttp_transport_mode,upload ? "stream-up" : "stream-one");
+        REQUIRE("http1/finish-payload",tls13_write_app(&c,(const uint8_t *)"last",4) == 0 && tls13_finish_write(&c,0) == 0);
+        CHECK("http1/finish-final-chunk-order",read_exact(pair[1],buffer,14) == 0 && !memcmp(buffer,"4\r\nlast\r\n0\r\n\r\n",14));
+        CHECK("http1/finish-idempotent",tls13_finish_write(&c,0) == 0 && recv(pair[1],buffer,sizeof(buffer),MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        clear_conn(&c); close(pair[0]); close(pair[1]);
+    }
+    tls13_conn_t c={.mode=CONN_MODE_XHTTP_PLAIN,.fd=-1}; strcpy(c.xhttp_transport_mode,"packet-up");
+    CHECK("http1/packet-up-does-not-invent-fin",tls13_finish_write(&c,0) == 0 && c.send_closed);
+}
+
+static void relay_backpressure(void) {
+    int pair[2]; uint8_t payload[65536],output[65536]; memset(payload,0x39,sizeof(payload));
+    REQUIRE("relay/backpressure-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    int small=1024; REQUIRE("relay/backpressure-buffer",setsockopt(pair[0],SOL_SOCKET,SO_SNDBUF,&small,sizeof(small)) == 0);
+    tls13_conn_t c={.fd=pair[0],.mode=CONN_MODE_PLAIN};
+    REQUIRE("relay/backpressure-enable",tls13_start_relay(&c) == 0);
+    CHECK("relay/backpressure-queues-payload",tls13_write_app(&c,payload,sizeof(payload)) == 0 && c.xmux_wire_output.len == sizeof(payload));
+    CHECK("relay/backpressure-does-not-block",tls13_flush(&c) == 0 && c.xmux_wire_output.len && c.xmux_wire_output.len < sizeof(payload));
+    CHECK("relay/backpressure-defers-fin",tls13_finish_write(&c,0) == 0 && tls13_finish_write(&c,0) == 0 && tls13_finish_pending(&c) == 1);
+    size_t total=0;
+    while (total < sizeof(payload)) {
+        ssize_t received=recv(pair[1],output+total,sizeof(output)-total,MSG_DONTWAIT);
+        if (received > 0) total+=(size_t)received;
+        REQUIRE("relay/backpressure-flush-progress",tls13_flush(&c) == 0);
+    }
+    CHECK("relay/backpressure-preserves-all-bytes",!memcmp(payload,output,sizeof(payload)));
+    CHECK("relay/backpressure-fin-after-last-byte",recv(pair[1],output,1,0) == 0 && !tls13_finish_pending(&c));
+    REQUIRE("relay/backpressure-response-after-fin",write_exact(pair[1],"reply",5) == 0);
+    size_t received=0; CHECK("relay/backpressure-retains-opposite-direction",tls13_read_app(&c,output,sizeof(output),&received) == 0 && received == 5 && !memcmp(output,"reply",5));
+    clear_conn(&c); close(pair[0]); close(pair[1]);
+    for (size_t cut=0;cut<32;cut++) {
+        REQUIRE("tls/fragment-relay-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        c=(tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_TLS};
+        REQUIRE("tls/fragment-relay-cipher",configure_tls_cipher(&c,0x1303) == 0 && tls13_start_relay(&c) == 0);
+        uint8_t *record=NULL; size_t length=0; uint64_t sequence=0;
+        REQUIRE("tls/fragment-relay-record",encrypt_record(&c,c.s_app_key,c.s_app_iv,&sequence,23,(const uint8_t *)"vless-core",10,&record,&length) == 0);
+        size_t prefix=cut < length ? cut : length-1;
+        REQUIRE("tls/fragment-relay-prefix",write_exact(pair[1],record,prefix) == 0);
+        received=0;
+        CHECK("tls/fragment-relay-yields",tls13_read_app(&c,output,sizeof(output),&received) == 1 && !received && !tls13_has_pending_input(&c));
+        CHECK("tls/fragment-relay-allows-upload",tls13_write_app(&c,(const uint8_t *)"upload",6) == 0 && tls13_flush(&c) == 0);
+        REQUIRE("tls/fragment-relay-tail",write_exact(pair[1],record+prefix,length-prefix) == 0); free(record);
+        CHECK("tls/fragment-relay-preserves-record",tls13_read_app(&c,output,sizeof(output),&received) == 0 && received == 10 && !memcmp(output,"vless-core",10));
+        clear_conn(&c); close(pair[0]); close(pair[1]);
+    }
+    REQUIRE("vision/raw-tail-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    c=(tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_REALITY};
+    REQUIRE("vision/raw-tail-cipher",configure_tls_cipher(&c,0x1303) == 0 && tls13_start_relay(&c) == 0);
+    uint8_t command[21]={0}; command[16]=2; uint8_t *record=NULL; size_t length=0; uint64_t sequence=0;
+    REQUIRE("vision/raw-tail-record",encrypt_record(&c,c.s_app_key,c.s_app_iv,&sequence,23,command,sizeof(command),&record,&length) == 0);
+    memcpy(payload,record,length); memcpy(payload+length,"raw tail",8); free(record);
+    REQUIRE("vision/raw-tail-combined-wire",write_exact(pair[1],payload,length+8) == 0);
+    received=0;
+    REQUIRE("vision/raw-tail-command",tls13_read_app(&c,output,sizeof(output),&received) == 0 && received == sizeof(command));
+    tls13_mark_raw_direct(&c);
+    CHECK("vision/raw-tail-readiness",tls13_has_pending_raw(&c));
+    CHECK("vision/raw-tail-delivered-before-socket",tls13_read_raw(&c,output,sizeof(output),&received) == 0 && received == 8 && !memcmp(output,"raw tail",8) && !tls13_has_pending_raw(&c));
+    clear_conn(&c); close(pair[0]); close(pair[1]);
+}
+
 static void protocol_edges(void) {
     hybrid_vectors();
     int pair[2]; tls13_conn_t c;
@@ -369,7 +458,7 @@ static void protocol_edges(void) {
     REQUIRE("tls/app-eof-fixture", shutdown(pair[1], SHUT_WR) == 0);
     c = (tls13_conn_t){.fd=pair[0]};
     uint8_t eof_buffer[32]; size_t eof_length = 99;
-    CHECK("tls/app-eof", tls13_read_app(&c, eof_buffer, sizeof(eof_buffer), &eof_length) == 0 && eof_length == 0);
+    CHECK("tls/eof-without-close-notify-rejected", tls13_read_app(&c, eof_buffer, sizeof(eof_buffer), &eof_length) < 0 && eof_length == 0);
     clear_conn(&c); close(pair[0]); close(pair[1]);
     for (int fatal = 0; fatal < 2; fatal++) {
         REQUIRE("tls/alert-pair", socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
@@ -505,6 +594,11 @@ int main(int argc, char **argv) {
     }
     hpack_status_vectors();
     custom_request_headers();
+    tls13_conn_t oversized_h2={.mode=CONN_MODE_GRPC_PLAIN}; core_http2_frame_t invalid_frame;
+    const uint8_t oversized_header[]={1,0,0,0,0,0,0,0,1};
+    REQUIRE("h2/oversized-frame-header-fixture",db_append(&oversized_h2.h2_net_cache,oversized_header,sizeof(oversized_header)) == 0);
+    CHECK("h2/oversized-frame-is-not-backpressure",xmux_transport_read_frame(&oversized_h2,&invalid_frame,0) < 0);
+    clear_conn(&oversized_h2);
     tls13_conn_t completed_http1={.mode=CONN_MODE_XHTTP_PLAIN,.xmux_http1_eof=1}; core_xmux_frame_t closed_http1;
     CHECK("xmux/http1-clean-idle-eof-notification",xmux_transport_read_frame(&completed_http1,&closed_http1,65535) == 0 && closed_http1.event == 4 && !closed_http1.id);
     CHECK("xmux/http1-clean-eof-reported-once",xmux_transport_read_frame(&completed_http1,&closed_http1,65535) == 1);
@@ -512,6 +606,8 @@ int main(int argc, char **argv) {
     hpack_continuation_vectors();
     hpack_response_phases();
     protocol_edges();
+    directional_finish();
+    relay_backpressure();
     tls13_conn_t multiplexed={.mode=CONN_MODE_XHTTP_REALITY};
     uint8_t settings_ack[9]={0,0,0,4,1,0,0,0,0};
     REQUIRE("xmux/h2-response-fixture", db_append(&multiplexed.h2_net_cache,settings_ack,sizeof(settings_ack)) == 0);
@@ -568,7 +664,7 @@ int main(int argc, char **argv) {
     invalidate_cached_tls_endpoint(&cfg, cfg.sni, (void *)&address, sizeof(address)); CHECK("tls/endpoint-invalidate", !get_cached_tls_endpoint(&cfg, cfg.sni, &found, &found_size));
     for (int fp = 0; fp < 6; fp++) for (int offer = 0; offer < 2; offer++) {
         cfg.fp_mode = fp; uint8_t priv[32], pub[32], random[32], auth[32], *hello = NULL; size_t length, sid;
-        REQUIRE("tls/clienthello-build", build_client_hello(&cfg, 0, offer, priv, pub, random, auth, &hello, &length, &sid, NULL) == 0);
+        REQUIRE("tls/clienthello-build", build_client_hello(&cfg, 0, offer, priv, pub, random, auth, &hello, &length, &sid, NULL,NULL) == 0);
         CHECK("tls/clienthello-length", hello[0] == 1 && (((size_t)hello[1]<<16)|((size_t)hello[2]<<8)|hello[3]) == length-4 && sid+32 <= length);
         free(hello);
     }

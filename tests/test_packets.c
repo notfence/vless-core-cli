@@ -3,6 +3,39 @@
 #include "vless.h"
 #include "vision.h"
 
+static void response_vectors(void) {
+    const uint8_t response[]={0,3,'a','b','c','v','l','e','s','s','-','c','o','r','e'};
+    for (size_t split=0;split<=sizeof(response);split++) {
+        vless_response_t state={0}; uint8_t payload[10]; size_t total=0;
+        size_t offsets[]={0,split,sizeof(response)};
+        for (unsigned i=0;i<2;i++) {
+            size_t size=offsets[i+1]-offsets[i],consumed=0;
+            int result=vless_consume_response(&state,response+offsets[i],size,&consumed);
+            REQUIRE("vless/response-header-bounds",result >= 0 && consumed <= size && size-consumed <= sizeof(payload)-total);
+            if (result) { memcpy(payload+total,response+offsets[i]+consumed,size-consumed); total+=size-consumed; }
+        }
+        CHECK("vless/fragmented-response-preserves-tail",state.complete && total == 10 && !memcmp(payload,"vless-core",10));
+    }
+    for (size_t cut=0;cut<5;cut++) {
+        vless_response_t state={0}; size_t consumed=0;
+        CHECK("vless/truncated-response-is-incomplete",vless_consume_response(&state,response,cut,&consumed) == 0 && !state.complete);
+    }
+    vless_response_t state={0}; size_t consumed=0; uint8_t bad[]={1,0};
+    CHECK("vless/response-version-rejected",vless_consume_response(&state,bad,2,&consumed) < 0);
+    uint8_t wire[26]={0}; wire[16]=0; wire[18]=3; wire[20]=2; memcpy(wire+21,"abc",3);
+    for (size_t cut=0;cut<=sizeof(wire);cut++) {
+        vision_unpad_t decoder; vision_unpad_init(&decoder,wire);
+        uint8_t *output=NULL; size_t length=0; int direct=0;
+        REQUIRE("vision/eof-vector",vision_unpad_feed(&decoder,wire,cut,&output,&length,&direct) == 0);
+        CHECK("vision/eof-between-complete-blocks",vision_unpad_complete(&decoder) == (cut == 0 || cut == sizeof(wire)));
+        free(output); vision_unpad_free(&decoder);
+    }
+    vision_unpad_t decoder; vision_unpad_init(&decoder,wire);
+    uint8_t *output=NULL; size_t length=0; int direct=0;
+    CHECK("vision/short-unpadded-tail-preserved",vision_unpad_feed(&decoder,(const uint8_t *)"vless",5,&output,&length,&direct) == 0 && length == 5 && !memcmp(output,"vless",5) && vision_unpad_complete(&decoder));
+    free(output); vision_unpad_free(&decoder);
+}
+
 static void vision_wire_vectors(const uint8_t uuid[16]) {
     for (int command = 1; command <= 2; command++) {
         uint8_t wire[80]; memcpy(wire, uuid, 16);
@@ -83,6 +116,7 @@ static void vision_terminal_reads(const uint8_t uuid[16]) {
 }
 
 int main(void) {
+    response_vectors();
     vless_config_t cfg; char error[128]; uint8_t packet[2048]; size_t length = 0;
     REQUIRE("packets/config", parse_core_uri("vless://00000000-0000-0000-0000-000000000001@127.0.0.1:443", &cfg, error, sizeof(error)) == 0);
     vision_wire_vectors(cfg.uuid);

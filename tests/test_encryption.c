@@ -3,6 +3,8 @@
 #include "uri.h"
 static uint8_t transport_data[131072];
 static size_t transport_length, transport_position;
+static int transport_yielding;
+static uint64_t write_times[64]; static size_t write_count;
 static void *cache_worker(void *opaque) {
     unsigned index=(unsigned)(uintptr_t)opaque;
     uint8_t identity[32]={0},pfs[64],ticket[16],loaded_pfs[64],loaded_ticket[16];
@@ -14,15 +16,23 @@ static void *cache_worker(void *opaque) {
     return NULL;
 }
 int tls13_write_app(tls13_conn_t *c, const uint8_t *data, size_t length) {
+    if (write_count < 64) write_times[write_count++]=core_now_ms();
     (void)c; if (transport_length + length > sizeof(transport_data)) return -1;
     memcpy(transport_data + transport_length, data, length); transport_length += length; return 0;
 }
 int tls13_read_app(tls13_conn_t *c, uint8_t *data, size_t capacity, size_t *length) {
     (void)c; size_t count = transport_length - transport_position; if (count > capacity) count = capacity;
-    memcpy(data, transport_data + transport_position, count); transport_position += count; *length = count; return 0;
+    memcpy(data, transport_data + transport_position, count); transport_position += count; *length = count; return !count && transport_yielding ? 1 : 0;
 }
+int tls13_has_pending_input(const tls13_conn_t *c) { (void)c; return !transport_yielding || transport_position < transport_length; }
+int tls13_get_fd(const tls13_conn_t *c) { (void)c; return -1; }
 int tls13_read_exact_app(tls13_conn_t *c, uint8_t *data, size_t length) {
     size_t got; return tls13_read_app(c, data, length, &got) != 0 || got != length ? -1 : 0;
+}
+int tls13_read_exact_or_eof(tls13_conn_t *c, uint8_t *data, size_t length) {
+    size_t got=0;
+    if (tls13_read_app(c,data,length,&got)) return -1;
+    return got == length ? 0 : !got ? 1 : -1;
 }
 int main(void) {
     vless_encryption_conn_t pending = {0};
@@ -80,6 +90,33 @@ int main(void) {
         CHECK("encryption/raw-fragmented-roundtrip", memcmp(raw, original, sizeof(raw)) == 0); EVP_CIPHER_CTX_free(encode); EVP_CIPHER_CTX_free(decode);
     }
     vless_config_t cfg = {0}; vless_encryption_conn_t *conn = (void *)1; char error[128];
+    vless_encryption_conn_t *eof_writer=calloc(1,sizeof(*eof_writer));
+    REQUIRE("encryption/eof-fixture",eof_writer != NULL);
+    aead_init(&eof_writer->outgoing,context,sizeof(context),secret,32);
+    transport_length=transport_position=0;
+    REQUIRE("encryption/eof-record",vless_encryption_write(eof_writer,payload,1) == 0);
+    size_t whole=transport_length; uint8_t complete_record[64]; memcpy(complete_record,transport_data,whole);
+    for (size_t cut=0;cut<=whole;cut++) {
+        vless_encryption_conn_t *reader=calloc(1,sizeof(*reader)); REQUIRE("encryption/eof-reader",reader != NULL);
+        aead_init(&reader->incoming,context,sizeof(context),secret,32);
+        transport_length=cut; transport_position=0; size_t received=0;
+        int result=vless_encryption_read(reader,output,sizeof(output),&received);
+        CHECK("encryption/clean-eof-vs-truncated-record",!cut ? result == 0 && !received : cut < whole ? result < 0 : result == 0 && received == 1 && output[0] == payload[0]);
+        vless_encryption_close(reader);
+    }
+    for (size_t cut=1;cut<whole;cut++) {
+        memcpy(transport_data,complete_record,whole);
+        vless_encryption_conn_t *reader=calloc(1,sizeof(*reader)); REQUIRE("encryption/fragment-reader",reader != NULL);
+        aead_init(&reader->incoming,context,sizeof(context),secret,32);
+        transport_length=cut; transport_position=0; transport_yielding=1; size_t received=0;
+        CHECK("encryption/partial-record-yields",vless_encryption_read(reader,output,sizeof(output),&received) == 1 && !received && transport_position == cut);
+        CHECK("encryption/partial-record-does-not-block-upload",vless_encryption_write(eof_writer,(const uint8_t *)"upload",6) == 0);
+        memcpy(transport_data,complete_record,whole);
+        transport_length=whole; transport_yielding=0;
+        CHECK("encryption/fragment-tail-retained",vless_encryption_read(reader,output,sizeof(output),&received) == 0 && received == 1 && output[0] == payload[0]);
+        vless_encryption_close(reader);
+    }
+    vless_encryption_close(eof_writer);
     CHECK("encryption/not-configured", vless_encryption_connect(&cfg, NULL, &conn, error, sizeof(error)) != 0 && conn == NULL);
     core_config_defaults(&cfg); cfg.encryption_enabled=1; cfg.encryption_zero_rtt=1;
     cfg.encryption_relay_count=1; cfg.encryption_relays[0].key_len=32;
@@ -150,5 +187,10 @@ int main(void) {
         snprintf(uri,sizeof(uri),"vless://00000000-0000-0000-0000-000000000001@127.0.0.1:1?encryption=mlkem768x25519plus.native.0rtt.%s.7yEo4KXNFHjDGOeL5a-4RTYsbP9p3Tc032CBVdrluQ8",invalid_padding[i]);
         CHECK("encryption/invalid-padding-rejected",parse_core_uri(uri,&cfg,error,sizeof(error)) < 0);
     }
+    transport_length=transport_position=write_count=0;
+    const int lengths[14]={4,3},gaps[14]={20,0}; const uint8_t padding_data[]={0,1,2,3,4,5,6};
+    REQUIRE("encryption/padding-writes",padding_write(NULL,padding_data,sizeof(padding_data),0,lengths,gaps,2) == 0);
+    CHECK("encryption/padding-boundaries",write_count == 2 && transport_length == sizeof(padding_data) && !memcmp(transport_data,padding_data,sizeof(padding_data)));
+    CHECK("encryption/padding-gap-enforced",write_times[1]-write_times[0] >= 15);
     return test_result();
 }

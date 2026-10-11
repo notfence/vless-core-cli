@@ -49,6 +49,10 @@ def seeds():
         "h2":[frame(1,4,1,b"\x88"),frame(1,0,1,b"\x48")+frame(9,4,1,bytes.fromhex("826402")),
               frame(4,1,0,b""),frame(8,0,0,b"\x00\x00\x00\x01"),frame(3,0,1,bytes(4)),
               frame(0,1,1,b"\x00\x00\x00\x00\x0c\x0a\x0avless-core")],
+        "pool":[frame(1,4,1,b"\x88")+frame(0,24,1,b"vless-core")+frame(0,1,1,b""),
+                frame(1,4,3,b"\x88")+frame(3,0,1,bytes(4))+frame(0,2,3,b"vless-core"),
+                frame(7,0,0,b"\x00\x00\x00\x01"+bytes(4)),frame(4,0,0,b"\x00\x04\x00\x00\x04\x00"),
+                frame(1,4,1,b"\x88")+frame(1,5,1,b"\x00\x0bgrpc-status\x010")],
         "grpc":[b"\x00\x00\x00\x00\x0c\x0a\x0avless-core",b"\x0a\x0avless-core",b"\x00"*5,b"\xff"*12,
                 b"\x00\x00\x00\x00\x08\x0a\x03abc\x0a\x01x",b"\x00\x01\x00\x00\x00\x0a\xfb\xff\xff\x07x"],
         "http":[b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nvless-core",
@@ -57,7 +61,8 @@ def seeds():
         "xhttp":[b"a\r\nvless-core\r\n0\r\n\r\n",b"a;vless-core=value\r\nvless-core\r\n0\r\nTrailer: value\r\n\r\n",b"ffffffffffffffff\r\n",b"0\r\n\r\n"],
         "ws":[b"\x82\x0avless-core",b"\x02\x05vless\x80\x05-core",b"\x89\x00",b"\x88\x00",b"\x82\x7e\x00\x0avless-core",b"\x82\x7f"+bytes(7)+b"\x0avless-core",
               b"\x01\x02\xf0\x9f\x89\x00\x80\x02\x98\x80",b"\xc2\x00",b"\x80\x00",b"\x82\x80"+bytes(4),b"\x88\x03\x03\xe8\xff"],
-        "vision":[bytes(16)+bytes([command,0,10,0,0])+b"vless-core" for command in (0,1,2)],
+        "vision":[*[bytes(16)+bytes([command,0,10,0,0])+b"vless-core" for command in (0,1,2)],
+                  b"\x00\x00vless-core",b"\x00\x0avless-coretail",b"\x00\xff",b"\x01\x00",b"short tail"],
         "tls":[b"\x02"+len(hello).to_bytes(3,"big")+hello,b"\x16\x03\x03\x00\x0avless-core",b"\x0b\x00\x00\x05\x00\x00\x00\x01\x00"],
         "encryption":[b"\x02vless-core",b"\x03vless-core",b"\x06vless-core",b"\x07vless-core",b"\x0bvless-core",bytes(21)],
     }
@@ -70,7 +75,7 @@ class FuzzTests(unittest.TestCase):
         self.assertTrue(binary.is_file(),f"missing mandatory fuzzer: {binary}")
         for parser, samples in seeds().items():
             with self.subTest(parser=parser), tempfile.TemporaryDirectory(prefix=f"fuzz-{parser}-",dir=os.environ["TEST_PRIVATE_ROOT"]) as directory:
-                binary=BUILD/("fuzz-encryption" if parser == "encryption" else "fuzz-parsers")
+                binary=BUILD/("fuzz-encryption" if parser == "encryption" else "fuzz-http2-pool" if parser == "pool" else "fuzz-parsers")
                 self.assertTrue(binary.is_file(),f"missing mandatory fuzzer: {binary}")
                 corpus = Path(directory)
                 for index, sample in enumerate(samples):

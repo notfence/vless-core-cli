@@ -1,5 +1,6 @@
 import struct
 import json
+import socket
 import threading
 import time
 import unittest
@@ -14,6 +15,9 @@ def envelope(payload):
     varint.append(length)
     message=b"\x0a"+varint+payload
     return b"\x00"+len(message).to_bytes(4,"big")+message
+
+def data_frames(stream, payload):
+    return b"".join(frame(0,stream=stream,payload=payload[offset:offset+16384]) for offset in range(0,len(payload),16384))
 
 def integer(data, offset, bits):
     value=data[offset]&((1<<bits)-1); offset+=1
@@ -45,7 +49,7 @@ def varint(data, offset):
 class GrpcPeer(Server):
     def __init__(self, maximum=100, acknowledge=True):
         self.maximum=maximum; self.acknowledge=acknowledge
-        self.requests=[]; self.windows=[]; self.ping=threading.Event()
+        self.requests=[]; self.windows=[]; self.ping=threading.Event(); self.finished=threading.Event(); self.uploads=[]
         super().__init__(self.handle)
 
     def handle(self, connection):
@@ -62,10 +66,10 @@ class GrpcPeer(Server):
                 connection.sendall(frame(4,1))
             elif kind == 1:
                 with self.lock: self.requests.append((connection,stream,headers(payload)))
-                streams[stream]={"buffer":bytearray(),"started":False,"responded":False}
+                streams[stream]={"buffer":bytearray(),"started":False,"responded":False,"ended":False}
             elif kind == 0:
                 state=streams[stream]; state["buffer"].extend(payload)
-                connection.sendall(frame(8,payload=size.to_bytes(4,"big"))+frame(8,stream=stream,payload=size.to_bytes(4,"big")))
+                if size: connection.sendall(frame(8,payload=size.to_bytes(4,"big"))+frame(8,stream=stream,payload=size.to_bytes(4,"big")))
                 while len(state["buffer"]) >= 5:
                     length=int.from_bytes(state["buffer"][1:5],"big")
                     if len(state["buffer"]) < length+5: break
@@ -76,6 +80,8 @@ class GrpcPeer(Server):
                         if len(data) < 26 or data[0] != 0: raise AssertionError("invalid VLESS request")
                         state["started"]=True; data=data[26:]
                     if not data: continue
+                    with self.lock: self.uploads.append((stream,data))
+                    if state["ended"]: continue
                     if data == b"reset": connection.sendall(frame(3,stream=stream,payload=(8).to_bytes(4,"big"))); continue
                     if data == b"status":
                         if not state["responded"]: connection.sendall(frame(1,4,stream,b"\x88")); state["responded"]=True
@@ -83,14 +89,43 @@ class GrpcPeer(Server):
                     if not state["responded"]:
                         connection.sendall(frame(1,4,stream,b"\x88")); state["responded"]=True
                         data=b"\x00\x00"+data
-                    connection.sendall(frame(0,stream=stream,payload=envelope(data)))
+                    connection.sendall(data_frames(stream,envelope(data)))
+                    if data.endswith(b"server-fin"):
+                        connection.sendall(frame(1,5,stream,b"\x00\x0bgrpc-status\x010")); state["ended"]=True
                     if data.endswith(b"goaway"): connection.sendall(frame(7,payload=stream.to_bytes(4,"big")+bytes(4)))
+                if flags&1:
+                    if state["buffer"]: raise AssertionError("truncated uplink gRPC message")
+                    if not state["ended"]:
+                        data=b"vless-core final reply"
+                        if not state["responded"]:
+                            connection.sendall(frame(1,4,stream,b"\x88")); state["responded"]=True; data=b"\x00\x00"+data
+                        connection.sendall(data_frames(stream,envelope(data))+frame(1,5,stream,b"\x00\x0bgrpc-status\x010")); state["ended"]=True
+                    self.finished.set()
             elif kind == 6 and not flags&1:
                 self.ping.set()
                 if self.acknowledge: connection.sendall(frame(6,1,payload=payload))
             elif kind == 3: streams.pop(stream,None)
 
 class GrpcTests(unittest.TestCase):
+    def test_client_fin_drains_reply_and_keeps_sibling(self):
+        with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none")) as core:
+            with socks_connect(core.port,80) as sibling, socks_connect(core.port,80) as tunnel:
+                exchange(tunnel,b"vless-core initial")
+                payload=bytes(range(251))*521; tunnel.sendall(payload); tunnel.shutdown(socket.SHUT_WR)
+                expected=payload+b"vless-core final reply"
+                self.assertEqual(exact(tunnel,len(expected)),expected)
+                self.assertEqual(tunnel.recv(1),b""); self.assertTrue(peer.finished.wait(1))
+                exchange(sibling,b"vless-core surviving sibling")
+            self.assertEqual(len(peer.connections),1)
+
+    def test_server_fin_keeps_client_upload_open(self):
+        with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none")) as core:
+            with socks_connect(core.port,80) as tunnel:
+                exchange(tunnel,b"server-fin"); self.assertEqual(tunnel.recv(1),b"")
+                tunnel.sendall(b"vless-core after server FIN"); tunnel.shutdown(socket.SHUT_WR)
+                self.assertTrue(peer.finished.wait(1))
+            self.assertIn(b"vless-core after server FIN",[data for _,data in peer.uploads])
+
     def test_xhttp_settings_do_not_change_grpc_transport(self):
         settings={"address":"127.0.0.2","port":1,"network":"xhttp","security":"none","xhttpSettings":{"path":"/vless-core"}}
         with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none",downloadSettings=json.dumps(settings))) as core:

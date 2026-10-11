@@ -922,12 +922,13 @@ static void *client_worker_run(void *arg) {
     if (cbuf_cap < 8192) {
         cbuf_cap = 8192;
     }
-    uint8_t *cbuf = (uint8_t *)malloc(cbuf_cap);
-    if (cbuf == NULL) {
+    uint8_t *cbuf = (uint8_t *)malloc(cbuf_cap),*output=malloc(256U*1024U);
+    if (cbuf == NULL || output == NULL || tls13_start_relay(tls)) {
         if (use_vision) {
             vision_unpad_free(&vunpad);
         }
         upstream_close(tls, encryption);
+        free(cbuf); free(output);
         close(cfd);
         return NULL;
     }
@@ -939,14 +940,28 @@ static void *client_worker_run(void *arg) {
     int downstream_direct = 0;
     int upstream_encryption_direct = 0;
     int downstream_encryption_direct = 0;
-    int forwarded_client_payload = (first_payload_len > 0) ? 1 : 0;
+    int client_eof=0,upstream_eof=0;
+    int client_send_closed=0; size_t output_length=0;
+    vless_response_t response={0};
 
     while (1) {
-        if (tls13_tick(tls)) break;
+        if (tls13_flush(tls) || tls13_tick(tls)) break;
+        if (output_length) {
+            ssize_t sent=core_send(cfd,output,output_length,MSG_DONTWAIT);
+            if (sent > 0) { output_length-=(size_t)sent; memmove(output,output+sent,output_length); }
+            else if (!sent || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
+        }
+        if (upstream_eof && !output_length && !client_send_closed) {
+            if (shutdown(cfd,SHUT_WR)) break;
+            client_send_closed=1;
+        }
+        int finishing=tls13_finish_pending(tls);
+        if (finishing < 0 || (client_eof && upstream_eof && !finishing && !output_length)) break;
         int client_ready = 0;
-        int client_writable = tls13_write_capacity(tls) >= 128U*1024U;
-        int upstream_ready = !downstream_direct &&
-                             (tls13_has_pending_input(tls) || vless_encryption_has_pending_input(encryption));
+        int client_writable = !client_eof && tls13_write_capacity(tls) >= 128U*1024U;
+        int receive_capacity=output_length <= 256U*1024U-sizeof(tbuf);
+        int upstream_ready = !upstream_eof && receive_capacity &&
+                             (downstream_direct ? tls13_has_pending_raw(tls) : tls13_has_pending_input(tls) || vless_encryption_has_pending_input(encryption));
         if (upstream_ready) {
             int s = client_writable ? core_wait_socket(cfd, POLLIN, 0) : 0;
             if (s < 0 && errno != EINTR) {
@@ -954,31 +969,31 @@ static void *client_worker_run(void *arg) {
             }
             client_ready = s > 0;
         } else {
-            struct pollfd fds[2] = {{.fd=client_writable ? cfd : -1,.events=POLLIN},
-                {.fd=tfd,.events=(short)(POLLIN | (tls13_needs_write(tls) ? POLLOUT : 0))}};
+            struct pollfd fds[2] = {{.fd=client_writable || output_length ? cfd : -1,.events=(short)((client_writable ? POLLIN : 0)|(output_length ? POLLOUT : 0))},
+                {.fd=!upstream_eof || finishing || tls13_needs_write(tls) ? tfd : -1,.events=(short)(((!upstream_eof && receive_capacity) || finishing ? POLLIN : 0) | (tls13_needs_write(tls) ? POLLOUT : 0))}};
             int s = core_poll(fds, 2, tls13_idle_timeout(tls));
             if (s < 0 || tls13_tick(tls)) {
                 break;
             }
             if (s == 0) continue;
             client_ready = (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0;
-            upstream_ready = (fds[1].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR)) != 0;
+            upstream_ready = receive_capacity && (fds[1].revents & (POLLIN | POLLHUP | POLLERR | (tls13_uses_async_io(tls) ? POLLOUT : 0))) != 0;
         }
 
         if (client_ready && tls13_reserve_write(tls, 128U*1024U)) {
             ssize_t n = recv_coalesced(cfd, cbuf, cbuf_cap, cbuf_cap > 8192 ? 2000 : 0);
             if (n <= 0) {
-                break;
-            }
-            if (upstream_direct) {
-                if (write_all(tfd, cbuf, (size_t)n) != 0) {
-                    break;
-                }
-                forwarded_client_payload = 1;
+                tls13_release_write(tls);
+                if (n < 0) break;
+                client_eof=1;
+                if (tls13_finish_write(tls,upstream_direct)) break;
                 continue;
             }
-
-            if (use_vision) {
+            if (upstream_direct) {
+                if (tls13_write_raw(tls, cbuf, (size_t)n) != 0) {
+                    break;
+                }
+            } else if (use_vision) {
                 uint8_t *wrapped = NULL;
                 size_t wrapped_len = 0;
                 if (vision_wrap_payload(&vwrap, cbuf, (size_t)n, &wrapped, &wrapped_len) != 0) {
@@ -997,9 +1012,6 @@ static void *client_worker_run(void *arg) {
                     }
                 }
                 free(wrapped);
-                if (wrapped_len > 0) {
-                    forwarded_client_payload = 1;
-                }
                 if (vwrap.direct_sent) {
                     if (encryption != NULL) {
                         upstream_encryption_direct = 1;
@@ -1011,7 +1023,6 @@ static void *client_worker_run(void *arg) {
                 if (upstream_write(tls, encryption, cbuf, (size_t)n) != 0) {
                     break;
                 }
-                forwarded_client_payload = 1;
             }
             tls13_release_write(tls);
         }
@@ -1024,35 +1035,21 @@ static void *client_worker_run(void *arg) {
             if (tls13_uses_h2(tls) || tls13_uses_async_io(tls)) {
                 upstream_ready = tls13_has_pending_app(tls) || vless_encryption_has_pending_input(encryption);
             }
+            if (upstream_eof) upstream_ready=0;
         }
 
         if (upstream_ready) {
             if (downstream_direct) {
-                ssize_t n = core_recv(tfd, tbuf, sizeof(tbuf), 0);
-                if (n <= 0) {
-                    break;
+                size_t got=0; int result=tls13_read_raw(tls,tbuf,sizeof(tbuf),&got);
+                if (result < 0) break;
+                if (result > 0) continue;
+                if (!got) {
+                    upstream_eof=1;
+                    continue;
                 }
                 if (!received_reply) { received_reply = 1; core_trace_complete(1); }
-                if (write_all(cfd, tbuf, (size_t)n) != 0) {
-                    break;
-                }
+                memcpy(output+output_length,tbuf,got); output_length+=got;
                 continue;
-            }
-
-            if (!got_vless_response) {
-                if (!forwarded_client_payload) {
-                    continue;
-                }
-                if (vless_read_response(tls, encryption) != 0) {
-                    vc_log_error("connection", "VLESS response read failed for %s:%u",
-                                 target_host, (unsigned)target_port);
-                    break;
-                }
-                got_vless_response = 1;
-                core_trace_stage(CORE_TRACE_CARRY);
-                if ((tls13_uses_h2(tls) || tls13_uses_async_io(tls)) && !tls13_has_pending_app(tls) && !vless_encryption_has_pending_input(encryption)) {
-                    continue;
-                }
             }
 
             size_t got = 0;
@@ -1061,22 +1058,43 @@ static void *client_worker_run(void *arg) {
                                     encryption, tbuf, sizeof(tbuf), &got)
                               : upstream_read(tls, encryption, tbuf,
                                               sizeof(tbuf), &got);
-            if (read_rc < 0 || (read_rc == 0 && got == 0)) {
+            if (read_rc < 0) {
+                if (!got_vless_response) vc_log_error("connection","VLESS response read failed: transport closed before the complete header");
                 break;
             }
             if (read_rc > 0) {
                 continue;
             }
+            if (!got) {
+                if (!got_vless_response) {
+                    vc_log_error("connection","VLESS response read failed: truncated header"); break;
+                }
+                if (use_vision && !vision_unpad_complete(&vunpad)) { vc_log_error("connection","truncated Vision response"); break; }
+                upstream_eof=1;
+                if (tls13_full_close(tls)) {
+                    client_eof=1;
+                    if (tls13_finish_write(tls,0)) break;
+                }
+                continue;
+            }
+            if (!got_vless_response) {
+                size_t consumed=0;
+                int parsed=vless_consume_response(&response,tbuf,got,&consumed);
+                if (parsed < 0) { vc_log_error("connection","VLESS response read failed: invalid version"); break; }
+                got-=consumed;
+                if (got) memmove(tbuf,tbuf+consumed,got);
+                if (!parsed) continue;
+                got_vless_response=1; core_trace_stage(CORE_TRACE_CARRY);
+                if (!got) continue;
+            }
 
             if (use_vision) {
                 if (allow_raw_vision && tls13_reality_is_raw_direct(tls)) {
                     if (!received_reply) { received_reply = 1; core_trace_complete(1); }
-                    if (write_all(cfd, tbuf, got) != 0) {
-                        break;
-                    }
+                    memcpy(output+output_length,tbuf,got); output_length+=got;
                     if (!downstream_direct) {
                         downstream_direct = 1;
-                        vc_log_warning("connection", "switched to Vision downstream direct mode by raw fallback for %s:%u",
+                        vc_log_warning("connection", "switched to authenticated Vision downstream direct mode for %s:%u",
                                        target_host, (unsigned)target_port);
                     }
                     continue;
@@ -1090,10 +1108,8 @@ static void *client_worker_run(void *arg) {
                 }
 
                 if (plain_len > 0 && !received_reply) { received_reply = 1; core_trace_complete(1); }
-                if (plain_len > 0 && write_all(cfd, plain, plain_len) != 0) {
-                    free(plain);
-                    break;
-                }
+                if (plain_len > 256U*1024U-output_length) { free(plain); break; }
+                if (plain_len) { memcpy(output+output_length,plain,plain_len); output_length+=plain_len; }
                 free(plain);
 
                 if (switch_to_direct) {
@@ -1106,9 +1122,7 @@ static void *client_worker_run(void *arg) {
                 }
             } else {
                 if (!received_reply) { received_reply = 1; core_trace_complete(1); }
-                if (write_all(cfd, tbuf, got) != 0) {
-                    break;
-                }
+                memcpy(output+output_length,tbuf,got); output_length+=got;
             }
         }
     }
@@ -1117,6 +1131,7 @@ static void *client_worker_run(void *arg) {
         vision_unpad_free(&vunpad);
     }
     free(cbuf);
+    free(output);
     upstream_close(tls, encryption);
     close(cfd);
     return NULL;

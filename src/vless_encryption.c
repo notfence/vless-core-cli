@@ -38,6 +38,10 @@ struct vless_encryption_conn {
     uint8_t *input;
     size_t input_len;
     size_t input_off;
+    int read_eof;
+    uint8_t incoming_random[16],record_header[5];
+    size_t incoming_random_length,record_header_length,record_length,record_received;
+    uint8_t *record_data;
     uint8_t cache_identity[32];
     uint64_t cache_generation;
     int incoming_deferred;
@@ -735,6 +739,7 @@ void vless_encryption_close(vless_encryption_conn_t *conn) {
         return;
     }
     free(conn->input);
+    free(conn->record_data);
     free(conn->prewrite);
     EVP_CIPHER_CTX_free(conn->outgoing_header_ctr);
     EVP_CIPHER_CTX_free(conn->incoming_header_ctr);
@@ -812,47 +817,51 @@ int vless_encryption_write_raw(vless_encryption_conn_t *conn,
 
 static int read_record(vless_encryption_conn_t *conn) {
     if (conn->incoming_deferred) {
-        uint8_t random[16];
-        if (transport_read_exact(conn->transport,random,sizeof(random))) { cache_invalidate(conn); return -1; }
-        aead_init(&conn->incoming,random,sizeof(random),conn->united_key,conn->united_key_len);
-        if (conn->outgoing_header_ctr && aes_ctr_init(&conn->incoming_header_ctr,conn->united_key,conn->united_key_len,random)) {
+        size_t received=0;
+        int result=tls13_read_app(conn->transport,conn->incoming_random+conn->incoming_random_length,sizeof(conn->incoming_random)-conn->incoming_random_length,&received);
+        if (result > 0) return 2;
+        if (result < 0 || !received) { cache_invalidate(conn); return -1; }
+        conn->incoming_random_length+=received;
+        if (conn->incoming_random_length < sizeof(conn->incoming_random)) return 2;
+        aead_init(&conn->incoming,conn->incoming_random,sizeof(conn->incoming_random),conn->united_key,conn->united_key_len);
+        if (conn->outgoing_header_ctr && aes_ctr_init(&conn->incoming_header_ctr,conn->united_key,conn->united_key_len,conn->incoming_random)) {
             cache_invalidate(conn); return -1;
         }
         conn->incoming_deferred=0;
+        OPENSSL_cleanse(conn->incoming_random,sizeof(conn->incoming_random));
+        return 2;
     }
-    uint8_t header[5];
-    if (transport_read_exact(conn->transport, header, sizeof(header)) != 0) {
-        cache_invalidate(conn);
-        return -1;
+    if (!conn->record_data) {
+        size_t received=0;
+        int result=tls13_read_app(conn->transport,conn->record_header+conn->record_header_length,sizeof(conn->record_header)-conn->record_header_length,&received);
+        if (result > 0) return 2;
+        if (result < 0) { cache_invalidate(conn); return -1; }
+        if (!received) {
+            if (conn->record_header_length || conn->cache_generation) { cache_invalidate(conn); return -1; }
+            conn->read_eof=1; return 1;
+        }
+        conn->record_header_length+=received;
+        if (conn->record_header_length < sizeof(conn->record_header)) return 2;
+        if (conn->incoming_header_ctr && aes_ctr_xor(conn->incoming_header_ctr,conn->record_header,sizeof(conn->record_header))) { cache_invalidate(conn); return -1; }
+        conn->record_length=((size_t)conn->record_header[3]<<8)|conn->record_header[4];
+        if (conn->record_header[0] != 23 || conn->record_header[1] != 3 || conn->record_header[2] != 3 || conn->record_length < 17 || conn->record_length > 16640) { cache_invalidate(conn); return -1; }
+        conn->record_data=malloc(conn->record_length);
+        if (!conn->record_data) { cache_invalidate(conn); return -1; }
+        return 2;
     }
-    if (conn->incoming_header_ctr != NULL &&
-        aes_ctr_xor(conn->incoming_header_ctr, header, sizeof(header)) != 0) {
-        cache_invalidate(conn);
-        return -1;
-    }
-    if (header[0] != 23 || header[1] != 3 || header[2] != 3) {
-        cache_invalidate(conn);
-        return -1;
-    }
-    size_t encrypted_len = ((size_t)header[3] << 8) | header[4];
-    if (encrypted_len < 17 || encrypted_len > 16640) {
-        cache_invalidate(conn);
-        return -1;
-    }
-    uint8_t *encrypted = (uint8_t *)malloc(encrypted_len);
-    uint8_t *plain = (uint8_t *)malloc(encrypted_len - 16);
-    if (encrypted == NULL || plain == NULL ||
-        transport_read_exact(conn->transport, encrypted,
-                             encrypted_len) != 0) {
-        cache_invalidate(conn);
-        free(encrypted);
-        free(plain);
-        return -1;
-    }
+    size_t received=0;
+    int result=tls13_read_app(conn->transport,conn->record_data+conn->record_received,conn->record_length-conn->record_received,&received);
+    if (result > 0) return 2;
+    if (result < 0 || !received) { cache_invalidate(conn); return -1; }
+    conn->record_received+=received;
+    if (conn->record_received < conn->record_length) return 2;
+    uint8_t *plain=malloc(conn->record_length-16);
+    if (!plain) { cache_invalidate(conn); return -1; }
     size_t plain_len = 0;
-    int rc = aead_open(&conn->incoming, NULL, encrypted, encrypted_len,
-                       header, sizeof(header), plain, &plain_len);
-    free(encrypted);
+    int rc = aead_open(&conn->incoming, NULL, conn->record_data, conn->record_length,
+                       conn->record_header, sizeof(conn->record_header), plain, &plain_len);
+    free(conn->record_data); conn->record_data=NULL;
+    conn->record_header_length=conn->record_length=conn->record_received=0;
     if (rc != 0) {
         cache_invalidate(conn);
         free(plain);
@@ -876,8 +885,11 @@ int vless_encryption_read(vless_encryption_conn_t *conn,
     if (cap == 0) {
         return 0;
     }
-    if (conn->input_off == conn->input_len && read_record(conn) != 0) {
-        return -1;
+    if (conn->input_off == conn->input_len) {
+        if (conn->read_eof) return 0;
+        int result;
+        do { result=read_record(conn); } while (result == 2 && tls13_has_pending_input(conn->transport));
+        if (result) return result == 2 ? 1 : result > 0 ? 0 : -1;
     }
     size_t available = conn->input_len - conn->input_off;
     size_t take = available < cap ? available : cap;
@@ -890,6 +902,7 @@ int vless_encryption_read(vless_encryption_conn_t *conn,
 int vless_encryption_read_raw(vless_encryption_conn_t *conn,
                               uint8_t *buf, size_t cap, size_t *out_len) {
     int rc = tls13_read_app(conn->transport, buf, cap, out_len);
+    if (!rc && !*out_len && (conn->incoming_raw_header_len || conn->incoming_raw_skip)) return -1;
     if (rc == 0 && *out_len > 0 && conn->incoming_header_ctr != NULL &&
         xor_raw_headers(conn->incoming_header_ctr, buf, *out_len,
                         conn->incoming_raw_header,
@@ -905,8 +918,12 @@ int vless_encryption_read_exact(vless_encryption_conn_t *conn,
     size_t off = 0;
     while (off < len) {
         size_t got = 0;
-        if (vless_encryption_read(conn, buf + off, len - off, &got) != 0 ||
-            got == 0) {
+        int result=vless_encryption_read(conn,buf+off,len-off,&got);
+        if (result > 0) {
+            if (!tls13_has_pending_input(conn->transport) && core_wait_socket(tls13_get_fd(conn->transport),POLLIN,-1) <= 0) return -1;
+            continue;
+        }
+        if (result < 0 || got == 0) {
             return -1;
         }
         off += got;

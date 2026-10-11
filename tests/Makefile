@@ -11,6 +11,7 @@ FUZZ_SRC = $(filter-out $(ROOT)/src/tls13_reality.c,$(BASE_SRC))
 FUZZ_OBJ = $(patsubst $(ROOT)/src/%.c,$(HOST_BUILD_DIR)/fuzz-src/%.o,$(FUZZ_SRC))
 FUZZ_BIN := $(HOST_BUILD_DIR)/fuzz-parsers
 ENCRYPTION_FUZZ_BIN := $(HOST_BUILD_DIR)/fuzz-encryption
+POOL_FUZZ_BIN := $(HOST_BUILD_DIR)/fuzz-http2-pool
 HOST_FLAGS := -O1 -g -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE -I$(ROOT)/include -I$(TEST_OPENSSL_PREFIX)/include $(SANITIZE)
 HOST_LIBS := $(TEST_OPENSSL_PREFIX)/lib/libssl.a $(TEST_OPENSSL_PREFIX)/lib/libcrypto.a -lpthread -ldl $(SANITIZE)
 HOST_LIB_FILES := $(TEST_OPENSSL_PREFIX)/lib/libssl.a $(TEST_OPENSSL_PREFIX)/lib/libcrypto.a
@@ -29,11 +30,12 @@ $(TEST_BINS) $(HOST_BUILD_DIR)/vless-core-test: $(HOST_LIB_FILES)
 $(BASE_OBJ) $(HOST_BUILD_DIR)/src/main.o $(NETWORK_GUARD) $(CLI_COVERAGE_OBJ) $(addsuffix .o,$(addprefix $(HOST_BUILD_DIR)/,$(TEST_NAMES))): $(HOST_BUILD_DIR)/settings
 $(FUZZ_OBJ) $(HOST_BUILD_DIR)/fuzz_parsers.o $(HOST_BUILD_DIR)/fuzz_network_guard.o: $(HOST_BUILD_DIR)/settings
 $(HOST_BUILD_DIR)/fuzz_encryption.o: $(HOST_BUILD_DIR)/settings
+$(HOST_BUILD_DIR)/fuzz_http2_pool.o: $(HOST_BUILD_DIR)/settings
 
 $(HOST_BUILD_DIR)/settings: FORCE | requirements
 	python3 $(ROOT)/tests/requirements.py settings "$@" "$(HOST_CC)" "$(HOST_FLAGS)" "$(HOST_LIBS)" "$(FUZZ_CC)" "$(FUZZ_FLAGS)"
 
-test: requirements $(TEST_BINS) $(HOST_BUILD_DIR)/vless-core-test $(FUZZ_BIN) $(ENCRYPTION_FUZZ_BIN)
+test: requirements $(TEST_BINS) $(HOST_BUILD_DIR)/vless-core-test $(FUZZ_BIN) $(ENCRYPTION_FUZZ_BIN) $(POOL_FUZZ_BIN)
 	TEST_BUILD_DIR="$(HOST_BUILD_DIR)" TEST_OPENSSL_PREFIX="$(TEST_OPENSSL_PREFIX)" TEST_XRAY_BIN="$(TEST_XRAY_BIN)" TEST_HOST_FLAGS="$(HOST_FLAGS)" TEST_HOST_LIBS="$(HOST_LIBS)" TEST_HOST_CC="$(HOST_CC)" TEST_NATIVE_NAMES="$(TEST_NAMES)" TEST_FUZZ_RUNS="$(FUZZ_RUNS)" python3 $(ROOT)/tests/run.py
 
 native: requirements $(TEST_BINS) $(HOST_BUILD_DIR)/vless-core-test
@@ -114,7 +116,14 @@ $(FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_parsers.o $(HOST_BUILD_DIR)/fuzz_network_gua
 $(ENCRYPTION_FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_encryption.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(filter-out $(HOST_BUILD_DIR)/fuzz-src/vless_encryption.o,$(FUZZ_OBJ)) $(HOST_LIB_FILES)
 	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
 
-fuzz: requirements $(FUZZ_BIN) $(ENCRYPTION_FUZZ_BIN)
+$(HOST_BUILD_DIR)/fuzz_http2_pool.o: $(ROOT)/tests/fuzz_http2_pool.c | requirements
+	mkdir -p $(dir $@)
+	$(FUZZ_CC) $(FUZZ_FLAGS) -MMD -MP -c $< -o $@
+
+$(POOL_FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_http2_pool.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(filter-out $(HOST_BUILD_DIR)/fuzz-src/http2_pool.o $(HOST_BUILD_DIR)/fuzz-src/vless.o $(HOST_BUILD_DIR)/fuzz-src/vless_encryption.o,$(FUZZ_OBJ)) $(HOST_LIB_FILES)
+	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
+
+fuzz: requirements $(FUZZ_BIN) $(ENCRYPTION_FUZZ_BIN) $(POOL_FUZZ_BIN)
 	TEST_BUILD_DIR="$(HOST_BUILD_DIR)" TEST_FUZZ_RUNS="$(FUZZ_RUNS)" python3 $(ROOT)/tests/test_fuzz.py
 
 asan:

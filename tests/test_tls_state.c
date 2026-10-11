@@ -41,6 +41,25 @@ static void retry_vectors(const uint8_t *client,size_t length) {
     for (size_t cut=0;cut<size;cut++) CHECK("tls/retry-truncation",core_tls_hello_parse(hello,cut,client,length,&parsed) != 0);
 }
 
+static void initial_share_vectors(void) {
+    vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); config.fp_mode=FP_FIREFOX;
+    EVP_PKEY *key=NULL,*peer=EVP_PKEY_Q_keygen(NULL,NULL,"EC","prime256v1");
+    uint8_t private_key[32],public_key[32],random[32],auth[32],*hello=NULL,peer_public[65],shared[96],expected[96];
+    size_t length=0,sid=0,public_length=0,shared_length=sizeof(shared),expected_length=sizeof(expected),count=0; const uint8_t *extension=NULL;
+    REQUIRE("tls/initial-p256-clienthello",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&length,&sid,NULL,&key) == 0 && key && peer);
+    REQUIRE("tls/initial-p256-extension",hello_extension(hello,length,51,&extension,&count) == 0);
+    const uint8_t *offered=NULL;
+    for (size_t offset=2;offset+4 <= count;) {
+        size_t size=((size_t)extension[offset+2]<<8)|extension[offset+3];
+        REQUIRE("tls/initial-p256-share-bound",size <= count-offset-4);
+        if (extension[offset] == 0 && extension[offset+1] == 23 && size == 65) offered=extension+offset+4;
+        offset+=size+4;
+    }
+    REQUIRE("tls/initial-p256-public-key",offered && EVP_PKEY_get_octet_string_param(peer,OSSL_PKEY_PARAM_PUB_KEY,peer_public,sizeof(peer_public),&public_length) == 1);
+    CHECK("tls/initial-p256-private-key-matches-wire",core_tls_ecdh(key,23,peer_public,public_length,shared,&shared_length) == 0 && core_tls_ecdh(peer,23,offered,65,expected,&expected_length) == 0 && shared_length == expected_length && !memcmp(shared,expected,shared_length));
+    free(hello); EVP_PKEY_free(key); EVP_PKEY_free(peer);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
         vless_config_t config; char error[256]={0}; tls13_conn_t *connection=NULL;
@@ -52,9 +71,10 @@ int main(int argc, char **argv) {
     vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); strcpy(config.alpn,"http/1.1");
     uint8_t private_key[32],public_key[32],random[32],auth[32],*hello=NULL;
     size_t length=0,sid=0,extension_length=0; const uint8_t *extension=NULL;
-    REQUIRE("tls/alpn-build",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&length,&sid,NULL) == 0);
+    REQUIRE("tls/alpn-build",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&length,&sid,NULL,NULL) == 0);
     CHECK("tls/alpn-explicit-on-wire",hello_extension(hello,length,16,&extension,&extension_length) == 0 && extension_length == 11 && !memcmp(extension,"\x00\x09\x08http/1.1",11));
     retry_vectors(hello,length);
+    initial_share_vectors();
     free(hello);
     tls13_conn_t negotiated={.tls_h2_required=1}; strcpy(negotiated.tls_offered_alpn,"h2,http/1.1");
     const uint8_t h2[]={0,9,0,16,0,5,0,3,2,'h','2'},none[]={0,0};
