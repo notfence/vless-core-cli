@@ -53,11 +53,23 @@
 #include <time.h>
 #include <unistd.h>
 
+#define TLS_HANDSHAKE_LIMIT (1024U*1024U)
+#define TLS_HANDSHAKE_TOTAL_LIMIT (8U*1024U*1024U)
+#define TLS_POST_HANDSHAKE_LIMIT (256U*1024U)
+#define TLS_RECORD_REKEY_LIMIT (UINT64_C(1)<<20)
+#define TLS_RECORD_HARD_LIMIT (UINT64_C(1)<<24)
+
 typedef struct {
     uint8_t *data;
     size_t len;
     size_t cap;
+    size_t limit;
+    size_t *handshake_bytes;
+    int tls_budget;
 } dynbuf_t;
+
+static pthread_mutex_t tls_buffer_lock=PTHREAD_MUTEX_INITIALIZER;
+static size_t tls_buffer_bytes;
 
 typedef enum {
     CONN_MODE_REALITY = 0,
@@ -172,6 +184,9 @@ struct tls13_conn {
     dynbuf_t tls_certificate_message;
     unsigned tls_auth_state;
     int tls_client_certificate_requested;
+    size_t tls_handshake_bytes;
+    unsigned tls_receive_record_limit,tls_send_record_limit;
+    int tls_receive_update_requested;
     dynbuf_t tls_post_handshake;
     char tls_offered_alpn[128], tls_selected_alpn[128];
     int tls_h2_required, tls_is_reality;
@@ -429,16 +444,42 @@ static void invalidate_cached_tls_endpoint(const vless_config_t *cfg, const char
 }
 
 static int db_reserve(dynbuf_t *b, size_t n) {
+    if (n > SIZE_MAX-b->len) { errno=EOVERFLOW; return -1; }
+    if (b->limit && b->len+n > b->limit) { errno=EMSGSIZE; return -1; }
     if (b->len + n <= b->cap) {
         return 0;
     }
     size_t nc = (b->cap == 0) ? 1024 : b->cap;
     while (nc < b->len + n) {
+        if (nc > SIZE_MAX/2) { nc=b->len+n; break; }
         nc *= 2;
     }
-    uint8_t *tmp = (uint8_t *)realloc(b->data, nc);
+    if (b->limit && nc > b->limit) nc=b->limit;
+    size_t retained=nc-b->cap,increase=b->tls_budget ? nc : retained;
+    if (b->tls_budget) {
+        pthread_mutex_lock(&tls_buffer_lock);
+        if (increase > TLS_HANDSHAKE_TOTAL_LIMIT-tls_buffer_bytes ||
+            (b->handshake_bytes && retained > TLS_HANDSHAKE_LIMIT-*b->handshake_bytes)) {
+            pthread_mutex_unlock(&tls_buffer_lock); errno=ENOBUFS; return -1;
+        }
+        tls_buffer_bytes+=increase;
+        if (b->handshake_bytes) *b->handshake_bytes+=retained;
+        pthread_mutex_unlock(&tls_buffer_lock);
+    }
+    uint8_t *tmp = b->tls_budget ? malloc(nc) : realloc(b->data,nc);
     if (tmp == NULL) {
+        if (b->tls_budget) {
+            pthread_mutex_lock(&tls_buffer_lock); tls_buffer_bytes-=increase;
+            if (b->handshake_bytes) *b->handshake_bytes-=retained;
+            pthread_mutex_unlock(&tls_buffer_lock);
+        }
         return -1;
+    }
+    if (b->tls_budget) {
+        if (b->len) memcpy(tmp,b->data,b->len);
+        if (b->data) { OPENSSL_cleanse(b->data,b->cap); free(b->data); }
+        pthread_mutex_lock(&tls_buffer_lock); tls_buffer_bytes-=b->cap;
+        pthread_mutex_unlock(&tls_buffer_lock);
     }
     b->data = tmp;
     b->cap = nc;
@@ -473,10 +514,42 @@ static void db_consume(dynbuf_t *b, size_t n) {
 }
 
 static void db_free(dynbuf_t *b) {
+    if (b->tls_budget) {
+        pthread_mutex_lock(&tls_buffer_lock); tls_buffer_bytes-=b->cap;
+        if (b->handshake_bytes) *b->handshake_bytes-=b->cap;
+        pthread_mutex_unlock(&tls_buffer_lock);
+        if (b->data) OPENSSL_cleanse(b->data,b->cap);
+    }
     if (b->data != NULL) {
         free(b->data);
     }
     memset(b, 0, sizeof(*b));
+}
+
+static int tls_buffer_init(dynbuf_t *buffer, size_t limit, size_t *owner) {
+    if (buffer->tls_budget) return buffer->limit == limit && buffer->handshake_bytes == owner ? 0 : -1;
+    if (buffer->cap > limit) { errno=EMSGSIZE; return -1; }
+    pthread_mutex_lock(&tls_buffer_lock);
+    if (buffer->cap > TLS_HANDSHAKE_TOTAL_LIMIT-tls_buffer_bytes || (owner && buffer->cap > TLS_HANDSHAKE_LIMIT-*owner)) {
+        pthread_mutex_unlock(&tls_buffer_lock); errno=ENOBUFS; return -1;
+    }
+    tls_buffer_bytes+=buffer->cap; if (owner) *owner+=buffer->cap;
+    pthread_mutex_unlock(&tls_buffer_lock);
+    buffer->limit=limit; buffer->handshake_bytes=owner; buffer->tls_budget=1; return 0;
+}
+
+static void tls_handshake_material_clear(tls13_conn_t *connection) {
+    OPENSSL_cleanse(connection->auth_key,sizeof(connection->auth_key));
+    OPENSSL_cleanse(connection->hs_secret,sizeof(connection->hs_secret));
+    OPENSSL_cleanse(connection->c_hs_traffic,sizeof(connection->c_hs_traffic));
+    OPENSSL_cleanse(connection->s_hs_traffic,sizeof(connection->s_hs_traffic));
+    OPENSSL_cleanse(connection->c_hs_key,sizeof(connection->c_hs_key));
+    OPENSSL_cleanse(connection->s_hs_key,sizeof(connection->s_hs_key));
+    OPENSSL_cleanse(connection->c_hs_iv,sizeof(connection->c_hs_iv));
+    OPENSSL_cleanse(connection->s_hs_iv,sizeof(connection->s_hs_iv));
+    db_free(&connection->transcript); db_free(&connection->tls_client_hello); db_free(&connection->tls_certificate_message);
+    X509_free(connection->tls_peer_certificate); connection->tls_peer_certificate=NULL;
+    EVP_PKEY_free(connection->tls_retry_key); connection->tls_retry_key=NULL;
 }
 
 static int write_exact(int fd, const void *buf, size_t len) {
@@ -4459,7 +4532,9 @@ static int read_record(int fd, uint8_t *rtype, uint8_t **payload, size_t *payloa
     }
 
     size_t len = ((size_t)hdr[3] << 8) | hdr[4];
-    uint8_t *buf = (uint8_t *)malloc(len);
+    if (hdr[1] != 3 || (hdr[2] != 3 && !(hdr[0] == 22 && hdr[2] == 1)) ||
+        len > (hdr[0] == 23 ? 16640U : 16384U)) { errno=EMSGSIZE; return -1; }
+    uint8_t *buf = (uint8_t *)malloc(len ? len : 1);
     if (buf == NULL) {
         return -1;
     }
@@ -4582,47 +4657,31 @@ static int transcript_hash(const tls13_conn_t *c, uint8_t *out) {
     return digest_hash(c->tls_md, c->transcript.data, c->transcript.len, out, c->tls_hash_len);
 }
 
-static int parse_first_cert_der(const uint8_t *cert_msg, size_t cert_msg_len, const uint8_t **der, size_t *der_len) {
-    if (cert_msg_len < 4 || cert_msg[0] != 0x0b) {
-        return -1;
+static int parse_first_cert_der(const uint8_t *message, size_t length, const uint8_t **der, size_t *der_length) {
+    if (!message || !der || !der_length || length < 8 || message[0] != 11 || message[4] ||
+        (((size_t)message[1]<<16)|((size_t)message[2]<<8)|message[3]) != length-4 ||
+        (((size_t)message[5]<<16)|((size_t)message[6]<<8)|message[7]) != length-8) return -1;
+    *der=NULL; *der_length=0;
+    for (size_t offset=8;offset < length;) {
+        if (length-offset < 3) return -1;
+        size_t size=((size_t)message[offset]<<16)|((size_t)message[offset+1]<<8)|message[offset+2]; offset+=3;
+        if (!size || size > length-offset) return -1;
+        if (!*der) { *der=message+offset; *der_length=size; }
+        offset+=size;
+        if (length-offset < 2) return -1;
+        size_t extensions=((size_t)message[offset]<<8)|message[offset+1]; offset+=2;
+        if (extensions > length-offset) return -1;
+        size_t end=offset+extensions,count=0; unsigned seen[256];
+        while (offset < end) {
+            if (end-offset < 4 || count == sizeof(seen)/sizeof(seen[0])) return -1;
+            unsigned type=((unsigned)message[offset]<<8)|message[offset+1];
+            size_t entry=((size_t)message[offset+2]<<8)|message[offset+3]; offset+=4;
+            if (entry > end-offset) return -1;
+            for (size_t i=0;i<count;i++) if (seen[i] == type) return -1;
+            seen[count++]=type; offset+=entry;
+        }
     }
-    size_t body_len = ((size_t)cert_msg[1] << 16) | ((size_t)cert_msg[2] << 8) | cert_msg[3];
-    if (4 + body_len > cert_msg_len) {
-        return -1;
-    }
-
-    const uint8_t *p = cert_msg + 4;
-    size_t n = body_len;
-
-    if (n < 1) {
-        return -1;
-    }
-    uint8_t req_ctx_len = p[0];
-    p += 1;
-    n -= 1;
-    if (n < (size_t)req_ctx_len + 3) {
-        return -1;
-    }
-    p += req_ctx_len;
-    n -= req_ctx_len;
-
-    size_t list_len = ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2];
-    p += 3;
-    n -= 3;
-
-    if (n < list_len || list_len < 3) {
-        return -1;
-    }
-
-    size_t cert_len = ((size_t)p[0] << 16) | ((size_t)p[1] << 8) | p[2];
-    p += 3;
-    if (cert_len == 0 || cert_len > n - 3) {
-        return -1;
-    }
-
-    *der = p;
-    *der_len = cert_len;
-    return 0;
+    return *der ? 0 : -1;
 }
 
 static int tls_cert_der_pin_hex(const uint8_t *der, size_t der_len, char pin_hex[65], char *err, size_t err_cap) {
@@ -4743,6 +4802,8 @@ static int load_x509_store_paths(X509_STORE *store) {
 }
 
 static int verify_tls_cert_message(const char *servername, const uint8_t *cert_msg, size_t cert_msg_len, char *err, size_t err_cap) {
+    const uint8_t *first=NULL; size_t first_length=0;
+    if (parse_first_cert_der(cert_msg,cert_msg_len,&first,&first_length)) { set_err(err,err_cap,"invalid TLS Certificate structure"); return -1; }
     X509 *leaf = NULL;
     STACK_OF(X509) *untrusted = NULL;
     X509_STORE *store = NULL;
@@ -4905,12 +4966,14 @@ static int calc_finished_verify(const tls13_conn_t *c, const uint8_t *traffic_se
     uint8_t finished_key[64];
     uint8_t zero_ctx[1] = {0};
     if (hkdf_expand_label_md(c->tls_md, traffic_secret, c->tls_hash_len, "finished", zero_ctx, 0, finished_key, c->tls_hash_len) != 0) {
-        return -1;
+        OPENSSL_cleanse(finished_key,sizeof(finished_key)); return -1;
     }
-    return hmac_digest(c->tls_md, finished_key, c->tls_hash_len, transcript_hash_val, c->tls_hash_len, out, c->tls_hash_len);
+    int result=hmac_digest(c->tls_md,finished_key,c->tls_hash_len,transcript_hash_val,c->tls_hash_len,out,c->tls_hash_len);
+    OPENSSL_cleanse(finished_key,sizeof(finished_key)); return result;
 }
 
 static int derive_handshake_keys(tls13_conn_t *c, const uint8_t *shared, size_t shared_len) {
+    int result=-1;
     uint8_t zero[64] = {0};
     uint8_t empty_hash[64];
     uint8_t early_secret[64];
@@ -4918,38 +4981,43 @@ static int derive_handshake_keys(tls13_conn_t *c, const uint8_t *shared, size_t 
     uint8_t thash[64];
 
     if (digest_hash(c->tls_md, NULL, 0, empty_hash, c->tls_hash_len) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     if (hkdf_extract_md(c->tls_md, zero, c->tls_hash_len, zero, c->tls_hash_len, early_secret, c->tls_hash_len) != 0) {
-        return -1;
+        goto cleanup;
     }
     if (derive_secret_md(c->tls_md, early_secret, c->tls_hash_len, "derived", empty_hash, c->tls_hash_len, derived, c->tls_hash_len) != 0) {
-        return -1;
+        goto cleanup;
     }
     if (hkdf_extract_md(c->tls_md, derived, c->tls_hash_len, shared, shared_len, c->hs_secret, c->tls_hash_len) != 0) {
-        return -1;
+        goto cleanup;
     }
     if (transcript_hash(c, thash) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     if (derive_secret_md(c->tls_md, c->hs_secret, c->tls_hash_len, "c hs traffic", thash, c->tls_hash_len, c->c_hs_traffic, c->tls_hash_len) != 0 ||
         derive_secret_md(c->tls_md, c->hs_secret, c->tls_hash_len, "s hs traffic", thash, c->tls_hash_len, c->s_hs_traffic, c->tls_hash_len) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     if (derive_key_iv_md(c->tls_md, c->c_hs_traffic, c->tls_hash_len, c->tls_key_len, c->c_hs_key, c->c_hs_iv) != 0 ||
         derive_key_iv_md(c->tls_md, c->s_hs_traffic, c->tls_hash_len, c->tls_key_len, c->s_hs_key, c->s_hs_iv) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     c->c_hs_seq = 0;
     c->s_hs_seq = 0;
-    return 0;
+    result=0;
+cleanup:
+    OPENSSL_cleanse(early_secret,sizeof(early_secret));
+    OPENSSL_cleanse(derived,sizeof(derived));
+    return result;
 }
 
 static int derive_app_keys(tls13_conn_t *c) {
+    int result=-1;
     uint8_t zero[64] = {0};
     uint8_t empty_hash[64];
     uint8_t derived2[64];
@@ -4957,34 +5025,38 @@ static int derive_app_keys(tls13_conn_t *c) {
     uint8_t thash[64];
 
     if (digest_hash(c->tls_md, NULL, 0, empty_hash, c->tls_hash_len) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     if (derive_secret_md(c->tls_md, c->hs_secret, c->tls_hash_len, "derived", empty_hash, c->tls_hash_len, derived2, c->tls_hash_len) != 0) {
-        return -1;
+        goto cleanup;
     }
     if (hkdf_extract_md(c->tls_md, derived2, c->tls_hash_len, zero, c->tls_hash_len, master_secret, c->tls_hash_len) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     if (transcript_hash(c, thash) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     if (derive_secret_md(c->tls_md, master_secret, c->tls_hash_len, "c ap traffic", thash, c->tls_hash_len, c->c_app_traffic, c->tls_hash_len) != 0 ||
         derive_secret_md(c->tls_md, master_secret, c->tls_hash_len, "s ap traffic", thash, c->tls_hash_len, c->s_app_traffic, c->tls_hash_len) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     if (derive_key_iv_md(c->tls_md, c->c_app_traffic, c->tls_hash_len, c->tls_key_len, c->c_app_key, c->c_app_iv) != 0 ||
         derive_key_iv_md(c->tls_md, c->s_app_traffic, c->tls_hash_len, c->tls_key_len, c->s_app_key, c->s_app_iv) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     c->c_app_seq = 0;
     c->s_app_seq = 0;
     c->c_app_record_bytes = 0;
-    return 0;
+    result=0;
+cleanup:
+    OPENSSL_cleanse(master_secret,sizeof(master_secret));
+    OPENSSL_cleanse(derived2,sizeof(derived2));
+    return result;
 }
 
 static const EVP_CIPHER *record_cipher_for_conn(const tls13_conn_t *c) {
@@ -5002,6 +5074,10 @@ static const EVP_CIPHER *record_cipher_for_conn(const tls13_conn_t *c) {
 
 static int encrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t inner_type, const uint8_t *plain,
                           size_t plain_len, uint8_t **out, size_t *out_len) {
+    *out=NULL; *out_len=0;
+    if (plain_len > 16384 || *seq >= TLS_RECORD_HARD_LIMIT ||
+        (c->tls_send_record_limit && plain_len+1 > c->tls_send_record_limit) ||
+        (inner_type != 21 && inner_type != 22 && inner_type != 23)) { errno=EMSGSIZE; return -1; }
     size_t inner_len = plain_len + 1;
     uint8_t *inner = (uint8_t *)malloc(inner_len);
     if (inner == NULL) {
@@ -5056,7 +5132,7 @@ static int encrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8
     }
 
     EVP_CIPHER_CTX_free(ctx);
-    free(inner);
+    OPENSSL_cleanse(inner,inner_len); free(inner);
 
     if (!ok) {
         free(record);
@@ -5071,7 +5147,8 @@ static int encrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8
 
 static int decrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t rtype, const uint8_t *payload,
                           size_t payload_len, uint8_t **plain, size_t *plain_len, uint8_t *inner_type) {
-    if (rtype != 0x17 || payload_len < 16) {
+    if (rtype != 0x17 || payload_len < 17 || payload_len > 16640 || *seq >= TLS_RECORD_HARD_LIMIT ||
+        (c->tls_receive_record_limit && payload_len-16 > c->tls_receive_record_limit)) {
         return -1;
     }
 
@@ -5132,16 +5209,12 @@ static int decrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8
     uint8_t ctype = buf[i - 1];
     size_t content_len = i - 1;
 
-    uint8_t *content = (uint8_t *)malloc(content_len);
-    if (content == NULL) {
-        free(buf);
-        return -1;
-    }
-    memcpy(content, buf, content_len);
-    free(buf);
+    if (content_len > 16384 || (ctype != 21 && ctype != 22 && ctype != 23)) { OPENSSL_cleanse(buf,ct_len); free(buf); return -1; }
+
+    OPENSSL_cleanse(buf+content_len,ct_len-content_len);
 
     *seq += 1;
-    *plain = content;
+    *plain = buf;
     *plain_len = content_len;
     *inner_type = ctype;
     return 0;
@@ -5380,6 +5453,7 @@ void tls13_mark_raw_direct(tls13_conn_t *c) {
 }
 
 static int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len) {
+    if (tls_buffer_init(&c->transcript,TLS_HANDSHAKE_LIMIT,&c->tls_handshake_bytes)) return -1;
     return db_append(&c->transcript, msg, msg_len);
 }
 
@@ -5391,13 +5465,13 @@ static int tls_update_keys(tls13_conn_t *c, int sending) {
     if (hkdf_expand_label_md(c->tls_md,secret,c->tls_hash_len,"traffic upd",NULL,0,next,c->tls_hash_len) ||
         derive_key_iv_md(c->tls_md,next,c->tls_hash_len,c->tls_key_len,key,iv)) { OPENSSL_cleanse(next,sizeof(next)); return -1; }
     memcpy(secret,next,c->tls_hash_len); OPENSSL_cleanse(next,sizeof(next));
-    if (sending) c->c_app_seq=0; else c->s_app_seq=0;
+    if (sending) c->c_app_seq=0; else { c->s_app_seq=0; c->tls_receive_update_requested=0; }
     return 0;
 }
 
-static int tls_key_update_reply(tls13_conn_t *c) {
+static int tls_key_update_send(tls13_conn_t *c, unsigned request) {
     if (c->send_closed) return -1;
-    const uint8_t message[]={24,0,0,1,0}; uint8_t *record=NULL; size_t length=0;
+    const uint8_t message[]={24,0,0,1,(uint8_t)request}; uint8_t *record=NULL; size_t length=0;
     if (encrypt_record(c,c->c_app_key,c->c_app_iv,&c->c_app_seq,22,message,sizeof(message),&record,&length)) return -1;
     int result;
     if (c->xmux_async) result=length > 256U*1024U-c->xmux_wire_output.len ? -1 : db_append(&c->xmux_wire_output,record,length);
@@ -5406,8 +5480,34 @@ static int tls_key_update_reply(tls13_conn_t *c) {
     return result ? -1 : tls_update_keys(c,1);
 }
 
+static int tls_prepare_app_record(tls13_conn_t *c) {
+    return c->c_app_seq >= TLS_RECORD_REKEY_LIMIT ? tls_key_update_send(c,0) : 0;
+}
+
+static int tls_session_ticket(const uint8_t *body, size_t length) {
+    if (length < 13) return -1;
+    uint32_t lifetime=((uint32_t)body[0]<<24)|((uint32_t)body[1]<<16)|((uint32_t)body[2]<<8)|body[3];
+    if (lifetime > 604800) return -1;
+    size_t offset=9+(size_t)body[8];
+    if (offset+2 > length) return -1;
+    size_t ticket=((size_t)body[offset]<<8)|body[offset+1]; offset+=2;
+    if (!ticket || ticket > length-offset) return -1;
+    offset+=ticket;
+    if (length-offset < 2 || (((size_t)body[offset]<<8)|body[offset+1]) != length-offset-2) return -1;
+    offset+=2; unsigned seen[256]; size_t count=0;
+    while (offset < length) {
+        if (length-offset < 4 || count == sizeof(seen)/sizeof(seen[0])) return -1;
+        unsigned type=((unsigned)body[offset]<<8)|body[offset+1]; size_t size=((size_t)body[offset+2]<<8)|body[offset+3]; offset+=4;
+        if (size > length-offset || (type == 42 && size != 4)) return -1;
+        for (size_t i=0;i<count;i++) if (seen[i] == type) return -1;
+        seen[count++]=type; offset+=size;
+    }
+    return 0;
+}
+
 static int tls_post_handshake(tls13_conn_t *c, const uint8_t *data, size_t length) {
-    if (c->tls_auth_state != 4 || length > 256U*1024U-c->tls_post_handshake.len || db_append(&c->tls_post_handshake,data,length)) return -1;
+    if (c->tls_auth_state != 4 || tls_buffer_init(&c->tls_post_handshake,TLS_POST_HANDSHAKE_LIMIT,NULL) ||
+        length > TLS_POST_HANDSHAKE_LIMIT-c->tls_post_handshake.len || db_append(&c->tls_post_handshake,data,length)) return -1;
     while (c->tls_post_handshake.len >= 4) {
         const uint8_t *message=c->tls_post_handshake.data;
         size_t size=((size_t)message[1]<<16)|((size_t)message[2]<<8)|message[3];
@@ -5415,15 +5515,20 @@ static int tls_post_handshake(tls13_conn_t *c, const uint8_t *data, size_t lengt
         if (c->tls_post_handshake.len < size+4) return 0;
         if (message[0] == 24) {
             unsigned request=message[4];
-            if (request > 1 || tls_update_keys(c,0) || (request && tls_key_update_reply(c))) return -1;
-        }
+            if (request > 1 || tls_update_keys(c,0) || (request && tls_key_update_send(c,0))) return -1;
+        } else if (tls_session_ticket(message+4,size)) return -1;
         db_consume(&c->tls_post_handshake,size+4);
     }
+    if (!c->tls_post_handshake.len) db_free(&c->tls_post_handshake);
     return 0;
 }
 
 static int tls_application_plain(tls13_conn_t *c, unsigned type, const uint8_t *data, size_t length, dynbuf_t *cache) {
     if (c->receive_closed) return -1;
+    if (c->s_app_seq >= TLS_RECORD_REKEY_LIMIT && !c->tls_receive_update_requested && !c->send_closed) {
+        if (tls_key_update_send(c,1)) return -1;
+        c->tls_receive_update_requested=1;
+    }
     if (type == 22) return tls_post_handshake(c,data,length);
     if (c->tls_post_handshake.len) return -1;
     if (type == 23) return db_append(cache,data,length);
@@ -5440,6 +5545,26 @@ static int tls_encrypted_extensions(tls13_conn_t *c, const uint8_t *data, size_t
         if (size > length-offset) return -1;
         for (size_t i=0;i<count;i++) if (seen[i] == type) return -1;
         seen[count++]=type;
+        if (type != 0 && type != 1 && type != 10 && type != 16 && type != 28 && type != 0x4469) return -1;
+        size_t offered_size=0;
+        const uint8_t *offered=core_tls_hello_extension(c->tls_client_hello.data,c->tls_client_hello.len,type,&offered_size);
+        if (!offered && (type != 16 || c->tls_client_hello.len)) return -1;
+        if (type == 0 && size) return -1;
+        if (type == 28) {
+            if (size != 2) return -1;
+            unsigned limit=((unsigned)data[offset]<<8)|data[offset+1];
+            if (limit < 64 || limit > 16385) return -1;
+            c->tls_send_record_limit=limit;
+            if (offered_size != 2) return -1;
+            c->tls_receive_record_limit=((unsigned)offered[0]<<8)|offered[1];
+        }
+        if (type == 1) {
+            if (size != 1 || offered_size != 1 || data[offset] != offered[0] || data[offset] < 1 || data[offset] > 4) return -1;
+            c->tls_send_record_limit=(1U<<(8+data[offset]))+1;
+        }
+        if (type == 10) {
+            if (size < 4 || (size&1) || (((size_t)data[offset]<<8)|data[offset+1]) != size-2) return -1;
+        }
         if (type == 16) {
             if (size < 3 || (((size_t)data[offset]<<8)|data[offset+1]) != size-2 || data[offset+2] != size-3 || size-3 >= sizeof(c->tls_selected_alpn)) return -1;
             memcpy(c->tls_selected_alpn,data+offset+3,size-3); c->tls_selected_alpn[size-3]=0;
@@ -5552,6 +5677,7 @@ static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, 
 }
 
 static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, EVP_PKEY *hybrid_key, const uint8_t *hybrid_pub, char *err, size_t err_cap) {
+    uint8_t client_priv[32]={0},shared[96]={0};
     int use_reality = (strcmp(cfg->security, "reality") == 0);
     tls_verify_mode_t verify_mode = tls_verify_mode_for_config(cfg);
     c->tls_verify_policy = verify_mode;
@@ -5561,9 +5687,13 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         (cfg->fp_mode == FP_RANDOM || cfg->fp_mode == FP_RANDOMIZED ? "http/1.1,h2" : "h2,http/1.1"));
     c->tls_h2_required=cfg->transport_mode == TRANSPORT_GRPC || cfg->transport_mode == TRANSPORT_XHTTP;
     c->tls_is_reality=use_reality;
-    if (c->tls_h2_required && !alpn_csv_has_token(c->tls_offered_alpn,"h2")) { set_err(err,err_cap,"HTTP/2 transport requires h2 ALPN"); return -1; }
+    c->tls_receive_record_limit=c->tls_send_record_limit=0; c->tls_receive_update_requested=0;
+    if (tls_buffer_init(&c->tls_client_hello,65536,&c->tls_handshake_bytes) ||
+        tls_buffer_init(&c->tls_certificate_message,TLS_HANDSHAKE_LIMIT,&c->tls_handshake_bytes)) {
+        set_err(err,err_cap,"TLS handshake memory budget exhausted"); goto handshake_failure;
+    }
+    if (c->tls_h2_required && !alpn_csv_has_token(c->tls_offered_alpn,"h2")) { set_err(err,err_cap,"HTTP/2 transport requires h2 ALPN"); goto handshake_failure; }
 
-    uint8_t client_priv[32];
     uint8_t client_pub[32];
     uint8_t client_random[32];
     uint8_t *ch = NULL;
@@ -5574,7 +5704,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     if (build_client_hello(cfg, use_reality, cipher_offer, client_priv, client_pub, client_random, c->auth_key, &ch, &ch_len, &sid_pos, hybrid_pub,&c->tls_retry_key) !=
         0) {
         set_err(err, err_cap, "failed to build ClientHello");
-        return -1;
+        goto handshake_failure;
     }
     if (c->tls_retry_key) c->tls_exchange_group=23;
 
@@ -5582,7 +5712,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     if (ch_record == NULL) {
         free(ch);
         set_err(err, err_cap, "failed to allocate ClientHello record");
-        return -1;
+        goto handshake_failure;
     }
     ch_record[0] = 0x16;
     ch_record[1] = 0x03;
@@ -5594,18 +5724,19 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         free(ch_record);
         free(ch);
         set_err(err, err_cap, "failed to send ClientHello");
-        return -1;
+        goto handshake_failure;
     }
     free(ch_record);
 
     if (append_transcript(c, ch, ch_len) != 0 || db_append(&c->tls_client_hello,ch,ch_len)) {
         free(ch);
         set_err(err, err_cap, "transcript append failed");
-        return -1;
+        goto handshake_failure;
     }
     free(ch);
 
     dynbuf_t plain_hs = {0};
+    if (tls_buffer_init(&plain_hs,TLS_HANDSHAKE_LIMIT,&c->tls_handshake_bytes)) goto handshake_failure;
     uint8_t server_share[TLS_HYBRID_SERVER_SHARE_SIZE];
     size_t share_len = 0;
     uint16_t server_cipher = 0;
@@ -5619,84 +5750,87 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         if (read_record(c->fd, &rtype, &pl, &pl_len) != 0) {
             db_free(&plain_hs);
             set_err(err, err_cap, "failed to read ServerHello record");
-            return -1;
+            goto handshake_failure;
         }
 
         if (rtype == 0x16) {
             if (db_append(&plain_hs, pl, pl_len) != 0) {
                 free(pl);
                 db_free(&plain_hs);
-                return -1;
+                goto handshake_failure;
             }
             free(pl);
 
             while (plain_hs.len >= 4) {
                 size_t mlen = ((size_t)plain_hs.data[1] << 16) | ((size_t)plain_hs.data[2] << 8) | plain_hs.data[3];
+                if (mlen > TLS_HANDSHAKE_LIMIT-4) { db_free(&plain_hs); set_err(err,err_cap,"TLS ServerHello exceeds handshake limit"); goto handshake_failure; }
                 if (plain_hs.len < 4 + mlen) {
                     break;
                 }
                 if (plain_hs.data[0] == 0x02) {
                     core_tls_hello_t server;
                     if (core_tls_hello_parse(plain_hs.data,4+mlen,c->tls_client_hello.data,c->tls_client_hello.len,&server)) {
-                        db_free(&plain_hs); set_err(err,err_cap,"invalid TLS ServerHello parameters"); return -1;
+                        db_free(&plain_hs); set_err(err,err_cap,"invalid TLS ServerHello parameters"); goto handshake_failure;
                     }
                     if (server.retry) {
-                        if (c->tls_retry_seen || use_reality) { db_free(&plain_hs); set_err(err,err_cap,c->tls_retry_seen ? "repeated TLS HelloRetryRequest" : "REALITY HelloRetryRequest is unsupported"); return -1; }
+                        if (c->tls_retry_seen || use_reality) { db_free(&plain_hs); set_err(err,err_cap,c->tls_retry_seen ? "repeated TLS HelloRetryRequest" : "REALITY HelloRetryRequest is unsupported"); goto handshake_failure; }
                         uint8_t hash[64],*retry=NULL; size_t retry_length=0;
                         EVP_PKEY *retry_key=NULL;
                         if (configure_tls_cipher(c,server.cipher) || transcript_hash(c,hash) ||
                             core_tls_hello_retry(c->tls_client_hello.data,c->tls_client_hello.len,&server,&retry,&retry_length,&retry_key)) {
-                            db_free(&plain_hs); set_err(err,err_cap,"unsupported TLS HelloRetryRequest"); return -1;
+                            db_free(&plain_hs); set_err(err,err_cap,"unsupported TLS HelloRetryRequest"); goto handshake_failure;
                         }
                         if (retry_key) { EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=retry_key; c->tls_exchange_group=server.group; }
                         c->transcript.len=0; uint8_t message_hash[]={254,0,0,(uint8_t)c->tls_hash_len};
                         int result=append_transcript(c,message_hash,4) || append_transcript(c,hash,c->tls_hash_len) ||
                             append_transcript(c,plain_hs.data,4+mlen) || append_transcript(c,retry,retry_length);
                         db_free(&c->tls_client_hello);
-                        if (!result) result=db_append(&c->tls_client_hello,retry,retry_length);
+                        if (!result) result=tls_buffer_init(&c->tls_client_hello,65536,&c->tls_handshake_bytes) || db_append(&c->tls_client_hello,retry,retry_length);
                         uint8_t header[]={22,3,3,(uint8_t)(retry_length>>8),(uint8_t)retry_length};
                         if (!result) result=write_exact(c->fd,header,5) || write_exact(c->fd,retry,retry_length);
                         free(retry); c->tls_retry_seen=1; c->tls_retry_group=server.group;
-                        if (result) { db_free(&plain_hs); set_err(err,err_cap,"failed to send retry ClientHello"); return -1; }
+                        if (result) { db_free(&plain_hs); set_err(err,err_cap,"failed to send retry ClientHello"); goto handshake_failure; }
                         db_consume(&plain_hs,4+mlen); break;
                     }
                     if (c->tls_retry_seen && (server.cipher != c->tls_cipher_suite || (c->tls_retry_group && server.group != c->tls_retry_group))) {
-                        db_free(&plain_hs); set_err(err,err_cap,"ServerHello changed HelloRetryRequest parameters"); return -1;
+                        db_free(&plain_hs); set_err(err,err_cap,"ServerHello changed HelloRetryRequest parameters"); goto handshake_failure;
                     }
                     if (parse_server_hello_for_keyshare(plain_hs.data, 4 + mlen, &server_cipher, server_share, &share_len) != 0) {
                         db_free(&plain_hs);
                         set_err(err, err_cap, "invalid ServerHello");
-                        return -1;
+                        goto handshake_failure;
                     }
                     if (configure_tls_cipher(c, server_cipher) != 0) {
                         db_free(&plain_hs);
                         set_err(err, err_cap, "unsupported TLS cipher suite");
-                        return -1;
+                        goto handshake_failure;
                     }
                     if (append_transcript(c, plain_hs.data, 4 + mlen) != 0) {
                         db_free(&plain_hs);
-                        return -1;
+                        goto handshake_failure;
                     }
                     server_group=server.group;
                     got_server_hello = 1;
                     db_consume(&plain_hs, 4 + mlen);
                     break;
                 }
-                db_free(&plain_hs); set_err(err,err_cap,"unexpected message before ServerHello"); return -1;
+                db_free(&plain_hs); set_err(err,err_cap,"unexpected message before ServerHello"); goto handshake_failure;
             }
-        } else {
+        } else if (rtype == 20 && pl_len == 1 && pl[0] == 1) {
             free(pl);
+        } else {
+            free(pl); db_free(&plain_hs); set_err(err,err_cap,"unexpected TLS record before ServerHello"); goto handshake_failure;
         }
     }
 
+    if (plain_hs.len) { db_free(&plain_hs); set_err(err,err_cap,"unexpected plaintext after ServerHello"); goto handshake_failure; }
     db_free(&plain_hs);
 
     if (!got_server_hello) {
         set_err(err, err_cap, "ServerHello not received");
-        return -1;
+        goto handshake_failure;
     }
 
-    uint8_t shared[96];
     size_t shared_len = 32;
     if (share_len == TLS_HYBRID_SERVER_SHARE_SIZE) {
 #if OPENSSL_VERSION_NUMBER >= 0x30500000L
@@ -5707,13 +5841,13 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         EVP_PKEY_CTX_free(kem);
         if (!ok) {
             set_err(err, err_cap, "TLS ML-KEM decapsulation failed");
-            return -1;
+            goto handshake_failure;
         }
         shared_len = 64;
 #else
         (void)hybrid_key;
         set_err(err, err_cap, "TLS X25519MLKEM768 requires OpenSSL 3.5 or newer");
-        return -1;
+        goto handshake_failure;
 #endif
     }
     int exchange_result;
@@ -5723,17 +5857,18 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     } else exchange_result=x25519_shared(client_priv, server_share + share_len - 32, shared + shared_len - 32);
     if (exchange_result != 0) {
         set_err(err, err_cap, "ECDH failed");
-        return -1;
+        goto handshake_failure;
     }
 
     if (derive_handshake_keys(c, shared, shared_len) != 0) {
         set_err(err, err_cap, "failed to derive handshake keys");
-        return -1;
+        goto handshake_failure;
     }
     vc_log_debug("tls", "selected key exchange=%s",server_group == 23 ? "P-256" : server_group == 24 ? "P-384" :
         server_group == 25 ? "P-521" : shared_len == 64 ? "X25519MLKEM768" : "X25519");
 
     dynbuf_t enc_hs = {0};
+    if (tls_buffer_init(&enc_hs,TLS_HANDSHAKE_LIMIT,&c->tls_handshake_bytes)) goto handshake_failure;
     int got_finished = 0;
 
     while (!got_finished) {
@@ -5743,12 +5878,14 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         if (read_record(c->fd, &rtype, &pl, &pl_len) != 0) {
             db_free(&enc_hs);
             set_err(err, err_cap, "failed to read encrypted handshake");
-            return -1;
+            goto handshake_failure;
         }
 
         if (rtype != 0x17) {
+            int compatibility=rtype == 20 && pl_len == 1 && pl[0] == 1;
             free(pl);
-            continue;
+            if (compatibility) continue;
+            db_free(&enc_hs); set_err(err,err_cap,"unexpected TLS record during server handshake"); goto handshake_failure;
         }
 
         uint8_t *dec = NULL;
@@ -5758,7 +5895,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
             free(pl);
             db_free(&enc_hs);
             set_err(err, err_cap, "failed to decrypt handshake record");
-            return -1;
+            goto handshake_failure;
         }
         free(pl);
 
@@ -5766,41 +5903,44 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
             if (db_append(&enc_hs, dec, dec_len) != 0) {
                 free(dec);
                 db_free(&enc_hs);
-                return -1;
+                goto handshake_failure;
             }
             free(dec);
 
             while (enc_hs.len >= 4) {
                 size_t hlen = ((size_t)enc_hs.data[1] << 16) | ((size_t)enc_hs.data[2] << 8) | enc_hs.data[3];
+                if (hlen > TLS_HANDSHAKE_LIMIT-4) { db_free(&enc_hs); set_err(err,err_cap,"TLS message exceeds handshake limit"); goto handshake_failure; }
                 if (enc_hs.len < 4 + hlen) {
                     break;
                 }
                 int result=server_handshake_message(cfg,c,enc_hs.data,4+hlen,err,err_cap);
                 if (result < 0) {
                     db_free(&enc_hs);
-                    return -1;
+                    goto handshake_failure;
                 }
                 db_consume(&enc_hs, 4 + hlen);
                 if (result > 0) { got_finished=1; break; }
             }
         } else {
             free(dec);
+            db_free(&enc_hs); set_err(err,err_cap,"unexpected TLS inner record during handshake"); goto handshake_failure;
         }
     }
 
+    if (enc_hs.len) { db_free(&enc_hs); set_err(err,err_cap,"unexpected handshake data after server Finished"); goto handshake_failure; }
     db_free(&enc_hs);
 
     // TLS 1.3 traffic_secret_0 is derived from transcript up to server Finished.
     if (derive_app_keys(c) != 0) {
         set_err(err, err_cap, "failed to derive application keys");
-        return -1;
+        goto handshake_failure;
     }
 
     static const uint8_t empty_certificate[]={11,0,0,4,0,0,0,0};
-    if (c->tls_client_certificate_requested && append_transcript(c,empty_certificate,sizeof(empty_certificate))) return -1;
+    if (c->tls_client_certificate_requested && append_transcript(c,empty_certificate,sizeof(empty_certificate))) goto handshake_failure;
     uint8_t thash[64],client_verify[64];
     if (transcript_hash(c,thash) || calc_finished_verify(c,c->c_hs_traffic,thash,client_verify)) {
-        set_err(err,err_cap,"failed to create client Finished"); return -1;
+        set_err(err,err_cap,"failed to create client Finished"); goto handshake_failure;
     }
 
     uint8_t flight[76],*fin_msg=flight+(c->tls_client_certificate_requested ? sizeof(empty_certificate) : 0);
@@ -5816,7 +5956,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     size_t enc_fin_len = 0;
     if (encrypt_record(c, c->c_hs_key, c->c_hs_iv, &c->c_hs_seq, 0x16, flight, (size_t)(fin_msg-flight)+fin_msg_len, &enc_fin, &enc_fin_len) != 0) {
         set_err(err, err_cap, "failed to encrypt client Finished");
-        return -1;
+        goto handshake_failure;
     }
 
     /*
@@ -5829,7 +5969,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     if (client_last_flight == NULL) {
         free(enc_fin);
         set_err(err, err_cap, "failed to allocate client Finished flight");
-        return -1;
+        goto handshake_failure;
     }
     memcpy(client_last_flight, ccs_rec, sizeof(ccs_rec));
     memcpy(client_last_flight + sizeof(ccs_rec), enc_fin, enc_fin_len);
@@ -5837,16 +5977,26 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         free(client_last_flight);
         free(enc_fin);
         set_err(err, err_cap, "failed to send client Finished");
-        return -1;
+        goto handshake_failure;
     }
     free(client_last_flight);
     free(enc_fin);
 
     if (append_transcript(c, fin_msg, fin_msg_len) != 0) {
-        return -1;
+        goto handshake_failure;
     }
 
+    OPENSSL_cleanse(client_priv,sizeof(client_priv)); OPENSSL_cleanse(shared,sizeof(shared));
+    tls_handshake_material_clear(c);
     return 0;
+handshake_failure:
+    OPENSSL_cleanse(client_priv,sizeof(client_priv)); OPENSSL_cleanse(shared,sizeof(shared));
+    tls_handshake_material_clear(c);
+    OPENSSL_cleanse(c->c_app_traffic,sizeof(c->c_app_traffic)); OPENSSL_cleanse(c->s_app_traffic,sizeof(c->s_app_traffic));
+    OPENSSL_cleanse(c->c_app_key,sizeof(c->c_app_key)); OPENSSL_cleanse(c->s_app_key,sizeof(c->s_app_key));
+    OPENSSL_cleanse(c->c_app_iv,sizeof(c->c_app_iv)); OPENSSL_cleanse(c->s_app_iv,sizeof(c->s_app_iv));
+    if (err && err_cap && !*err) set_err(err,err_cap,errno == ENOBUFS || errno == EMSGSIZE ? "TLS handshake memory or message limit exceeded" : "TLS handshake failed");
+    return -1;
 }
 
 static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, char *err, size_t err_cap) {
@@ -5891,6 +6041,7 @@ static void reset_manual_tls_handshake(tls13_conn_t *c) {
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL;
     db_free(&c->tls_certificate_message); c->tls_auth_state=0;
     c->tls_client_certificate_requested=0;
+    c->tls_receive_record_limit=c->tls_send_record_limit=0; c->tls_receive_update_requested=0;
     db_free(&c->tls_post_handshake); c->tls_selected_alpn[0]=0;
     db_free(&c->tls_client_hello); EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL; c->tls_retry_seen=0; c->tls_retry_group=0; c->tls_exchange_group=0;
     c->tls_cipher_suite = 0;
@@ -6459,7 +6610,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     if (c == NULL) {
         return;
     }
-    if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); free(c); return; }
+    if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); OPENSSL_cleanse(c,sizeof(*c)); free(c); return; }
     if (!c->send_closed && c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
         int upload_fd = strcmp(c->xhttp_transport_mode, "stream-one") == 0 ? c->fd : c->xhttp_upload_fd;
         if (upload_fd >= 0) {
@@ -6502,12 +6653,14 @@ void tls13_reality_close(tls13_conn_t *c) {
     db_free(&c->transcript);
     db_free(&c->app_cache);
     db_free(&c->xmux_raw_input); db_free(&c->xmux_plain_output); db_free(&c->xmux_wire_output);
+    OPENSSL_cleanse(c,sizeof(*c));
     free(c);
 }
 
 static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
+        if (tls_prepare_app_record(c)) return -1;
         size_t chunk = len - off;
         /*
          * Go/uTLS uses dynamic TLS record sizing and keeps early app records
@@ -6521,6 +6674,7 @@ static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t
         if (chunk > 16384) {
             chunk = 16384;
         }
+        if (c->tls_send_record_limit && chunk >= c->tls_send_record_limit) chunk=c->tls_send_record_limit-1;
 
         uint8_t *rec = NULL;
         size_t rec_len = 0;
@@ -6637,7 +6791,7 @@ static int relay_read_record(tls13_conn_t *c, uint8_t *type, uint8_t **payload, 
     for (;;) {
         if (c->xmux_raw_input.len >= 5) {
             size_t size=((size_t)c->xmux_raw_input.data[3]<<8)|c->xmux_raw_input.data[4];
-            if (size > 18432) return -1;
+            if (c->xmux_raw_input.data[0] != 23 || c->xmux_raw_input.data[1] != 3 || c->xmux_raw_input.data[2] != 3 || size > 16640) return -1;
             if (c->xmux_raw_input.len >= size+5) {
                 *payload=malloc(size ? size : 1); if (!*payload) return -1;
                 *type=c->xmux_raw_input.data[0]; *length=size;
@@ -6673,7 +6827,7 @@ static int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
         if (rtype != 0x17) {
             vc_log_warning("tls", "non-app record type=0x%02x in app phase", rtype);
             free(pl);
-            continue;
+            return -1;
         }
 
         uint8_t *dec = NULL;
@@ -6885,7 +7039,10 @@ static int xmux_transport_flush(void *opaque) {
         return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ? 0 : -1;
     }
     if (!connection->xmux_wire_output.len && connection->xmux_plain_output.len) {
+        if (tls_prepare_app_record(connection)) return -1;
+        if (connection->xmux_wire_output.len) return 0;
         size_t limit=connection->c_app_record_bytes < 128U*1024U ? 1186 : 16384;
+        if (connection->tls_send_record_limit && limit >= connection->tls_send_record_limit) limit=connection->tls_send_record_limit-1;
         size_t length=connection->xmux_plain_output.len < limit ? connection->xmux_plain_output.len : limit;
         uint8_t *record=NULL; size_t record_length=0;
         if (encrypt_record(connection,connection->c_app_key,connection->c_app_iv,&connection->c_app_seq,0x17,
@@ -6945,7 +7102,7 @@ static int xmux_transport_collect(void *opaque) {
         while (connection->xmux_raw_input.len >= 5) {
             const uint8_t *record=connection->xmux_raw_input.data;
             size_t length=((size_t)record[3]<<8)|record[4];
-            if (length > 18432) return -1;
+            if (record[0] != 23 || record[1] != 3 || record[2] != 3 || length > 16640) return -1;
             if (connection->xmux_raw_input.len < length+5) break;
             if (record[0] == 0x17) {
                 uint8_t *plain=NULL,inner=0; size_t plain_length=0;

@@ -26,6 +26,7 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
 }
 
 static void fuzz_clear(tls13_conn_t *c) {
+    db_free(&c->transcript);
     db_free(&c->tls_post_handshake); db_free(&c->tls_client_hello); db_free(&c->tls_certificate_message);
     X509_free(c->tls_peer_certificate); EVP_PKEY_free(c->tls_retry_key);
     db_free(&c->h2_net_cache);
@@ -231,6 +232,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             free(retry); EVP_PKEY_free(key);
         }
         configure_tls_cipher(&c,0x1303); c.tls_auth_state=4;
+        (void)tls_certificate_request(data,size);
+        (void)tls_session_ticket(data,size);
+        (void)tls_encrypted_extensions(&c,data,size);
+        (void)append_transcript(&c,data,size);
         (void)tls_post_handshake(&c,data,size);
         int pair[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) abort();

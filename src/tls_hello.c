@@ -35,6 +35,11 @@ static int client_group(const uint8_t *hello,size_t length,size_t start,unsigned
     }
     return 0;
 }
+const uint8_t *core_tls_hello_extension(const uint8_t *hello,size_t length,unsigned type,size_t *size) {
+    size_t ciphers,start;
+    if (!hello || !size || client_fields(hello,length,&ciphers,&start)) return NULL;
+    *size=0; return extension(hello,length,start,type,size);
+}
 int core_tls_hello_parse(const uint8_t *message,size_t length,const uint8_t *client,size_t client_length,core_tls_hello_t *result) {
     static const uint8_t retry_random[]={0xcf,0x21,0xad,0x74,0xe5,0x9a,0x61,0x11,0xbe,0x1d,0x8c,0x02,0x1e,0x65,0xb8,0x91,0xc2,0xa2,0x11,0x16,0x7a,0xbb,0x8c,0x5e,0x07,0x9e,0x09,0xe2,0xc8,0xa8,0x33,0x9c};
     size_t ciphers,start;

@@ -199,6 +199,7 @@ int main(void) {
             tls13_conn_t connection={.fd=pair[0]}; char error[256]={0};
             core_set_socket_io_timeout(pair[0],1000);
             int result=run_tls_handshake(&config,&connection,TLS_CIPHER_OFFER_CHACHA,error,sizeof(error));
+            CHECK("auth/handshake-memory-released",connection.tls_handshake_bytes == 0);
             if (!variant && result) fprintf(stderr,"valid handshake %d/%s: %s\n",kind,modes[mode],error);
             if (variant == 0 || variant == 7) CHECK("auth/valid-signature",result == 0);
             else CHECK("auth/malformed-handshake-rejected",result != 0);
@@ -213,5 +214,6 @@ int main(void) {
         }
         OPENSSL_free(der); X509_free(certificate); EVP_PKEY_free(key);
     }
+    CHECK("auth/global-handshake-memory-released",tls_buffer_bytes == 0);
     return test_result();
 }

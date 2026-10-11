@@ -3,6 +3,10 @@
 #include "../src/tls13_reality.c"
 #include "uri.h"
 
+static int allocation_failure;
+void *__real_malloc(size_t);
+void *__wrap_malloc(size_t size) { if (allocation_failure) { allocation_failure=0; errno=ENOMEM; return NULL; } return __real_malloc(size); }
+
 static int hello_extension(const uint8_t *hello, size_t length, unsigned kind, const uint8_t **body, size_t *size) {
     if (length < 40) return -1;
     size_t offset=39+hello[38];
@@ -60,6 +64,141 @@ static void initial_share_vectors(void) {
     free(hello); EVP_PKEY_free(key); EVP_PKEY_free(peer);
 }
 
+static void record_limit_vectors(void) {
+    tls13_conn_t connection={.tls_auth_state=4};
+    REQUIRE("tls/record-limit-cipher",configure_tls_cipher(&connection,0x1303) == 0);
+    uint8_t *data=calloc(1,16385),*record=NULL; size_t size=0;
+    REQUIRE("tls/record-limit-payload",data);
+    uint64_t sequence=0;
+    CHECK("tls/oversized-plaintext-rejected",encrypt_record(&connection,connection.c_app_key,connection.c_app_iv,&sequence,23,data,16385,&record,&size) != 0);
+    free(record); record=NULL; sequence=UINT64_MAX;
+    CHECK("tls/sequence-cannot-wrap",encrypt_record(&connection,connection.c_app_key,connection.c_app_iv,&sequence,23,data,1,&record,&size) != 0 && sequence == UINT64_MAX);
+    free(record); free(data);
+    const uint8_t ticket[]={4,0,0,0};
+    CHECK("tls/empty-session-ticket-rejected",tls_post_handshake(&connection,ticket,sizeof(ticket)) != 0);
+    db_free(&connection.tls_post_handshake);
+    const uint8_t valid_ticket[]={4,0,0,14,0,0,0,60,0,0,0,0,0,0,1,'x',0,0};
+    CHECK("tls/session-ticket-structure-accepted",tls_post_handshake(&connection,valid_ticket,sizeof(valid_ticket)) == 0);
+    db_free(&connection.tls_post_handshake);
+    const uint8_t bad_extensions[]={0,6,0,51,0,2,0,29};
+    CHECK("tls/key-share-forbidden-in-encrypted-extensions",tls_encrypted_extensions(&connection,bad_extensions,sizeof(bad_extensions)) != 0);
+    const uint8_t unoffered[]={0,4,0xab,0xcd,0,0};
+    CHECK("tls/unoffered-encrypted-extension-rejected",tls_encrypted_extensions(&connection,unoffered,sizeof(unoffered)) != 0);
+    dynbuf_t cache={0};
+    CHECK("tls/unexpected-inner-record-rejected",tls_application_plain(&connection,20,(const uint8_t *)"\x01",1,&cache) != 0);
+    const uint8_t fatal[]={2,40};
+    CHECK("tls/fatal-alert-is-not-ignored",tls_application_plain(&connection,21,fatal,sizeof(fatal),&cache) < 0);
+    db_free(&cache);
+    uint8_t *transcript=calloc(1,1024U*1024U+1);
+    REQUIRE("tls/transcript-limit-payload",transcript);
+    CHECK("tls/handshake-accumulation-limited",append_transcript(&connection,transcript,1024U*1024U+1) != 0);
+    db_free(&connection.transcript);
+    tls13_conn_t *connections=calloc(9,sizeof(*connections)); REQUIRE("tls/global-handshake-budget-fixture",connections);
+    for (unsigned i=0;i<8;i++) REQUIRE("tls/global-handshake-budget-within-limit",append_transcript(connections+i,transcript,1024U*1024U) == 0);
+    CHECK("tls/global-handshake-budget-enforced",append_transcript(connections+8,transcript,1024U*1024U) != 0);
+    for (unsigned i=0;i<9;i++) db_free(&connections[i].transcript);
+    CHECK("tls/global-handshake-budget-recovered",append_transcript(&connection,transcript,1024U*1024U) == 0);
+    db_free(&connection.transcript); free(connections); free(transcript);
+    CHECK("tls/global-handshake-budget-no-leak",tls_buffer_bytes == 0);
+    allocation_failure=1;
+    CHECK("tls/handshake-allocation-reservation-rollback",append_transcript(&connection,(const uint8_t *)"vless-core",10) != 0 && !tls_buffer_bytes && !connection.tls_handshake_bytes);
+    REQUIRE("tls/handshake-allocation-recovery",append_transcript(&connection,(const uint8_t *)"vless-core",10) == 0);
+    size_t accounted=tls_buffer_bytes; uint8_t block[1024]={0}; allocation_failure=1;
+    CHECK("tls/handshake-resize-reservation-rollback",append_transcript(&connection,block,sizeof(block)) != 0 && tls_buffer_bytes == accounted && connection.transcript.len == 10 && !memcmp(connection.transcript.data,"vless-core",10));
+    db_free(&connection.transcript); CHECK("tls/handshake-allocation-cleanup",tls_buffer_bytes == 0);
+}
+
+static void automatic_update_vectors(void) {
+    for (unsigned pooled=0;pooled<2;pooled++) {
+        int pair[2]; REQUIRE("tls/automatic-update-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        tls13_conn_t sender={.fd=pair[0],.mode=CONN_MODE_TLS,.tls_auth_state=4,.xmux_async=(int)pooled},peer={0};
+        REQUIRE("tls/automatic-update-ciphers",configure_tls_cipher(&sender,0x1303) == 0 && configure_tls_cipher(&peer,0x1303) == 0);
+        memset(sender.c_app_traffic,7,32); memcpy(peer.s_app_traffic,sender.c_app_traffic,32);
+        REQUIRE("tls/automatic-update-keys",derive_key_iv_md(sender.tls_md,sender.c_app_traffic,32,32,sender.c_app_key,sender.c_app_iv) == 0);
+        memcpy(peer.s_app_key,sender.c_app_key,32); memcpy(peer.s_app_iv,sender.c_app_iv,12);
+        sender.c_app_seq=peer.s_app_seq=TLS_RECORD_REKEY_LIMIT;
+        if (pooled) {
+            REQUIRE("tls/automatic-pooled-update-queue",db_append(&sender.xmux_plain_output,"vless-core",10) == 0);
+            REQUIRE("tls/automatic-pooled-update-flush",xmux_transport_flush(&sender) == 0 && xmux_transport_flush(&sender) == 0 && xmux_transport_flush(&sender) == 0);
+            CHECK("tls/control-record-not-counted-as-upload",sender.xmux_flushed == 10);
+        } else REQUIRE("tls/automatic-single-update-write",reality_write_app_records(&sender,(const uint8_t *)"vless-core",10) == 0);
+        uint8_t type,*record=NULL,*plain=NULL,inner=0; size_t size=0,length=0;
+        REQUIRE("tls/automatic-update-wire",read_record(pair[1],&type,&record,&size) == 0 && decrypt_record(&peer,peer.s_app_key,peer.s_app_iv,&peer.s_app_seq,type,record,size,&plain,&length,&inner) == 0);
+        CHECK("tls/automatic-update-precedes-payload",inner == 22 && length == 5 && !memcmp(plain,"\x18\x00\x00\x01\x00",5)); free(record); free(plain);
+        REQUIRE("tls/automatic-update-peer-rotate",tls_update_keys(&peer,0) == 0);
+        REQUIRE("tls/automatic-update-new-key-wire",read_record(pair[1],&type,&record,&size) == 0 && decrypt_record(&peer,peer.s_app_key,peer.s_app_iv,&peer.s_app_seq,type,record,size,&plain,&length,&inner) == 0);
+        CHECK("tls/automatic-update-new-key-payload",inner == 23 && length == 10 && !memcmp(plain,"vless-core",10) && sender.c_app_seq == 1);
+        free(record); free(plain); db_free(&sender.xmux_plain_output); db_free(&sender.xmux_wire_output); close(pair[0]); close(pair[1]);
+    }
+    int pair[2]; REQUIRE("tls/receive-update-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    tls13_conn_t receiver={.fd=pair[0],.mode=CONN_MODE_TLS,.tls_auth_state=4,.s_app_seq=TLS_RECORD_REKEY_LIMIT},peer={0};
+    REQUIRE("tls/receive-update-cipher",configure_tls_cipher(&receiver,0x1303) == 0 && configure_tls_cipher(&peer,0x1303) == 0);
+    memset(receiver.c_app_traffic,7,32);
+    REQUIRE("tls/receive-update-keys",derive_key_iv_md(receiver.tls_md,receiver.c_app_traffic,32,32,receiver.c_app_key,receiver.c_app_iv) == 0);
+    memcpy(peer.s_app_key,receiver.c_app_key,32); memcpy(peer.s_app_iv,receiver.c_app_iv,12);
+    dynbuf_t cache={0};
+    REQUIRE("tls/receive-update-request",tls_application_plain(&receiver,23,(const uint8_t *)"vless-core",10,&cache) == 0);
+    uint8_t type,*record=NULL,*plain=NULL,inner=0; size_t size=0,length=0;
+    REQUIRE("tls/receive-update-request-wire",read_record(pair[1],&type,&record,&size) == 0 && decrypt_record(&peer,peer.s_app_key,peer.s_app_iv,&peer.s_app_seq,type,record,size,&plain,&length,&inner) == 0);
+    CHECK("tls/receive-update-requested-once",inner == 22 && length == 5 && plain[4] == 1 && receiver.tls_receive_update_requested);
+    free(record); free(plain);
+    REQUIRE("tls/receive-update-second-payload",tls_application_plain(&receiver,23,(const uint8_t *)"x",1,&cache) == 0);
+    uint8_t byte; CHECK("tls/receive-update-not-repeated",recv(pair[1],&byte,1,MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    CHECK("tls/receive-update-request-cleared",tls_update_keys(&receiver,0) == 0 && !receiver.tls_receive_update_requested && !receiver.s_app_seq);
+    db_free(&cache); close(pair[0]); close(pair[1]);
+}
+
+static void incoming_record_vectors(void) {
+    tls13_conn_t connection={0}; REQUIRE("tls/incoming-record-cipher",configure_tls_cipher(&connection,0x1303) == 0);
+    static const struct { size_t content,padding; unsigned limit; int accepted; } cases[]={
+        {16384,0,0,1},{16385,0,0,0},{16384,239,0,1},{16384,240,0,0},{16384,239,16385,0},
+    };
+    for (size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+        size_t inner_size=cases[i].content+1+cases[i].padding,encrypted_size=inner_size+16;
+        uint8_t *inner=calloc(1,inner_size),*encrypted=malloc(encrypted_size); REQUIRE("tls/incoming-record-fixture",inner && encrypted);
+        memset(inner,'A',cases[i].content); inner[cases[i].content]=23;
+        uint8_t header[]={23,3,3,(uint8_t)(encrypted_size>>8),(uint8_t)encrypted_size};
+        EVP_CIPHER_CTX *cipher=EVP_CIPHER_CTX_new(); int written=0,final=0;
+        REQUIRE("tls/independent-peer-record",cipher && EVP_EncryptInit_ex(cipher,EVP_chacha20_poly1305(),NULL,connection.s_app_key,connection.s_app_iv) == 1 &&
+            EVP_EncryptUpdate(cipher,NULL,&written,header,5) == 1 && EVP_EncryptUpdate(cipher,encrypted,&written,inner,(int)inner_size) == 1 &&
+            EVP_EncryptFinal_ex(cipher,encrypted+written,&final) == 1 && EVP_CIPHER_CTX_ctrl(cipher,EVP_CTRL_AEAD_GET_TAG,16,encrypted+inner_size) == 1);
+        EVP_CIPHER_CTX_free(cipher); free(inner); connection.tls_receive_record_limit=cases[i].limit;
+        uint8_t *plain=NULL,type=0; size_t length=0; uint64_t sequence=0;
+        int result=decrypt_record(&connection,connection.s_app_key,connection.s_app_iv,&sequence,23,encrypted,encrypted_size,&plain,&length,&type);
+        CHECK("tls/incoming-record-size-and-padding",cases[i].accepted ? result == 0 && length == cases[i].content && type == 23 && sequence == 1 : result < 0 && !sequence);
+        free(plain); free(encrypted);
+    }
+    int pair[2]; REQUIRE("tls/oversized-wire-record-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    uint8_t oversized[]={23,3,3,0x41,0x01,'A'};
+    REQUIRE("tls/oversized-wire-record-feed",write_exact(pair[1],oversized,sizeof(oversized)) == 0 && shutdown(pair[1],SHUT_WR) == 0);
+    uint8_t type,*payload=NULL,byte=0; size_t length=0;
+    CHECK("tls/oversized-wire-record-rejected-before-payload",read_record(pair[0],&type,&payload,&length) != 0 && recv(pair[0],&byte,1,MSG_DONTWAIT) == 1 && byte == 'A');
+    free(payload); close(pair[0]); close(pair[1]);
+    REQUIRE("tls/unprotected-app-record-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    connection=(tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_TLS,.tls_auth_state=4}; REQUIRE("tls/unprotected-app-record-cipher",configure_tls_cipher(&connection,0x1303) == 0);
+    uint8_t *record=NULL; uint64_t sequence=0; const uint8_t ccs[]={20,3,3,0,1,1};
+    REQUIRE("tls/unprotected-app-record-feed",encrypt_record(&connection,connection.s_app_key,connection.s_app_iv,&sequence,23,(const uint8_t *)"vless-core",10,&record,&length) == 0 &&
+        write_exact(pair[1],ccs,sizeof(ccs)) == 0 && write_exact(pair[1],record,length) == 0 && shutdown(pair[1],SHUT_WR) == 0);
+    uint8_t output[32]; size_t received=0;
+    CHECK("tls/unprotected-app-record-is-not-skipped",tls13_read_app(&connection,output,sizeof(output),&received) < 0 && !received);
+    free(record); db_free(&connection.app_cache); close(pair[0]); close(pair[1]);
+    const uint8_t valid_certificate[]={11,0,0,10,0,0,0,6,0,0,1,'x',0,0};
+    const uint8_t context_certificate[]={11,0,0,11,1,'x',0,0,6,0,0,1,'x',0,0};
+    const uint8_t *der=NULL; size_t der_length=0;
+    CHECK("tls/certificate-container-valid",parse_first_cert_der(valid_certificate,sizeof(valid_certificate),&der,&der_length) == 0 && der_length == 1);
+    CHECK("tls/server-certificate-context-must-be-empty",parse_first_cert_der(context_certificate,sizeof(context_certificate),&der,&der_length) != 0);
+    uint8_t trailing[sizeof(valid_certificate)+1]; memcpy(trailing,valid_certificate,sizeof(valid_certificate)); trailing[3]++; trailing[sizeof(valid_certificate)]=0;
+    CHECK("tls/certificate-list-cannot-have-trailing-data",parse_first_cert_der(trailing,sizeof(trailing),&der,&der_length) != 0);
+    for (size_t cut=0;cut<sizeof(valid_certificate);cut++) CHECK("tls/certificate-container-truncation",parse_first_cert_der(valid_certificate,cut,&der,&der_length) != 0);
+    vless_config_t config; core_config_defaults(&config); config.fp_mode=FP_FIREFOX; strcpy(config.sni,"vless-core.test");
+    uint8_t private_key[32],public_key[32],random[32],auth[32],*hello=NULL; size_t hello_size=0,sid=0;
+    REQUIRE("tls/record-limit-clienthello",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&hello_size,&sid,NULL,NULL) == 0);
+    connection=(tls13_conn_t){0}; REQUIRE("tls/record-limit-clienthello-cache",db_append(&connection.tls_client_hello,hello,hello_size) == 0); free(hello);
+    const uint8_t limits[]={0,6,0,28,0,2,0,64};
+    CHECK("tls/record-size-limit-negotiated",tls_encrypted_extensions(&connection,limits,sizeof(limits)) == 0 && connection.tls_send_record_limit == 64 && connection.tls_receive_record_limit == 16385);
+    db_free(&connection.tls_client_hello);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
         vless_config_t config; char error[256]={0}; tls13_conn_t *connection=NULL;
@@ -68,6 +207,9 @@ int main(int argc, char **argv) {
         if (result) fprintf(stderr,"handshake: %s\n",error);
         CHECK("tls/live-retry-handshake",result == 0); tls13_reality_close(connection); return test_result();
     }
+    record_limit_vectors();
+    automatic_update_vectors();
+    incoming_record_vectors();
     vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); strcpy(config.alpn,"http/1.1");
     uint8_t private_key[32],public_key[32],random[32],auth[32],*hello=NULL;
     size_t length=0,sid=0,extension_length=0; const uint8_t *extension=NULL;

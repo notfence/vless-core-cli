@@ -12,4 +12,5 @@ typedef struct {
 int core_tls_hello_parse(const uint8_t *,size_t,const uint8_t *,size_t,core_tls_hello_t *);
 int core_tls_hello_retry(const uint8_t *,size_t,const core_tls_hello_t *,uint8_t **,size_t *,EVP_PKEY **);
 int core_tls_ecdh(EVP_PKEY *,uint16_t,const uint8_t *,size_t,uint8_t *,size_t *);
+const uint8_t *core_tls_hello_extension(const uint8_t *,size_t,unsigned,size_t *);
 #endif
