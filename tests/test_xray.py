@@ -1011,6 +1011,20 @@ class XrayTests(unittest.TestCase):
             result = subprocess.run([str(BUILD/"test_tls"),uri(listen_port,"tcp","tls")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=15)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
 
+    def test_optional_tls_client_certificate_request(self):
+        cert,key=certificate(); listen_port=port()
+        command=[str(OPENSSL),"s_server","-accept",f"127.0.0.1:{listen_port}","-cert",str(cert),"-key",str(key),"-tls1_3","-groups","X25519","-verify","1","-www"]
+        with Process(command,"optional-client-certificate",ready="ACCEPT") as server:
+            result=subprocess.run([str(BUILD/"test_tls_state"),uri(listen_port,"tcp","tls",fp="qq")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
+
+    def test_required_tls_client_certificate_is_not_supported(self):
+        cert,key=certificate(); listen_port=port()
+        command=[str(OPENSSL),"s_server","-accept",f"127.0.0.1:{listen_port}","-cert",str(cert),"-key",str(key),"-tls1_3","-groups","X25519","-Verify","1","-www"]
+        with Process(command,"required-client-certificate",ready="ACCEPT"), cli(uri(listen_port,"tcp","tls",fp="qq"),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+            with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core no client certificate")
+
     def test_reference_vision_fixture(self):
         cert,_ = certificate()
         with Server(tls=True) as target, xray_server("tcp","tls",flow="xtls-rprx-vision") as reference:

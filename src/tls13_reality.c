@@ -171,6 +171,7 @@ struct tls13_conn {
     X509 *tls_peer_certificate;
     dynbuf_t tls_certificate_message;
     unsigned tls_auth_state;
+    int tls_client_certificate_requested;
     dynbuf_t tls_post_handshake;
     char tls_offered_alpn[128], tls_selected_alpn[128];
     int tls_h2_required, tls_is_reality;
@@ -4066,17 +4067,6 @@ static int ext_sct(dynbuf_t *exts) {
     return add_ext(exts, 0x0012, NULL, 0);
 }
 
-static int ext_compress_cert_brotli(dynbuf_t *exts) {
-    /* algorithm list length=2, brotli=0x0002 */
-    uint8_t data[] = {0x02, 0x00, 0x02};
-    return add_ext(exts, 0x001b, data, sizeof(data));
-}
-
-static int ext_delegated_credentials_firefox(dynbuf_t *exts) {
-    uint8_t data[] = {0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03};
-    return add_ext(exts, 0x0022, data, sizeof(data));
-}
-
 static int ext_record_size_limit_firefox(dynbuf_t *exts) {
     uint8_t data[] = {0x40, 0x01};
     return add_ext(exts, 0x001c, data, sizeof(data));
@@ -4237,7 +4227,7 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
             ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
             ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0, hybrid_pub) != 0 ||
             ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, boring_grease_vers) != 0 ||
-            ext_compress_cert_brotli(&exts) != 0 || ext_application_settings_h2(&exts) != 0 ||
+            ext_application_settings_h2(&exts) != 0 ||
             ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
             db_free(&exts);
             db_free(&hs);
@@ -4258,7 +4248,7 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
             ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
             ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0, hybrid_pub) != 0 ||
             ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, boring_grease_vers) != 0 ||
-            ext_compress_cert_brotli(&exts) != 0 || ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
+            ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
             db_free(&exts);
             db_free(&hs);
             return -1;
@@ -4274,7 +4264,7 @@ static int build_client_hello(const vless_config_t *cfg, int use_reality, tls_ci
         if (ext_server_name(&exts, cfg->sni) != 0 || ext_extended_master_secret(&exts) != 0 ||
             ext_renegotiation_info(&exts) != 0 || ext_supported_groups_firefox(&exts, hybrid_pub != NULL) != 0 ||
             ext_ec_point_formats(&exts) != 0 || ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 ||
-            ext_status_request(&exts) != 0 || ext_delegated_credentials_firefox(&exts) != 0 ||
+            ext_status_request(&exts) != 0 ||
             ext_key_share_firefox(&exts, client_pub, hybrid_pub,retained) != 0 || ext_supported_versions_firefox(&exts) != 0 ||
             ext_sig_algs_firefox(&exts) != 0 || ext_psk_modes(&exts) != 0 || ext_record_size_limit_firefox(&exts) != 0 ||
             ext_ech_grease_firefox(&exts) != 0) {
@@ -5498,9 +5488,35 @@ static int verify_server_signature(const vless_config_t *cfg, tls13_conn_t *c, c
     EVP_MD_CTX_free(verify); EVP_PKEY_free(key); return ok ? 0 : -1;
 }
 
+static int tls_certificate_request(const uint8_t *body, size_t length) {
+    if (length < 3 || body[0] || (((size_t)body[1]<<8)|body[2]) != length-3) return -1;
+    unsigned seen[256]; size_t count=0; int signatures=0;
+    for (size_t offset=3;offset<length;) {
+        if (length-offset < 4 || count == sizeof(seen)/sizeof(seen[0])) return -1;
+        unsigned type=((unsigned)body[offset]<<8)|body[offset+1];
+        size_t size=((size_t)body[offset+2]<<8)|body[offset+3]; offset+=4;
+        if (size > length-offset) return -1;
+        for (size_t i=0;i<count;i++) if (seen[i] == type) return -1;
+        seen[count++]=type;
+        if (type == 13 || type == 50) {
+            if (size < 4 || (size&1) || (((size_t)body[offset]<<8)|body[offset+1]) != size-2) return -1;
+            if (type == 13) signatures=1;
+        }
+        offset+=size;
+    }
+    return signatures ? 0 : -1;
+}
+
 static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, const uint8_t *message, size_t length, char *err, size_t err_cap) {
     if (length < 4) return -1;
     unsigned type=message[0]; size_t body_length=length-4;
+    if (type == 13) {
+        if (c->tls_auth_state != 1 || c->tls_client_certificate_requested || tls_certificate_request(message+4,body_length)) {
+            set_err(err,err_cap,"invalid or unexpected TLS CertificateRequest"); return -1;
+        }
+        if (append_transcript(c,message,length)) return -1;
+        c->tls_client_certificate_requested=1; return 0;
+    }
     static const unsigned expected[]={8,11,15,20};
     if (c->tls_auth_state >= 4 || type != expected[c->tls_auth_state]) {
         set_err(err,err_cap,"unexpected TLS server handshake message"); return -1;
@@ -5774,20 +5790,21 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
 
     db_free(&enc_hs);
 
-    uint8_t thash[64];
-    uint8_t client_verify[64];
-    if (transcript_hash(c, thash) != 0 || calc_finished_verify(c, c->c_hs_traffic, thash, client_verify) != 0) {
-        set_err(err, err_cap, "failed to create client Finished");
-        return -1;
-    }
-
     // TLS 1.3 traffic_secret_0 is derived from transcript up to server Finished.
     if (derive_app_keys(c) != 0) {
         set_err(err, err_cap, "failed to derive application keys");
         return -1;
     }
 
-    uint8_t fin_msg[68];
+    static const uint8_t empty_certificate[]={11,0,0,4,0,0,0,0};
+    if (c->tls_client_certificate_requested && append_transcript(c,empty_certificate,sizeof(empty_certificate))) return -1;
+    uint8_t thash[64],client_verify[64];
+    if (transcript_hash(c,thash) || calc_finished_verify(c,c->c_hs_traffic,thash,client_verify)) {
+        set_err(err,err_cap,"failed to create client Finished"); return -1;
+    }
+
+    uint8_t flight[76],*fin_msg=flight+(c->tls_client_certificate_requested ? sizeof(empty_certificate) : 0);
+    if (c->tls_client_certificate_requested) memcpy(flight,empty_certificate,sizeof(empty_certificate));
     size_t fin_msg_len = 4 + c->tls_hash_len;
     fin_msg[0] = 0x14;
     fin_msg[1] = 0x00;
@@ -5797,7 +5814,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
 
     uint8_t *enc_fin = NULL;
     size_t enc_fin_len = 0;
-    if (encrypt_record(c, c->c_hs_key, c->c_hs_iv, &c->c_hs_seq, 0x16, fin_msg, fin_msg_len, &enc_fin, &enc_fin_len) != 0) {
+    if (encrypt_record(c, c->c_hs_key, c->c_hs_iv, &c->c_hs_seq, 0x16, flight, (size_t)(fin_msg-flight)+fin_msg_len, &enc_fin, &enc_fin_len) != 0) {
         set_err(err, err_cap, "failed to encrypt client Finished");
         return -1;
     }
@@ -5873,6 +5890,7 @@ static const char *tls_cipher_suite_name(uint16_t suite) {
 static void reset_manual_tls_handshake(tls13_conn_t *c) {
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL;
     db_free(&c->tls_certificate_message); c->tls_auth_state=0;
+    c->tls_client_certificate_requested=0;
     db_free(&c->tls_post_handshake); c->tls_selected_alpn[0]=0;
     db_free(&c->tls_client_hello); EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL; c->tls_retry_seen=0; c->tls_retry_group=0; c->tls_exchange_group=0;
     c->tls_cipher_suite = 0;

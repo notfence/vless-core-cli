@@ -76,6 +76,13 @@ int main(int argc, char **argv) {
     retry_vectors(hello,length);
     initial_share_vectors();
     free(hello);
+    for (unsigned fingerprint=0;fingerprint<3;fingerprint++) {
+        config.fp_mode=(fingerprint_mode_t[]){FP_CHROME,FP_FIREFOX,FP_QQ}[fingerprint]; hello=NULL;
+        REQUIRE("tls/advertised-certificate-capabilities-build",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&length,&sid,NULL,NULL) == 0);
+        CHECK("tls/no-unsupported-certificate-compression",hello_extension(hello,length,27,&extension,&extension_length) != 0);
+        CHECK("tls/no-unsupported-delegated-credentials",hello_extension(hello,length,34,&extension,&extension_length) != 0);
+        free(hello);
+    }
     tls13_conn_t negotiated={.tls_h2_required=1}; strcpy(negotiated.tls_offered_alpn,"h2,http/1.1");
     const uint8_t h2[]={0,9,0,16,0,5,0,3,2,'h','2'},none[]={0,0};
     CHECK("tls/alpn-h2-negotiated",tls_encrypted_extensions(&negotiated,h2,sizeof(h2)) == 0);
