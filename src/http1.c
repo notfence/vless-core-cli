@@ -28,6 +28,38 @@ static int token(const uint8_t *data, size_t length) {
     return 1;
 }
 
+static int chunk_extensions(const uint8_t *data, size_t length) {
+    size_t offset=0;
+    while (offset < length) {
+        while (offset < length && (data[offset] == ' ' || data[offset] == '\t')) offset++;
+        if (offset == length || data[offset++] != ';') return -1;
+        while (offset < length && (data[offset] == ' ' || data[offset] == '\t')) offset++;
+        size_t start=offset;
+        while (offset < length && token(data+offset,1)) offset++;
+        if (start == offset) return -1;
+        size_t next=offset;
+        while (next < length && (data[next] == ' ' || data[next] == '\t')) next++;
+        if (next == length || data[next] != '=') continue;
+        offset=next+1;
+        while (offset < length && (data[offset] == ' ' || data[offset] == '\t')) offset++;
+        if (offset < length && data[offset] == '"') {
+            offset++; int closed=0;
+            while (offset < length) {
+                unsigned byte=data[offset++];
+                if (byte == '"') { closed=1; break; }
+                if (byte == '\\') { if (offset == length) return -1; byte=data[offset++]; }
+                if ((byte < 0x20 && byte != '\t') || byte == 0x7f) return -1;
+            }
+            if (!closed) return -1;
+        } else {
+            start=offset;
+            while (offset < length && token(data+offset,1)) offset++;
+            if (start == offset) return -1;
+        }
+    }
+    return 0;
+}
+
 static int contains_token(const uint8_t *data, size_t length, const char *word) {
     while (length) {
         while (length && (*data == ' ' || *data == '\t' || *data == ',')) { data++; length--; }
@@ -46,6 +78,7 @@ static int headers(core_http1_response_t *parser, const uint8_t *data, size_t le
     if (end > 65536) return -1;
     size_t line=line_length(data,end);
     if (line < 14 || (memcmp(data,"HTTP/1.1 ",9) && memcmp(data,"HTTP/1.0 ",9)) || data[9] < '1' || data[9] > '5' || data[10] < '0' || data[10] > '9' || data[11] < '0' || data[11] > '9' || data[12] != ' ') return -1;
+    for (size_t i=13;i+2<line;i++) if ((data[i] < 0x20 && data[i] != '\t') || data[i] == 0x7f) return -1;
     int status=(data[9]-'0')*100+(data[10]-'0')*10+data[11]-'0';
     if (status == 101) return -1;
     int seen_length=0,seen_encoding=0,close_connection=data[7] == '0';
@@ -77,6 +110,7 @@ static int headers(core_http1_response_t *parser, const uint8_t *data, size_t le
     event->kind=1; event->status=status; event->consumed=end;
     if (status < 200) return 0;
     parser->chunked=seen_encoding; parser->close_connection=close_connection;
+    parser->close_delimited=!seen_length && !seen_encoding;
     parser->remaining=seen_length ? content_length : UINT64_MAX;
     parser->state=seen_encoding ? 2 : 1;
     if (!seen_encoding && !seen_length) parser->close_connection=1;
@@ -95,14 +129,14 @@ int core_http1_next(core_http1_response_t *parser, const uint8_t *data, size_t l
                 parser->state=7; event->kind=3; event->close_connection=parser->close_connection; return 0;
             }
             if (!length) {
-                if (eof && parser->state == 1 && parser->remaining == UINT64_MAX) { parser->remaining=0; continue; }
+                if (eof && parser->state == 1 && parser->close_delimited) { parser->remaining=0; continue; }
                 return eof ? -1 : 1;
             }
             if (!capacity) return 1;
             size_t take=length < capacity ? length : capacity;
             if ((uint64_t)take > parser->remaining) take=(size_t)parser->remaining;
             event->kind=2; event->offset=event->consumed; event->length=take; event->consumed+=take;
-            if (parser->remaining != UINT64_MAX) parser->remaining-=take;
+            if (!parser->close_delimited) parser->remaining-=take;
             return 0;
         }
         if (parser->state == 4) {
@@ -113,9 +147,9 @@ int core_http1_next(core_http1_response_t *parser, const uint8_t *data, size_t l
         if (parser->state == 2) {
             size_t line=line_length(data,length);
             if (!line) return eof || length > 1024 ? -1 : 1;
-            size_t digits=0; while (digits+2 < line && data[digits] != ';') digits++;
-            if (number(data,digits,16,&parser->remaining) != 0) return -1;
-            for (size_t i=digits;i+2<line;i++) if (data[i] < 0x20 || data[i] == 0x7f) return -1;
+            size_t digits=0;
+            while (digits+2 < line && ((data[digits] >= '0' && data[digits] <= '9') || (data[digits] >= 'a' && data[digits] <= 'f') || (data[digits] >= 'A' && data[digits] <= 'F'))) digits++;
+            if (number(data,digits,16,&parser->remaining) || chunk_extensions(data+digits,line-2-digits)) return -1;
             data+=line; length-=line; event->consumed+=line;
             parser->state=parser->remaining ? 3 : 5;
         }
@@ -127,6 +161,9 @@ int core_http1_next(core_http1_response_t *parser, const uint8_t *data, size_t l
             if (line > 2) {
                 const uint8_t *colon=memchr(data,':',line-2);
                 if (!colon || !token(data,(size_t)(colon-data))) return -1;
+                size_t name=(size_t)(colon-data);
+                if ((name == 14 && !strncasecmp((const char *)data,"Content-Length",name)) || (name == 17 && !strncasecmp((const char *)data,"Transfer-Encoding",name)) ||
+                    (name == 7 && !strncasecmp((const char *)data,"Trailer",name))) return -1;
                 for (size_t i=(size_t)(colon-data)+1;i+2<line;i++) if ((data[i] < 0x20 && data[i] != '\t') || data[i] == 0x7f) return -1;
             }
             data+=line; length-=line; event->consumed+=line;

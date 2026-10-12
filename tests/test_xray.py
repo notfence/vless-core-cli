@@ -28,6 +28,54 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_http1_stream_upload_invalid_ack_aborts_session(self):
+        acknowledged=threading.Event()
+        def handler(connection):
+            request=bytearray()
+            while not request.endswith(b"\r\n\r\n"): request.extend(exact(connection,1))
+            if request.startswith(b"GET "):
+                self.assertTrue(acknowledged.wait(2))
+                connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n\x00\x00vless-core")
+                connection.recv(1); return
+            self.assertTrue(request.startswith(b"POST "))
+            connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\nx")
+            acknowledged.set()
+            while True:
+                line=bytearray()
+                while not line.endswith(b"\r\n"): line.extend(exact(connection,1))
+                size=int(line,16)
+                exact(connection,size+2)
+                if not size: return
+        with Server(handler) as server, cli(uri(server.port,"xhttp","none",mode="stream-up")) as core:
+            with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core")
+            self.assertIn("upload response failed",core.log)
+
+    def test_http1_post_response_is_fully_validated(self):
+        responses=[
+            (True,b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+            (True,b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nvless-core"),
+            (False,b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\nx"),
+            (False,b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nTransfer-Encoding: chunked\r\n\r\na\r\nvless-core\r\n0\r\n\r\n"),
+            (False,b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nvless-core"),
+            (False,b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\najunk\r\nvless-core\r\n0\r\n\r\n"),
+            (True,b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na;vless-core=yes\r\nvless-core\r\n0\r\nX-Result: ok\r\n\r\n"),
+        ]
+        cert,_=certificate()
+        for security in ("none","tls"):
+            for valid,response in responses:
+                def handler(connection):
+                    request=bytearray()
+                    while not request.endswith(b"\r\n\r\n"): request.extend(exact(connection,1))
+                    if request.startswith(b"GET "): connection.recv(1); return
+                    self.assertTrue(request.startswith(b"POST "))
+                    self.assertEqual(exact(connection,10),b"vless-core")
+                    for offset in range(0,len(response),3): connection.sendall(response[offset:offset+3])
+                    if security == "tls": connection.unwrap()
+                with self.subTest(security=security,valid=valid,response=response), Server(handler,tls=security == "tls") as server:
+                    result=subprocess.run([str(BUILD/"test_tls"),"--xhttp-post",uri(server.port,"xhttp",security,mode="packet-up",alpn="http/1.1")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=5)
+                    self.assertEqual(result.returncode,0 if valid else 1,result.stdout+result.stderr)
+
     def test_duplex_backpressure_does_not_block_reply(self):
         payload=bytes(range(251))*66842; failures=[]; cert,_=certificate()
         def handler(connection):

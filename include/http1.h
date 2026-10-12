@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 typedef struct {
-    int state, chunked, close_connection;
+    int state, chunked, close_connection, close_delimited;
     uint64_t remaining;
     size_t header_bytes;
 } core_http1_response_t;

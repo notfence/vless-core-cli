@@ -131,11 +131,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (result || event.kind == 3) break;
         }
         if (db_append(&c.xhttp_net_cache, data, size) != 0) abort();
-        int status, chunked;
-        int64_t length;
-        (void)parse_http_response_headers(NULL, -1, &c.xhttp_net_cache, &status, &chunked, &length, error, sizeof(error));
-        c.xhttp_net_cache.len = 0;
-        if (db_append(&c.xhttp_net_cache, data, size) != 0) abort();
         c.mode = CONN_MODE_WS;
         (void)core_ws_validate_upgrade(data,size,"vless-core","vless-core");
         (void)parse_ws_upgrade_response(&c,&c.xhttp_net_cache,"vless-core","vless-core",error,sizeof(error));
@@ -157,9 +152,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0 || shutdown(pair[1], SHUT_WR) != 0) abort();
         c.fd = pair[0];
         c.mode = CONN_MODE_XHTTP_PLAIN;
-        c.xhttp_headers_read = 1;
-        c.xhttp_chunked = 1;
-        c.xhttp_chunk_rem = -1;
+        c.xhttp_http1_response=(core_http1_response_t){.state=2,.chunked=1};
         if (db_append(&c.xhttp_net_cache, data, size) != 0) abort();
         while (c.xhttp_net_cache.len > 0) {
             size_t before = c.xhttp_net_cache.len;

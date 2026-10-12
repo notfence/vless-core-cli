@@ -242,6 +242,15 @@ static void wait_tls_fixture(tls13_conn_t *c) {
     struct timeval timeout = {2,0};
     REQUIRE("xhttp/tls-fixture-input", select(c->fd + 1, &rfds, NULL, NULL, &timeout) > 0);
 }
+static int xhttp_fixture_read(tls13_conn_t *c, uint8_t *data, size_t capacity, size_t *length) {
+    uint64_t until=core_now_ms()+2000;
+    for (;;) {
+        int result=tls13_read_app(c,data,capacity,length);
+        if (result != 1) return result;
+        uint64_t now=core_now_ms();
+        if (now >= until || core_wait_socket(c->fd,POLLIN,(int)(until-now)) <= 0) return -1;
+    }
+}
 static int live_xhttp_chunks(const char *uri) {
     vless_config_t cfg; char error[256]; tls13_conn_t *c = NULL;
     REQUIRE("xhttp/tls-fixture-config", parse_core_uri(uri, &cfg, error, sizeof(error)) == 0);
@@ -250,7 +259,8 @@ static int live_xhttp_chunks(const char *uri) {
     core_set_socket_io_timeout(c->fd, 500);
     int flags = fcntl(c->fd, F_GETFL, 0);
     uint8_t data[64]; size_t length = 0;
-    CHECK("xhttp/tls-first-chunk", tls13_read_app(c, data, sizeof(data), &length) == 0 && length == 3 && memcmp(data, "abc", 3) == 0);
+    wait_tls_fixture(c);
+    CHECK("xhttp/tls-first-chunk", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && length == 3 && memcmp(data, "abc", 3) == 0);
     for (int stage = 0; stage < 4; stage++) {
         if (stage) wait_tls_fixture(c);
         CHECK("xhttp/tls-incomplete-chunk-yields", tls13_read_app(c, data, sizeof(data), &length) == 1 && length == 0);
@@ -259,15 +269,15 @@ static int live_xhttp_chunks(const char *uri) {
         REQUIRE("xhttp/tls-fixture-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
     }
     wait_tls_fixture(c);
-    CHECK("xhttp/tls-fragmented-chunk-body", tls13_read_app(c, data, sizeof(data), &length) == 0 && length == 1 && data[0] == 'v');
+    CHECK("xhttp/tls-fragmented-chunk-body", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && length == 1 && data[0] == 'v');
     REQUIRE("xhttp/tls-body-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
     wait_tls_fixture(c);
-    CHECK("xhttp/tls-fragmented-chunk-tail", tls13_read_app(c, data, sizeof(data), &length) == 0 && length == 3 && memcmp(data, "pn!", 3) == 0);
+    CHECK("xhttp/tls-fragmented-chunk-tail", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && length == 3 && memcmp(data, "pn!", 3) == 0);
     CHECK("xhttp/tls-chunk-ending-yields", tls13_read_app(c, data, sizeof(data), &length) == 1 && length == 0);
     CHECK("xhttp/tls-chunk-ending-not-pending", !tls13_has_pending_app(c));
     REQUIRE("xhttp/tls-end-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
     wait_tls_fixture(c);
-    CHECK("xhttp/tls-chunked-eof", tls13_read_app(c, data, sizeof(data), &length) == 0 && !length && c->xhttp_eof);
+    CHECK("xhttp/tls-chunked-eof", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && !length && c->xhttp_eof);
     CHECK("xhttp/tls-final-flags-restored", fcntl(c->fd, F_GETFL, 0) == flags);
     tls13_reality_close(c);
     return test_result();
@@ -559,7 +569,7 @@ static void protocol_edges(void) {
         clear_conn(&c); close(pair[0]); close(pair[1]);
     }
     REQUIRE("xhttp/chunk-pair", socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
-    c = (tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_XHTTP_PLAIN,.xhttp_chunk_rem=-1,.xhttp_content_rem=-1};
+    c = (tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_XHTTP_PLAIN};
     const char *chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;vless-core=yes\r\nabc\r\n0\r\n\r\n";
     db_append(&c.xhttp_net_cache,chunked,strlen(chunked));
     CHECK("xhttp/chunked-extensions", xhttp_fill_app_cache(&c) == 0 && c.app_cache.len == 3 && memcmp(c.app_cache.data,"abc",3) == 0);
@@ -578,7 +588,48 @@ static void protocol_edges(void) {
     CHECK("xhttp/query-capacity-error-preserves-input",xhttp_append_query_param(path,strlen(path)+4,"key","value") != 0 && !strcmp(path,previous));
     CHECK("xhttp/path-trailing-slash-before-query", normalize_xhttp_path("/vless-core?fixed=1",path,sizeof(path)) == 0 && !strcmp(path,"/vless-core/?fixed=1"));
 }
+static void xhttp_http1_vectors(void) {
+    const char *invalid[]={
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3junk\r\nabc\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcZZ0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nBad trailer\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc",
+    };
+    for (size_t i=0;i<sizeof(invalid)/sizeof(*invalid);i++) {
+        int pair[2]; REQUIRE("xhttp/http1-malformed-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        tls13_conn_t connection={.fd=pair[0],.mode=CONN_MODE_XHTTP_PLAIN};
+        REQUIRE("xhttp/http1-malformed-fixture",db_append(&connection.xhttp_net_cache,invalid[i],strlen(invalid[i])) == 0 && shutdown(pair[1],SHUT_WR) == 0);
+        int result=0;
+        for (unsigned step=0;step<32 && result >= 0;step++) {
+            result=xhttp_fill_app_cache(&connection); connection.app_cache.len=0;
+        }
+        CHECK("xhttp/http1-invalid-framing-is-not-clean-eof",result < 0 && !connection.xhttp_eof);
+        clear_conn(&connection); close(pair[0]); close(pair[1]);
+    }
+    const char *valid[]={
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabc",
+    };
+    for (size_t i=0;i<sizeof(valid)/sizeof(*valid);i++) {
+        int pair[2]; REQUIRE("xhttp/http1-complete-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        tls13_conn_t connection={.fd=pair[0],.mode=CONN_MODE_XHTTP_PLAIN};
+        REQUIRE("xhttp/http1-complete-fixture",db_append(&connection.xhttp_net_cache,valid[i],strlen(valid[i])) == 0 && shutdown(pair[1],SHUT_WR) == 0);
+        CHECK("xhttp/http1-interim-or-close-body",xhttp_fill_app_cache(&connection) == 0 && connection.app_cache.len == 3 && !memcmp(connection.app_cache.data,"abc",3));
+        connection.app_cache.len=0;
+        CHECK("xhttp/http1-complete-eof",xhttp_fill_app_cache(&connection) < 0 && connection.xhttp_eof);
+        clear_conn(&connection); close(pair[0]); close(pair[1]);
+    }
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1],"--xhttp-post")) {
+        vless_config_t config; tls13_conn_t *connection=NULL; char error[256]={0};
+        if (parse_core_uri(argv[2],&config,error,sizeof(error)) || tls13_reality_connect(&config,&connection,error,sizeof(error))) { fprintf(stderr,"%s\n",error); return 2; }
+        int result=tls13_write_app(connection,(const uint8_t *)"vless-core",10);
+        tls13_reality_close(connection); return result ? 1 : 0;
+    }
     if (argc == 3 && strcmp(argv[1], "--xhttp-chunks") == 0) return live_xhttp_chunks(argv[2]);
     if (argc == 2) {
         vless_config_t cfg; char error[256]; REQUIRE("tls/live-config", parse_core_uri(argv[1], &cfg, error, sizeof(error)) == 0);
@@ -592,6 +643,7 @@ int main(int argc, char **argv) {
         }
         return test_result();
     }
+    xhttp_http1_vectors();
     hpack_status_vectors();
     custom_request_headers();
     tls13_conn_t oversized_h2={.mode=CONN_MODE_GRPC_PLAIN}; core_http2_frame_t invalid_frame;

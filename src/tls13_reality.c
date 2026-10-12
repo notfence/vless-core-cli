@@ -174,7 +174,7 @@ struct tls13_conn {
     conn_mode_t mode;
     int xhttp_upload_fd;
     pthread_t xhttp_upload_reader;
-    int xhttp_upload_reader_started;
+    int xhttp_upload_reader_started, xhttp_upload_failed, xhttp_upload_stopping;
 
     uint8_t auth_key[32];
 
@@ -246,11 +246,8 @@ struct tls13_conn {
     core_range_t xhttp_post_intervals;
     uint64_t xhttp_last_post_ms;
     uint64_t xhttp_seq;
-    int xhttp_chunked;
-    int64_t xhttp_content_rem;
-    int64_t xhttp_chunk_rem;
-    int xhttp_eof;
-    int xhttp_headers_read;
+    core_http1_response_t xhttp_http1_response;
+    int xhttp_eof, xhttp_wire_eof;
     int xhttp_tls_insecure;
     char xhttp_pin_key[320];
     tls_verify_mode_t tls_verify_policy;
@@ -1406,85 +1403,32 @@ static void trim_ascii(char *s) {
     s[end - start] = '\0';
 }
 
-static int contains_case_insensitive(const char *haystack, const char *needle) {
-    size_t hlen = strlen(haystack);
-    size_t nlen = strlen(needle);
-    if (nlen == 0 || hlen < nlen) {
-        return 0;
-    }
-    for (size_t i = 0; i + nlen <= hlen; i++) {
-        if (strncasecmp(haystack + i, needle, nlen) == 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int parse_http_response_headers(SSL *ssl, int fd, dynbuf_t *cache, int *status_code, int *chunked, int64_t *content_len, char *err,
-                                       size_t err_cap) {
-    *status_code = 0;
-    *chunked = 0;
-    *content_len = -1;
-
+static int xhttp_read_http1_response(SSL *ssl, int fd, char *err, size_t err_cap) {
+    core_http1_response_t parser={0}; dynbuf_t cache={.limit=73728}; int eof=0,result=-1;
     for (;;) {
-        size_t hdr_bytes = find_double_crlf(cache->data, cache->len);
-        if (hdr_bytes > 0) {
-            char *headers = (char *)calloc(1, hdr_bytes + 1);
-            if (headers == NULL) {
-                set_err(err, err_cap, "oom");
-                return -1;
-            }
-            memcpy(headers, cache->data, hdr_bytes);
-
-            char *save = NULL;
-            char *line = strtok_r(headers, "\r\n", &save);
-            if (line == NULL || sscanf(line, "HTTP/%*s %d", status_code) != 1) {
-                free(headers);
-                set_err(err, err_cap, "invalid HTTP status line");
-                return -1;
-            }
-
-            for (line = strtok_r(NULL, "\r\n", &save); line != NULL; line = strtok_r(NULL, "\r\n", &save)) {
-                char *colon = strchr(line, ':');
-                if (colon == NULL) {
-                    continue;
-                }
-                *colon = '\0';
-                char *key = line;
-                char *val = colon + 1;
-                trim_ascii(key);
-                trim_ascii(val);
-                if (strcasecmp(key, "Transfer-Encoding") == 0 && contains_case_insensitive(val, "chunked")) {
-                    *chunked = 1;
-                } else if (strcasecmp(key, "Content-Length") == 0) {
-                    long long n = strtoll(val, NULL, 10);
-                    if (n >= 0) {
-                        *content_len = (int64_t)n;
-                    }
-                }
-            }
-
-            free(headers);
-            db_consume(cache, hdr_bytes);
-            return 0;
+        core_http1_event_t event;
+        int parsed=core_http1_next(&parser,cache.data,cache.len,eof,8192,&event);
+        if (parsed < 0) break;
+        if (!parsed && event.kind == 1 && event.status >= 200 && event.status != 200) {
+            if (err && err_cap) snprintf(err,err_cap,"XHTTP HTTP/1.1 response returned non-200: %d",event.status);
+            db_free(&cache); return -1;
         }
-
-        uint8_t tmp[4096];
-        size_t got = 0;
-        int read_rc = ssl != NULL ? ssl_read_some(ssl, tmp, sizeof(tmp), &got) : fd_read_some(fd, tmp, sizeof(tmp), &got);
-        if (read_rc != 0 || got == 0) {
-            set_err(err, err_cap, "failed to read HTTP headers");
-            return -1;
+        db_consume(&cache,event.consumed);
+        if (!parsed && event.kind == 3) { if (!cache.len) result=0; break; }
+        if (!parsed) continue;
+        uint8_t input[4096]; size_t received=0;
+        int read_result=ssl ? ssl_read_some(ssl,input,sizeof(input),&received) : fd_read_some(fd,input,sizeof(input),&received);
+        if (read_result < 0 && (!ssl || !(SSL_get_shutdown(ssl)&SSL_RECEIVED_SHUTDOWN))) break;
+        if (read_result > 0) {
+            if (core_wait_socket(fd,POLLIN,-1) <= 0) break;
+            continue;
         }
-        if (db_append(cache, tmp, got) != 0) {
-            set_err(err, err_cap, "oom");
-            return -1;
-        }
-        if (cache->len > 32768) {
-            set_err(err, err_cap, "HTTP headers too large");
-            return -1;
-        }
+        if (!received) eof=1;
+        else if (db_append(&cache,input,received)) break;
     }
+    db_free(&cache);
+    if (result) set_err(err,err_cap,"invalid or truncated XHTTP HTTP/1.1 response");
+    return result;
 }
 
 static int base64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap) {
@@ -1668,242 +1612,51 @@ static int ws_fill_app_cache(tls13_conn_t *c) {
     }
 }
 
-static int xhttp_stream_read_some(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
-    *out_len = 0;
-    if (cap == 0) {
-        return 0;
-    }
-    if (c->xhttp_net_cache.len > 0) {
-        size_t take = c->xhttp_net_cache.len;
-        if (take > cap) {
-            take = cap;
-        }
-        memcpy(buf, c->xhttp_net_cache.data, take);
-        db_consume(&c->xhttp_net_cache, take);
-        *out_len = take;
-        return 0;
-    }
-    return c->ssl != NULL ? ssl_read_some(c->ssl, buf, cap, out_len) : fd_read_some(c->fd, buf, cap, out_len);
-}
-
-static int xhttp_stream_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        size_t got = 0;
-        if (xhttp_stream_read_some(c, buf + off, len - off, &got) != 0 || got == 0) {
-            return -1;
-        }
-        off += got;
-    }
-    return 0;
-}
-
-static int xhttp_stream_read_line(tls13_conn_t *c, char *line, size_t cap) {
-    if (cap < 2) {
-        return -1;
-    }
-    size_t off = 0;
-    for (;;) {
-        uint8_t ch = 0;
-        if (xhttp_stream_read_exact(c, &ch, 1) != 0) {
-            return -1;
-        }
-        if (off + 1 >= cap) {
-            return -1;
-        }
-        line[off++] = (char)ch;
-        if (ch == '\n') {
-            break;
-        }
-    }
-    line[off] = '\0';
-    while (off > 0 && (line[off - 1] == '\r' || line[off - 1] == '\n')) {
-        line[--off] = '\0';
-    }
-    return 0;
-}
-
 static int xhttp_buffer_available(tls13_conn_t *c) {
-    if (c->mode != CONN_MODE_XHTTP_PLAIN && c->mode != CONN_MODE_XHTTP_TLS) {
-        return 0;
-    }
-    if (c->ssl != NULL) {
-        int flags = fcntl(c->fd, F_GETFL, 0);
-        if (flags < 0 || fcntl(c->fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-            return -1;
-        }
-        uint8_t tmp[4096];
+    c->xhttp_net_cache.limit=73728;
+    if (c->xhttp_wire_eof) return 0;
+    uint8_t input[4096];
+    if (c->ssl) {
+        int flags=fcntl(c->fd,F_GETFL,0);
+        if (flags < 0 || fcntl(c->fd,F_SETFL,flags|O_NONBLOCK)) return -1;
         ERR_clear_error();
-        int n = SSL_read(c->ssl, tmp, sizeof(tmp));
-        int error = n > 0 ? SSL_ERROR_NONE : SSL_get_error(c->ssl, n);
-        int saved_errno = errno;
-        if (fcntl(c->fd, F_SETFL, flags) != 0) {
-            return -1;
-        }
-        errno = saved_errno;
-        if (n > 0) {
-            return db_append(&c->xhttp_net_cache, tmp, (size_t)n);
-        }
-        return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ? 0 : -1;
+        int received=SSL_read(c->ssl,input,sizeof(input));
+        int error=received > 0 ? SSL_ERROR_NONE : SSL_get_error(c->ssl,received),saved=errno;
+        if (fcntl(c->fd,F_SETFL,flags)) return -1;
+        errno=saved;
+        if (received > 0) return db_append(&c->xhttp_net_cache,input,(size_t)received);
+        if (error == SSL_ERROR_ZERO_RETURN) { c->xhttp_wire_eof=1; return 0; }
+        return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE || (error == SSL_ERROR_SYSCALL && saved == EINTR) ? 0 : -1;
     }
-    int ready = core_wait_socket(c->fd, POLLIN, 0);
-    if (ready <= 0) {
-        return ready < 0 && errno != EINTR ? -1 : 0;
-    }
-    uint8_t tmp[4096];
-    ssize_t n = core_recv(c->fd, tmp, sizeof(tmp), 0);
-    if (n > 0) {
-        return db_append(&c->xhttp_net_cache, tmp, (size_t)n);
-    }
-    if (n == 0) {
-        return -1;
-    }
-    return errno == EINTR ? 0 : -1;
-}
-
-static int xhttp_line_ready(tls13_conn_t *c, size_t skip) {
-    if (c->mode != CONN_MODE_XHTTP_PLAIN && c->mode != CONN_MODE_XHTTP_TLS) {
-        return 1;
-    }
-    if (c->xhttp_net_cache.len > skip && memchr(c->xhttp_net_cache.data + skip, '\n', c->xhttp_net_cache.len - skip) != NULL) {
-        return 1;
-    }
-    if (xhttp_buffer_available(c) != 0) {
-        return -1;
-    }
-    if (c->xhttp_net_cache.len <= skip) {
-        return 0;
-    }
-    return memchr(c->xhttp_net_cache.data + skip, '\n', c->xhttp_net_cache.len - skip) != NULL;
+    int ready=core_wait_socket(c->fd,POLLIN,0);
+    if (ready <= 0) return ready < 0 && errno != EINTR ? -1 : 0;
+    ssize_t received=recv(c->fd,input,sizeof(input),MSG_DONTWAIT);
+    if (received > 0) return db_append(&c->xhttp_net_cache,input,(size_t)received);
+    if (!received) { c->xhttp_wire_eof=1; return 0; }
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : -1;
 }
 
 static int xhttp_fill_app_cache(tls13_conn_t *c) {
-    if (c->xhttp_eof) {
-        return -1;
-    }
-
-    if (!c->xhttp_headers_read) {
-        int status = 0;
-        int chunked = 0;
-        int64_t content_len = -1;
-        char err[160] = {0};
-        if (parse_http_response_headers(c->ssl, c->fd, &c->xhttp_net_cache, &status, &chunked, &content_len, err, sizeof(err)) != 0) {
-            if (err[0] != '\0') {
-                vc_log_error("xhttp", "%s", err);
-            }
-            return -1;
-        }
-        if (status != 200) {
-            vc_log_error("xhttp", "GET returned non-200: %d", status);
-            return -1;
-        }
-        c->xhttp_chunked = chunked;
-        c->xhttp_content_rem = content_len;
-        c->xhttp_chunk_rem = -1;
-        c->xhttp_headers_read = 1;
-    }
-
-    if (!c->xhttp_chunked) {
-        if (c->xhttp_content_rem == 0) {
-            c->xhttp_eof = 1;
-            return -1;
-        }
-
-        uint8_t tmp[8192];
-        size_t got = 0;
-        size_t ask = sizeof(tmp);
-        if (c->xhttp_content_rem > 0 && (int64_t)ask > c->xhttp_content_rem) {
-            ask = (size_t)c->xhttp_content_rem;
-        }
-        if (xhttp_stream_read_some(c, tmp, ask, &got) != 0 || got == 0) {
-            return -1;
-        }
-        if (db_append(&c->app_cache, tmp, got) != 0) {
-            return -1;
-        }
-        if (c->xhttp_content_rem > 0) {
-            c->xhttp_content_rem -= (int64_t)got;
-        }
-        return 0;
-    }
-
+    if (c->xhttp_eof) return -1;
     for (;;) {
-        if (c->xhttp_chunk_rem < 0) {
-            int line_ready = xhttp_line_ready(c, 0);
-            if (line_ready < 0) {
-                return -1;
-            }
-            if (!line_ready) {
-                return 1;
-            }
-            char line[128];
-            if (xhttp_stream_read_line(c, line, sizeof(line)) != 0) {
-                return -1;
-            }
-            char *semi = strchr(line, ';');
-            if (semi != NULL) {
-                *semi = '\0';
-            }
-            trim_ascii(line);
-            if (line[0] == '\0') {
-                continue;
-            }
-            unsigned long long n = strtoull(line, NULL, 16);
-            c->xhttp_chunk_rem = (int64_t)n;
-            if (c->xhttp_chunk_rem == 0) {
-                for (;;) {
-                    if (xhttp_stream_read_line(c, line, sizeof(line)) != 0) {
-                        return -1;
-                    }
-                    if (line[0] == '\0') {
-                        break;
-                    }
-                }
-                c->xhttp_eof = 1;
-                return -1;
-            }
+        core_http1_event_t event;
+        int result=core_http1_next(&c->xhttp_http1_response,c->xhttp_net_cache.data,c->xhttp_net_cache.len,c->xhttp_wire_eof,8192,&event);
+        if (result < 0) { vc_log_error("xhttp","invalid or truncated XHTTP HTTP/1.1 response"); return -1; }
+        if (!result && event.kind == 1 && event.status >= 200 && event.status != 200) {
+            vc_log_error("xhttp","GET returned non-200: %d",event.status); return -1;
         }
-
-        if (c->xhttp_chunk_rem == 0) {
-            int line_ready = xhttp_line_ready(c, 2);
-            if (line_ready < 0) {
-                return -1;
-            }
-            if (!line_ready) {
-                return 1;
-            }
-            uint8_t crlf[2];
-            if (xhttp_stream_read_exact(c, crlf, sizeof(crlf)) != 0) {
-                return -1;
-            }
-            c->xhttp_chunk_rem = -1;
-            continue;
+        if (!result && event.kind == 2 && db_append(&c->app_cache,c->xhttp_net_cache.data+event.offset,event.length)) return -1;
+        db_consume(&c->xhttp_net_cache,event.consumed);
+        if (!result && event.kind == 3) {
+            if (c->xhttp_net_cache.len) return -1;
+            c->xhttp_eof=1; return -1;
         }
-
-        uint8_t tmp[8192];
-        size_t ask = sizeof(tmp);
-        if ((int64_t)ask > c->xhttp_chunk_rem) {
-            ask = (size_t)c->xhttp_chunk_rem;
-        }
-        size_t got = 0;
-        if (c->xhttp_net_cache.len == 0) {
-            if (xhttp_buffer_available(c) != 0) {
-                return -1;
-            }
-            if (c->xhttp_net_cache.len == 0) {
-                return 1;
-            }
-        }
-        if (xhttp_stream_read_some(c, tmp, ask, &got) != 0 || got == 0) {
-            return -1;
-        }
-        if (db_append(&c->app_cache, tmp, got) != 0) {
-            return -1;
-        }
-        c->xhttp_chunk_rem -= (int64_t)got;
-        if (c->app_cache.len > 0) {
-            return 0;
-        }
+        if (c->app_cache.len) return 0;
+        if (!result) continue;
+        size_t before=c->xhttp_net_cache.len;
+        int previous_eof=c->xhttp_wire_eof;
+        if (xhttp_buffer_available(c)) return -1;
+        if (before == c->xhttp_net_cache.len && previous_eof == c->xhttp_wire_eof) return 1;
     }
 }
 
@@ -3287,15 +3040,22 @@ static int xhttp_conn_write_all(tls13_conn_t *c, const void *buf, size_t len) {
 }
 
 static void *xhttp_plain_upload_reader(void *arg) {
-    int fd = (int)(intptr_t)arg;
-    uint8_t buf[4096];
-    while (core_recv(fd, buf, sizeof(buf), 0) > 0) {
+    tls13_conn_t *connection=arg; char error[160]={0};
+    if (xhttp_read_http1_response(NULL,connection->xhttp_upload_fd,error,sizeof(error))) {
+        pthread_mutex_lock(&g_tls_state_lock);
+        int failed=!connection->xhttp_upload_stopping;
+        if (failed) connection->xhttp_upload_failed=1;
+        pthread_mutex_unlock(&g_tls_state_lock);
+        if (failed) {
+            vc_log_error("xhttp","upload response failed: %s",error);
+            shutdown(connection->fd,SHUT_RDWR);
+        }
     }
     return NULL;
 }
 
 static int xhttp_start_plain_upload_reader(tls13_conn_t *c) {
-    if (pthread_create(&c->xhttp_upload_reader, NULL, xhttp_plain_upload_reader, (void *)(intptr_t)c->xhttp_upload_fd) != 0) {
+    if (pthread_create(&c->xhttp_upload_reader, NULL, xhttp_plain_upload_reader, c) != 0) {
         return -1;
     }
     c->xhttp_upload_reader_started = 1;
@@ -3341,11 +3101,8 @@ static int xhttp_send_plain_stream_request(tls13_conn_t *c, int fd, char *err, s
         return -1;
     }
 
-    c->xhttp_chunked = 0;
-    c->xhttp_content_rem = -1;
-    c->xhttp_chunk_rem = -1;
-    c->xhttp_eof = 0;
-    c->xhttp_headers_read = 0;
+    c->xhttp_http1_response=(core_http1_response_t){0};
+    c->xhttp_eof=c->xhttp_wire_eof=0;
     return 0;
 }
 
@@ -3394,11 +3151,8 @@ static int xhttp_send_download_request(const vless_config_t *cfg, tls13_conn_t *
         return -1;
     }
 
-    c->xhttp_chunked = 0;
-    c->xhttp_content_rem = -1;
-    c->xhttp_chunk_rem = -1;
-    c->xhttp_eof = 0;
-    c->xhttp_headers_read = 0;
+    c->xhttp_http1_response=(core_http1_response_t){0};
+    c->xhttp_eof=c->xhttp_wire_eof=0;
     (void)cfg;
     return 0;
 }
@@ -3426,7 +3180,6 @@ static int xhttp_post_packet_plain(tls13_conn_t *c, const uint8_t *buf, size_t *
     }
     *length=packet.consumed;
 
-    const char *method = c->xhttp_uplink_method;
     dynbuf_t request={0};
     if (xhttp_http1_packet_request(c,request_path,packet.headers,packet.body_size,"close",&request) != 0) {
         free(packet.headers); db_free(&request);
@@ -3440,19 +3193,7 @@ static int xhttp_post_packet_plain(tls13_conn_t *c, const uint8_t *buf, size_t *
         rc = -1;
         set_err(err, err_cap, "failed to send xhttp POST");
     } else {
-        dynbuf_t cache = {0};
-        int status = 0;
-        int chunked = 0;
-        int64_t content_len = -1;
-        if (parse_http_response_headers(NULL, fd, &cache, &status, &chunked, &content_len, err, err_cap) != 0) {
-            rc = -1;
-        } else if (status != 200) {
-            rc = -1;
-            if (err != NULL && err_cap > 0) {
-                snprintf(err, err_cap, "xhttp %s returned non-200: %d", method, status);
-            }
-        }
-        db_free(&cache);
+        rc=xhttp_read_http1_response(NULL,fd,err,err_cap);
     }
 
     free(packet.headers); db_free(&request); close(fd);
@@ -3510,7 +3251,6 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length
     }
     *length=packet.consumed;
 
-    const char *method = c->xhttp_uplink_method;
     dynbuf_t request={0};
     if (xhttp_http1_packet_request(c,request_path,packet.headers,packet.body_size,"close",&request) != 0) {
         free(packet.headers); db_free(&request);
@@ -3527,21 +3267,7 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length
         rc = -1;
         set_err(err, err_cap, "failed to send xhttp POST");
     } else {
-        dynbuf_t cache = {0};
-        int status = 0;
-        int chunked = 0;
-        int64_t content_len = -1;
-        if (parse_http_response_headers(ssl, fd, &cache, &status, &chunked, &content_len, err, err_cap) != 0) {
-            rc = -1;
-        } else if (status != 200) {
-            rc = -1;
-            if (err != NULL && err_cap > 0) {
-                snprintf(err, err_cap, "xhttp %s returned non-200: %d", method, status);
-            }
-        }
-        db_free(&cache);
-        (void)chunked;
-        (void)content_len;
+        rc=xhttp_read_http1_response(ssl,fd,err,err_cap);
     }
 
     free(packet.headers); db_free(&request);
@@ -5225,6 +4951,10 @@ int tls13_idle_timeout(const tls13_conn_t *c) {
 }
 
 int tls13_tick(tls13_conn_t *c) {
+    if (c && c->xhttp_upload_reader_started) {
+        pthread_mutex_lock(&g_tls_state_lock); int failed=c->xhttp_upload_failed; pthread_mutex_unlock(&g_tls_state_lock);
+        if (failed) return -1;
+    }
     if (tls13_idle_timeout(c) == 0) {
         if (ws_write_frame(c,9,NULL,0)) return -1;
         c->ws_next_heartbeat=core_now_ms()+c->ws_heartbeat_ms;
@@ -5308,15 +5038,9 @@ int tls13_has_pending_input(const tls13_conn_t *c) {
         return 1;
     }
     if (c->mode == CONN_MODE_XHTTP_TLS || c->mode == CONN_MODE_XHTTP_PLAIN) {
-        int cache_ready = c->xhttp_net_cache.len > 0;
-        if (c->xhttp_headers_read && c->xhttp_chunked && c->xhttp_chunk_rem <= 0) {
-            size_t skip = c->xhttp_chunk_rem == 0 ? 2 : 0;
-            cache_ready = c->xhttp_net_cache.len > skip &&
-                          memchr(c->xhttp_net_cache.data + skip, '\n', c->xhttp_net_cache.len - skip) != NULL;
-        }
-        if (cache_ready || (c->ssl != NULL && SSL_pending(c->ssl) > 0)) {
-            return 1;
-        }
+        core_http1_response_t parser=c->xhttp_http1_response; core_http1_event_t event;
+        int result=core_http1_next(&parser,c->xhttp_net_cache.data,c->xhttp_net_cache.len,c->xhttp_wire_eof,8192,&event);
+        if (result <= 0 || event.consumed || c->xhttp_eof || (c->ssl && SSL_pending(c->ssl) > 0)) return 1;
     }
     if (c->mode == CONN_MODE_XHTTP_TLS_H2 && h2_cached_frame_ready(c)) {
         return 1;
@@ -6253,8 +5977,6 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
 
 static int xhttp_configure(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap) {
     c->xhttp_seq = 0;
-    c->xhttp_chunk_rem = -1;
-    c->xhttp_content_rem = -1;
 
     snprintf(c->remote_host, sizeof(c->remote_host), "%s", cfg->server_host);
     c->remote_port = cfg->server_port;
@@ -6600,6 +6322,7 @@ void tls13_reality_close(tls13_conn_t *c) {
         (void)h2_send_frame(c, H2_FRAME_DATA, H2_FLAG_END_STREAM, c->h2_stream_id, NULL, 0);
     }
     if (c->xhttp_upload_fd >= 0) {
+        pthread_mutex_lock(&g_tls_state_lock); c->xhttp_upload_stopping=1; pthread_mutex_unlock(&g_tls_state_lock);
         shutdown(c->xhttp_upload_fd, SHUT_RDWR);
         if (c->xhttp_upload_reader_started) {
             pthread_join(c->xhttp_upload_reader, NULL);

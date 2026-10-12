@@ -29,6 +29,7 @@ int main(void) {
         "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nvless-core",
         "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;ext=v\r\nvles\r\n6\r\ns-core\r\n0\r\nx-trailer: value\r\n\r\n",
         "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nvless-core",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na ; extension = \"vless core\" ; flag\r\nvless-core\r\n0\r\n\r\n",
     };
     for (size_t i=0;i<sizeof(cases)/sizeof(*cases);i++)
         for (size_t fragment=1;fragment<=strlen(cases[i]);fragment++) CHECK("http1/fragmented-complete-response", transfer(cases[i],fragment,1) == 0);
@@ -38,9 +39,14 @@ int main(void) {
         "HTTP/1.1 101 Switching Protocols\r\n\r\nvless-core",
         "HTTP/1.1 200 OK\r\nContent-Length: 10x\r\n\r\nvless-core",
         "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\nvless-core",
+        "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\nvless-core",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nx\r\nvless-core\r\n0\r\n\r\n",
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\nvless-core\r\n0\r\nBad trailer\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nvless-core",
+        "HTTP/1.1 200 bad\x01reason\r\nContent-Length: 10\r\n\r\nvless-core",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na;bad name\r\nvless-core\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na;key=\"unterminated\r\nvless-core\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\nvless-core\r\n0\r\nContent-Length: 10\r\n\r\n",
     };
     for (size_t i=0;i<sizeof(invalid)/sizeof(*invalid);i++) CHECK("http1/reject-malformed-or-truncated-response", transfer(invalid[i],1,1) != 0);
     core_http1_response_t parser={0}; core_http1_event_t event;
