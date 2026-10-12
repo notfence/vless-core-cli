@@ -187,6 +187,12 @@ int main(void) {
         PREFIX "type=xhttp&mode=stream-up&extra=%7B%22uplinkHTTPMethod%22%3A%22GET%22%7D",
         PREFIX "type=xhttp&mode=stream-one&extra=%7B%22uplinkDataPlacement%22%3A%22header%22%7D", "socks5://host:0", "socks5://[::1"
     };
+    for (size_t t=0;t<4;t++) for (size_t s=0;s<3;s++) {
+        char value[1024];
+        snprintf(value,sizeof(value),"vless://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=mlkem768x25519plus.native.0rtt." PBK "&type=%s&security=%s&flow=xtls-rprx-vision&pbk=" PBK "&sid=01",types[t],securities[s]);
+        int result=parse(value);
+        CHECK("uri/encryption-vision-supported-transports",t == 1 && s == 2 ? result < 0 : result == 0 && !strcmp(config.flow,"xtls-rprx-vision") && config.encryption_enabled);
+    }
     for (size_t i = 0; i < sizeof(invalid) / sizeof(*invalid); i++) {
         char name[80]; snprintf(name, sizeof(name), "uri/reject/%zu", i); CHECK(name, parse(invalid[i]) != 0);
     }

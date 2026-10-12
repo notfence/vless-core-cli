@@ -70,7 +70,7 @@ def seeds():
         "vision":[*[bytes(16)+bytes([command,0,10,0,0])+b"vless-core" for command in (0,1,2)],
                   b"\x00\x00vless-core",b"\x00\x0avless-coretail",b"\x00\xff",b"\x01\x00",b"short tail"],
         "tls":[b"\x02"+len(hello).to_bytes(3,"big")+hello,b"\x16\x03\x03\x00\x0avless-core",b"\x0b\x00\x00\x05\x00\x00\x00\x01\x00"],
-        "encryption":[b"\x02vless-core",b"\x03vless-core",b"\x06vless-core",b"\x07vless-core",b"\x0bvless-core",bytes(21)],
+        "encryption":[b"\x02vless-core",b"\x03vless-core",b"\x06vless-core",b"\x07vless-core",b"\x0bvless-core",b"\x12vless-core",b"\x16vless-core",bytes(21)],
     }
 
 class FuzzTests(unittest.TestCase):

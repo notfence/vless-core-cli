@@ -58,7 +58,7 @@ struct core_http2_stream {
     int notify[2], notified, ready, failed, eof, closed, references;
     int first_actor;
     mux_manager_t *waiting_manager;
-    int finish_requested, finish_sent;
+    int finish_requested, finish_sent, relay_async;
     uint64_t finish_fence;
     core_connection_trace_t trace;
     int trace_present;
@@ -923,6 +923,13 @@ int core_http2_pending(const core_http2_stream_t *stream) {
     pthread_mutex_unlock(&mux_lock); return pending;
 }
 
+int core_http2_start_relay(core_http2_stream_t *stream) {
+    pthread_mutex_lock(&mux_lock);
+    int result=!stream || stream->failed || stream->closed ? -1 : 0;
+    if (!result) stream->relay_async=1;
+    pthread_mutex_unlock(&mux_lock); return result;
+}
+
 void core_http2_drain_notifications(core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
     uint8_t bytes[128]; while (recv(stream->notify[0],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {}
@@ -977,7 +984,7 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
         pthread_mutex_unlock(&mux_lock);
         if (offset < length && wait_for_output(stream) <= 0) return -1;
     }
-    while (core_deadline_active()) {
+    while (!stream->relay_async && core_deadline_active()) {
         pthread_mutex_lock(&mux_lock);
         int failed=stream->failed || stream->closed;
         int pending=stream->tx.length || stream->upload->opening || stream->write_fence > stream->upload->flushed;

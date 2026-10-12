@@ -318,6 +318,10 @@ def xray_client(server_port, transport="tcp", security="reality", mode=None, flo
         if alpn is not None: stream["tlsSettings"]["alpn"]=alpn
     if transport == "xhttp":
         stream["xhttpSettings"] = {"path":"/vless-core", "mode":mode or "auto", **(extra or {})}
+    elif transport == "ws":
+        stream["wsSettings"] = {"path":"/vless-core", **(extra or {})}
+    elif transport == "grpc":
+        stream["grpcSettings"] = {"serviceName":"vless-core", "multiMode":mode == "multi", **(extra or {})}
     config = {"log":{"loglevel":"info"}, "inbounds":[{"listen":"127.0.0.1", "port":0, "protocol":"socks", "settings":{"auth":"noauth", "udp":False}}], "outbounds":[{"protocol":"vless", "settings":{"vnext":[{"address":"127.0.0.1", "port":server_port, "users":[{"id":UUID, "encryption":encryption, "flow":flow}]}]}, "streamSettings":stream}]}
     def command(listen_port):
         config["inbounds"][0]["port"] = listen_port

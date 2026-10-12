@@ -5057,7 +5057,8 @@ int tls13_tick(tls13_conn_t *c) {
 }
 
 int tls13_start_relay(tls13_conn_t *c) {
-    if (!c || c->xmux_stream || (c->mode != CONN_MODE_PLAIN && c->mode != CONN_MODE_TLS && c->mode != CONN_MODE_REALITY && c->mode != CONN_MODE_WS)) return 0;
+    if (c && c->xmux_stream) return core_http2_start_relay(c->xmux_stream);
+    if (!c || (c->mode != CONN_MODE_PLAIN && c->mode != CONN_MODE_TLS && c->mode != CONN_MODE_REALITY && c->mode != CONN_MODE_WS)) return 0;
     int flags=fcntl(c->fd,F_GETFL,0);
     if (flags < 0 || fcntl(c->fd,F_SETFL,flags|O_NONBLOCK)) return -1;
     if (c->ssl) SSL_set_mode(c->ssl,SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER|SSL_MODE_ENABLE_PARTIAL_WRITE);
@@ -5138,7 +5139,7 @@ int tls13_has_pending_input(const tls13_conn_t *c) {
         int result=core_http1_next(&parser,c->xhttp_net_cache.data,c->xhttp_net_cache.len,c->xhttp_wire_eof,8192,&event);
         if (result <= 0 || event.consumed || c->xhttp_eof || (c->ssl && SSL_pending(c->ssl) > 0)) return 1;
     }
-    if (c->mode == CONN_MODE_XHTTP_TLS_H2 && h2_cached_frame_ready(c)) {
+    if (c->mode == CONN_MODE_XHTTP_TLS_H2 && (h2_cached_frame_ready(c) || (c->ssl && SSL_pending(c->ssl) > 0))) {
         return 1;
     }
     if (c->mode == CONN_MODE_XHTTP_REALITY && c->h2_net_cache.len > 0) {
@@ -6711,13 +6712,14 @@ int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
 int tls13_read_exact_or_eof(tls13_conn_t *c, uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
+        if (core_deadline_active() && !core_deadline_remaining()) return -1;
         size_t got = 0;
         int rc = tls13_read_app(c, buf + off, len - off, &got);
         if (rc < 0) {
             return -1;
         }
         if (rc > 0) {
-            if (tls13_flush(c) || core_wait_socket(c->fd,tls13_needs_write(c) ? POLLOUT : POLLIN,-1) <= 0) return -1;
+            if (tls13_flush(c) || (!tls13_has_pending_input(c) && core_wait_socket(c->fd,tls13_needs_write(c) ? POLLOUT : POLLIN,-1) <= 0)) return -1;
             continue;
         }
         if (got == 0) {

@@ -21,6 +21,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t length) {
     core_http2_stream_t first={.download=&actor,.upload=&actor,.down_id=1,.up_id=1,.ready=1,.references=INT_MAX};
     core_http2_stream_t second={.download=&actor,.upload=&actor,.down_id=3,.up_id=3,.ready=1,.references=INT_MAX};
     first.next=&second; streams=&first;
+    if (core_http2_start_relay(&first) || core_http2_start_relay(&second)) abort();
     mux_request_t *a=calloc(1,sizeof(*a)),*b=calloc(1,sizeof(*b));
     if (!a || !b || notification_pair(first.notify) || notification_pair(second.notify) || notification_pair(actor.wake)) abort();
     *a=(mux_request_t){.next=b,.stream=&first,.id=1,.role=1,.send_window=1024,.receive_window=1024};

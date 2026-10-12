@@ -901,6 +901,14 @@ int vless_encryption_read(vless_encryption_conn_t *conn,
 
 int vless_encryption_read_raw(vless_encryption_conn_t *conn,
                               uint8_t *buf, size_t cap, size_t *out_len) {
+    *out_len=0;
+    if (!cap) return 0;
+    if (conn->input_off < conn->input_len) {
+        size_t available=conn->input_len-conn->input_off;
+        size_t take=available < cap ? available : cap;
+        memcpy(buf,conn->input+conn->input_off,take); conn->input_off+=take; *out_len=take;
+        return 0;
+    }
     int rc = tls13_read_app(conn->transport, buf, cap, out_len);
     if (!rc && !*out_len && (conn->incoming_raw_header_len || conn->incoming_raw_skip)) return -1;
     if (rc == 0 && *out_len > 0 && conn->incoming_header_ctr != NULL &&

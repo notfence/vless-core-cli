@@ -35,6 +35,13 @@ int tls13_read_exact_or_eof(tls13_conn_t *c, uint8_t *data, size_t length) {
     return got == length ? 0 : !got ? 1 : -1;
 }
 int main(void) {
+    vless_encryption_conn_t raw_switch={0}; uint8_t tail[16]; size_t tail_length=0;
+    raw_switch.input=(uint8_t *)"buffered"; raw_switch.input_len=8;
+    memcpy(transport_data,"wire",4); transport_length=4; transport_position=0;
+    CHECK("encryption/raw-switch-drains-decrypted-tail-first",vless_encryption_read_raw(&raw_switch,tail,3,&tail_length) == 0 && tail_length == 3 && !memcmp(tail,"buf",3) && !transport_position);
+    CHECK("encryption/raw-switch-drains-complete-tail",vless_encryption_read_raw(&raw_switch,tail,sizeof(tail),&tail_length) == 0 && tail_length == 5 && !memcmp(tail,"fered",5) && !transport_position);
+    CHECK("encryption/raw-switch-preserves-outer-transport",vless_encryption_read_raw(&raw_switch,tail,sizeof(tail),&tail_length) == 0 && tail_length == 4 && !memcmp(tail,"wire",4));
+    transport_length=transport_position=0;
     vless_encryption_conn_t pending = {0};
     CHECK("encryption/null-readiness", !vless_encryption_has_pending_input(NULL));
     CHECK("encryption/empty-readiness", !vless_encryption_has_pending_input(&pending));
@@ -56,6 +63,16 @@ int main(void) {
     REQUIRE("encryption/aead-seal", aead_seal(&sender, NULL, plain, sizeof(plain), aad, sizeof(aad), encoded, &encoded_len) == 0);
     CHECK("encryption/aead-open", aead_open(&receiver, NULL, encoded, encoded_len, aad, sizeof(aad), decoded, &decoded_len) == 0 && decoded_len == sizeof(plain) && memcmp(plain, decoded, decoded_len) == 0);
     CHECK("encryption/nonce-advance", sender.nonce[11] == 1 && receiver.nonce[11] == 1);
+    uint8_t raw_record[]={23,3,3,0,3,'r','a','w'},raw_original[sizeof(raw_record)],raw_iv[16]={0};
+    memcpy(raw_original,raw_record,sizeof(raw_record)); EVP_CIPHER_CTX *raw_encoder=NULL;
+    vless_encryption_conn_t buffered_raw={.input=(uint8_t *)"buffered",.input_len=8};
+    REQUIRE("encryption/raw-tail-ctr-initialized",aes_ctr_init(&raw_encoder,secret,32,raw_iv) == 0 && aes_ctr_init(&buffered_raw.incoming_header_ctr,secret,32,raw_iv) == 0);
+    uint8_t raw_header[5]; size_t raw_header_length=0,raw_skip=0;
+    REQUIRE("encryption/raw-tail-wire-masked",xor_raw_headers(raw_encoder,raw_record,sizeof(raw_record),raw_header,&raw_header_length,&raw_skip,0) == 0);
+    memcpy(transport_data,raw_record,sizeof(raw_record)); transport_length=sizeof(raw_record); transport_position=0;
+    CHECK("encryption/raw-tail-not-remasked",vless_encryption_read_raw(&buffered_raw,tail,sizeof(tail),&tail_length) == 0 && tail_length == 8 && !memcmp(tail,"buffered",8) && !transport_position);
+    CHECK("encryption/raw-tail-keeps-next-header-ctr-aligned",vless_encryption_read_raw(&buffered_raw,tail,sizeof(tail),&tail_length) == 0 && tail_length == sizeof(raw_original) && !memcmp(tail,raw_original,sizeof(raw_original)));
+    EVP_CIPHER_CTX_free(raw_encoder); EVP_CIPHER_CTX_free(buffered_raw.incoming_header_ctr); transport_length=transport_position=0;
     for (size_t i = 0; i < encoded_len; i++) {
         aead_init(&receiver, context, sizeof(context), secret, 32); encoded[i] ^= 1;
         CHECK("encryption/tamper-rejected", aead_open(&receiver, NULL, encoded, encoded_len, aad, sizeof(aad), decoded, &decoded_len) != 0); encoded[i] ^= 1;

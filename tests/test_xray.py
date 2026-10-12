@@ -14,6 +14,11 @@ from unittest import mock
 import fixtures
 from fixtures import BUILD, OPENSSL, XRAY, PRIVATE, KEY, PUBLIC_KEY, Process, Server, CountingProxy, certificate, cli, exact, exchange, port, socks_connect, uri, xray_client, xray_server
 
+ENCRYPTION_VISION_CASES = [("tcp",security,None) for security in ("none","tls","reality")]
+ENCRYPTION_VISION_CASES += [("ws",security,None) for security in ("none","tls")]
+ENCRYPTION_VISION_CASES += [("grpc",security,None) for security in ("none","tls","reality")]
+ENCRYPTION_VISION_CASES += [("xhttp","none","packet-up"),("xhttp","tls","packet-up"),("xhttp","reality","stream-one")]
+
 SUBSCRIPTION_EXTRA = {
     "mode":"stream-one", "seqKey":"x-amz-cf-pop", "seqPlacement":"header",
     "sessionIDKey":"x-amz-cf-id", "sessionIDLength":"16-32",
@@ -1011,6 +1016,140 @@ class XrayTests(unittest.TestCase):
         for transport, security, flow in (("tcp","tls","xtls-rprx-vision"),("tcp","reality","xtls-rprx-vision"),("ws","tls",""),("xhttp","tls",""),("xhttp","reality",""),("grpc","tls","")):
             with self.subTest(transport=transport,security=security,flow=flow):
                 self.transfer(transport,security,flow=flow,encryption=f"mlkem768x25519plus.random.1rtt.{PUBLIC_KEY}",decryption=f"mlkem768x25519plus.random.0s.{KEY}",tls_target=bool(flow))
+
+    def test_encryption_vision_transport_matrix(self):
+        cert,_=certificate(); context=ssl.create_default_context(cafile=str(cert)); payload=bytes(range(251))*1045
+        def finish(connection):
+            while True:
+                data=connection.recv(65536)
+                if not data: break
+                connection.sendall(data)
+            raw=connection.unwrap(); raw.shutdown(socket.SHUT_WR); raw.close()
+        for transport,security,mode in ENCRYPTION_VISION_CASES:
+            for encryption_mode in ("native","xorpub","random"):
+                for rtt in ("0rtt","1rtt"):
+                    with self.subTest(transport=transport,security=security,mode=mode,encryption=encryption_mode,rtt=rtt):
+                        with Server(finish,tls=True) as target, xray_server(transport,security,mode,flow="xtls-rprx-vision",decryption=f"mlkem768x25519plus.{encryption_mode}.60s.{KEY}") as reference:
+                            config=uri(reference.port,transport,security,mode=mode or "auto",flow="xtls-rprx-vision",encryption=f"mlkem768x25519plus.{encryption_mode}.{rtt}.{PUBLIC_KEY}")
+                            with cli(config,environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                                try:
+                                    for connection_index in range(2):
+                                        with socks_connect(core.port,target.port) as connection:
+                                            with context.wrap_socket(connection,server_hostname="vless-core.test") as tunnel:
+                                                exchange(tunnel,b"vless-core encryption vision")
+                                                exchange(tunnel,payload)
+                                                raw=tunnel.unwrap(); raw.shutdown(socket.SHUT_WR)
+                                                with raw: self.assertEqual(raw.recv(1),b"")
+                                    self.assertIsNone(core.process.poll(),core.log)
+                                except BaseException as error: raise AssertionError(f"{transport}/{security}/{mode}/{encryption_mode}/{rtt}: {error}\n{core.log}\n{reference.log}") from error
+
+    def test_encryption_vision_reference_matrix(self):
+        cert,_=certificate(); context=ssl.create_default_context(cafile=str(cert))
+        for transport,security,mode in ENCRYPTION_VISION_CASES:
+            with self.subTest(transport=transport,security=security,mode=mode), Server(tls=True) as target:
+                with xray_server(transport,security,mode,flow="xtls-rprx-vision",decryption=f"mlkem768x25519plus.native.60s.{KEY}") as reference:
+                    with xray_client(reference.port,transport,security,mode,flow="xtls-rprx-vision",encryption=f"mlkem768x25519plus.native.0rtt.{PUBLIC_KEY}") as client:
+                        for connection_index in range(2):
+                            with socks_connect(client.port,target.port) as connection, context.wrap_socket(connection,server_hostname="vless-core.test") as tunnel:
+                                exchange(tunnel,b"vless-core reference encryption vision")
+                                exchange(tunnel,bytes(range(251))*1045)
+
+    def test_packet_up_encryption_repeated_handshakes(self):
+        cert,_=certificate(); context=ssl.create_default_context(cafile=str(cert)); payload=bytes(range(251))*1045
+        def finish(connection):
+            while True:
+                data=connection.recv(65536)
+                if not data: break
+                connection.sendall(data)
+            raw=connection.unwrap(); raw.shutdown(socket.SHUT_WR); raw.close()
+        for rtt in ("0rtt","1rtt"):
+            with self.subTest(rtt=rtt), Server(finish,tls=True) as target:
+                with xray_server("xhttp","tls","packet-up",flow="xtls-rprx-vision",decryption=f"mlkem768x25519plus.native.60s.{KEY}") as reference:
+                    with cli(uri(reference.port,"xhttp","tls",mode="packet-up",flow="xtls-rprx-vision",encryption=f"mlkem768x25519plus.native.{rtt}.{PUBLIC_KEY}"),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                        try:
+                            for connection_index in range(32):
+                                with socks_connect(core.port,target.port) as connection, context.wrap_socket(connection,server_hostname="vless-core.test") as tunnel:
+                                    exchange(tunnel,payload)
+                                    raw=tunnel.unwrap(); raw.shutdown(socket.SHUT_WR)
+                                    with raw: self.assertEqual(raw.recv(1),b"")
+                            self.assertIsNone(core.process.poll(),core.log)
+                        except BaseException as error: raise AssertionError(f"packet-up/{rtt}/{connection_index}: {error}\n{core.log}\n{reference.log}") from error
+
+    def test_encryption_vision_stream_modes_and_finish(self):
+        cert,_=certificate(); context=ssl.create_default_context(cafile=str(cert)); payload=bytes(range(251))*1045
+        cases=[("grpc",security,"multi",None,False) for security in ("none","tls","reality")]
+        cases += [("xhttp",security,mode,alpn,pooled) for security,alpn in (("tls",None),("tls","http/1.1"),("reality",None)) for mode in ("stream-one","stream-up","packet-up") for pooled in (False,True)]
+        cases += [("tcp","none",None,None,False),("ws","none",None,None,False),("ws","tls",None,None,False)]
+        def finish(connection):
+            while True:
+                data=connection.recv(65536)
+                if not data: break
+                connection.sendall(data)
+            raw=connection.unwrap(); raw.shutdown(socket.SHUT_WR); raw.close()
+        for transport,security,mode,alpn,pooled in cases:
+            with self.subTest(transport=transport,security=security,mode=mode,alpn=alpn,pooled=pooled), Server(finish,tls=True) as target:
+                with xray_server(transport,security,mode,flow="xtls-rprx-vision",decryption=f"mlkem768x25519plus.random.60s.{KEY}") as reference:
+                    parameters={"flow":"xtls-rprx-vision","encryption":f"mlkem768x25519plus.random.0rtt.{PUBLIC_KEY}"}
+                    if mode: parameters["mode"]=mode
+                    if alpn: parameters["alpn"]=alpn
+                    if pooled: parameters["extra"]=json.dumps({"xmux":{"maxConnections":1}})
+                    with cli(uri(reference.port,transport,security,**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                        try:
+                            for connection_index in range(2):
+                                with socks_connect(core.port,target.port) as connection, context.wrap_socket(connection,server_hostname="vless-core.test") as tunnel:
+                                    exchange(tunnel,payload)
+                                    raw=tunnel.unwrap(); raw.shutdown(socket.SHUT_WR)
+                                    with raw: self.assertEqual(raw.recv(1),b"")
+                        except BaseException as error: raise AssertionError(f"{transport}/{security}/{mode}/{alpn}/{pooled}: {error}\n{core.log}\n{reference.log}") from error
+
+    def test_parallel_protocol_load_and_resource_recovery(self):
+        cert,_=certificate(); context=ssl.create_default_context(cafile=str(cert)); payload=bytes(range(251))*523
+        cases=[("tcp","tls",None,{}),("ws","tls",None,{}),("grpc","tls","gun",{}),("grpc","tls","multi",{})]
+        cases += [("xhttp","tls","packet-up",{"xmux":{"maxConnections":size}}) for size in (1,2,3)]
+        cases += [("xhttp","reality","stream-one",dict(SUBSCRIPTION_EXTRA,
+                   xmux=dict(SUBSCRIPTION_EXTRA["xmux"],maxConnections=size))) for size in (1,2,3)]
+        def finish(connection):
+            while True:
+                data=connection.recv(65536)
+                if not data: break
+                connection.sendall(data)
+            raw=connection.unwrap(); raw.shutdown(socket.SHUT_WR); raw.close()
+        for transport,security,mode,extra in cases:
+            pool_size=extra.get("xmux",{}).get("maxConnections",1)
+            with self.subTest(transport=transport,security=security,mode=mode,pool_size=pool_size), Server(finish,tls=True) as target:
+                server_extra=dict(extra); server_extra.pop("mode",None)
+                with xray_server(transport,security,mode,flow="xtls-rprx-vision",decryption=f"mlkem768x25519plus.native.60s.{KEY}",**server_extra) as reference:
+                    parameters={"flow":"xtls-rprx-vision","encryption":f"mlkem768x25519plus.native.0rtt.{PUBLIC_KEY}"}
+                    if mode: parameters["mode"]=mode
+                    if extra: parameters["extra"]=json.dumps(extra)
+                    with cli(uri(reference.port,transport,security,**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                        descriptors=Path(f"/proc/{core.process.pid}/fd"); tasks=Path(f"/proc/{core.process.pid}/task")
+                        def transfer(index):
+                            with socks_connect(core.port,target.port) as connection, context.wrap_socket(connection,server_hostname="vless-core.test") as tunnel:
+                                tunnel.settimeout(8); exchange(tunnel,payload)
+                                raw=tunnel.unwrap(); raw.shutdown(socket.SHUT_WR)
+                                with raw: self.assertEqual(raw.recv(1),b"")
+                        for warmup in range(pool_size): transfer(warmup)
+                        previous=None; stable=time.monotonic(); end=stable+3
+                        while True:
+                            now=time.monotonic(); state=(len(list(descriptors.iterdir())),len(list(tasks.iterdir())))
+                            if state != previous: previous=state; stable=now
+                            if now-stable >= 0.2: break
+                            self.assertLess(now,end,"warmup did not release client resources"); time.sleep(0.02)
+                        baseline_fds,baseline_tasks=state
+                        try:
+                            for repetition in range(5):
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=16) as workers: list(workers.map(transfer,range(16)))
+                                end=time.monotonic()+3
+                                while True:
+                                    state=(len(list(descriptors.iterdir())),len(list(tasks.iterdir())))
+                                    if state[0] <= baseline_fds and state[1] <= baseline_tasks: break
+                                    self.assertLess(time.monotonic(),end,
+                                                    f"parallel clients did not release resources after round {repetition+1}: "
+                                                    f"fds={state[0]} (baseline={baseline_fds}), threads={state[1]} (baseline={baseline_tasks})")
+                                    time.sleep(0.02)
+                                self.assertIsNone(core.process.poll(),core.log)
+                        except BaseException as error: raise AssertionError(f"{transport}/{security}/{mode}/pool={pool_size}: {error}\n{core.log}\n{reference.log}") from error
 
     def test_tls_security_policy(self):
         cert, _ = certificate()

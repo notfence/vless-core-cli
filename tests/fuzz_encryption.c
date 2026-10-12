@@ -70,6 +70,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t length) {
         if (result > 0) continue;
         if (result < 0 || !received) break;
         if (received > sizeof(output)) abort();
+        if (data[0]&16) break;
+    }
+    if (data[0]&16) {
+        for (size_t i=0;i<length+32;i++) {
+            size_t received=0;
+            int result=vless_encryption_read_raw(reader,output,sizeof(output),&received);
+            if (result > 0) continue;
+            if (result < 0 || !received) break;
+            if (received > sizeof(output)) abort();
+        }
     }
     vless_encryption_close(reader); vless_encryption_close(writer);
     return 0;

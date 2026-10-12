@@ -79,6 +79,18 @@ static void directional_finish(void) {
     close(actor.wake[0]); close(actor.wake[1]); close(stream.notify[0]); close(stream.notify[1]); close(sibling.notify[0]); close(sibling.notify[1]);
     streams=NULL; upload_bytes=download_bytes=0;
 }
+static void asynchronous_relay_deadline(void) {
+    core_http2_stream_t stream={0}; mux_actor_t actor={0};
+    stream.download=stream.upload=&actor;
+    REQUIRE("h2/relay-deadline-notifications",notification_pair(stream.notify) == 0 && notification_pair(actor.wake) == 0);
+    core_deadline_t deadline; REQUIRE("h2/relay-deadline-attach",core_deadline_attach(&deadline) == 0); core_deadline_begin(100);
+    CHECK("h2/relay-start-idempotent",core_http2_start_relay(&stream) == 0 && core_http2_start_relay(&stream) == 0 && stream.relay_async);
+    CHECK("h2/relay-queues-without-blocking-response",core_http2_write(&stream,(const uint8_t *)"vless-core",10) == 0 && stream.tx.length == 10 && core_deadline_active() && core_deadline_remaining() > 0);
+    CHECK("h2/relay-rejects-invalid-stream",core_http2_start_relay(NULL) < 0);
+    stream.closed=1; CHECK("h2/relay-rejects-closed-stream",core_http2_start_relay(&stream) < 0);
+    core_deadline_end(); core_deadline_detach(); free(stream.tx.data); upload_bytes=0;
+    close(stream.notify[0]); close(stream.notify[1]); close(actor.wake[0]); close(actor.wake[1]);
+}
 
 static void grpc_pool_policy(void) {
     wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend};
@@ -204,6 +216,7 @@ static void http2_wire_vectors(void) {
 }
 
 int main(void) {
+    asynchronous_relay_deadline();
     http2_wire_vectors();
     cancelled_stream_cleanup();
     paced_stream_isolation();

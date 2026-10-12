@@ -108,6 +108,16 @@ static void zero_minimum_post_interval(void) {
     CHECK("xhttp/ordinary-zero-minimum-preserves-deadline",xhttp_wait_post(&connection,error,sizeof(error)) < 0 && pacing_clock == 1051 && errno == ETIMEDOUT);
     core_deadline_end(); core_deadline_detach(); pacing_clock=0;
 }
+static void exact_read_drains_buffered_http2(void) {
+    int pair[2]; REQUIRE("h2/exact-read-buffered-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    tls13_conn_t c={.fd=pair[0],.mode=CONN_MODE_GRPC_PLAIN,.xmux_async=1,.h2_stream_id=1,.h2_next_stream_id=3,.h2_receive_window=65535,.h2_peer_initial_window=65535};
+    const uint8_t frames[]={0,0,0,4,0,0,0,0,0, 0,0,1,1,4,0,0,0,1,0x88, 0,0,10,0,0,0,0,0,1,'v','l','e','s','s','-','c','o','r','e'};
+    REQUIRE("h2/exact-read-preloaded-control-and-data",db_append(&c.h2_net_cache,frames,sizeof(frames)) == 0);
+    core_deadline_t deadline; REQUIRE("h2/exact-read-deadline",core_deadline_attach(&deadline) == 0); core_deadline_begin(20);
+    uint8_t output[10];
+    CHECK("h2/exact-read-does-not-wait-for-already-buffered-data",tls13_read_exact_app(&c,output,sizeof(output)) == 0 && !memcmp(output,"vless-core",10) && core_deadline_remaining() > 0);
+    core_deadline_end(); core_deadline_detach(); clear_conn(&c); close(pair[0]); close(pair[1]);
+}
 static void hpack_status_vectors(void) {
     static const struct { uint8_t data[5]; size_t size; int status; } cases[] = {
         {{0x48,0x82,0x10,0x01},4,200},
@@ -766,6 +776,7 @@ int main(int argc, char **argv) {
     hpack_status_vectors();
     custom_request_headers();
     zero_minimum_post_interval();
+    exact_read_drains_buffered_http2();
     tls13_conn_t oversized_h2={.mode=CONN_MODE_GRPC_PLAIN}; core_http2_frame_t invalid_frame;
     const uint8_t oversized_header[]={1,0,0,0,0,0,0,0,1};
     REQUIRE("h2/oversized-frame-header-fixture",db_append(&oversized_h2.h2_net_cache,oversized_header,sizeof(oversized_header)) == 0);

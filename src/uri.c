@@ -706,8 +706,8 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         memcpy(cfg->xhttp_path,escaped,strlen(escaped)+1);
     }
     if (cfg->flow[0] && strcmp(cfg->flow,"xtls-rprx-vision")) { set_err(err,err_cap,"unsupported flow"); return -1; }
-    if (cfg->flow[0] && (cfg->transport_mode == TRANSPORT_WS || cfg->transport_mode == TRANSPORT_GRPC ||
-        (cfg->transport_mode == TRANSPORT_XHTTP && !cfg->encryption_enabled))) vc_log_warning("uri","field query.flow is not applied to this transport");
+    if (cfg->flow[0] && !cfg->encryption_enabled && (cfg->transport_mode == TRANSPORT_WS || cfg->transport_mode == TRANSPORT_GRPC ||
+        cfg->transport_mode == TRANSPORT_XHTTP)) vc_log_warning("uri","field query.flow is not applied to this transport");
     if (strcmp(cfg->security,"reality") && (cfg->pbk_len || cfg->short_id_len)) vc_log_warning("uri","fields query.pbk/query.sid are not applied without REALITY");
 
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
@@ -768,7 +768,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
             set_err(err, err_cap, "unsupported grpc mode");
             return -1;
         }
-        cfg->flow[0] = '\0';
+        if (!cfg->encryption_enabled) cfg->flow[0] = '\0';
         if (!grpc_reality) {
             cfg->pbk_len = 0;
             cfg->short_id_len = 0;
@@ -787,7 +787,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
             set_err(err, err_cap, "ws requires security=tls or security=none");
             return -1;
         }
-        cfg->flow[0] = '\0';
+        if (!cfg->encryption_enabled) cfg->flow[0] = '\0';
         cfg->pbk_len = 0;
         cfg->short_id_len = 0;
         if (cfg->xhttp_path[0] == '\0') {
@@ -817,7 +817,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         cfg->pbk_len = 0;
         cfg->short_id_len = 0;
     } else if (strcmp(cfg->security, "none") == 0) {
-        if (cfg->flow[0] != '\0') {
+        if (cfg->flow[0] != '\0' && !cfg->encryption_enabled) {
             set_err(err, err_cap, "tcp without security does not support flow");
             return -1;
         }
