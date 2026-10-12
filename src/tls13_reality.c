@@ -17,6 +17,7 @@
 #include "deadline.h"
 #include "hpack.h"
 #include "http1.h"
+#include "http2.h"
 #include "connection_trace.h"
 #include "tls13_reality.h"
 #include "tls_hello.h"
@@ -148,6 +149,14 @@ typedef struct {
     socklen_t address_len;
 } tls_endpoint_entry_t;
 
+typedef struct h2_response_entry {
+    struct h2_response_entry *next;
+    uint32_t id;
+    core_http2_response_t response;
+    int64_t receive_window;
+    int request_ended;
+} h2_response_entry_t;
+
 static tls_aes_fallback_entry_t g_tls_aes_fallback_cache[TLS_AES_FALLBACK_CACHE_SIZE];
 static size_t g_tls_aes_fallback_count = 0;
 static tls_endpoint_entry_t g_tls_endpoint_cache[TLS_ENDPOINT_CACHE_SIZE];
@@ -169,6 +178,10 @@ struct tls13_conn {
     uint32_t xmux_http1_id;
     int xmux_http1_role, xmux_http1_eof, xmux_http1_eof_notified;
     core_hpack_decoder_t hpack;
+    core_http2_validation_t h2_validation;
+    h2_response_entry_t *h2_responses;
+    unsigned h2_response_count;
+    int64_t h2_receive_window;
     int fd;
     int ignore_server_ips;
     conn_mode_t mode;
@@ -282,9 +295,11 @@ struct tls13_conn {
     uint32_t h2_header_stream_id;
     uint8_t h2_header_flags;
     uint32_t h2_next_stream_id;
+    int h2_goaway;
     uint32_t h2_peer_initial_window;
     uint32_t h2_peer_max_frame_size;
     uint32_t h2_peer_header_list_size;
+    uint32_t h2_peer_concurrency;
     int64_t h2_peer_conn_window;
     int64_t h2_peer_stream_window;
     uint32_t h2_upload_stream_id;
@@ -1749,10 +1764,48 @@ static int h2_send_window_update(tls13_conn_t *c, uint32_t stream_id, uint32_t i
     return h2_send_frame(c, H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload, sizeof(payload));
 }
 
-static int h2_note_recv_data(tls13_conn_t *c, size_t payload_len) {
+static h2_response_entry_t *h2_response_get(tls13_conn_t *c, uint32_t id, int create) {
+    for (h2_response_entry_t *entry=c->h2_responses;entry;entry=entry->next) if (entry->id == id) return entry;
+    if (!create) return NULL;
+    if (c->h2_response_count >= 256) { errno=EAGAIN; return NULL; }
+    h2_response_entry_t *entry=calloc(1,sizeof(*entry));
+    if (!entry) return NULL;
+    entry->id=id; entry->receive_window=H2_CLIENT_INITIAL_WINDOW;
+    if (id == c->h2_stream_id) entry->response.headers=c->h2_headers_received;
+    entry->next=c->h2_responses; c->h2_responses=entry; c->h2_response_count++;
+    return entry;
+}
+
+static void h2_response_remove(tls13_conn_t *c, uint32_t id) {
+    h2_response_entry_t **cursor=&c->h2_responses;
+    while (*cursor) {
+        if ((*cursor)->id == id) { h2_response_entry_t *entry=*cursor; *cursor=entry->next; c->h2_response_count--; free(entry); return; }
+        cursor=&(*cursor)->next;
+    }
+}
+
+static void h2_response_clear(tls13_conn_t *c) {
+    while (c->h2_responses) h2_response_remove(c,c->h2_responses->id);
+}
+
+static unsigned h2_response_active(const tls13_conn_t *c) {
+    unsigned count=0;
+    for (const h2_response_entry_t *entry=c->h2_responses;entry;entry=entry->next)
+        if (!entry->response.ended || !entry->request_ended) count++;
+    return count;
+}
+
+static int h2_note_recv_data(tls13_conn_t *c, h2_response_entry_t *entry, size_t payload_len, int delivered) {
     if (payload_len == 0) {
         return 0;
     }
+    if ((int64_t)payload_len > c->h2_receive_window || (entry && (int64_t)payload_len > entry->receive_window)) return -1;
+    if (!delivered) {
+        if (h2_send_window_update(c,0,(uint32_t)payload_len) || (entry && !entry->response.ended && h2_send_window_update(c,entry->id,(uint32_t)payload_len))) return -1;
+        return 0;
+    }
+    c->h2_receive_window-=(int64_t)payload_len;
+    if (entry) entry->receive_window-=(int64_t)payload_len;
     if (payload_len > 0x7FFFFFFFU || c->h2_recv_conn_pending > 0x7FFFFFFFU - payload_len ||
         c->h2_recv_stream_pending > 0x7FFFFFFFU - payload_len) {
         return -1;
@@ -1768,6 +1821,8 @@ static int h2_note_recv_data(tls13_conn_t *c, size_t payload_len) {
     uint32_t stream_inc = c->h2_recv_stream_pending;
     c->h2_recv_conn_pending = 0;
     c->h2_recv_stream_pending = 0;
+    c->h2_receive_window+=conn_inc;
+    if (entry) entry->receive_window+=stream_inc;
     if (h2_send_window_update(c, 0, conn_inc) != 0 || h2_send_window_update(c, c->h2_stream_id, stream_inc) != 0) {
         return -1;
     }
@@ -1882,12 +1937,13 @@ static int h2_read_exact(tls13_conn_t *c, uint8_t *buf, size_t len) {
 }
 
 static int h2_read_frame(tls13_conn_t *c, uint8_t *type, uint8_t *flags, uint32_t *stream_id, uint8_t **payload, size_t *payload_len) {
+    *payload=NULL; *payload_len=0;
     uint8_t hdr[9];
     if (h2_read_exact(c, hdr, sizeof(hdr)) != 0) {
         return -1;
     }
     size_t len = ((size_t)hdr[0] << 16) | ((size_t)hdr[1] << 8) | (size_t)hdr[2];
-    if (len > H2_MAX_INBOUND_FRAME) {
+    if (len > H2_DEFAULT_MAX_FRAME) {
         return -1;
     }
 
@@ -1906,6 +1962,13 @@ static int h2_read_frame(tls13_conn_t *c, uint8_t *type, uint8_t *flags, uint32_
     *type = hdr[3];
     *flags = hdr[4];
     *stream_id = (((uint32_t)hdr[5] << 24) | ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 8) | (uint32_t)hdr[8]) & 0x7FFFFFFFU;
+    if (!c->xmux_async && core_http2_validate_frame(&c->h2_validation,*type,*flags,*stream_id,body,len)) {
+        free(body); vc_log_error("h2","invalid h2 frame sequence"); return -1;
+    }
+    if (!c->xmux_async && (*type == 0 || *type == 1 || *type == 3 || *type == 8) && *stream_id &&
+        (!(*stream_id&1) || (*stream_id != c->h2_stream_id && *stream_id != c->h2_upload_stream_id && *stream_id >= c->h2_next_stream_id))) {
+        free(body); vc_log_error("h2","h2 frame on idle stream"); return -1;
+    }
     *payload = body;
     *payload_len = len;
     return 0;
@@ -1961,44 +2024,36 @@ static int hpack_append_literal_new_name(dynbuf_t *b, const char *name, const ch
 }
 
 
-static int h2_finish_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id, const uint8_t *block, size_t len, char *err,
-                             size_t err_cap) {
+static int h2_finish_headers(tls13_conn_t *c, uint8_t flags, uint32_t stream_id, const uint8_t *block, size_t len, char *err, size_t err_cap) {
     core_hpack_headers_t headers;
-    if (core_hpack_decode(&c->hpack, block, len, &headers) != 0) {
-        core_trace_failure(CORE_TRACE_TRANSPORT);
-        set_err(err, err_cap, "invalid h2 header block");
-        return -1;
-    }
-    int status = headers.status;
-    if (status == 101) { set_err(err,err_cap,"HTTP/2 does not support status 101"); return -1; }
-    if (status >= 100 && status < 200) {
-        if ((flags & H2_FLAG_END_STREAM) != 0 || (stream_id == c->h2_stream_id && c->h2_headers_received)) {
-            set_err(err, err_cap, "invalid h2 informational response"); return -1;
+    int decoded=core_hpack_decode(&c->hpack,block,len,&headers);
+    if (decoded == -1) { core_trace_failure(CORE_TRACE_TRANSPORT); set_err(err,err_cap,"invalid h2 header block"); return -1; }
+    h2_response_entry_t *entry=h2_response_get(c,stream_id,stream_id == c->h2_stream_id);
+    if (!entry) {
+        if (!(stream_id&1) || (stream_id != c->h2_stream_id && stream_id >= c->h2_next_stream_id)) {
+            set_err(err,err_cap,"h2 response on idle stream"); return -1;
         }
         return 0;
     }
-    if (status != 0 && status != 200) {
+    if (decoded || core_http2_response_headers(&entry->response,&headers,flags&H2_FLAG_END_STREAM)) {
+        core_trace_failure(CORE_TRACE_TRANSPORT); set_err(err,err_cap,"invalid h2 response headers"); return -1;
+    }
+    int status=headers.status;
+    if (status >= 100 && status < 200) return 0;
+    if (status && status != 200) {
         core_trace_failure(CORE_TRACE_TRANSPORT);
-        if (err != NULL && err_cap > 0) {
-            snprintf(err, err_cap, "%s h2 stream %u returned non-200: %d", c->grpc_transport ? "grpc" : "xhttp",
-                     (unsigned)stream_id, status);
-        }
+        if (err && err_cap) snprintf(err,err_cap,"%s h2 stream %u returned non-200: %d",c->grpc_transport ? "grpc" : "xhttp",stream_id,status);
         return -1;
     }
-    if (stream_id == c->h2_stream_id) {
-        if ((!c->h2_headers_received && status == 0) ||
-            (c->h2_headers_received && (status != 0 || !(flags & H2_FLAG_END_STREAM)))) {
-            set_err(err, err_cap, "invalid h2 response header order"); return -1;
-        }
-        if (status) c->h2_headers_received = 1;
-    }
-    if (c->grpc_transport && headers.has_grpc_status && headers.grpc_status != 0) {
+    if (stream_id == c->h2_stream_id) c->h2_headers_received=entry->response.headers;
+    if (c->grpc_transport && headers.has_grpc_status && headers.grpc_status) {
         core_trace_failure(CORE_TRACE_TRANSPORT);
-        if (err && err_cap) snprintf(err, err_cap, "grpc stream %u returned grpc-status=%d", (unsigned)stream_id, headers.grpc_status);
+        if (err && err_cap) snprintf(err,err_cap,"grpc stream %u returned grpc-status=%d",stream_id,headers.grpc_status);
         return -1;
     }
-    if (stream_id == c->h2_stream_id && (flags & H2_FLAG_END_STREAM) != 0) {
-        c->h2_stream_eof = 1;
+    if (entry->response.ended) {
+        if (stream_id == c->h2_stream_id) c->h2_stream_eof=1;
+        else if (entry->request_ended) h2_response_remove(c,stream_id);
     }
     return 0;
 }
@@ -2085,12 +2140,14 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
             uint16_t id = ((uint16_t)payload[off] << 8) | (uint16_t)payload[off + 1];
             uint32_t val = ((uint32_t)payload[off + 2] << 24) | ((uint32_t)payload[off + 3] << 16) | ((uint32_t)payload[off + 4] << 8) |
                            (uint32_t)payload[off + 5];
-            if (id == 4) {
+            if (id == 3) c->h2_peer_concurrency=val;
+            else if (id == 4) {
                 if (val > 0x7FFFFFFFU) {
                     set_err(err, err_cap, "invalid h2 initial window");
                     return -1;
                 }
                 int64_t delta = (int64_t)val - (int64_t)c->h2_peer_initial_window;
+                if (c->h2_peer_stream_window+delta > INT_MAX || (c->h2_upload_stream_id && c->h2_upload_stream_window+delta > INT_MAX)) return -1;
                 c->h2_peer_initial_window = val;
                 c->h2_peer_stream_window += delta;
                 if (c->h2_upload_stream_id != 0) {
@@ -2161,6 +2218,7 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
             return -1;
         }
         {
+            if (stream_id != c->h2_stream_id && !h2_response_get(c,stream_id,0)) return 0;
             uint32_t code = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
                             ((uint32_t)payload[2] << 8) | (uint32_t)payload[3];
             if (code == 0 && stream_id == c->h2_stream_id && c->h2_stream_eof) {
@@ -2175,8 +2233,16 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
         }
         return -1;
     case H2_FRAME_GOAWAY:
-        set_err(err, err_cap, "h2 goaway");
-        return -1;
+        if (stream_id || payload_len < 8) { set_err(err,err_cap,"invalid h2 goaway"); return -1; }
+        {
+            uint32_t last=(((uint32_t)payload[0]<<24)|((uint32_t)payload[1]<<16)|((uint32_t)payload[2]<<8)|payload[3])&0x7fffffffU;
+            uint32_t code=((uint32_t)payload[4]<<24)|((uint32_t)payload[5]<<16)|((uint32_t)payload[6]<<8)|payload[7];
+            c->h2_goaway=1;
+            if (code || c->h2_stream_id > last) { set_err(err,err_cap,"h2 goaway rejected stream"); return -1; }
+            for (h2_response_entry_t *entry=c->h2_responses;entry;entry=entry->next)
+                if (!entry->response.ended && entry->id > last) { set_err(err,err_cap,"h2 goaway rejected stream"); return -1; }
+            return 0;
+        }
     default:
         return 0;
     }
@@ -2198,7 +2264,7 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
     }
 
     uint32_t initial_window = c->grpc_physical_only ? c->grpc_initial_window : c->xmux_physical ? 65535 : H2_CLIENT_INITIAL_WINDOW;
-    uint8_t settings[18] = {
+    uint8_t settings[24] = {
         0x00,
         0x04,
         (uint8_t)(initial_window >> 24),
@@ -2207,6 +2273,7 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
         (uint8_t)initial_window,
         0,1,0,0,0x10,0,
         0,6,0,1,0,0,
+        0,2,0,0,0,0,
     };
     if (h2_send_frame(c, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings)) != 0 ||
         (!c->xmux_physical && !c->grpc_physical_only && h2_send_window_update(c, 0, H2_CONNECTION_WINDOW_INC) != 0)) {
@@ -2348,7 +2415,9 @@ static int h2_pump_one_frame(tls13_conn_t *c) {
     }
 
     int rc = 0;
-    if (type == H2_FRAME_DATA && stream_id == c->h2_stream_id && c->h2_header_stream_id == 0) {
+    if (type == H2_FRAME_DATA && c->h2_header_stream_id == 0) {
+        h2_response_entry_t *entry=h2_response_get(c,stream_id,stream_id == c->h2_stream_id);
+        if (!stream_id || !(stream_id&1) || (!entry && stream_id >= c->h2_next_stream_id)) { free(payload); return -1; }
         size_t off = 0;
         size_t data_len = payload_len;
         if ((flags & H2_FLAG_PADDED) != 0) {
@@ -2365,18 +2434,21 @@ static int h2_pump_one_frame(tls13_conn_t *c) {
             }
         }
 
-        if (rc == 0 && h2_note_recv_data(c, payload_len) != 0) {
+        if (rc == 0 && entry && core_http2_response_data(&entry->response,data_len,flags&H2_FLAG_END_STREAM)) rc=-1;
+        int delivered=stream_id == c->h2_stream_id;
+        if (rc == 0 && h2_note_recv_data(c, entry, payload_len, delivered) != 0) {
             rc = -1;
         }
-        if (rc == 0 && data_len > 0) {
+        if (rc == 0 && delivered && data_len > 0) {
             if (c->grpc_transport) {
                 rc = grpc_feed_data(c, payload + off, data_len);
             } else if (db_append(&c->app_cache, payload + off, data_len) != 0) {
                 rc = -1;
             }
         }
-        if ((flags & H2_FLAG_END_STREAM) != 0) {
-            c->h2_stream_eof = 1;
+        if (rc == 0 && (flags & H2_FLAG_END_STREAM) != 0) {
+            if (delivered) c->h2_stream_eof=1;
+            else if (entry && entry->request_ended) h2_response_remove(c,stream_id);
         }
     } else {
         rc = h2_process_control_frame(c, type, flags, stream_id, payload, payload_len, err, sizeof(err));
@@ -2789,6 +2861,8 @@ static int h2_send_xhttp_body(tls13_conn_t *c, uint32_t stream_id, const uint8_t
     }
     c->h2_upload_stream_id = 0;
     c->h2_upload_stream_window = 0;
+    h2_response_entry_t *entry=h2_response_get(c,stream_id,0);
+    if (entry) { entry->request_ended=1; if (entry->response.ended) h2_response_remove(c,stream_id); }
     return 0;
 }
 
@@ -2801,6 +2875,7 @@ static int xhttp_h2_begin(tls13_conn_t *c, char *err, size_t err_cap) {
     c->h2_peer_initial_window = H2_DEFAULT_WINDOW;
     c->h2_peer_max_frame_size = H2_DEFAULT_MAX_FRAME;
     c->h2_peer_header_list_size = 8192;
+    c->h2_peer_concurrency=UINT32_MAX;
     c->h2_peer_conn_window = H2_DEFAULT_WINDOW;
     c->h2_peer_stream_window = H2_DEFAULT_WINDOW;
     c->h2_upload_stream_id = 0;
@@ -2809,6 +2884,12 @@ static int xhttp_h2_begin(tls13_conn_t *c, char *err, size_t err_cap) {
     c->h2_recv_stream_pending = 0;
     c->h2_stream_eof = 0;
     c->h2_request_cancelled = 0;
+    c->h2_receive_window=H2_DEFAULT_WINDOW+H2_CONNECTION_WINDOW_INC;
+    if (!c->xmux_physical && !c->grpc_physical_only) {
+        h2_response_entry_t *entry=h2_response_get(c,c->h2_stream_id,1);
+        if (!entry) { set_err(err,err_cap,"failed to allocate h2 response state"); return -1; }
+        entry->request_ended=!c->grpc_transport && strcmp(c->xhttp_transport_mode,"stream-one");
+    }
 
     if (h2_send_client_preface(c, err, err_cap) != 0) {
         return -1;
@@ -2845,7 +2926,18 @@ static int xhttp_h2_send_stream_one_request(tls13_conn_t *c, char *err, size_t e
     return h2_send_xhttp_request_headers(c, c->h2_stream_id, method, request_path, extra_headers, 0, 1, 1, err, err_cap);
 }
 
+static int h2_request_capacity(tls13_conn_t *c, char *err, size_t err_cap) {
+    if (c->h2_goaway) { set_err(err,err_cap,"h2 goaway prevents new requests"); return -1; }
+    if (!c->h2_next_stream_id || c->h2_next_stream_id > 0x7ffffffdU) { set_err(err,err_cap,"h2 stream identifier exhausted"); return -1; }
+    if (tls13_drain_h2_input(c) < 0) { set_err(err,err_cap,"failed to read h2 settings"); return -1; }
+    while (!c->h2_goaway && (c->h2_response_count >= 256 || h2_response_active(c) >= c->h2_peer_concurrency))
+        if (h2_pump_one_frame(c)) { set_err(err,err_cap,"h2 outstanding response capacity wait failed"); return -1; }
+    if (c->h2_goaway) { set_err(err,err_cap,"h2 goaway prevents new requests"); return -1; }
+    return 0;
+}
+
 static int xhttp_h2_send_stream_up_request(tls13_conn_t *c, char *err, size_t err_cap) {
+    if (h2_request_capacity(c,err,err_cap)) return -1;
     char request_path[2048];
     char extra_headers[16384];
     if (xhttp_prepare_request(c, "", request_path, sizeof(request_path), extra_headers, sizeof(extra_headers)) != 0) {
@@ -2857,6 +2949,7 @@ static int xhttp_h2_send_stream_up_request(tls13_conn_t *c, char *err, size_t er
     c->h2_next_stream_id += 2;
     c->h2_upload_stream_id = stream_id;
     c->h2_upload_stream_window = c->h2_peer_initial_window;
+    if (!h2_response_get(c,stream_id,1)) { set_err(err,err_cap,"failed to allocate h2 response state"); return -1; }
     const char *method = c->xhttp_uplink_method;
     return h2_send_xhttp_request_headers(c, stream_id, method, request_path, extra_headers, 0, 1, 1, err, err_cap);
 }
@@ -2873,6 +2966,7 @@ static int xhttp_wait_post(tls13_conn_t *connection, char *error, size_t capacit
 }
 
 static int xhttp_h2_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length, char *err, size_t err_cap) {
+    if (h2_request_capacity(c,err,err_cap)) return -1;
     if (xhttp_wait_post(c,err,err_cap) != 0) return -1;
     char seq[32];
     snprintf(seq, sizeof(seq), "%llu", (unsigned long long)c->xhttp_seq++);
@@ -2884,6 +2978,9 @@ static int xhttp_h2_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *len
 
     uint32_t stream_id = c->h2_next_stream_id;
     c->h2_next_stream_id += 2;
+    h2_response_entry_t *entry=h2_response_get(c,stream_id,1);
+    if (!entry) { free(packet.headers); set_err(err,err_cap,"failed to allocate h2 response state"); return -1; }
+    entry->request_ended=!packet.body_size;
     const char *method = c->xhttp_uplink_method;
     int result=h2_send_xhttp_request_headers(c,stream_id,method,request_path,packet.headers,packet.body_size,packet.body_size != 0,0,err,err_cap);
     if (!result && packet.body_size) result=h2_send_xhttp_body(c,stream_id,buf,packet.body_size,err,err_cap);
@@ -5061,7 +5158,7 @@ static int h2_cached_frame_ready(const tls13_conn_t *c) {
     if (c->h2_net_cache.len >= 9) {
         size_t frame_len = ((size_t)c->h2_net_cache.data[0] << 16) | ((size_t)c->h2_net_cache.data[1] << 8) |
                            (size_t)c->h2_net_cache.data[2];
-        if (frame_len <= H2_MAX_INBOUND_FRAME && c->h2_net_cache.len >= 9 + frame_len) {
+        if (frame_len > H2_DEFAULT_MAX_FRAME || c->h2_net_cache.len >= 9 + frame_len) {
             return 1;
         }
     }
@@ -6312,6 +6409,7 @@ void tls13_reality_close(tls13_conn_t *c) {
         return;
     }
     if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); OPENSSL_cleanse(c,sizeof(*c)); free(c); return; }
+    h2_response_clear(c);
     if (!c->send_closed && c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
         int upload_fd = strcmp(c->xhttp_transport_mode, "stream-one") == 0 ? c->fd : c->xhttp_upload_fd;
         if (upload_fd >= 0) {
@@ -6668,7 +6766,10 @@ int tls13_finish_write(tls13_conn_t *c, int raw) {
         if (!result) result=relay_write_wire(c,record,length);
         free(record);
     }
-    if (!result) c->send_closed=1;
+    if (!result) {
+        c->send_closed=1;
+        for (h2_response_entry_t *entry=c->h2_responses;entry;entry=entry->next) entry->request_ended=1;
+    }
     return result;
 }
 

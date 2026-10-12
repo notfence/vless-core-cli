@@ -40,100 +40,131 @@ static void evict_to(core_hpack_decoder_t *decoder, size_t size) {
     }
 }
 
-static int lookup(const core_hpack_decoder_t *decoder, uint32_t index, const char **name, const char **value) {
+static int lookup(const core_hpack_decoder_t *decoder, uint32_t index, const char **name, size_t *name_length, const char **value, size_t *value_length) {
     if (!index) return -1;
-    if (index <= sizeof(static_table) / sizeof(static_table[0])) {
-        *name = static_table[index - 1].name; *value = static_table[index - 1].value; return 0;
+    if (index <= sizeof(static_table)/sizeof(*static_table)) {
+        *name=static_table[index-1].name; *value=static_table[index-1].value;
+        *name_length=strlen(*name); *value_length=strlen(*value); return 0;
     }
-    index -= (uint32_t)(sizeof(static_table) / sizeof(static_table[0])) + 1;
+    index-=(uint32_t)(sizeof(static_table)/sizeof(*static_table))+1;
     if (index >= decoder->count) return -1;
-    *name = decoder->entries[index].name; *value = decoder->entries[index].value; return 0;
+    const core_hpack_entry_t *entry=decoder->entries+index;
+    *name=entry->name; *value=entry->value; *name_length=entry->name_length; *value_length=entry->value_length; return 0;
 }
 
-static int insert(core_hpack_decoder_t *decoder, const char *name, const char *value) {
-    size_t size = strlen(name) + strlen(value) + 32;
-    if (size > decoder->maximum) { evict_to(decoder, 0); return 0; }
-    char *name_copy = strdup(name), *value_copy = strdup(value);
+static int insert(core_hpack_decoder_t *decoder, const char *name, size_t name_length, const char *value, size_t value_length) {
+    size_t size=name_length+value_length+32;
+    if (size > decoder->maximum) { evict_to(decoder,0); return 0; }
+    char *name_copy=malloc(name_length+1),*value_copy=malloc(value_length+1);
     if (!name_copy || !value_copy) { free(name_copy); free(value_copy); return -1; }
-    evict_to(decoder, decoder->maximum - size);
-    if (decoder->count >= sizeof(decoder->entries) / sizeof(decoder->entries[0])) { free(name_copy); free(value_copy); return -1; }
-    memmove(decoder->entries + 1, decoder->entries, decoder->count * sizeof(decoder->entries[0]));
-    decoder->entries[0] = (core_hpack_entry_t){.name=name_copy,.value=value_copy,.size=size};
-    decoder->count++; decoder->size += size;
-    return 0;
+    memcpy(name_copy,name,name_length); name_copy[name_length]=0;
+    memcpy(value_copy,value,value_length); value_copy[value_length]=0;
+    evict_to(decoder,decoder->maximum-size);
+    if (decoder->count >= sizeof(decoder->entries)/sizeof(*decoder->entries)) { free(name_copy); free(value_copy); return -1; }
+    memmove(decoder->entries+1,decoder->entries,decoder->count*sizeof(*decoder->entries));
+    decoder->entries[0]=(core_hpack_entry_t){.name=name_copy,.value=value_copy,.size=size,.name_length=name_length,.value_length=value_length};
+    decoder->count++; decoder->size+=size; return 0;
 }
 
-static int read_allocated_string(const uint8_t *block, size_t length, size_t *offset, char **text) {
-    size_t start = *offset, decoded = 0;
-    if (core_hpack_read_string(block, length, offset, NULL, 0, &decoded) != 0 || decoded > CORE_HPACK_HEADER_LIMIT) return -1;
-    *text = malloc(decoded + 1);
+static int read_allocated_string(const uint8_t *block, size_t length, size_t *offset, char **text, size_t *decoded_length) {
+    size_t start=*offset,decoded=0;
+    if (core_hpack_read_string(block,length,offset,NULL,0,&decoded) || decoded > CORE_HPACK_HEADER_LIMIT) return -1;
+    *text=malloc(decoded+1);
     if (!*text) return -1;
-    size_t verify = start, actual = 0;
-    if (core_hpack_read_string(block, length, &verify, *text, decoded + 1, &actual) != 0 || actual != decoded || memchr(*text, 0, decoded)) {
-        free(*text); *text = NULL; return -1;
-    }
-    return 0;
+    size_t verify=start,actual=0;
+    if (core_hpack_read_string(block,length,&verify,*text,decoded+1,&actual) || actual != decoded) { free(*text); *text=NULL; return -1; }
+    *decoded_length=decoded; return 0;
 }
 
-static int emit_header(core_hpack_headers_t *headers, const char *name, const char *value) {
-    size_t name_length = strlen(name), value_length = strlen(value);
-    if (!name_length || name_length + value_length + 32 > CORE_HPACK_HEADER_LIMIT - headers->decoded_size) return -1;
-    for (size_t i = 0; i < name_length; i++) {
-        unsigned char ch = (unsigned char)name[i];
-        if (ch <= 0x20 || ch >= 0x7f || (ch >= 'A' && ch <= 'Z') || (ch == ':' && i != 0)) return -1;
+static int field_is(const char *field, size_t length, const char *expected) { return length == strlen(expected) && !memcmp(field,expected,length); }
+
+static int emit_header(core_hpack_headers_t *headers, const char *name, size_t name_length, const char *value, size_t value_length) {
+    int invalid=0;
+    size_t size=name_length+value_length+32;
+    if (headers->decoded_size > CORE_HPACK_HEADER_LIMIT || size > CORE_HPACK_HEADER_LIMIT-headers->decoded_size) {
+        headers->decoded_size=CORE_HPACK_HEADER_LIMIT+1; invalid=1;
+    } else headers->decoded_size+=size;
+    if (!name_length) invalid=1;
+    for (size_t i=0;i<name_length;i++) {
+        unsigned byte=(unsigned char)name[i];
+        if (byte == ':' && !i) continue;
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9') || (byte && strchr("!#$%&'*+-.^_`|~",(int)byte)))) invalid=1;
     }
-    if (strchr(value, '\r') || strchr(value, '\n')) return -1;
-    headers->decoded_size += name_length + value_length + 32;
-    if (!strcmp(name, ":status")) {
-        if (headers->status || value_length != 3 || value[0] < '1' || value[0] > '9' || value[1] < '0' || value[1] > '9' || value[2] < '0' || value[2] > '9') return -1;
-        headers->status = (value[0]-'0')*100 + (value[1]-'0')*10 + value[2]-'0';
-    }
-    if (!strcmp(name, "grpc-status")) {
-        if (headers->has_grpc_status || !value_length) return -1;
-        unsigned status = 0;
-        for (size_t i = 0; i < value_length; i++) {
-            if (value[i] < '0' || value[i] > '9' || status > (INT_MAX - (unsigned)(value[i]-'0')) / 10) return -1;
-            status = status * 10 + (unsigned)(value[i]-'0');
+    if (name_length && name[0] == ':') {
+        if (headers->regular_seen || name_length == 1) invalid=1;
+        if (!field_is(name,name_length,":status")) {
+            const char *pseudos[]={":method",":scheme",":authority",":path",":protocol"}; unsigned flag=0;
+            for (size_t i=0;i<sizeof(pseudos)/sizeof(*pseudos);i++) if (field_is(name,name_length,pseudos[i])) flag=1U<<i;
+            if (!flag || (headers->other_pseudo&flag)) invalid=1;
+            headers->other_pseudo|=flag ? flag : 0x80000000U;
         }
-        headers->has_grpc_status = 1; headers->grpc_status = (int)status;
+    } else headers->regular_seen=1;
+    for (size_t i=0;i<value_length;i++) if (((unsigned char)value[i] < 0x20 && value[i] != '\t') || (unsigned char)value[i] == 0x7f) invalid=1;
+    if (value_length && (value[0] == ' ' || value[0] == '\t' || value[value_length-1] == ' ' || value[value_length-1] == '\t')) invalid=1;
+    const char *forbidden[]={"connection","proxy-connection","keep-alive","transfer-encoding","upgrade"};
+    for (size_t i=0;i<sizeof(forbidden)/sizeof(*forbidden);i++) if (field_is(name,name_length,forbidden[i])) invalid=1;
+    if (field_is(name,name_length,"te")) { headers->has_te=1; if (!field_is(value,value_length,"trailers")) invalid=1; }
+    if (field_is(name,name_length,":status")) {
+        if (headers->status_seen++ || value_length != 3 || value[0] < '1' || value[0] > '5' || value[1] < '0' || value[1] > '9' || value[2] < '0' || value[2] > '9') invalid=1;
+        else headers->status=(value[0]-'0')*100+(value[1]-'0')*10+value[2]-'0';
     }
-    return 0;
+    if (field_is(name,name_length,"content-length")) {
+        uint64_t parsed=0; int valid=value_length != 0;
+        for (size_t i=0;i<value_length;i++) {
+            unsigned digit=(unsigned char)value[i]-'0';
+            if (digit > 9 || parsed > (UINT64_MAX-digit)/10) { valid=0; break; }
+            parsed=parsed*10+digit;
+        }
+        if (!valid || (headers->has_content_length && headers->content_length != parsed)) invalid=1;
+        headers->has_content_length=1; headers->content_length=parsed;
+    }
+    if (field_is(name,name_length,"grpc-status")) {
+        if (headers->has_grpc_status || !value_length) invalid=1;
+        unsigned status=0; int valid=value_length != 0;
+        for (size_t i=0;i<value_length;i++) {
+            if (value[i] < '0' || value[i] > '9' || status > (INT_MAX-(unsigned)(value[i]-'0'))/10) { valid=0; break; }
+            status=status*10+(unsigned)(value[i]-'0');
+        }
+        if (!valid) invalid=1;
+        headers->has_grpc_status=1; headers->grpc_status=valid ? (int)status : -1;
+    }
+    return invalid ? -2 : 0;
 }
 
 int core_hpack_decode(core_hpack_decoder_t *decoder, const uint8_t *block, size_t length, core_hpack_headers_t *headers) {
     if (!decoder || !headers || (!block && length)) return -1;
     if (!decoder->initialized) core_hpack_init(decoder);
-    memset(headers, 0, sizeof(*headers));
-    size_t offset = 0; int saw_header = 0;
+    memset(headers,0,sizeof(*headers));
+    size_t offset=0; int saw_header=0,invalid=0;
     while (offset < length) {
-        uint8_t first = block[offset];
-        uint32_t index = 0;
-        if ((first & 0xe0) == 0x20) {
-            if (saw_header || core_hpack_decode_int(block,length,&offset,5,&index) != 0 || index > CORE_HPACK_TABLE_LIMIT) return -1;
-            decoder->maximum = index; evict_to(decoder, index); continue;
+        uint8_t first=block[offset]; uint32_t index=0;
+        if ((first&0xe0) == 0x20) {
+            if (saw_header || core_hpack_decode_int(block,length,&offset,5,&index) || index > CORE_HPACK_TABLE_LIMIT) return -1;
+            decoder->maximum=index; evict_to(decoder,index); continue;
         }
-        saw_header = 1;
-        const char *name = NULL, *value = NULL;
-        char *owned_name = NULL, *owned_value = NULL;
-        if (first & 0x80) {
-            if (core_hpack_decode_int(block,length,&offset,7,&index) != 0 || lookup(decoder,index,&name,&value) != 0 || emit_header(headers,name,value) != 0) return -1;
+        saw_header=1;
+        const char *name=NULL,*value=NULL; size_t name_length=0,value_length=0;
+        char *owned_name=NULL,*owned_value=NULL;
+        if (first&0x80) {
+            if (core_hpack_decode_int(block,length,&offset,7,&index) || lookup(decoder,index,&name,&name_length,&value,&value_length)) return -1;
+            if (emit_header(headers,name,name_length,value,value_length)) invalid=1;
             continue;
         }
-        if (core_hpack_decode_int(block,length,&offset,(first & 0x40) ? 6 : 4,&index) != 0) return -1;
+        if (core_hpack_decode_int(block,length,&offset,first&0x40 ? 6 : 4,&index)) return -1;
         if (index) {
-            if (lookup(decoder,index,&name,&value) != 0) return -1;
+            if (lookup(decoder,index,&name,&name_length,&value,&value_length)) return -1;
         } else {
-            if (read_allocated_string(block,length,&offset,&owned_name) != 0) return -1;
-            name = owned_name;
+            if (read_allocated_string(block,length,&offset,&owned_name,&name_length)) return -1;
+            name=owned_name;
         }
-        if (read_allocated_string(block,length,&offset,&owned_value) != 0) { free(owned_name); return -1; }
-        value = owned_value;
-        int result = emit_header(headers,name,value);
-        if (result == 0 && (first & 0x40)) result = insert(decoder,name,value);
+        if (read_allocated_string(block,length,&offset,&owned_value,&value_length)) { free(owned_name); return -1; }
+        value=owned_value;
+        if (emit_header(headers,name,name_length,value,value_length)) invalid=1;
+        int result=first&0x40 ? insert(decoder,name,name_length,value,value_length) : 0;
         free(owned_name); free(owned_value);
-        if (result != 0) return -1;
+        if (result) return -1;
     }
-    return 0;
+    return invalid ? -2 : 0;
 }
 
 int core_hpack_status(const uint8_t *block, size_t length) {

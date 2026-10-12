@@ -11,6 +11,7 @@ ssize_t __wrap_write(int fd, const void *data, size_t size) { if (io_failure == 
 int __wrap_fsync(int fd) { if (io_failure == 2) { io_failure = 0; errno = EIO; return -1; } return __real_fsync(fd); }
 int __wrap_rename(const char *source, const char *destination) { if (io_failure == 3) { io_failure = 0; errno = EIO; return -1; } return __real_rename(source, destination); }
 static void clear_conn(tls13_conn_t *c) {
+    h2_response_clear(c);
     db_free(&c->tls_post_handshake); db_free(&c->tls_client_hello); db_free(&c->tls_certificate_message);
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL; EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL;
     db_free(&c->h2_net_cache); db_free(&c->h2_send_buf); db_free(&c->app_cache); db_free(&c->transcript);
@@ -61,11 +62,12 @@ static void hpack_status_vectors(void) {
         {{0x48,0x83,0x68,0x4f,0xff},5,429},
         {{0x48,0x83,0x6c,0x0c,0xff},5,503},
     };
-    tls13_conn_t connection = {0};
+    tls13_conn_t connection = {.h2_stream_id=1};
     char error[160];
     for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
         CHECK("h2/huffman-status", core_hpack_status(cases[i].data,cases[i].size) == cases[i].status);
         for (int grpc = 0; grpc <= 1; grpc++) {
+            h2_response_clear(&connection); connection.h2_headers_received=connection.h2_stream_eof=0;
             connection.grpc_transport = grpc;
             error[0] = 0;
             int result = h2_process_headers(&connection,H2_FLAG_END_HEADERS,1,cases[i].data,cases[i].size,error,sizeof(error));
@@ -116,12 +118,15 @@ static void hpack_status_vectors(void) {
     for (size_t i = 0; i < sizeof(malformed)/sizeof(malformed[0]); i++) {
         CHECK("h2/malformed-status-block", core_hpack_status(malformed[i].data,malformed[i].size) < 0);
         error[0] = 0;
-        CHECK("h2/malformed-header-diagnostic", h2_process_headers(&connection,H2_FLAG_END_HEADERS,1,malformed[i].data,malformed[i].size,error,sizeof(error)) < 0 && strstr(error,"invalid h2 header block") != NULL);
+        CHECK("h2/malformed-header-diagnostic", h2_process_headers(&connection,H2_FLAG_END_HEADERS,1,malformed[i].data,malformed[i].size,error,sizeof(error)) < 0 && strstr(error,"invalid h2") != NULL);
+        clear_conn(&connection); connection.h2_headers_received=connection.h2_stream_eof=0;
     }
     const uint8_t trailer[] = {0,11,'g','r','p','c','-','s','t','a','t','u','s',1,'0'};
+    REQUIRE("h2/trailer-initial-response",h2_process_headers(&connection,H2_FLAG_END_HEADERS,1,(const uint8_t *)"\x88",1,error,sizeof(error)) == 0);
     CHECK("h2/statusless-trailers", core_hpack_status(trailer,sizeof(trailer)) == 0 && h2_process_headers(&connection,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,trailer,sizeof(trailer),error,sizeof(error)) == 0);
     const uint8_t long_name[] = {0,8,':','s','t','a','t','u','s','x',4,'2','0','0','0'};
-    CHECK("h2/status-name-not-truncated", core_hpack_status(long_name,sizeof(long_name)) == 0);
+    CHECK("h2/status-name-not-truncated", core_hpack_status(long_name,sizeof(long_name)) < 0);
+    clear_conn(&connection); connection.h2_headers_received=connection.h2_stream_eof=0;
     uint8_t wrapped[16] = {2,0,0,0,0,0};
     memcpy(wrapped+6,cases[2].data,cases[2].size);
     CHECK("h2/padded-priority-huffman-status", h2_process_headers(&connection,H2_FLAG_END_HEADERS|H2_FLAG_PADDED|H2_FLAG_PRIORITY,1,wrapped,6+cases[2].size+2,error,sizeof(error)) < 0 && strstr(error,"non-200: 403") != NULL);
@@ -209,6 +214,7 @@ static void hpack_continuation_vectors(void) {
     CHECK("h2/multipart-middle", h2_process_control_frame(&c,H2_FRAME_CONTINUATION,0,1,success+1,1,error,sizeof(error)) == 0 && !c.h2_stream_eof);
     CHECK("h2/multipart-end", h2_process_control_frame(&c,H2_FRAME_CONTINUATION,H2_FLAG_END_HEADERS,1,success+2,2,error,sizeof(error)) == 0 && c.h2_stream_eof);
     c.h2_stream_eof = 0;
+    c.h2_next_stream_id=5; REQUIRE("h2/next-request-state",h2_response_get(&c,3,1) != NULL);
     CHECK("h2/next-header-block", h2_process_headers(&c,H2_FLAG_END_HEADERS,3,success,sizeof(success),error,sizeof(error)) == 0);
     REQUIRE("h2/oversized-header-start", h2_process_headers(&c,0,1,success,1,error,sizeof(error)) == 0);
     c.h2_header_block.len = H2_MAX_INBOUND_FRAME;
@@ -504,6 +510,7 @@ static void protocol_edges(void) {
         REQUIRE("h2/flow-pair", socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
         core_set_socket_io_timeout(pair[0], 2000); core_set_socket_io_timeout(pair[1], 2000);
         c = (tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_GRPC_PLAIN,.grpc_transport=grpc,.h2_stream_id=1,.h2_peer_max_frame_size=64};
+        c.h2_validation.settings_received=1; c.h2_validation.settings_pending=1;
         strcpy(c.xhttp_transport_mode,"stream-one");
         flow_peer_t peer = {.fd=pair[1]}; pthread_t thread; REQUIRE("h2/flow-thread", pthread_create(&thread,NULL,flow_peer,&peer) == 0);
         CHECK(grpc ? "h2/grpc-zero-window-resume" : "h2/xhttp-zero-window-resume", h2_write_data(&c,data,sizeof(data)) == 0);
@@ -529,6 +536,8 @@ static void protocol_edges(void) {
     REQUIRE("h2/cancelled-upload-pair", socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     core_set_socket_io_timeout(pair[0], 200);
     c = (tls13_conn_t){.fd=pair[0],.mode=CONN_MODE_GRPC_PLAIN,.h2_stream_id=1};
+    c.h2_validation.settings_received=1; c.h2_validation.settings_pending=1;
+    c.h2_headers_received=1; c.h2_receive_window=H2_CLIENT_INITIAL_WINDOW+H2_DEFAULT_WINDOW;
     strcpy(c.xhttp_transport_mode, "stream-one");
     uint8_t completed_response[] = {0,0,10,0,1,0,0,0,1,'v','l','e','s','s','-','c','o','r','e',0,0,4,3,0,0,0,0,1,0,0,0,0};
     REQUIRE("h2/cancelled-upload-response", write_exact(pair[1], completed_response, sizeof(completed_response)) == 0);
@@ -623,6 +632,55 @@ static void xhttp_http1_vectors(void) {
     }
 }
 
+static void http2_single_wire_vectors(void) {
+    const uint8_t invalid[][10]={{0,0,1,0,0,0,0,0,1,'x'},{0,0,0,4,1,0,0,0,0},{0,0,0,99,0,0,0,0,0},{0,0x40,1,0,0,0,0,0,1}};
+    const size_t sizes[]={10,9,9,9};
+    for (size_t i=0;i<sizeof(sizes)/sizeof(*sizes);i++) {
+        tls13_conn_t connection={.fd=-1,.mode=CONN_MODE_GRPC_PLAIN};
+        REQUIRE("h2/single-wire-invalid-fixture",db_append(&connection.h2_net_cache,invalid[i],sizes[i]) == 0);
+        if (i == 3) CHECK("h2/oversize-header-is-ready-for-rejection",h2_cached_frame_ready(&connection));
+        uint8_t type,flags,*body=NULL; uint32_t stream; size_t length;
+        CHECK("h2/single-wire-initial-sequence-or-size",h2_read_frame(&connection,&type,&flags,&stream,&body,&length) < 0 && !body);
+        free(body); clear_conn(&connection);
+    }
+    tls13_conn_t connection={.fd=-1,.mode=CONN_MODE_GRPC_PLAIN};
+    const uint8_t frames[]={0,0,0,4,0,0,0,0,0,0,0,1,99,255,0,0,0,7,'x'};
+    REQUIRE("h2/single-wire-extension-fixture",db_append(&connection.h2_net_cache,frames,sizeof(frames)) == 0);
+    uint8_t type,flags,*body=NULL; uint32_t stream; size_t length;
+    CHECK("h2/single-wire-settings",h2_read_frame(&connection,&type,&flags,&stream,&body,&length) == 0 && type == 4);
+    free(body);
+    CHECK("h2/single-wire-unknown-extension",h2_read_frame(&connection,&type,&flags,&stream,&body,&length) == 0 && type == 99 && length == 1 && body[0] == 'x');
+    free(body); clear_conn(&connection);
+    connection=(tls13_conn_t){.h2_stream_id=1};
+    for (unsigned id=1;id<=256;id++) REQUIRE("h2/response-state-gradual-reservation",h2_response_get(&connection,id*2-1,1) != NULL);
+    CHECK("h2/response-state-count-bound",!h2_response_get(&connection,513,1) && connection.h2_response_count == 256);
+    h2_response_remove(&connection,3);
+    CHECK("h2/response-state-budget-recovers",h2_response_get(&connection,513,1) != NULL && connection.h2_response_count == 256);
+    clear_conn(&connection); CHECK("h2/response-state-cleanup",!connection.h2_responses && !connection.h2_response_count);
+    connection=(tls13_conn_t){.fd=-1,.h2_stream_id=1,.h2_upload_stream_id=3,.xmux_async=1};
+    h2_response_entry_t *main=h2_response_get(&connection,1,1),*upload=h2_response_get(&connection,3,1);
+    REQUIRE("h2/active-response-fixture",main && upload);
+    CHECK("h2/active-streams-counted",h2_response_active(&connection) == 2);
+    main->response.ended=upload->response.ended=1;
+    CHECK("h2/half-closed-streams-still-active",h2_response_active(&connection) == 2);
+    connection.send_closed=1;
+    main->request_ended=upload->request_ended=1;
+    CHECK("h2/fully-closed-streams-not-active",!h2_response_active(&connection));
+    char error[160]; const uint8_t limit[]={0,3,0,0,0,1};
+    CHECK("h2/single-server-concurrency-applied",h2_process_control_frame(&connection,H2_FRAME_SETTINGS,0,0,limit,sizeof(limit),error,sizeof(error)) == 0 && connection.h2_peer_concurrency == 1);
+    const uint8_t accepted[]={0,0,0,3,0,0,0,0};
+    CHECK("h2/single-goaway-preserves-accepted-stream",h2_process_control_frame(&connection,H2_FRAME_GOAWAY,0,0,accepted,sizeof(accepted),error,sizeof(error)) == 0 && connection.h2_goaway);
+    size_t pending=1;
+    CHECK("h2/single-goaway-blocks-new-request",xhttp_h2_post_packet(&connection,(const uint8_t *)"x",&pending,error,sizeof(error)) < 0 && strstr(error,"prevents new requests"));
+    clear_conn(&connection);
+    connection=(tls13_conn_t){.fd=-1,.mode=CONN_MODE_GRPC_PLAIN,.h2_stream_id=1,.h2_next_stream_id=3,.h2_peer_concurrency=UINT32_MAX};
+    connection.h2_validation.settings_received=1;
+    const uint8_t queued_goaway[]={0,0,8,7,0,0,0,0,0,0,0,0,1,0,0,0,0};
+    REQUIRE("h2/queued-goaway-fixture",db_append(&connection.h2_net_cache,queued_goaway,sizeof(queued_goaway)) == 0);
+    CHECK("h2/goaway-during-admission-prevents-new-request",h2_request_capacity(&connection,error,sizeof(error)) < 0 && strstr(error,"prevents new requests"));
+    clear_conn(&connection);
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1],"--xhttp-post")) {
         vless_config_t config; tls13_conn_t *connection=NULL; char error[256]={0};
@@ -643,6 +701,7 @@ int main(int argc, char **argv) {
         }
         return test_result();
     }
+    http2_single_wire_vectors();
     xhttp_http1_vectors();
     hpack_status_vectors();
     custom_request_headers();
@@ -660,7 +719,7 @@ int main(int argc, char **argv) {
     protocol_edges();
     directional_finish();
     relay_backpressure();
-    tls13_conn_t multiplexed={.mode=CONN_MODE_XHTTP_REALITY};
+    tls13_conn_t multiplexed={.mode=CONN_MODE_XHTTP_REALITY,.xmux_async=1};
     uint8_t settings_ack[9]={0,0,0,4,1,0,0,0,0};
     REQUIRE("xmux/h2-response-fixture", db_append(&multiplexed.h2_net_cache,settings_ack,sizeof(settings_ack)) == 0);
     core_xmux_frame_t response;
@@ -733,13 +792,13 @@ int main(int argc, char **argv) {
     const uint8_t literal_status[] = {0x48,3,'2','0','0'};
     const uint8_t plain_status[] = {0x08,3,'2','0','0'};
     const uint8_t named_status[] = {0,7,':','s','t','a','t','u','s',3,'2','0','4'};
-    const uint8_t extra_header[] = {0x40,3,'f','o','o',3,'b','a','r',0x88};
+    const uint8_t extra_header[] = {0x88,0x40,3,'f','o','o',3,'b','a','r'};
     CHECK("h2/literal-indexed-status", core_hpack_status(literal_status,sizeof(literal_status)) == 200);
     CHECK("h2/literal-plain-status", core_hpack_status(plain_status,sizeof(plain_status)) == 200);
     CHECK("h2/literal-named-status", core_hpack_status(named_status,sizeof(named_status)) == 204);
     CHECK("h2/unknown-header-skipped", core_hpack_status(extra_header,sizeof(extra_header)) == 200);
     for (size_t cut = 0; cut < sizeof(literal_status); cut++) CHECK("h2/truncated-literal-status", cut == 0 ? core_hpack_status(literal_status,cut) == 0 : core_hpack_status(literal_status,cut) < 0);
-    for (size_t cut = 0; cut < sizeof(extra_header); cut++) CHECK("h2/truncated-unknown-header", cut == 0 || cut == sizeof(extra_header)-1 ? core_hpack_status(extra_header,cut) == 0 : core_hpack_status(extra_header,cut) < 0);
+    for (size_t cut = 0; cut < sizeof(extra_header); cut++) CHECK("h2/truncated-unknown-header", cut == 0 ? core_hpack_status(extra_header,cut) == 0 : cut == 1 ? core_hpack_status(extra_header,cut) == 200 : core_hpack_status(extra_header,cut) < 0);
     const uint8_t huffman_status[] = {0x48,0x81,0xff};
     CHECK("h2/invalid-huffman-padding", core_hpack_status(huffman_status,sizeof(huffman_status)) < 0);
     errno = 0; set_connect_err(error,sizeof(error),"vless-core"); CHECK("tls/connect-error-without-errno", strcmp(error,"vless-core") == 0);

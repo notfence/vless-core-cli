@@ -30,8 +30,8 @@ static void directional_finish(void) {
     core_http2_stream_t sibling={.upload=&actor,.download=&actor,.ready=1,.down_id=3,.up_id=3,.references=2};
     mux_request_t *request=calloc(1,sizeof(*request)),*other=calloc(1,sizeof(*other));
     REQUIRE("h2/finish-fixture-requests",request && other);
-    *request=(mux_request_t){.stream=&stream,.id=1,.role=1,.send_window=65535,.headers=1};
-    *other=(mux_request_t){.stream=&sibling,.id=3,.role=1,.send_window=65535,.headers=1};
+    *request=(mux_request_t){.stream=&stream,.id=1,.role=1,.send_window=65535,.response={.headers=1}};
+    *other=(mux_request_t){.stream=&sibling,.id=3,.role=1,.send_window=65535,.response={.headers=1}};
     request->next=other; actor.requests=request;
     REQUIRE("h2/finish-fixture-notifications",notification_pair(actor.wake) == 0 && notification_pair(stream.notify) == 0 && notification_pair(sibling.notify) == 0);
     REQUIRE("h2/finish-queued-payload",queue_append(&stream.tx,(const uint8_t *)"vless-core",10,XMUX_STREAM_LIMIT) == 0);
@@ -75,6 +75,7 @@ static void grpc_pool_policy(void) {
     for (unsigned i=0;i<4;i++) {
         actors[i].manager=&manager; actors[i].group=&group; actors[i].http2=1;
         actors[i].peer_concurrency=1;
+        actors[i].validation.settings_received=1; actors[i].validation.settings_pending=1;
         actors[i].requests=&requests[i]; actors[i].next=i<3 ? &actors[i+1] : NULL;
     }
     errno=0;
@@ -93,7 +94,7 @@ static void grpc_pool_policy(void) {
     actors[0].draining=0; actors[0].receive_window=262144; actors[0].latest_stream=3;
     core_xmux_stream_t first={.download=&actors[0],.upload=&actors[0],.down_id=1,.up_id=1,.ready=1},second={.download=&actors[0],.upload=&actors[0],.down_id=3,.up_id=3,.ready=1};
     REQUIRE("grpc/policy-notification-channels",notification_pair(first.notify) == 0 && notification_pair(second.notify) == 0 && notification_pair(actors[0].wake) == 0);
-    mux_request_t request_a={.stream=&first,.id=1,.role=1,.receive_window=262144},request_b={.stream=&second,.id=3,.role=1,.headers=1,.receive_window=262144};
+    mux_request_t request_a={.stream=&first,.id=1,.role=1,.receive_window=262144},request_b={.stream=&second,.id=3,.role=1,.response={.headers=1},.receive_window=262144};
     request_a.next=&request_b; actors[0].requests=&request_a;
     uint8_t status[]={0x88,0,11,'g','r','p','c','-','s','t','a','t','u','s',1,'7'};
     core_xmux_frame_t trailer={.type=1,.flags=5,.id=1,.data=status,.length=sizeof(status)};
@@ -133,7 +134,7 @@ static void cancelled_stream_cleanup(void) {
     REQUIRE("xmux/cancelled-stream-notifications",notification_pair(stream->notify) == 0 && notification_pair(actor.wake) == 0);
     stream->download=stream->upload=&actor; stream->references=2; stream->ready=1; stream->down_id=stream->up_id=3;
     strcpy(stream->config.xhttp_mode,"packet-up"); stream->packet_limit=1024;
-    request->stream=stream; request->role=3; request->id=3; request->remaining=10; request->headers=1;
+    request->stream=stream; request->role=3; request->id=3; request->remaining=10; request->response.headers=1;
     actor.requests=request; streams=stream; stream_count=1;
     REQUIRE("xmux/cancelled-stream-pending-upload",queue_append(&stream->tx,(uint8_t *)"vless-core",10,XMUX_STREAM_LIMIT) == 0);
     upload_bytes=33; core_xmux_close(stream);
@@ -150,7 +151,23 @@ static void cancelled_stream_cleanup(void) {
     close(actor.wake[0]); close(actor.wake[1]); streams=NULL; stream_count=0; upload_bytes=0;
 }
 
+static void http2_wire_vectors(void) {
+    wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend};
+    manager.config.transport_mode=TRANSPORT_XHTTP;
+    mux_actor_t actor={.manager=&manager,.physical=&wire,.http2=1,.latest_stream=1,.receive_window=65535,.peer_window=65535};
+    core_http2_stream_t stream={0}; REQUIRE("h2/wire-notifications",notification_pair(stream.notify) == 0);
+    mux_request_t request={.stream=&stream,.id=1,.role=1,.response={.headers=1},.receive_window=65535}; actor.requests=&request;
+    core_http2_frame_t data={.type=0,.id=1,.data=(uint8_t *)"x",.length=1};
+    CHECK("h2/wire-initial-settings-required",process_frame(&actor,&data) < 0);
+    request.response.headers=0;
+    const uint8_t wrong_response[]={0x88,0,5,':','p','a','t','h',1,'/'};
+    int result=finish_headers(&actor,1,4,wrong_response,sizeof(wrong_response));
+    CHECK("h2/wire-request-pseudo-is-stream-error",result == 0 && stream.failed && !actor.failed);
+    free(stream.rx.data); core_hpack_clear(&actor.hpack); close(stream.notify[0]); close(stream.notify[1]); download_bytes=0;
+}
+
 int main(void) {
+    http2_wire_vectors();
     cancelled_stream_cleanup();
     paced_stream_isolation();
     mux_queue_t queue={0}; uint8_t bytes[4096]={0};
@@ -161,9 +178,10 @@ int main(void) {
     wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend,.config.xmux.present=1};
     mux_group_t group={.manager=&manager,.reuse_limit=4,.request_limit=8,.expires_ms=UINT64_MAX};
     mux_actor_t actor={.manager=&manager,.group=&group,.http2=1,.physical=&wire,.latest_stream=5,.send_window=65535,.receive_window=65535,.peer_window=65535,.peer_frame=16384};
+    actor.validation.settings_received=1; actor.validation.settings_pending=1;
     core_xmux_stream_t stream={.references=1,.down_id=3,.up_id=3,.until_ms=UINT64_MAX}; REQUIRE("xmux/notifications", notification_pair(stream.notify) == 0);
     snprintf(stream.config.xhttp_mode,sizeof(stream.config.xhttp_mode),"stream-one");
-    mux_request_t first={.stream=&stream,.id=3,.role=1,.headers=1,.send_window=65535,.receive_window=65535};
+    mux_request_t first={.stream=&stream,.id=3,.role=1,.response={.headers=1},.send_window=65535,.receive_window=65535};
     actor.requests=&first;
     core_xmux_frame_t data={.type=0,.id=3,.data=(uint8_t *)"vless-core",.length=10};
     CHECK("xmux/receive-data", process_frame(&actor,&data) == 0 && stream.rx.length == 10 && download_bytes == 10);
@@ -173,26 +191,29 @@ int main(void) {
     CHECK("xmux/client-consumes-data", core_xmux_read(&stream,output,sizeof(output),&length) == 0 && length == 10 && !memcmp(output,"vless-core",10));
     CHECK("xmux/consumption-refunds-windows", advance_streams(&actor) == 0 && actor.receive_window == 65535 && first.receive_window == 65535 && wire.frames == 2);
     core_xmux_frame_t zero_window={.type=8,.id=3,.data=(uint8_t[]){0,0,0,0},.length=4};
-    CHECK("xmux/zero-window-increment", process_frame(&actor,&zero_window) != 0);
+    CHECK("xmux/zero-window-increment", process_frame(&actor,&zero_window) == 0 && stream.failed && first.reset && !actor.failed);
+    stream.failed=first.reset=first.ended=0;
     first.send_window=INT_MAX;
-    zero_window.data=(uint8_t[]){0,0,0,1}; CHECK("xmux/window-overflow", process_frame(&actor,&zero_window) != 0);
+    zero_window.data=(uint8_t[]){0,0,0,1}; CHECK("xmux/window-overflow", process_frame(&actor,&zero_window) == 0 && stream.failed && !actor.failed);
+    stream.failed=first.reset=first.ended=0;
     first.send_window=65535;
     core_xmux_stream_t sibling={0}; REQUIRE("xmux/sibling-notifications", notification_pair(sibling.notify) == 0);
-    mux_request_t second={.stream=&sibling,.id=5,.role=1,.headers=1,.send_window=65535,.receive_window=65535}; first.next=&second;
+    mux_request_t second={.stream=&sibling,.id=5,.role=1,.response={.headers=1},.send_window=65535,.receive_window=65535}; first.next=&second;
     core_xmux_frame_t reset={.type=3,.id=3,.data=(uint8_t[]){0,0,0,8},.length=4};
     CHECK("xmux/reset-isolated", process_frame(&actor,&reset) == 0 && stream.failed && !sibling.failed && !actor.failed);
-    stream.failed=0; first.ended=0;
+    stream.failed=0; first.ended=first.reset=0;
     core_xmux_frame_t goaway={.type=7,.data=(uint8_t[]){0,0,0,3,0,0,0,0},.length=8};
     CHECK("xmux/goaway-drains-accepted-streams", process_frame(&actor,&goaway) == 0 && actor.draining && !stream.failed && sibling.failed);
-    sibling.failed=0; second.ended=0; actor.draining=0; first.ended=0; first.headers=0;
+    sibling.failed=0; second.ended=0; actor.draining=0; first.ended=0; first.response.headers=0;
     core_xmux_frame_t upgrade={.type=1,.flags=4,.id=3,.data=(uint8_t[]){0x48,3,'1','0','1'},.length=5};
-    CHECK("xmux/http2-protocol-upgrade-rejected",process_frame(&actor,&upgrade) != 0);
+    CHECK("xmux/http2-protocol-upgrade-rejected",process_frame(&actor,&upgrade) == 0 && stream.failed && !actor.failed);
+    stream.failed=first.ended=first.reset=0; first.response=(core_http2_response_t){0};
     core_hpack_clear(&actor.hpack);
     core_xmux_frame_t initial={.type=1,.flags=4,.id=3,.data=(uint8_t[]){0x48,3,'2','0','0'},.length=5};
-    CHECK("xmux/stateful-initial-headers", process_frame(&actor,&initial) == 0 && first.headers && actor.hpack.count == 1);
-    second.headers=0;
+    CHECK("xmux/stateful-initial-headers", process_frame(&actor,&initial) == 0 && first.response.headers && actor.hpack.count == 1);
+    second.response.headers=0;
     initial.id=5; initial.data=(uint8_t[]){0xbe}; initial.length=1;
-    CHECK("xmux/dynamic-index-other-stream", process_frame(&actor,&initial) == 0 && second.headers);
+    CHECK("xmux/dynamic-index-other-stream", process_frame(&actor,&initial) == 0 && second.response.headers);
     initial.id=3; initial.flags=4|1; initial.data=(uint8_t[]){0,1,'x',1,'v'}; initial.length=5;
     CHECK("xmux/trailers-complete-stream", process_frame(&actor,&initial) == 0 && first.ended && stream.eof);
     stream.failed=0; stream.eof=0;

@@ -7,6 +7,7 @@
 #include "connection_trace.h"
 #include "socket_util.h"
 #include "hpack.h"
+#include "http2.h"
 #include "core_log.h"
 #include "server_ips.h"
 #include "xhttp_config.h"
@@ -35,7 +36,8 @@ typedef struct mux_request {
     struct mux_request *next;
     core_http2_stream_t *stream;
     uint32_t id;
-    int role, headers, ended, reset, send_ended;
+    int role, ended, reset, send_ended;
+    core_http2_response_t response;
     int64_t send_window, receive_window;
     size_t remaining;
 } mux_request_t;
@@ -68,6 +70,7 @@ struct mux_actor {
     void *physical;
     mux_request_t *requests;
     core_hpack_decoder_t hpack;
+    core_http2_validation_t validation;
     mux_queue_t header_block;
     core_connection_trace_t trace;
     core_trace_stage_t progress_stage;
@@ -414,21 +417,36 @@ static mux_manager_t *get_manager(const vless_config_t *config, const core_http2
     manager->next=managers; managers=manager; return manager;
 }
 
+static int reject_stream(mux_actor_t *actor, uint32_t id, const char *error, uint8_t code) {
+    mux_request_t *request=find_request(actor,id);
+    if (request) { fail_stream(request->stream,error); request->ended=request->reset=1; }
+    const uint8_t payload[]={0,0,0,code};
+    return send_frame(actor,3,0,id,payload,sizeof(payload));
+}
+
+static int reject_response(mux_actor_t *actor, uint32_t id, const char *error) {
+    return reject_stream(actor,id,error,1);
+}
+
+static int reject_data(mux_actor_t *actor, uint32_t id, size_t length, const char *error, uint8_t code) {
+    if (window_update(actor,0,(uint32_t)length)) return -1;
+    return reject_stream(actor,id,error,code);
+}
+
 static int finish_headers(mux_actor_t *actor, uint32_t id, uint8_t flags, const uint8_t *data, size_t length) {
     core_hpack_headers_t headers;
-    if (core_hpack_decode(&actor->hpack,data,length,&headers) != 0) {
+    int decoded=core_hpack_decode(&actor->hpack,data,length,&headers);
+    if (decoded == -1) {
         snprintf(actor->error,sizeof(actor->error),"invalid h2 header block"); return -1;
     }
     mux_request_t *request=find_request(actor,id);
-    if (!request) return 0;
-    if (headers.status == 101) return -1;
-    if (headers.status >= 100 && headers.status < 200) return request->headers || (flags&1) ? -1 : 0;
-    if ((!request->headers && !headers.status) || (request->headers && (headers.status || !(flags&1)))) return -1;
+    if (!request || request->reset) return 0;
+    if (decoded || core_http2_response_headers(&request->response,&headers,flags&1)) return reject_response(actor,id,"invalid h2 response headers");
+    if (headers.status >= 100 && headers.status < 200) return 0;
     if (headers.status && headers.status != 200) {
         char error[96]; snprintf(error,sizeof(error),"%s h2 stream %u returned non-200: %d",grpc_manager(actor->manager) ? "grpc" : "xhttp",id,headers.status);
         fail_stream(request->stream,error); request->ended=1; return 0;
     }
-    request->headers=1;
     if (grpc_manager(actor->manager) && headers.has_grpc_status && headers.grpc_status) {
         fail_stream(request->stream,"gRPC peer returned nonzero grpc-status"); request->ended=1; return 0;
     }
@@ -446,12 +464,12 @@ static int process_frame(mux_actor_t *actor, const core_http2_frame_t *frame) {
         if (!request) return -1;
         if (frame->event == 1) {
             if (frame->status >= 100 && frame->status < 200 && frame->status != 101) return 0;
-            if (frame->status != 200 || request->headers) return -1;
-            request->headers=1;
+            if (frame->status != 200 || request->response.headers) return -1;
+            request->response.headers=1;
             if (frame->close_connection) actor->draining=1;
             return 0;
         }
-        if (!request->headers || request->ended) return -1;
+        if (!request->response.headers || request->ended) return -1;
         if (frame->event == 3) {
             request->ended=1;
             if (frame->close_connection) actor->draining=1;
@@ -463,18 +481,29 @@ static int process_frame(mux_actor_t *actor, const core_http2_frame_t *frame) {
         return process_frame(actor,&data);
     }
     if (actor->header_id && frame->type != 9) return -1;
+    if (actor->http2) {
+        int validation=core_http2_validate_frame(&actor->validation,frame->type,frame->flags,frame->id,frame->data,frame->length);
+        if (validation == -1) { snprintf(actor->error,sizeof(actor->error),"invalid h2 frame sequence"); return -1; }
+        if (validation == -2) {
+            if (reject_response(actor,frame->id,"invalid h2 stream frame")) return -1;
+            if (frame->type != 1) return 0;
+        }
+        if ((frame->type == 0 || frame->type == 1 || frame->type == 3 || frame->type == 8) && frame->id && (!(frame->id&1) || frame->id > actor->latest_stream)) return -1;
+    }
     mux_request_t *request=find_request(actor,frame->id);
     const uint8_t *data=frame->data; size_t length=frame->length;
     if (frame->type == 0) {
         if (!frame->id || !(frame->id&1) || frame->id > actor->latest_stream) return -1;
+        if ((int64_t)length > actor->receive_window) return -1;
         if (!request) {
-            if ((int64_t)length > actor->receive_window) return -1;
             return window_update(actor,0,(uint32_t)length);
         }
-        if (!request->headers || request->ended) return -1;
+        if (request->reset) return window_update(actor,0,(uint32_t)length);
+        if (!request->response.headers || request->ended) return reject_data(actor,frame->id,length,"invalid h2 response data order",1);
         size_t skip=0,body=length;
         if (frame->flags&8) { if (!length || data[0] >= length) return -1; skip=1; body-=1+data[0]; }
-        if ((int64_t)length > actor->receive_window || (int64_t)length > request->receive_window) return -1;
+        if (actor->http2 && core_http2_response_data(&request->response,body,frame->flags&1)) return reject_data(actor,frame->id,length,"invalid h2 response content-length",1);
+        if ((int64_t)length > request->receive_window) return reject_data(actor,frame->id,length,"h2 stream receive window exceeded",3);
         actor->receive_window-=(int64_t)length; request->receive_window-=(int64_t)length;
         core_http2_stream_t *stream=request->stream;
         if ((request->role == 0 || request->role == 1) && !stream->closed) {
@@ -513,7 +542,9 @@ static int process_frame(mux_actor_t *actor, const core_http2_frame_t *frame) {
             else if (id == 6) actor->peer_header_limit=value;
             else if (id == 4) {
                 if (value > INT_MAX) return -1;
-                int64_t delta=(int64_t)value-actor->peer_window; actor->peer_window=value;
+                int64_t delta=(int64_t)value-actor->peer_window;
+                for (mux_request_t *entry=actor->requests;entry;entry=entry->next) if (entry->send_window+delta > INT_MAX) return -1;
+                actor->peer_window=value;
                 for (mux_request_t *entry=actor->requests;entry;entry=entry->next) entry->send_window+=delta;
             } else if (id == 5) { if (value < 16384 || value > 16777215) return -1; actor->peer_frame=value; }
         }
@@ -523,7 +554,10 @@ static int process_frame(mux_actor_t *actor, const core_http2_frame_t *frame) {
         uint32_t increment=(((uint32_t)data[0]<<24)|((uint32_t)data[1]<<16)|((uint32_t)data[2]<<8)|data[3])&INT_MAX;
         if (!increment) return -1;
         int64_t *window=!frame->id ? &actor->send_window : request ? &request->send_window : NULL;
-        if (window) { if (*window > INT_MAX-(int64_t)increment) return -1; *window+=increment; }
+        if (window) {
+            if (*window > INT_MAX-(int64_t)increment) return frame->id ? reject_stream(actor,frame->id,"h2 stream window overflow",3) : -1;
+            *window+=increment;
+        }
     } else if (frame->type == 3) {
         if (!frame->id || length != 4) return -1;
         if (request) {

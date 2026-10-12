@@ -47,14 +47,16 @@ def varint(data, offset):
         shift+=7
 
 class GrpcPeer(Server):
-    def __init__(self, maximum=100, acknowledge=True):
+    def __init__(self, maximum=100, acknowledge=True, settings=None):
         self.maximum=maximum; self.acknowledge=acknowledge
+        self.server_settings=settings
         self.requests=[]; self.windows=[]; self.ping=threading.Event(); self.finished=threading.Event(); self.uploads=[]
         super().__init__(self.handle)
 
     def handle(self, connection):
         if exact(connection,24) != b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n": raise AssertionError("missing HTTP/2 preface")
-        connection.sendall(frame(4,payload=struct.pack("!HI",3,self.maximum)))
+        if self.server_settings is not False:
+            connection.sendall(frame(4,payload=struct.pack("!HI",3,self.maximum) if self.server_settings is None else self.server_settings))
         streams={}
         while True:
             header=exact(connection,9); size=int.from_bytes(header[:3],"big")
@@ -82,12 +84,22 @@ class GrpcPeer(Server):
                     if not data: continue
                     with self.lock: self.uploads.append((stream,data))
                     if state["ended"]: continue
+                    if data in (b"bad-order",b"bad-nul",b"bad-pseudo",b"bad-compression",b"bad-length",b"bad-trailers"):
+                        retained=b"\x40\x0cx-vless-core\x08retained"
+                        blocks={b"bad-order":retained+b"\x88",b"bad-nul":b"\x88\x40\x03x\x00y\x01v"+retained,
+                                b"bad-pseudo":b"\x88\x44\x01/"+retained,b"bad-compression":b"\x88\xff\xff\xff\xff\xff\x10",
+                                b"bad-length":b"\x88\x0f\x0d\x010"+retained,b"bad-trailers":b"\x88"}
+                        connection.sendall(frame(1,4,stream,blocks[data]))
+                        if data == b"bad-length": connection.sendall(data_frames(stream,envelope(b"\x00\x00vless-core")))
+                        if data == b"bad-trailers": connection.sendall(data_frames(stream,envelope(b"\x00\x00"))+frame(1,5,stream,b"\x88"+retained))
+                        state["responded"]=state["ended"]=True; continue
+                    if data == b"extension": connection.sendall(frame(99,255,9999,b"vless-core extension"))
                     if data == b"reset": connection.sendall(frame(3,stream=stream,payload=(8).to_bytes(4,"big"))); continue
                     if data == b"status":
                         if not state["responded"]: connection.sendall(frame(1,4,stream,b"\x88")); state["responded"]=True
                         connection.sendall(frame(1,5,stream,b"\x00\x0bgrpc-status\x017")); continue
                     if not state["responded"]:
-                        connection.sendall(frame(1,4,stream,b"\x88")); state["responded"]=True
+                        connection.sendall(frame(1,4,stream,b"\x88\xbe" if data == b"indexed" else b"\x88")); state["responded"]=True
                         data=b"\x00\x00"+data
                     connection.sendall(data_frames(stream,envelope(data)))
                     if data.endswith(b"server-fin"):
@@ -107,6 +119,34 @@ class GrpcPeer(Server):
             elif kind == 3: streams.pop(stream,None)
 
 class GrpcTests(unittest.TestCase):
+    def test_malformed_http_response_keeps_sibling_and_hpack_table(self):
+        with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none")) as core:
+            with socks_connect(core.port,80) as healthy:
+                exchange(healthy,b"vless-core warmup")
+                for action in (b"bad-order",b"bad-nul",b"bad-pseudo",b"bad-length",b"bad-trailers"):
+                    with self.subTest(action=action), socks_connect(core.port,80) as rejected:
+                        rejected.sendall(action); self.assertEqual(rejected.recv(1),b"")
+                    with socks_connect(core.port,80) as indexed: exchange(indexed,b"indexed")
+                    exchange(healthy,b"vless-core surviving stream")
+                exchange(healthy,b"extension")
+                self.assertEqual(len(peer.connections),1)
+
+    def test_hpack_compression_error_closes_physical_connection(self):
+        with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none")) as core:
+            with socks_connect(core.port,80) as healthy, socks_connect(core.port,80) as rejected:
+                exchange(healthy,b"vless-core warmup")
+                rejected.sendall(b"bad-compression"); self.assertEqual(rejected.recv(1),b"")
+                self.assertEqual(healthy.recv(1),b"")
+            with socks_connect(core.port,80) as recovered: exchange(recovered,b"vless-core recovered physical connection")
+            self.assertEqual(len(peer.connections),2)
+
+    def test_invalid_server_preface_and_settings_are_rejected(self):
+        for settings in (False,b"\x00",struct.pack("!HI",2,1),struct.pack("!HI",4,0x80000000),struct.pack("!HI",5,1)):
+            with self.subTest(settings=settings), GrpcPeer(settings=settings) as peer, cli(uri(peer.port,"grpc","none")) as core:
+                with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                    with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core")
+                self.assertIn("invalid h2 frame sequence",core.log)
+
     def test_client_fin_drains_reply_and_keeps_sibling(self):
         with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none")) as core:
             with socks_connect(core.port,80) as sibling, socks_connect(core.port,80) as tunnel:

@@ -19,6 +19,20 @@ static void standard_sequence(const char *const blocks[3]) {
 }
 
 int main(void) {
+    core_hpack_decoder_t retained={0}; core_hpack_headers_t retained_headers;
+    const uint8_t malformed[]={0x40,1,'X',1,'v',0x40,1,'x',1,'n'};
+    CHECK("hpack/malformed-http-retains-compression-state",core_hpack_decode(&retained,malformed,sizeof(malformed),&retained_headers) != 0 && retained.count == 2);
+    const uint8_t following[]={0x88,0xbe};
+    CHECK("hpack/healthy-stream-after-malformed-http",core_hpack_decode(&retained,following,sizeof(following),&retained_headers) == 0 && retained_headers.status == 200);
+    core_hpack_clear(&retained);
+    const uint8_t nul_name[]={0x40,3,'x',0,'y',1,'v',0x40,1,'x',1,'n'};
+    CHECK("hpack/nul-http-retains-compression-state",core_hpack_decode(&retained,nul_name,sizeof(nul_name),&retained_headers) != 0 && retained.count == 2);
+    CHECK("hpack/healthy-stream-after-nul-http",core_hpack_decode(&retained,following,sizeof(following),&retained_headers) == 0 && retained_headers.status == 200);
+    core_hpack_clear(&retained);
+    const uint8_t wrong_order[]={0,1,'x',1,'v',0x88},wrong_status[]={0x48,3,'9','0','0'};
+    CHECK("hpack/pseudo-after-regular-field",core_hpack_decode(&retained,wrong_order,sizeof(wrong_order),&retained_headers) != 0);
+    CHECK("hpack/status-outside-http-range",core_hpack_decode(&retained,wrong_status,sizeof(wrong_status),&retained_headers) != 0);
+    core_hpack_clear(&retained);
     standard_sequence((const char *const[]){
         "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d",
         "4803333037c1c0bf",

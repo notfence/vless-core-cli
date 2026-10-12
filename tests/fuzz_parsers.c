@@ -26,6 +26,7 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
 }
 
 static void fuzz_clear(tls13_conn_t *c) {
+    h2_response_clear(c);
     db_free(&c->transcript);
     db_free(&c->tls_post_handshake); db_free(&c->tls_client_hello); db_free(&c->tls_certificate_message);
     X509_free(c->tls_peer_certificate); EVP_PKEY_free(c->tls_retry_key);
@@ -42,7 +43,7 @@ static void fuzz_clear(tls13_conn_t *c) {
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size > 65536) return 0;
     char error[160] = {0};
-    tls13_conn_t c = {.fd = -1, .mode = CONN_MODE_GRPC_PLAIN, .h2_stream_id = 1,
+    tls13_conn_t c = {.fd = -1, .mode = CONN_MODE_GRPC_PLAIN, .h2_stream_id = 1,.h2_next_stream_id=3,.h2_receive_window=H2_CLIENT_INITIAL_WINDOW+H2_DEFAULT_WINDOW,
                      .h2_peer_initial_window = H2_DEFAULT_WINDOW, .h2_peer_stream_window = H2_DEFAULT_WINDOW,
                      .h2_peer_conn_window = H2_DEFAULT_WINDOW};
     switch (fuzz_target) {
