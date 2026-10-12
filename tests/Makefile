@@ -59,7 +59,7 @@ $(HOST_BUILD_DIR)/test_main: $(HOST_BUILD_DIR)/test_main.o $(BASE_OBJ) $(NETWORK
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=calloc,--wrap=pthread_create,--wrap=accept
 
 $(HOST_BUILD_DIR)/test_tls: $(HOST_BUILD_DIR)/test_tls.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
-	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=write,--wrap=rename,--wrap=fsync,--wrap=core_http2_pending
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=write,--wrap=rename,--wrap=fsync,--wrap=core_http2_pending,--wrap=core_now_ms,--wrap=clock_gettime,--wrap=poll,--wrap=RAND_bytes
 
 $(HOST_BUILD_DIR)/test_tls_handshake: $(HOST_BUILD_DIR)/test_tls_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
@@ -80,7 +80,7 @@ $(HOST_BUILD_DIR)/test_dialer: $(HOST_BUILD_DIR)/test_dialer.o $(filter-out $(HO
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=getaddrinfo,--wrap=connect,--wrap=poll
 
 $(HOST_BUILD_DIR)/test_xmux: $(HOST_BUILD_DIR)/test_xmux.o $(filter-out $(HOST_BUILD_DIR)/src/http2_pool.o,$(BASE_OBJ)) $(NETWORK_GUARD)
-	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=core_now_ms,--wrap=RAND_bytes
 
 $(HOST_BUILD_DIR)/test_grpc: $(HOST_BUILD_DIR)/test_grpc.o $(filter-out $(HOST_BUILD_DIR)/src/grpc.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=malloc

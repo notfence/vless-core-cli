@@ -1,4 +1,5 @@
 #include "xhttp_payload.h"
+#include "xhttp_config.h"
 #include "utils.h"
 #include "check.h"
 #include <stdlib.h>
@@ -10,7 +11,7 @@ static uint32_t next_random;
 int __wrap_RAND_bytes(unsigned char *output, int length) {
     if (!controlled_random) return __real_RAND_bytes(output,length);
     if (controlled_random < 0 || length != (int)sizeof(next_random)) return 0;
-    uint32_t value=130+next_random++; memcpy(output,&value,sizeof(value)); return 1;
+    uint32_t value=controlled_random == 2 ? next_random : controlled_random == 3 ? next_random++ : 130+next_random++; memcpy(output,&value,sizeof(value)); return 1;
 }
 
 static size_t payload_values(const char *headers, const char *key, int cookie, char *output, size_t capacity) {
@@ -27,6 +28,22 @@ static size_t payload_values(const char *headers, const char *key, int cookie, c
 }
 
 int main(void) {
+    uint64_t due;
+    controlled_random=2; next_random=101;
+    CHECK("xhttp/interval-zero-endpoint",core_xhttp_post_due((core_range_t){0,100},1000,1001,&due) == 0 && due == 1001);
+    next_random=201;
+    CHECK("xhttp/interval-upper-endpoint",core_xhttp_post_due((core_range_t){0,100},1000,1001,&due) == 0 && due == 1100);
+    CHECK("xhttp/interval-does-not-restart-elapsed-time",core_xhttp_post_due((core_range_t){0,100},1000,2000,&due) == 0 && due == 2000);
+    CHECK("xhttp/interval-upper-endpoint-overflow",core_xhttp_post_due((core_range_t){0,100},UINT64_MAX-50,UINT64_MAX-49,&due) < 0);
+    next_random=UINT32_MAX;
+    CHECK("xhttp/interval-maximum-range",core_xhttp_post_due((core_range_t){0,INT32_MAX},1000,1001,&due) == 0 && due == UINT64_C(2147484647));
+    controlled_random=-1;
+    CHECK("xhttp/interval-rng-failure",core_xhttp_post_due((core_range_t){0,100},1000,1001,&due) < 0);
+    CHECK("xhttp/interval-first-post-needs-no-randomness",core_xhttp_post_due((core_range_t){0,100},0,1001,&due) == 0 && due == 1001);
+    controlled_random=3; next_random=0;
+    CHECK("xhttp/interval-rejects-biased-random-values",core_xhttp_post_due((core_range_t){0,100},1000,1001,&due) == 0 && due == 1068 && next_random == 69);
+    CHECK("xhttp/interval-invalid-input",core_xhttp_post_due((core_range_t){-1,100},1000,1001,&due) < 0 && core_xhttp_post_due((core_range_t){100,0},1000,1001,&due) < 0 && core_xhttp_post_due((core_range_t){0,100},1000,1001,NULL) < 0);
+    controlled_random=0;
     uint8_t bytes[65535]; for (size_t i=0;i<sizeof(bytes);i++) bytes[i]=(uint8_t)i;
     char error[160]; core_xhttp_payload_t packet;
     core_xhttp_payload_options_t options={.placement="header",.key="vless-core",.chunks={64,64}};

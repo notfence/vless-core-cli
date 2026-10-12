@@ -369,7 +369,7 @@ int core_xhttp_post_due(core_range_t range, uint64_t previous, uint64_t now, uin
     if (!previous) { *due=now; return 0; }
     if (!range.max) range=(core_range_t){30,30};
     unsigned interval=0;
-    if (range.min && sample((unsigned)range.min,(unsigned)range.max,&interval) != 0) return -1;
+    if (sample((unsigned)range.min,(unsigned)range.max,&interval) != 0) return -1;
     if (previous > UINT64_MAX-interval) return -1;
     *due=previous+interval > now ? previous+interval : now; return 0;
 }

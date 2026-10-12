@@ -146,7 +146,7 @@ int main(void) {
     CHECK("xhttp/first-packet-not-delayed",core_xhttp_post_due((core_range_t){100,100},0,1000,&due) == 0 && due == 1000);
     CHECK("xhttp/default-packet-interval",core_xhttp_post_due((core_range_t){0,0},1000,1001,&due) == 0 && due == 1030);
     CHECK("xhttp/explicit-packet-interval",core_xhttp_post_due((core_range_t){120,120},1000,1001,&due) == 0 && due == 1120);
-    CHECK("xhttp/zero-minimum-disables-pacing",core_xhttp_post_due((core_range_t){0,100},1000,1001,&due) == 0 && due == 1001);
+    CHECK("xhttp/zero-minimum-interval-in-range",core_xhttp_post_due((core_range_t){0,100},1000,1001,&due) == 0 && due >= 1001 && due <= 1100);
     CHECK("xhttp/elapsed-interval-not-restarted",core_xhttp_post_due((core_range_t){120,120},1000,2000,&due) == 0 && due == 2000);
     CHECK("xhttp/interval-overflow-rejected",core_xhttp_post_due((core_range_t){120,120},UINT64_MAX-1,UINT64_MAX,&due) != 0);
     vless_config_t sized={0}; sized.xhttp_max_each_post_min=64; sized.xhttp_max_each_post_max=256;

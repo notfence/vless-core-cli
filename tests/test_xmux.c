@@ -4,6 +4,20 @@
 
 typedef struct { size_t pending; int frames, last_type, flags[16]; uint32_t last_id, ids[16]; uint64_t enqueued, flushed; } wire_t;
 static int session_failure;
+static uint64_t pacing_clock;
+static uint32_t pacing_random;
+uint64_t __real_core_now_ms(void);
+int __real_RAND_bytes(unsigned char *,int);
+uint64_t __wrap_core_now_ms(void) { return pacing_clock ? pacing_clock : __real_core_now_ms(); }
+int __wrap_RAND_bytes(unsigned char *data,int length) {
+    if (!pacing_clock) return __real_RAND_bytes(data,length);
+    if (length != (int)sizeof(pacing_random)) return 0;
+    memcpy(data,&pacing_random,sizeof(pacing_random)); return 1;
+}
+static int pacing_request(void *physical,const vless_config_t *config,const char *session,uint64_t sequence,int role,const uint8_t *data,size_t length,uint32_t *id,uint32_t limit,size_t *consumed,size_t *body) {
+    (void)physical; (void)config; (void)session; (void)sequence; (void)role; (void)data; (void)limit;
+    *id=3; *consumed=*body=length; return 0;
+}
 static int fixture_session(const vless_config_t *config, char *session, size_t capacity) {
     (void)config;
     if (session_failure) { errno=EIO; return -1; }
@@ -130,6 +144,23 @@ static void paced_stream_isolation(void) {
     free(delayed.tx.data); free(active.tx.data); close(delayed.notify[0]); close(delayed.notify[1]); close(active.notify[0]); close(active.notify[1]);
     streams=NULL; upload_bytes=0;
 }
+static void zero_minimum_packet_interval(void) {
+    wire_t wire={0}; const core_xmux_backend_t backend={.send_frame=fixture_send,.pending=fixture_pending,.request=pacing_request};
+    mux_manager_t manager={.backend=&backend}; mux_group_t group={.manager=&manager,.request_limit=100,.expires_ms=UINT64_MAX};
+    mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.peer_frame=16384,.peer_concurrency=100,.peer_window=65535,.send_window=65535},downloading={0};
+    core_xmux_stream_t stream={.download=&downloading,.upload=&actor,.ready=1,.down_id=1,.packet_limit=1024,.last_post_ms=1000,.references=2};
+    strcpy(stream.config.xhttp_mode,"packet-up"); stream.config.xhttp_min_posts_interval_max=100;
+    REQUIRE("xmux/zero-minimum-notifications",notification_pair(stream.notify) == 0);
+    REQUIRE("xmux/zero-minimum-payload",queue_append(&stream.tx,(const uint8_t *)"vless-core",10,XMUX_STREAM_LIMIT) == 0);
+    streams=&stream; upload_bytes=10; pacing_clock=1001; pacing_random=201;
+    CHECK("xmux/zero-minimum-honors-upper-endpoint",advance_streams(&actor) == 0 && stream.tx.length == 10 && stream.next_post_ms == 1100 && !actor.requests && !wire.frames);
+    pacing_random=101; pacing_clock=1099;
+    CHECK("xmux/interval-not-resampled-before-due",advance_streams(&actor) == 0 && stream.tx.length == 10 && stream.next_post_ms == 1100 && !actor.requests);
+    pacing_clock=1100;
+    CHECK("xmux/packet-sent-at-monotonic-due",advance_streams(&actor) == 0 && !stream.tx.length && stream.last_post_ms == 1100 && wire.frames == 1 && wire.last_id == 3);
+    free(actor.requests); free(stream.tx.data); close(stream.notify[0]); close(stream.notify[1]);
+    streams=NULL; upload_bytes=0; pacing_clock=0;
+}
 
 static void cancelled_stream_cleanup(void) {
     wire_t wire={.pending=23}; mux_manager_t manager={.backend=&fixture_backend,.config.xmux.present=1};
@@ -176,6 +207,7 @@ int main(void) {
     http2_wire_vectors();
     cancelled_stream_cleanup();
     paced_stream_isolation();
+    zero_minimum_packet_interval();
     mux_queue_t queue={0}; uint8_t bytes[4096]={0};
     for (size_t i=0;i<64;i++) REQUIRE("xmux/queue-fill", queue_append(&queue,bytes,sizeof(bytes),XMUX_STREAM_LIMIT) == 0);
     CHECK("xmux/queue-hard-limit", queue.length == XMUX_STREAM_LIMIT && queue_append(&queue,bytes,1,XMUX_STREAM_LIMIT) != 0);

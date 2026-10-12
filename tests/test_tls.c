@@ -5,6 +5,30 @@
 #include <sys/wait.h>
 static int io_failure;
 static int pooled_fixture_pending=-1;
+static uint64_t pacing_clock;
+static uint32_t pacing_random;
+static int pacing_waits,pacing_interrupted,pacing_timeouts[4];
+uint64_t __real_core_now_ms(void);
+int __real_RAND_bytes(unsigned char *,int);
+int __real_poll(struct pollfd *,nfds_t,int);
+int __real_clock_gettime(clockid_t,struct timespec *);
+uint64_t __wrap_core_now_ms(void) { return pacing_clock ? pacing_clock : __real_core_now_ms(); }
+int __wrap_clock_gettime(clockid_t id,struct timespec *now) {
+    if (!pacing_clock || id != CLOCK_MONOTONIC) return __real_clock_gettime(id,now);
+    now->tv_sec=(time_t)(pacing_clock/1000); now->tv_nsec=(long)(pacing_clock%1000)*1000000; return 0;
+}
+int __wrap_RAND_bytes(unsigned char *data,int length) {
+    if (!pacing_clock) return __real_RAND_bytes(data,length);
+    if (length != (int)sizeof(pacing_random)) return 0;
+    memcpy(data,&pacing_random,sizeof(pacing_random)); return 1;
+}
+int __wrap_poll(struct pollfd *descriptors,nfds_t count,int timeout) {
+    if (!pacing_clock || count) return __real_poll(descriptors,count,timeout);
+    if (pacing_waits < 4) pacing_timeouts[pacing_waits]=timeout;
+    pacing_waits++;
+    if (pacing_interrupted) { pacing_interrupted=0; pacing_clock+=7; errno=EINTR; return -1; }
+    pacing_clock+=(unsigned)timeout; return 0;
+}
 int __real_core_http2_pending(const core_http2_stream_t *);
 int __wrap_core_http2_pending(const core_http2_stream_t *stream) { return pooled_fixture_pending >= 0 ? pooled_fixture_pending : __real_core_http2_pending(stream); }
 ssize_t __real_write(int fd, const void *data, size_t size);
@@ -70,6 +94,19 @@ static void custom_request_headers(void) {
         CHECK("xhttp/http2-grpc-header-policy",request_header_value(block,length,"content-type",no_grpc ? "application/vless-core" : "application/grpc") == 1);
         db_free(&connection.xmux_plain_output); db_free(&connection.h2_send_buf);
     }
+}
+static void zero_minimum_post_interval(void) {
+    tls13_conn_t connection={.xhttp_post_intervals={0,100},.xhttp_last_post_ms=1000}; char error[160];
+    pacing_clock=1001; pacing_random=201; pacing_waits=0; pacing_interrupted=1;
+    CHECK("xhttp/ordinary-zero-minimum-paces-and-retries-eintr",xhttp_wait_post(&connection,error,sizeof(error)) == 0 && connection.xhttp_last_post_ms == 1100 && pacing_waits == 2 && pacing_timeouts[0] == 99 && pacing_timeouts[1] == 92);
+    connection.xhttp_last_post_ms=1000; pacing_clock=1001; pacing_random=101; pacing_waits=0;
+    CHECK("xhttp/ordinary-zero-interval-needs-no-wait",xhttp_wait_post(&connection,error,sizeof(error)) == 0 && connection.xhttp_last_post_ms == 1001 && !pacing_waits);
+    connection.xhttp_last_post_ms=0; pacing_random=201;
+    CHECK("xhttp/ordinary-first-post-immediate",xhttp_wait_post(&connection,error,sizeof(error)) == 0 && !pacing_waits);
+    core_deadline_t deadline; REQUIRE("xhttp/zero-minimum-deadline-attach",core_deadline_attach(&deadline) == 0); core_deadline_begin(50);
+    connection.xhttp_last_post_ms=1000;
+    CHECK("xhttp/ordinary-zero-minimum-preserves-deadline",xhttp_wait_post(&connection,error,sizeof(error)) < 0 && pacing_clock == 1051 && errno == ETIMEDOUT);
+    core_deadline_end(); core_deadline_detach(); pacing_clock=0;
 }
 static void hpack_status_vectors(void) {
     static const struct { uint8_t data[5]; size_t size; int status; } cases[] = {
@@ -728,6 +765,7 @@ int main(int argc, char **argv) {
     xhttp_http1_vectors();
     hpack_status_vectors();
     custom_request_headers();
+    zero_minimum_post_interval();
     tls13_conn_t oversized_h2={.mode=CONN_MODE_GRPC_PLAIN}; core_http2_frame_t invalid_frame;
     const uint8_t oversized_header[]={1,0,0,0,0,0,0,0,1};
     REQUIRE("h2/oversized-frame-header-fixture",db_append(&oversized_h2.h2_net_cache,oversized_header,sizeof(oversized_header)) == 0);
