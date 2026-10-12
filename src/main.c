@@ -941,13 +941,13 @@ static void *client_worker_run(void *arg) {
     int downstream_direct = 0;
     int upstream_encryption_direct = 0;
     int downstream_encryption_direct = 0;
-    int client_eof=0,upstream_eof=0;
+    int client_eof=0,upstream_eof=0,upstream_failed=0;
     int client_send_closed=0; size_t output_length=0;
     vless_response_t response={0};
 
     while (1) {
         if (!got_vless_response && core_deadline_active() && !core_deadline_remaining()) break;
-        if (tls13_flush(tls) || tls13_tick(tls)) break;
+        if (!upstream_failed && (tls13_flush(tls) || tls13_tick(tls))) { upstream_failed=client_eof=upstream_eof=1; }
         if (output_length) {
             ssize_t sent=core_send(cfd,output,output_length,MSG_DONTWAIT);
             if (sent > 0) { output_length-=(size_t)sent; memmove(output,output+sent,output_length); }
@@ -957,8 +957,9 @@ static void *client_worker_run(void *arg) {
             if (shutdown(cfd,SHUT_WR)) break;
             client_send_closed=1;
         }
-        int finishing=tls13_finish_pending(tls);
-        if (finishing < 0 || (client_eof && upstream_eof && !finishing && !output_length)) break;
+        int finishing=upstream_failed ? 0 : tls13_finish_pending(tls);
+        if (finishing < 0) { upstream_failed=client_eof=upstream_eof=1; finishing=0; }
+        if (client_eof && upstream_eof && !finishing && !output_length) break;
         int client_ready = 0;
         int client_writable = !client_eof && tls13_write_capacity(tls) >= 128U*1024U;
         int receive_capacity=output_length <= 256U*1024U-sizeof(tbuf);
@@ -974,7 +975,7 @@ static void *client_worker_run(void *arg) {
             struct pollfd fds[2] = {{.fd=client_writable || output_length ? cfd : -1,.events=(short)((client_writable ? POLLIN : 0)|(output_length ? POLLOUT : 0))},
                 {.fd=!upstream_eof || finishing || tls13_needs_write(tls) ? tfd : -1,.events=(short)(((!upstream_eof && receive_capacity) || finishing ? POLLIN : 0) | (tls13_needs_write(tls) ? POLLOUT : 0))}};
             int s = core_poll(fds, 2, tls13_idle_timeout(tls));
-            if (s < 0 || tls13_tick(tls)) {
+            if (s < 0 || (!upstream_failed && tls13_tick(tls))) {
                 break;
             }
             if (s == 0) continue;
@@ -1033,7 +1034,7 @@ static void *client_worker_run(void *arg) {
         if (upstream_ready) {
             int drained = tls13_drain_h2_input(tls);
             if (drained < 0) {
-                break;
+                upstream_failed=client_eof=upstream_eof=1; continue;
             }
             if (tls13_uses_h2(tls) || tls13_uses_async_io(tls)) {
                 upstream_ready = tls13_has_pending_app(tls) || vless_encryption_has_pending_input(encryption);
@@ -1044,7 +1045,7 @@ static void *client_worker_run(void *arg) {
         if (upstream_ready) {
             if (downstream_direct) {
                 size_t got=0; int result=tls13_read_raw(tls,tbuf,sizeof(tbuf),&got);
-                if (result < 0) break;
+                if (result < 0) { upstream_failed=client_eof=upstream_eof=1; continue; }
                 if (result > 0) continue;
                 if (!got) {
                     upstream_eof=1;
@@ -1063,7 +1064,7 @@ static void *client_worker_run(void *arg) {
                                               sizeof(tbuf), &got);
             if (read_rc < 0) {
                 if (!got_vless_response) vc_log_error("connection","VLESS response read failed: transport closed before the complete header");
-                break;
+                upstream_failed=client_eof=upstream_eof=1; continue;
             }
             if (read_rc > 0) {
                 continue;

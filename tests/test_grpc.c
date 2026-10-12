@@ -16,6 +16,24 @@ static int decode(const uint8_t *input, size_t size, size_t step, size_t *total)
 }
 
 int main(void) {
+    const char *content_types[]={"application/grpc","application/grpc+proto","APPLICATION/GRPC+json","application/grpc; charset=utf-8","application/grpc+proto; key=\"vless-core\""};
+    for (size_t i=0;i<sizeof(content_types)/sizeof(*content_types);i++) CHECK("grpc/valid-content-type",core_grpc_content_type(content_types[i],strlen(content_types[i])));
+    const char *bad_types[]={"application/grpc-web","application/grpc+","application/grpc;","application/grpc +proto","text/plain","application/grpc; key=\"open","application/grpc\0bad"};
+    for (size_t i=0;i<sizeof(bad_types)/sizeof(*bad_types)-1;i++) CHECK("grpc/invalid-content-type",!core_grpc_content_type(bad_types[i],strlen(bad_types[i])));
+    CHECK("grpc/content-type-nul",!core_grpc_content_type(bad_types[6],20));
+    core_hpack_headers_t headers={.status=200,.content_type_seen=1,.grpc_content_type=1}; char metadata_error[160];
+    CHECK("grpc/initial-headers",!core_grpc_response_headers(&headers,1,0,metadata_error,sizeof(metadata_error)));
+    CHECK("grpc/missing-final-status",core_grpc_response_headers(&headers,1,1,metadata_error,sizeof(metadata_error)) < 0);
+    headers.has_grpc_status=1;
+    CHECK("grpc/trailers-only-ok",!core_grpc_response_headers(&headers,1,1,metadata_error,sizeof(metadata_error)));
+    CHECK("grpc/nonterminal-status",core_grpc_response_headers(&headers,1,0,metadata_error,sizeof(metadata_error)) < 0);
+    headers.grpc_status=123;
+    CHECK("grpc/unknown-status",core_grpc_response_headers(&headers,1,1,metadata_error,sizeof(metadata_error)) < 0 && strstr(metadata_error,"grpc-status=2"));
+    const int http_codes[]={400,401,403,404,429,502,503,504,500},grpc_codes[]={13,16,7,12,14,14,14,14,2};
+    for (size_t i=0;i<sizeof(http_codes)/sizeof(*http_codes);i++) {
+        headers=(core_hpack_headers_t){.status=http_codes[i]}; char expected[32]; snprintf(expected,sizeof(expected),"grpc-status=%d",grpc_codes[i]);
+        CHECK("grpc/http-error-mapping",core_grpc_response_headers(&headers,1,0,metadata_error,sizeof(metadata_error)) < 0 && strstr(metadata_error,expected));
+    }
     const uint8_t message[]={0,0,0,0,14,0x10,0xff,0x01,10,3,'a','b','c',10,4,'d','e','f','g',0,0,0,0,0};
     size_t payload;
     for (size_t step=1;step<sizeof(message);step++) CHECK("grpc/streaming-repeated-fields",decode(message,sizeof(message),step,&payload) == 0 && payload == 7);

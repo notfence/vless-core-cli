@@ -104,6 +104,12 @@ static void grpc_pool_policy(void) {
     CHECK("grpc/window-not-replenished-before-consumption",process_frame(&actors[0],&data) == 0 && !second.consumed && request_b.receive_window == 262141);
     uint8_t output[3]; size_t received=0;
     CHECK("grpc/window-consumption-accounted",core_http2_read(&second,output,3,&received) == 0 && received == 3 && second.consumed == 3);
+    REQUIRE("grpc/failure-queued-data",process_frame(&actors[0],&data) == 0);
+    second.failed=1;
+    CHECK("grpc/failure-defers-until-buffer-drained",core_http2_finish_pending(&second) == 0);
+    CHECK("grpc/failed-stream-still-drains",core_http2_read(&second,output,3,&received) == 0 && received == 3);
+    CHECK("grpc/failure-after-drain",core_http2_finish_pending(&second) == -1);
+    second.failed=0;
     CHECK("grpc/window-update-after-consumption",advance_streams(&actors[0]) == 0 && !second.consumed && request_b.receive_window == 262144);
     streams=NULL; free(second.rx.data); core_hpack_clear(&actors[0].hpack);
     close(first.notify[0]); close(first.notify[1]); close(second.notify[0]); close(second.notify[1]); close(actors[0].wake[0]); close(actors[0].wake[1]);

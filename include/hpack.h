@@ -17,7 +17,7 @@ typedef struct {
     int grpc_status;
     int has_grpc_status;
     size_t decoded_size;
-    unsigned regular_seen, other_pseudo, status_seen, has_content_length, has_te;
+    unsigned regular_seen, other_pseudo, status_seen, has_content_length, has_te, content_type_seen, grpc_content_type;
     uint64_t content_length;
 } core_hpack_headers_t;
 

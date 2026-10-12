@@ -4,6 +4,65 @@
 #include <string.h>
 #include <strings.h>
 
+static int media_token(unsigned char value) {
+    return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') || (value && strchr("!#$%&'*+-.^_`|~",value));
+}
+
+int core_grpc_content_type(const char *value, size_t length) {
+    if (!value || length < 16 || strncasecmp(value,"application/grpc",16)) return 0;
+    size_t offset=16;
+    if (offset < length && value[offset] == '+') {
+        size_t start=++offset;
+        while (offset < length && media_token((unsigned char)value[offset])) offset++;
+        if (offset == start) return 0;
+    }
+    while (offset < length) {
+        while (offset < length && (value[offset] == ' ' || value[offset] == '\t')) offset++;
+        if (offset == length || value[offset++] != ';') return 0;
+        while (offset < length && (value[offset] == ' ' || value[offset] == '\t')) offset++;
+        size_t start=offset;
+        while (offset < length && media_token((unsigned char)value[offset])) offset++;
+        if (start == offset || offset == length || value[offset++] != '=') return 0;
+        if (offset < length && value[offset] == '"') {
+            offset++; int closed=0;
+            while (offset < length) {
+                unsigned char byte=(unsigned char)value[offset++];
+                if (byte == '"') { closed=1; break; }
+                if (byte == '\\') { if (offset == length) return 0; byte=(unsigned char)value[offset++]; }
+                if ((byte < 0x20 && byte != '\t') || byte == 0x7f) return 0;
+            }
+            if (!closed) return 0;
+        } else {
+            start=offset; while (offset < length && media_token((unsigned char)value[offset])) offset++;
+            if (start == offset) return 0;
+        }
+    }
+    return 1;
+}
+
+int core_grpc_response_headers(const core_hpack_headers_t *headers, int initial, int end, char *error, size_t capacity) {
+    const char *reason=NULL; int status=0;
+    if (initial && headers->status != 200) {
+        status=headers->status == 400 ? 13 : headers->status == 401 ? 16 : headers->status == 403 ? 7 : headers->status == 404 ? 12 :
+            headers->status == 429 || headers->status == 502 || headers->status == 503 || headers->status == 504 ? 14 : 2;
+        if (end && headers->has_grpc_status) status=headers->grpc_status;
+        if (!status) status=2;
+    } else if (initial && (headers->content_type_seen != 1 || !headers->grpc_content_type)) reason="gRPC response has invalid content-type";
+    else if (!initial && headers->content_type_seen) reason="gRPC content-type is not permitted in trailers";
+    else if (headers->has_grpc_status && !end) reason="gRPC status is not terminal";
+    else if (end && !headers->has_grpc_status) reason="gRPC response ended without grpc-status";
+    else if (end) status=headers->grpc_status;
+    if (reason) { if (error && capacity) snprintf(error,capacity,"%s",reason); return -1; }
+    if (status) {
+        if (error && capacity) {
+            if (initial && headers->status != 200) snprintf(error,capacity,"grpc h2 non-200: %d mapped to gRPC grpc-status=%d",headers->status,status);
+            else snprintf(error,capacity,"gRPC peer returned grpc-status=%d",status < 0 || status > 16 ? 2 : status);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 static int parameter_error(char *error, size_t capacity, const char *key) {
     if (error && capacity) snprintf(error,capacity,"invalid gRPC field %s",key);
     return -1;

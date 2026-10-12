@@ -879,11 +879,13 @@ class XrayTests(unittest.TestCase):
                                 received.extend(payload)
                         data = b"\x00\x00"+reply
                         trailer = b""
+                        response_block=block
                         if transport == "grpc":
                             message = b"\x0a"+bytes([len(data)])+data
                             data = b"\x00"+len(message).to_bytes(4,"big")+message
                             trailer = frame(1,5,b"\x00\x0bgrpc-status\x010")
-                        headers = frame(1,0,block[:1])+frame(9,4,block[1:]) if fragmented else frame(1,4,block)
+                            response_block += b"\x00\x0ccontent-type\x10application/grpc"
+                        headers = frame(1,0,response_block[:1])+frame(9,4,response_block[1:]) if fragmented else frame(1,4,response_block)
                         response = frame(4,0,b"",0)+headers+frame(0,0 if trailer else 1,data)+trailer
                         for offset in range(0,len(response),3):
                             connection.sendall(response[offset:offset+3])
@@ -906,7 +908,7 @@ class XrayTests(unittest.TestCase):
                                 except ConnectionError:
                                     pass
                         if status != 200:
-                            expected = "invalid h2 header block" if status is None else f"{transport} h2 stream 1 returned non-200: {status}"
+                            expected = "invalid h2 header block" if status is None else f"non-200: {status}"
                             self.assertIn(expected,core.log)
                         self.assertIsNone(core.process.poll(),core.log)
 

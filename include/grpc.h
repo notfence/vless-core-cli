@@ -1,6 +1,7 @@
 #ifndef CORE_GRPC_H
 #define CORE_GRPC_H
 #include "types.h"
+#include "hpack.h"
 typedef struct {
     uint8_t header[5];
     unsigned header_used, phase, wire, field, shift, found, failed;
@@ -10,4 +11,6 @@ typedef struct {
 int core_grpc_parameter(vless_config_t *, const char *, const char *, char *, size_t);
 int core_grpc_decode(core_grpc_decoder_t *, const uint8_t *, size_t, size_t *, const uint8_t **, size_t *);
 int core_grpc_complete(const core_grpc_decoder_t *);
+int core_grpc_content_type(const char *, size_t);
+int core_grpc_response_headers(const core_hpack_headers_t *, int, int, char *, size_t);
 #endif

@@ -70,7 +70,11 @@ static void hpack_status_vectors(void) {
             h2_response_clear(&connection); connection.h2_headers_received=connection.h2_stream_eof=0;
             connection.grpc_transport = grpc;
             error[0] = 0;
-            int result = h2_process_headers(&connection,H2_FLAG_END_HEADERS,1,cases[i].data,cases[i].size,error,sizeof(error));
+            dynbuf_t header={0};
+            REQUIRE("h2/status-fixture",db_append(&header,cases[i].data,cases[i].size) == 0);
+            if (grpc) REQUIRE("h2/grpc-status-content-type",hpack_append_literal_new_name(&header,"content-type","application/grpc") == 0);
+            int result = h2_process_headers(&connection,H2_FLAG_END_HEADERS,1,header.data,header.len,error,sizeof(error));
+            db_free(&header);
             CHECK("h2/huffman-status-result", cases[i].status == 200 ? result == 0 : result < 0);
             if (cases[i].status != 200) {
                 char expected[32]; snprintf(expected,sizeof(expected),"non-200: %d",cases[i].status);
@@ -122,7 +126,8 @@ static void hpack_status_vectors(void) {
         clear_conn(&connection); connection.h2_headers_received=connection.h2_stream_eof=0;
     }
     const uint8_t trailer[] = {0,11,'g','r','p','c','-','s','t','a','t','u','s',1,'0'};
-    REQUIRE("h2/trailer-initial-response",h2_process_headers(&connection,H2_FLAG_END_HEADERS,1,(const uint8_t *)"\x88",1,error,sizeof(error)) == 0);
+    const uint8_t grpc_headers[]="\x88\x00\x0c" "content-type\x10" "application/grpc";
+    REQUIRE("h2/trailer-initial-response",h2_process_headers(&connection,H2_FLAG_END_HEADERS,1,grpc_headers,sizeof(grpc_headers)-1,error,sizeof(error)) == 0);
     CHECK("h2/statusless-trailers", core_hpack_status(trailer,sizeof(trailer)) == 0 && h2_process_headers(&connection,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,trailer,sizeof(trailer),error,sizeof(error)) == 0);
     const uint8_t long_name[] = {0,8,':','s','t','a','t','u','s','x',4,'2','0','0','0'};
     CHECK("h2/status-name-not-truncated", core_hpack_status(long_name,sizeof(long_name)) < 0);
@@ -223,21 +228,21 @@ static void hpack_continuation_vectors(void) {
 }
 static void hpack_response_phases(void) {
     tls13_conn_t c = {.h2_stream_id=1,.grpc_transport=1}; char error[160];
-    const uint8_t interim[] = {0x48,3,'1','0','3'}, success[] = {0x88};
+    const uint8_t interim[] = {0x48,3,'1','0','3'}, success[] = "\x88\x00\x0c" "content-type\x10" "application/grpc";
     const uint8_t upgrade[] = {0x48,3,'1','0','1'};
     CHECK("h2/protocol-upgrade-status-rejected",h2_process_headers(&c,H2_FLAG_END_HEADERS,1,upgrade,sizeof(upgrade),error,sizeof(error)) != 0);
     core_hpack_clear(&c.hpack);
     const uint8_t trailer[] = {0x40,11,'g','r','p','c','-','s','t','a','t','u','s',1,'0'};
     CHECK("h2/informational-response", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,interim,sizeof(interim),error,sizeof(error)) == 0 && !c.h2_headers_received && !c.h2_stream_eof);
     CHECK("h2/informational-end-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,interim,sizeof(interim),error,sizeof(error)) != 0);
-    CHECK("h2/initial-response", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success),error,sizeof(error)) == 0 && c.h2_headers_received);
-    CHECK("h2/repeated-initial-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success),error,sizeof(error)) != 0);
+    CHECK("h2/initial-response", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success)-1,error,sizeof(error)) == 0 && c.h2_headers_received);
+    CHECK("h2/repeated-initial-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success)-1,error,sizeof(error)) != 0);
     CHECK("h2/late-informational-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,interim,sizeof(interim),error,sizeof(error)) != 0);
     CHECK("h2/nonfinal-trailer-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,trailer,sizeof(trailer),error,sizeof(error)) != 0);
     CHECK("h2/grpc-trailer-completes", h2_process_headers(&c,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,trailer,sizeof(trailer),error,sizeof(error)) == 0 && c.h2_stream_eof);
     clear_conn(&c); c.h2_headers_received=0; c.h2_stream_eof=0;
     CHECK("h2/trailer-before-response-rejected", h2_process_headers(&c,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,trailer,sizeof(trailer),error,sizeof(error)) != 0);
-    CHECK("h2/new-stream-response", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success),error,sizeof(error)) == 0);
+    CHECK("h2/new-stream-response", h2_process_headers(&c,H2_FLAG_END_HEADERS,1,success,sizeof(success)-1,error,sizeof(error)) == 0);
     const uint8_t failed[] = {0x7e,2,'1','3'};
     CHECK("h2/grpc-error-trailer", h2_process_headers(&c,H2_FLAG_END_HEADERS|H2_FLAG_END_STREAM,1,failed,sizeof(failed),error,sizeof(error)) != 0 && strstr(error,"grpc-status=13"));
     clear_conn(&c);

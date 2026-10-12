@@ -4,6 +4,10 @@
 
 static void standard_sequence(const char *const blocks[3]) {
     core_hpack_decoder_t decoder = {0}; core_hpack_headers_t headers;
+    const uint8_t overflow_status[]="\x00\x0b" "grpc-status\x19" "9999999999999999999999999";
+    CHECK("hpack/unknown-numeric-grpc-status",core_hpack_decode(&decoder,overflow_status,sizeof(overflow_status)-1,&headers) == 0 && headers.has_grpc_status && headers.grpc_status == 2);
+    const uint8_t leading_zero[]="\x00\x0b" "grpc-status\x02" "00";
+    CHECK("hpack/grpc-status-not-canonical",core_hpack_decode(&decoder,leading_zero,sizeof(leading_zero)-1,&headers) == -2);
     const uint8_t limit[] = {0x3f,0xe1,1};
     REQUIRE("hpack/rfc-table-limit", core_hpack_decode(&decoder,limit,sizeof(limit),&headers) == 0 && decoder.maximum == 256);
     const int statuses[] = {302,307,200};

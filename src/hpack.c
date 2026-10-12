@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "hpack.h"
+#include "grpc.h"
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
@@ -104,6 +105,7 @@ static int emit_header(core_hpack_headers_t *headers, const char *name, size_t n
     const char *forbidden[]={"connection","proxy-connection","keep-alive","transfer-encoding","upgrade"};
     for (size_t i=0;i<sizeof(forbidden)/sizeof(*forbidden);i++) if (field_is(name,name_length,forbidden[i])) invalid=1;
     if (field_is(name,name_length,"te")) { headers->has_te=1; if (!field_is(value,value_length,"trailers")) invalid=1; }
+    if (field_is(name,name_length,"content-type")) { headers->content_type_seen++; headers->grpc_content_type=core_grpc_content_type(value,value_length); }
     if (field_is(name,name_length,":status")) {
         if (headers->status_seen++ || value_length != 3 || value[0] < '1' || value[0] > '5' || value[1] < '0' || value[1] > '9' || value[2] < '0' || value[2] > '9') invalid=1;
         else headers->status=(value[0]-'0')*100+(value[1]-'0')*10+value[2]-'0';
@@ -120,13 +122,13 @@ static int emit_header(core_hpack_headers_t *headers, const char *name, size_t n
     }
     if (field_is(name,name_length,"grpc-status")) {
         if (headers->has_grpc_status || !value_length) invalid=1;
-        unsigned status=0; int valid=value_length != 0;
+        unsigned status=0; int valid=value_length != 0 && (value_length == 1 || value[0] != '0');
         for (size_t i=0;i<value_length;i++) {
-            if (value[i] < '0' || value[i] > '9' || status > (INT_MAX-(unsigned)(value[i]-'0'))/10) { valid=0; break; }
-            status=status*10+(unsigned)(value[i]-'0');
+            if (value[i] < '0' || value[i] > '9') { valid=0; break; }
+            if (status <= 16) status=status*10+(unsigned)(value[i]-'0');
         }
         if (!valid) invalid=1;
-        headers->has_grpc_status=1; headers->grpc_status=valid ? (int)status : -1;
+        headers->has_grpc_status=1; headers->grpc_status=valid ? status > 16 ? 2 : (int)status : -1;
     }
     return invalid ? -2 : 0;
 }

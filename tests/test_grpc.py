@@ -19,6 +19,17 @@ def envelope(payload):
 def data_frames(stream, payload):
     return b"".join(frame(0,stream=stream,payload=payload[offset:offset+16384]) for offset in range(0,len(payload),16384))
 
+def literal(name, value):
+    name=name.encode(); value=value.encode()
+    def size(length):
+        if length < 127: return bytes([length])
+        result=bytearray([127]); length-=127
+        while length >= 128: result.append((length&127)|128); length>>=7
+        return bytes(result+bytes([length]))
+    return b"\x00"+size(len(name))+name+size(len(value))+value
+
+GRPC_HEADERS=b"\x88"+literal("content-type","application/grpc")
+
 def integer(data, offset, bits):
     value=data[offset]&((1<<bits)-1); offset+=1
     if value < (1<<bits)-1: return value,offset
@@ -47,9 +58,10 @@ def varint(data, offset):
         shift+=7
 
 class GrpcPeer(Server):
-    def __init__(self, maximum=100, acknowledge=True, settings=None):
+    def __init__(self, maximum=100, acknowledge=True, settings=None, responses=None):
         self.maximum=maximum; self.acknowledge=acknowledge
         self.server_settings=settings
+        self.responses=responses or {}
         self.requests=[]; self.windows=[]; self.ping=threading.Event(); self.finished=threading.Event(); self.uploads=[]
         super().__init__(self.handle)
 
@@ -84,11 +96,25 @@ class GrpcPeer(Server):
                     if not data: continue
                     with self.lock: self.uploads.append((stream,data))
                     if state["ended"]: continue
+                    if data in self.responses:
+                        response=self.responses[data]
+                        block=b"\x88" if response.get("http",200) == 200 else literal(":status",str(response["http"]))
+                        if response.get("content_type") is not None: block+=literal("content-type",response["content_type"])
+                        if response.get("initial_status") is not None: block+=literal("grpc-status",response["initial_status"])
+                        body=response.get("body",b"")
+                        connection.sendall(frame(1,5 if response.get("only") else 4,stream,block))
+                        if not response.get("only"):
+                            if body: connection.sendall(data_frames(stream,envelope(b"\x00\x00"+body)))
+                            if response.get("data_end"): connection.sendall(frame(0,1,stream))
+                            else:
+                                final=b"" if response.get("status") is None else literal("grpc-status",response["status"])
+                                connection.sendall(frame(1,5,stream,final))
+                        state["responded"]=state["ended"]=True; continue
                     if data in (b"bad-order",b"bad-nul",b"bad-pseudo",b"bad-compression",b"bad-length",b"bad-trailers"):
                         retained=b"\x40\x0cx-vless-core\x08retained"
                         blocks={b"bad-order":retained+b"\x88",b"bad-nul":b"\x88\x40\x03x\x00y\x01v"+retained,
                                 b"bad-pseudo":b"\x88\x44\x01/"+retained,b"bad-compression":b"\x88\xff\xff\xff\xff\xff\x10",
-                                b"bad-length":b"\x88\x0f\x0d\x010"+retained,b"bad-trailers":b"\x88"}
+                                b"bad-length":GRPC_HEADERS+b"\x0f\x0d\x010"+retained,b"bad-trailers":GRPC_HEADERS}
                         connection.sendall(frame(1,4,stream,blocks[data]))
                         if data == b"bad-length": connection.sendall(data_frames(stream,envelope(b"\x00\x00vless-core")))
                         if data == b"bad-trailers": connection.sendall(data_frames(stream,envelope(b"\x00\x00"))+frame(1,5,stream,b"\x88"+retained))
@@ -96,10 +122,10 @@ class GrpcPeer(Server):
                     if data == b"extension": connection.sendall(frame(99,255,9999,b"vless-core extension"))
                     if data == b"reset": connection.sendall(frame(3,stream=stream,payload=(8).to_bytes(4,"big"))); continue
                     if data == b"status":
-                        if not state["responded"]: connection.sendall(frame(1,4,stream,b"\x88")); state["responded"]=True
+                        if not state["responded"]: connection.sendall(frame(1,4,stream,GRPC_HEADERS)); state["responded"]=True
                         connection.sendall(frame(1,5,stream,b"\x00\x0bgrpc-status\x017")); continue
                     if not state["responded"]:
-                        connection.sendall(frame(1,4,stream,b"\x88\xbe" if data == b"indexed" else b"\x88")); state["responded"]=True
+                        connection.sendall(frame(1,4,stream,GRPC_HEADERS+b"\xbe" if data == b"indexed" else GRPC_HEADERS)); state["responded"]=True
                         data=b"\x00\x00"+data
                     connection.sendall(data_frames(stream,envelope(data)))
                     if data.endswith(b"server-fin"):
@@ -110,7 +136,7 @@ class GrpcPeer(Server):
                     if not state["ended"]:
                         data=b"vless-core final reply"
                         if not state["responded"]:
-                            connection.sendall(frame(1,4,stream,b"\x88")); state["responded"]=True; data=b"\x00\x00"+data
+                            connection.sendall(frame(1,4,stream,GRPC_HEADERS)); state["responded"]=True; data=b"\x00\x00"+data
                         connection.sendall(data_frames(stream,envelope(data))+frame(1,5,stream,b"\x00\x0bgrpc-status\x010")); state["ended"]=True
                     self.finished.set()
             elif kind == 6 and not flags&1:
@@ -119,6 +145,42 @@ class GrpcPeer(Server):
             elif kind == 3: streams.pop(stream,None)
 
 class GrpcTests(unittest.TestCase):
+    def test_grpc_requires_content_type_and_terminal_status(self):
+        cases=(("missing-type",None,"0",{}),("wrong-type","text/plain","0",{}),
+               ("wrong-suffix","application/grpc-web","0",{}),("empty-suffix","application/grpc+","0",{}),
+               ("missing-status","application/grpc",None,{}),("early-status","application/grpc",None,{"initial_status":"0"}),
+               ("data-end","application/grpc",None,{"data_end":True}),
+               ("invalid-status","application/grpc","no",{}),("unknown-status","application/grpc","2147483648",{}),
+               ("only-success","application/grpc","0",{"only":True,"initial_status":"0"}),
+               ("only-failure","application/grpc","7",{"only":True,"initial_status":"7"}))
+        responses={name.encode():dict(content_type=kind,status=status,**options) for name,kind,status,options in cases}
+        with GrpcPeer(responses=responses) as peer, cli(uri(peer.port,"grpc","none")) as core:
+            with socks_connect(core.port,80) as sibling:
+                exchange(sibling,b"vless-core sibling")
+                for name,_,_,_ in cases:
+                    with self.subTest(case=name), socks_connect(core.port,80) as rejected:
+                        rejected.sendall(name.encode()); self.assertEqual(rejected.recv(1),b"")
+                        if name != "only-success": self.assertIn("gRPC",core.log)
+                    exchange(sibling,b"vless-core unchanged sibling")
+            self.assertEqual(len(peer.connections),1)
+
+    def test_grpc_error_drains_validated_data_and_maps_status(self):
+        reply=bytes(range(251))*701
+        cases=(("success","0",{}),("missing",None,{}),("denied","7",{}),("unknown","9999999999999999999999999",{}),
+               ("data-end",None,{"data_end":True}))
+        responses={name.encode():dict(content_type="application/grpc+proto",status=status,body=reply,**options) for name,status,options in cases}
+        with GrpcPeer(responses=responses) as peer, cli(uri(peer.port,"grpc","none")) as core:
+            with socks_connect(core.port,80) as sibling:
+                exchange(sibling,b"vless-core initial sibling")
+                for name,_,_ in cases:
+                    with self.subTest(case=name), socks_connect(core.port,80) as tunnel:
+                        tunnel.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,8192)
+                        tunnel.sendall(name.encode()); time.sleep(0.05)
+                        self.assertEqual(exact(tunnel,len(reply)),reply); self.assertEqual(tunnel.recv(1),b"")
+                    exchange(sibling,b"vless-core retained sibling")
+            self.assertEqual(len(peer.connections),1)
+            self.assertIn("grpc-status=2",core.log)
+
     def test_malformed_http_response_keeps_sibling_and_hpack_table(self):
         with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none")) as core:
             with socks_connect(core.port,80) as healthy:

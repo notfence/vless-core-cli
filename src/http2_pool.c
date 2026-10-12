@@ -8,6 +8,7 @@
 #include "socket_util.h"
 #include "hpack.h"
 #include "http2.h"
+#include "grpc.h"
 #include "core_log.h"
 #include "server_ips.h"
 #include "xhttp_config.h"
@@ -441,14 +442,16 @@ static int finish_headers(mux_actor_t *actor, uint32_t id, uint8_t flags, const 
     }
     mux_request_t *request=find_request(actor,id);
     if (!request || request->reset) return 0;
-    if (decoded || core_http2_response_headers(&request->response,&headers,flags&1)) return reject_response(actor,id,"invalid h2 response headers");
+    int initial=!request->response.headers;
+    if (decoded || core_http2_response_headers(&request->response,&headers,flags&1)) return reject_response(actor,id,grpc_manager(actor->manager) ? "invalid gRPC response headers" : "invalid h2 response headers");
     if (headers.status >= 100 && headers.status < 200) return 0;
+    if (grpc_manager(actor->manager)) {
+        char error[128];
+        if (core_grpc_response_headers(&headers,initial,flags&1,error,sizeof(error))) return reject_response(actor,id,error);
+    }
     if (headers.status && headers.status != 200) {
         char error[96]; snprintf(error,sizeof(error),"%s h2 stream %u returned non-200: %d",grpc_manager(actor->manager) ? "grpc" : "xhttp",id,headers.status);
         fail_stream(request->stream,error); request->ended=1; return 0;
-    }
-    if (grpc_manager(actor->manager) && headers.has_grpc_status && headers.grpc_status) {
-        fail_stream(request->stream,"gRPC peer returned nonzero grpc-status"); request->ended=1; return 0;
     }
     if (flags&1) { request->ended=1; if (request->role == 0 || request->role == 1) { request->stream->eof=1; signal_stream(request->stream); } }
     return 0;
@@ -513,7 +516,10 @@ static int process_frame(mux_actor_t *actor, const core_http2_frame_t *frame) {
             if (window_update(actor,0,(uint32_t)length) != 0 || window_update(actor,frame->id,(uint32_t)length) != 0) return -1;
             actor->receive_window+=(int64_t)length; request->receive_window+=(int64_t)length;
         }
-        if (frame->flags&1) { request->ended=1; if (request->role == 0 || request->role == 1) { stream->eof=1; signal_stream(stream); } }
+        if (frame->flags&1) {
+            if (grpc_manager(actor->manager)) return reject_response(actor,frame->id,"gRPC DATA ended without grpc-status");
+            request->ended=1; if (request->role == 0 || request->role == 1) { stream->eof=1; signal_stream(stream); }
+        }
     } else if (frame->type == 1 || frame->type == 9) {
         if (!frame->id) return -1;
         uint8_t flags=frame->flags;
@@ -1012,7 +1018,7 @@ int core_http2_finish_write(core_http2_stream_t *stream) {
 
 int core_http2_finish_pending(const core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
-    int result=!stream || stream->failed ? -1 : stream->finish_requested &&
+    int result=!stream ? -1 : stream->failed ? stream->rx.length ? 0 : -1 : stream->finish_requested &&
         (!stream->finish_sent || stream->finish_fence > stream->upload->flushed);
     pthread_mutex_unlock(&mux_lock); return result;
 }
