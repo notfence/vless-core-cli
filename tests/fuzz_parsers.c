@@ -27,6 +27,7 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
 
 static void fuzz_clear(tls13_conn_t *c) {
     h2_response_clear(c);
+    core_grpc_clear(&c->grpc_decoder); db_free(&c->grpc_net_cache);
     db_free(&c->transcript);
     db_free(&c->tls_post_handshake); db_free(&c->tls_client_hello); db_free(&c->tls_certificate_message);
     X509_free(c->tls_peer_certificate); EVP_PKEY_free(c->tls_retry_key);
@@ -118,9 +119,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     case 3: {
         size_t step = size ? 1 + data[0] % 64 : 1;
-        for (size_t off = 0; off < size; off += step) {
-            size_t length = size - off < step ? size - off : step;
-            if (grpc_feed_data(&c, data + off, length) != 0) break;
+        for (unsigned multi=0;multi<2;multi++) {
+            core_grpc_clear(&c.grpc_decoder); c.grpc_decoder.multi=multi; c.grpc_read_failed=0;
+            db_consume(&c.grpc_net_cache,c.grpc_net_cache.len); db_consume(&c.app_cache,c.app_cache.len);
+            for (size_t off = 0; off < size; off += step) {
+                size_t length = size - off < step ? size - off : step;
+                if (grpc_feed_data(&c, data + off, length) != 0) break;
+                while (c.app_cache.len || core_grpc_pending(&c.grpc_decoder) || c.grpc_net_cache.len) {
+                    db_consume(&c.app_cache,c.app_cache.len);
+                    if (grpc_fill_app_cache(&c) != 0) break;
+                }
+            }
         }
         break;
     }

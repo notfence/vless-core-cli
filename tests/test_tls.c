@@ -4,6 +4,9 @@
 #include "uri.h"
 #include <sys/wait.h>
 static int io_failure;
+static int pooled_fixture_pending=-1;
+int __real_core_http2_pending(const core_http2_stream_t *);
+int __wrap_core_http2_pending(const core_http2_stream_t *stream) { return pooled_fixture_pending >= 0 ? pooled_fixture_pending : __real_core_http2_pending(stream); }
 ssize_t __real_write(int fd, const void *data, size_t size);
 int __real_fsync(int fd);
 int __real_rename(const char *source, const char *destination);
@@ -11,6 +14,7 @@ ssize_t __wrap_write(int fd, const void *data, size_t size) { if (io_failure == 
 int __wrap_fsync(int fd) { if (io_failure == 2) { io_failure = 0; errno = EIO; return -1; } return __real_fsync(fd); }
 int __wrap_rename(const char *source, const char *destination) { if (io_failure == 3) { io_failure = 0; errno = EIO; return -1; } return __real_rename(source, destination); }
 static void clear_conn(tls13_conn_t *c) {
+    core_grpc_clear(&c->grpc_decoder); db_free(&c->grpc_net_cache);
     h2_response_clear(c);
     db_free(&c->tls_post_handshake); db_free(&c->tls_client_hello); db_free(&c->tls_certificate_message);
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL; EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL;
@@ -19,6 +23,19 @@ static void clear_conn(tls13_conn_t *c) {
     db_free(&c->xmux_raw_input); db_free(&c->xmux_wire_output); db_free(&c->xmux_plain_output);
     db_free(&c->h2_header_block);
     core_hpack_clear(&c->hpack);
+}
+
+static void grpc_pooled_buffer_readiness(void) {
+    tls13_conn_t c={.grpc_transport=1}; unsigned char fixture=0;
+    c.xmux_stream=(core_http2_stream_t *)&fixture; pooled_fixture_pending=0;
+    const uint8_t header[]={0,0,0,0x23,0x2b,10,0xa8,0x46};
+    uint8_t payload[9000]; memset(payload,'x',sizeof(payload));
+    REQUIRE("grpc/pending-buffer-header",grpc_feed_data(&c,header,sizeof(header)) == 0);
+    REQUIRE("grpc/pending-buffer-body",grpc_feed_data(&c,payload,sizeof(payload)) == 0);
+    REQUIRE("grpc/pending-buffer-first-chunk",c.app_cache.len == 8192 && core_grpc_pending(&c.grpc_decoder));
+    db_consume(&c.app_cache,c.app_cache.len);
+    CHECK("grpc/pooled-decoder-buffer-ready",tls13_has_pending_input(&c) && tls13_has_pending_app(&c));
+    c.xmux_stream=NULL; pooled_fixture_pending=-1; clear_conn(&c);
 }
 
 static int request_header_value(const uint8_t *block, size_t length, const char *key, const char *expected) {
@@ -706,6 +723,7 @@ int main(int argc, char **argv) {
         }
         return test_result();
     }
+    grpc_pooled_buffer_readiness();
     http2_single_wire_vectors();
     xhttp_http1_vectors();
     hpack_status_vectors();
@@ -826,7 +844,11 @@ int main(int argc, char **argv) {
     c.grpc_transport = 1; uint8_t grpc[] = {0,0,0,0,5,10,3,'a','b','c'};
     for (size_t i = 0; i < sizeof(grpc); i++) REQUIRE("grpc/fragmented-frame", grpc_feed_data(&c, grpc+i, 1) == 0);
     CHECK("grpc/decoded-hunk", c.app_cache.len == 3 && memcmp(c.app_cache.data, "abc", 3) == 0);
-    uint8_t compressed[] = {1,0,0,0,0}; CHECK("grpc/compressed-reject", grpc_feed_data(&c, compressed, 5) != 0); c.grpc_decoder=(core_grpc_decoder_t){0};
+    uint8_t compressed[] = {1,0,0,0,0};
+    CHECK("grpc/error-follows-buffered-hunk",grpc_feed_data(&c,compressed,5) == 0 && c.app_cache.len == 3);
+    db_consume(&c.app_cache,3);
+    CHECK("grpc/compressed-reject",grpc_fill_app_cache(&c) < 0 && c.grpc_read_failed);
+    core_grpc_clear(&c.grpc_decoder); db_consume(&c.grpc_net_cache,c.grpc_net_cache.len); c.grpc_read_failed=0;
     CHECK("batch/grpc", tls13_write_batch_size(&c) == 65536); c.grpc_transport = 0;
     strcpy(c.xhttp_transport_mode, "packet-up"); c.mode = CONN_MODE_XHTTP_PLAIN; c.xhttp_max_each_post_bytes = 2000000;
     CHECK("batch/xhttp-cap", tls13_write_batch_size(&c) == 1048576); c.xhttp_max_each_post_bytes = 1000; CHECK("batch/xhttp-small", tls13_write_batch_size(&c) == 1000);

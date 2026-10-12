@@ -276,6 +276,7 @@ struct tls13_conn {
     char grpc_authority[320];
     char grpc_user_agent[256];
     core_grpc_decoder_t grpc_decoder;
+    dynbuf_t grpc_net_cache;
     int grpc_read_failed;
     int grpc_physical_only;
     unsigned grpc_initial_window;
@@ -2347,29 +2348,47 @@ static size_t protobuf_write_varint(uint8_t *out, size_t value) {
 }
 
 
-static int grpc_feed_data(tls13_conn_t *c, const uint8_t *data, size_t length) {
-    size_t offset=0;
-    while (offset < length) {
+static int grpc_fill_app_cache(tls13_conn_t *c) {
+    while (!c->app_cache.len) {
+        if (core_grpc_pending(&c->grpc_decoder)) {
+            uint8_t output[8192]; size_t length=0;
+            if (core_grpc_read(&c->grpc_decoder,output,sizeof(output),&length) || (length && db_append(&c->app_cache,output,length))) return -1;
+            if (length) return 0;
+        }
+        if (c->grpc_read_failed) return -1;
+        if (!c->grpc_net_cache.len) return 1;
         size_t consumed=0,payload_length=0; const uint8_t *payload=NULL;
-        int result=core_grpc_decode(&c->grpc_decoder,data+offset,length-offset,&consumed,&payload,&payload_length);
-        if (result < 0 || !consumed || (payload_length && db_append(&c->app_cache,payload,payload_length))) return -1;
-        offset+=consumed;
+        int result=core_grpc_decode(&c->grpc_decoder,c->grpc_net_cache.data,c->grpc_net_cache.len,&consumed,&payload,&payload_length);
+        if (result < 0 || (!consumed && !core_grpc_pending(&c->grpc_decoder)) || (payload_length && db_append(&c->app_cache,payload,payload_length))) {
+            vc_log_error("grpc",c->grpc_decoder.failed == 2 ? "gRPC message buffering budget exhausted" : c->grpc_decoder.failed == 3 ? "gRPC message buffer allocation failed" : "invalid gRPC protobuf message");
+            c->grpc_read_failed=1; return -1;
+        }
+        db_consume(&c->grpc_net_cache,consumed);
     }
     return 0;
+}
+
+static int grpc_feed_data(tls13_conn_t *c, const uint8_t *data, size_t length) {
+    c->grpc_net_cache.limit=32768;
+    if (db_append(&c->grpc_net_cache,data,length)) return -1;
+    return grpc_fill_app_cache(c) < 0 ? -1 : 0;
 }
 
 static int grpc_pool_read(tls13_conn_t *c, uint8_t *buffer, size_t capacity, size_t *length) {
     *length=0;
     if (!capacity) return 0;
     if (!c->app_cache.len) {
-        if (c->grpc_read_failed) return -1;
-        uint8_t input[8192]; size_t received=0;
-        int result=core_http2_read(c->xmux_stream,input,sizeof(input),&received);
-        if (result < 0) return core_grpc_complete(&c->grpc_decoder) ? result : -1;
-        if (result > 0) return result;
-        if (!received) return core_grpc_complete(&c->grpc_decoder) ? 0 : -1;
-        if (grpc_feed_data(c,input,received)) { c->grpc_read_failed=1; if (!c->app_cache.len) return -1; }
-        if (!c->app_cache.len) return 1;
+        int pending=grpc_fill_app_cache(c);
+        if (pending < 0) return -1;
+        if (pending) {
+            uint8_t input[8192]; size_t received=0;
+            int result=core_http2_read(c->xmux_stream,input,sizeof(input),&received);
+            if (result < 0) return -1;
+            if (result > 0) return result;
+            if (!received) return core_grpc_complete(&c->grpc_decoder) && !c->grpc_net_cache.len ? 0 : -1;
+            if (grpc_feed_data(c,input,received)) { c->grpc_read_failed=1; if (!c->app_cache.len) return -1; }
+            if (!c->app_cache.len) return 1;
+        }
     }
     size_t take=c->app_cache.len < capacity ? c->app_cache.len : capacity;
     memcpy(buffer,c->app_cache.data,take); db_consume(&c->app_cache,take);
@@ -2466,6 +2485,10 @@ static int h2_pump_one_frame(tls13_conn_t *c) {
 }
 
 static int h2_fill_app_cache(tls13_conn_t *c) {
+    if (c->grpc_transport) {
+        int result=grpc_fill_app_cache(c);
+        if (result <= 0) return result;
+    }
     if (c->grpc_read_failed) return -1;
     if (c->h2_stream_eof) {
         return -1;
@@ -5113,6 +5136,7 @@ int tls13_read_raw(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
 }
 
 int tls13_has_pending_app(const tls13_conn_t *c) {
+    if (c && c->grpc_transport && (c->grpc_net_cache.len || core_grpc_pending(&c->grpc_decoder) || c->grpc_read_failed)) return 1;
     if (c && c->xmux_stream) return c->app_cache.len || core_xmux_pending(c->xmux_stream);
     if (tls13_uses_h2(c)) {
         return c->app_cache.len > 0 || c->h2_stream_eof || c->grpc_read_failed;
@@ -5124,11 +5148,11 @@ int tls13_has_pending_input(const tls13_conn_t *c) {
     if (c == NULL) {
         return 0;
     }
+    if (c->grpc_transport && (c->grpc_net_cache.len || core_grpc_pending(&c->grpc_decoder) || c->grpc_read_failed)) return 1;
     if (c->xmux_stream) return c->app_cache.len || core_xmux_pending(c->xmux_stream);
     if (c->app_cache.len > 0) {
         return 1;
     }
-    if (c->grpc_transport && c->grpc_read_failed) return 1;
     if (c->relay_async && (c->mode == CONN_MODE_TLS || c->mode == CONN_MODE_REALITY)) {
         if (c->receive_closed) return 1;
         if (c->xmux_raw_input.len >= 5) {
@@ -5190,7 +5214,7 @@ int tls13_drain_h2_input(tls13_conn_t *c) {
         (c->mode != CONN_MODE_XHTTP_TLS_H2 && c->mode != CONN_MODE_XHTTP_REALITY && c->mode != CONN_MODE_GRPC_PLAIN)) {
         return 0;
     }
-    if (c->grpc_transport && c->grpc_read_failed) return c->app_cache.len ? 0 : -1;
+    if (c->grpc_transport && grpc_fill_app_cache(c) < 0) return c->app_cache.len ? 0 : -1;
 
     if (c->mode == CONN_MODE_XHTTP_TLS_H2 &&
         c->app_cache.len == 0 &&
@@ -6291,6 +6315,7 @@ static int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, s
     snprintf(c->remote_sni, sizeof(c->remote_sni), "%s", cfg->sni[0] != '\0' ? cfg->sni : cfg->server_host);
     snprintf(c->grpc_service_name, sizeof(c->grpc_service_name), "%s", cfg->grpc_service_name);
     c->grpc_multi_mode = strcmp(cfg->xhttp_mode, "multi") == 0;
+    c->grpc_decoder.multi=(unsigned)c->grpc_multi_mode;
 
     if (cfg->grpc_authority[0] != '\0') {
         snprintf(c->grpc_authority, sizeof(c->grpc_authority), "%s", cfg->grpc_authority);
@@ -6358,6 +6383,7 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
     if (cfg->transport_mode == TRANSPORT_GRPC) {
         if (!cfg->grpc_physical_only) {
             c->grpc_transport=1;
+            c->grpc_decoder.multi=strcmp(cfg->xhttp_mode,"multi") == 0;
             c->xmux_stream=core_http2_connect(cfg,&xmux_backend,err,err_cap);
             if (!c->xmux_stream) { free(c); return -1; }
             c->fd=core_http2_fd(c->xmux_stream); *out=c; return 0;
@@ -6414,6 +6440,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     if (c == NULL) {
         return;
     }
+    core_grpc_clear(&c->grpc_decoder); db_free(&c->grpc_net_cache);
     if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); OPENSSL_cleanse(c,sizeof(*c)); free(c); return; }
     h2_response_clear(c);
     if (!c->send_closed && c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
@@ -6737,7 +6764,10 @@ int tls13_read_exact_app(tls13_conn_t *c, uint8_t *buf, size_t len) {
 
 int tls13_finish_pending(const tls13_conn_t *c) {
     if (!c) return -1;
-    if (c->xmux_stream) { int result=core_http2_finish_pending(c->xmux_stream); return result < 0 && c->app_cache.len ? 0 : result; }
+    if (c->xmux_stream) {
+        int result=core_http2_finish_pending(c->xmux_stream);
+        return result < 0 && (c->app_cache.len || (c->grpc_transport && (c->grpc_net_cache.len || core_grpc_pending(&c->grpc_decoder)))) ? 0 : result;
+    }
     return c->send_closed && (c->xmux_wire_output.len || c->relay_raw_finish);
 }
 

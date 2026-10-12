@@ -104,7 +104,18 @@ class GrpcPeer(Server):
                         body=response.get("body",b"")
                         connection.sendall(frame(1,5 if response.get("only") else 4,stream,block))
                         if not response.get("only"):
-                            if body: connection.sendall(data_frames(stream,envelope(b"\x00\x00"+body)))
+                            if "raw" in response: connection.sendall(data_frames(stream,response["raw"]))
+                            elif "message" in response:
+                                message=response["message"]; encoded=b"\x00"+len(message).to_bytes(4,"big")+message
+                                split=response.get("split",len(encoded))
+                                connection.sendall(data_frames(stream,encoded[:split]))
+                                if "release" in response:
+                                    response["sent"].set()
+                                    if not response["release"].wait(2): raise AssertionError("gRPC message fragment not released")
+                                if split < len(encoded): connection.sendall(data_frames(stream,encoded[split:]))
+                            elif body: connection.sendall(data_frames(stream,envelope(b"\x00\x00"+body)))
+                            if response.get("hold"):
+                                state["responded"]=True; continue
                             if response.get("data_end"): connection.sendall(frame(0,1,stream))
                             else:
                                 final=b"" if response.get("status") is None else literal("grpc-status",response["status"])
@@ -145,6 +156,45 @@ class GrpcPeer(Server):
             elif kind == 3: streams.pop(stream,None)
 
 class GrpcTests(unittest.TestCase):
+    def test_gun_budget_failure_isolated_and_recovers(self):
+        response=dict(content_type="application/grpc",raw=b"\x00\x01\x00\x00\x00",hold=True)
+        with GrpcPeer(responses={b"hold":response}) as peer, cli(uri(peer.port,"grpc","none")) as core:
+            with socks_connect(core.port,80) as sibling:
+                exchange(sibling,b"vless-core established sibling")
+                with socks_connect(core.port,80) as holding:
+                    holding.sendall(b"hold"); holding.settimeout(0.15)
+                    with self.assertRaises(TimeoutError): holding.recv(1)
+                    with socks_connect(core.port,80) as rejected:
+                        rejected.sendall(b"vless-core budget rejection"); self.assertEqual(rejected.recv(1),b"")
+                    self.assertIn("gRPC message buffering budget exhausted",core.log)
+                self.assertTrue(peer.finished.wait(1))
+                exchange(sibling,b"vless-core recovered sibling")
+                with socks_connect(core.port,80) as recovered: exchange(recovered,b"vless-core recovered budget")
+            self.assertEqual(len(peer.connections),1)
+
+    def test_gun_last_field_and_multi_repeated_fields(self):
+        for mode in ("gun","multi"):
+            first=b"\x00\x00discarded"; last=b"\x00\x00vless-core last" if mode == "gun" else b"vless-core last"
+            message=b"\x0a"+bytes([len(first)])+first+b"\x0a"+bytes([len(last)])+last
+            response=dict(content_type="application/grpc",status="0",message=message)
+            expected=last[2:] if mode == "gun" else first[2:]+last
+            with self.subTest(mode=mode), GrpcPeer(responses={b"fields":response}) as peer, cli(uri(peer.port,"grpc","none",mode=mode)) as core:
+                with socks_connect(core.port,80) as tunnel:
+                    tunnel.sendall(b"fields"); self.assertEqual(exact(tunnel,len(expected)),expected); self.assertEqual(tunnel.recv(1),b"")
+
+    def test_gun_waits_for_complete_protobuf_message(self):
+        first=b"\x00\x00discarded"; last=b"\x00\x00vless-core complete"
+        message=b"\x0a"+bytes([len(first)])+first+b"\x0a"+bytes([len(last)])+last
+        release=threading.Event(); sent=threading.Event()
+        response=dict(content_type="application/grpc",status="0",message=message,split=7+len(first),release=release,sent=sent)
+        with GrpcPeer(responses={b"fragmented":response}) as peer, cli(uri(peer.port,"grpc","none")) as core:
+            with socks_connect(core.port,80) as tunnel:
+                try:
+                    tunnel.sendall(b"fragmented"); self.assertTrue(sent.wait(1)); tunnel.settimeout(0.1)
+                    with self.assertRaises(TimeoutError): tunnel.recv(1)
+                finally: release.set()
+                tunnel.settimeout(2); self.assertEqual(exact(tunnel,len(last)-2),last[2:]); self.assertEqual(tunnel.recv(1),b"")
+
     def test_grpc_requires_content_type_and_terminal_status(self):
         cases=(("missing-type",None,"0",{}),("wrong-type","text/plain","0",{}),
                ("wrong-suffix","application/grpc-web","0",{}),("empty-suffix","application/grpc+","0",{}),
