@@ -525,7 +525,7 @@ static void *client_worker_run(void *arg) {
     uint16_t target_port = 0;
     int negotiation_result = socks5_negotiate_and_get_target(cfd, target_host, sizeof(target_host), &target_port);
     if (negotiation_result != 0) {
-        if (negotiation_result != SOCKS5_NEGOTIATION_REJECTED) socks5_send_failure(cfd, 0x01);
+        if (negotiation_result != SOCKS5_NEGOTIATION_REJECTED) socks5_send_failure(cfd,socks5_request_reply(negotiation_result));
         close(cfd);
         return NULL;
     }
@@ -603,10 +603,11 @@ static void *client_worker_run(void *arg) {
                                             direct_err,
                                             sizeof(direct_err));
         if (direct_fd < 0) {
+            uint8_t failure=socks5_error_reply(errno);
             vc_log_error("routing", "direct connect failed for %s:%u: %s",
                          target_host, (unsigned)target_port, direct_err);
             if (!socks_success_sent) {
-                socks5_send_failure(cfd, 0x05);
+                socks5_send_failure(cfd,failure);
             }
             close(cfd);
             return NULL;
@@ -668,13 +669,14 @@ static void *client_worker_run(void *arg) {
         }
 
         core_deadline_begin(g_connect_timeout_ms);
-        int upstream_fd = socks5_upstream_connect(&cfg, upstream_target, target_port, err, sizeof(err));
+        uint8_t failure=1;
+        int upstream_fd = socks5_upstream_connect(&cfg,upstream_target,target_port,err,sizeof(err),&failure);
         if (upstream_fd < 0) {
             vc_log_error("socks5", "upstream connect failed for %s:%u via %s:%u: %s",
                          upstream_target, (unsigned)target_port,
                          cfg.server_host, (unsigned)cfg.server_port, err);
             if (!socks_success_sent) {
-                socks5_send_failure(cfd, 0x05);
+                socks5_send_failure(cfd,failure);
             }
             close(cfd);
             return NULL;
@@ -710,9 +712,10 @@ static void *client_worker_run(void *arg) {
     tls13_conn_t *tls = NULL;
     core_deadline_begin(g_connect_timeout_ms);
     if (tls13_reality_connect(&cfg, &tls, err, sizeof(err)) != 0) {
+        uint8_t failure=socks5_error_reply(errno);
         vc_log_error("connection", "upstream connect failed: %s", err);
         if (!socks_success_sent) {
-            socks5_send_failure(cfd, 0x05);
+            socks5_send_failure(cfd,failure);
         }
         close(cfd);
         return NULL;
@@ -725,7 +728,7 @@ static void *client_worker_run(void *arg) {
                                  sizeof(err)) != 0) {
         vc_log_error("connection", "VLESS encryption handshake failed: %s", err);
         if (!socks_success_sent) {
-            socks5_send_failure(cfd, 0x05);
+            socks5_send_failure(cfd, 0x01);
         }
         upstream_close(tls, encryption);
         close(cfd);

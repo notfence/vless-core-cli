@@ -10,6 +10,25 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+int socks5_domain_valid(const uint8_t *domain, size_t length) {
+    if (!domain || !length || length > 255) return 0;
+    for (size_t i=0;i<length;i++) if (domain[i] <= 0x20 || domain[i] == 0x7f) return 0;
+    return 1;
+}
+
+uint8_t socks5_error_reply(int error) {
+    if (error == EACCES || error == EPERM) return 2;
+    if (error == ENETUNREACH || error == ENETDOWN) return 3;
+    if (error == EHOSTUNREACH || error == EHOSTDOWN) return 4;
+    if (error == ECONNREFUSED) return 5;
+    if (error == EAFNOSUPPORT) return 8;
+    return 1;
+}
+
+uint8_t socks5_request_reply(int result) {
+    return result == SOCKS5_COMMAND_UNSUPPORTED ? 7 : result == SOCKS5_ADDRESS_UNSUPPORTED ? 8 : 1;
+}
+
 static int read_exact(int fd, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     size_t off = 0;
@@ -82,9 +101,10 @@ int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_
         return -1;
     }
 
-    if (req_head[0] != 0x05 || req_head[1] != 0x01) {
+    if (req_head[0] != 0x05 || req_head[2] != 0x00) {
         return -1;
     }
+    if (req_head[1] != 0x01) return SOCKS5_COMMAND_UNSUPPORTED;
 
     uint8_t atyp = req_head[3];
     if (atyp == 0x01) {
@@ -106,6 +126,7 @@ int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_
         if (read_exact(fd, host, dlen) != 0) {
             return -1;
         }
+        if (!socks5_domain_valid((const uint8_t *)host,dlen)) return -1;
         host[dlen] = '\0';
     } else if (atyp == 0x04) {
         uint8_t ip6[16];
@@ -116,7 +137,7 @@ int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_
             return -1;
         }
     } else {
-        return -1;
+        return SOCKS5_ADDRESS_UNSUPPORTED;
     }
 
     uint8_t pbuf[2];
@@ -124,6 +145,5 @@ int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_
         return -1;
     }
     *port = (uint16_t)((pbuf[0] << 8) | pbuf[1]);
-
-    return 0;
+    return *port ? 0 : -1;
 }

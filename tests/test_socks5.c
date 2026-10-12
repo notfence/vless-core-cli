@@ -1,6 +1,7 @@
 #include "check.h"
 #include "socks5.h"
 #include <arpa/inet.h>
+#include <errno.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -34,6 +35,13 @@ static void check_methods(const uint8_t *methods, uint8_t count, int accepted) {
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    const int errors[]={EACCES,EPERM,ENETDOWN,ENETUNREACH,EHOSTDOWN,EHOSTUNREACH,ECONNREFUSED,EAFNOSUPPORT,ETIMEDOUT,EIO,0};
+    const uint8_t replies[]={2,2,3,3,4,4,5,8,1,1,1};
+    for (size_t i=0;i<sizeof(errors)/sizeof(*errors);i++) CHECK("socks/system-error-replies",socks5_error_reply(errors[i]) == replies[i]);
+    CHECK("socks/command-reply",socks5_request_reply(SOCKS5_COMMAND_UNSUPPORTED) == 7);
+    CHECK("socks/address-reply",socks5_request_reply(SOCKS5_ADDRESS_UNSUPPORTED) == 8);
+    CHECK("socks/general-reply",socks5_request_reply(-1) == 1);
+    CHECK("socks/domain-validation-bounds",!socks5_domain_valid(NULL,1) && !socks5_domain_valid((const uint8_t *)"",0) && !socks5_domain_valid((const uint8_t *)"x",256));
     for (int method = 0; method <= 255; method++) { uint8_t value = (uint8_t)method; check_methods(&value,1,method == 0); }
     const uint8_t first[] = {0,2,1}, last[] = {2,1,0};
     check_methods(first,sizeof(first),1); check_methods(last,sizeof(last),1);
@@ -56,6 +64,18 @@ int main(void) {
     }
     const uint8_t valid[] = {5,1,0,5,1,0,1,127,0,0,1,0x1f,0x90};
     char host[260]; uint16_t port = 0;
+    memcpy(wire,valid,sizeof(valid)); wire[5]=1;
+    CHECK("socks/reserved-byte-rejected",parse_wire(wire,sizeof(valid),host,sizeof(host),&port) != 0);
+    memcpy(wire,valid,sizeof(valid)); wire[11]=wire[12]=0;
+    CHECK("socks/zero-destination-port-rejected",parse_wire(wire,sizeof(valid),host,sizeof(host),&port) != 0);
+    const uint8_t bad_domain[]={5,1,0,5,1,0,3,3,'a',0,'b',0x1f,0x90};
+    CHECK("socks/nul-domain-rejected",parse_wire(bad_domain,sizeof(bad_domain),host,sizeof(host),&port) != 0);
+    for (unsigned control=1;control<33;control++) {
+        memcpy(wire,bad_domain,sizeof(bad_domain)); wire[9]=(uint8_t)control;
+        CHECK("socks/control-domain-rejected",parse_wire(wire,sizeof(bad_domain),host,sizeof(host),&port) != 0);
+    }
+    memcpy(wire,bad_domain,sizeof(bad_domain)); wire[9]=0x7f;
+    CHECK("socks/del-domain-rejected",parse_wire(wire,sizeof(bad_domain),host,sizeof(host),&port) != 0);
     const size_t positions[] = {0,1,3,4,6}; const uint8_t invalid[] = {4,0,4,2,0xff};
     for (size_t i = 0; i < sizeof(positions)/sizeof(*positions); i++) {
         memcpy(wire, valid, sizeof(valid)); wire[positions[i]] = invalid[i];

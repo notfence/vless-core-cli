@@ -59,6 +59,51 @@ class Upstream(Server):
             self.echo(connection)
 
 class SocksTests(unittest.TestCase):
+    def test_ignored_uri_fields_warn_without_values(self):
+        with Upstream() as upstream, cli(f"socks5://127.0.0.1:{upstream.port}?security=none&type=xhttp&extra=secret-private-parameter&fp=not-applied&allowInsecure=true") as core:
+            with socks_connect(core.port,8080) as tunnel: exchange(tunnel,b"vless-core unchanged SOCKS transport")
+            for field in ("transport","extra","fp","allowinsecure"): self.assertIn(f"query.{field} is not applied to SOCKS5",core.log)
+            self.assertNotIn("secret-private-parameter",core.log)
+            self.assertNotIn("not-applied",core.log)
+
+    def wire_reply(self, core, request):
+        with socket.create_connection(("127.0.0.1",core.port),timeout=3) as connection:
+            connection.sendall(b"\x05\x01\x00"); self.assertEqual(exact(connection,2),b"\x05\x00")
+            connection.sendall(request)
+            return exact(connection,10)[1]
+
+    def test_invalid_local_requests_and_reply_codes(self):
+        address=b"\x7f\x00\x00\x01\x1f\x90"
+        cases=((b"\x05\x02\x00\x01"+address,7),(b"\x05\x03\x00\x01"+address,7),
+               (b"\x05\x01\x00\xff",8),(b"\x05\x01\x01\x01"+address,1),
+               (b"\x04\x01\x00\x01"+address,1),(b"\x05\x01\x00\x01"+address[:-2]+bytes(2),1),
+               (b"\x05\x01\x00\x03\x03a\x00b\x1f\x90",1),(b"\x05\x01\x00\x03\x03a\nb\x1f\x90",1))
+        with Upstream() as upstream, cli(f"socks5://127.0.0.1:{upstream.port}") as core:
+            for request,expected in cases:
+                with self.subTest(request=request): self.assertEqual(self.wire_reply(core,request),expected)
+            self.assertEqual(upstream.targets,[])
+
+    def test_upstream_reply_reason_is_preserved(self):
+        request=b"\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\x90"
+        for code in range(1,9):
+            response=bytes([5,code,0,1])+b"\x7f\x00\x00\x01\x00\x00"
+            with self.subTest(code=code), Upstream(connect_response=response) as upstream, cli(f"socks5://127.0.0.1:{upstream.port}") as core:
+                self.assertEqual(self.wire_reply(core,request),code)
+
+    def test_malformed_upstream_addresses_are_general_failure(self):
+        request=b"\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\x90"
+        responses=(b"\x05\x00\x01\x01\x7f\x00\x00\x01\x00\x00",b"\x05\x09\x00\x01\x7f\x00\x00\x01\x00\x00",
+                   b"\x05\x00\x00\x03\x00\x00\x00",b"\x05\x00\x00\x03\x03a\x00b\x00\x00",b"\x05\x00\x00\x03\x03a\nb\x00\x00")
+        for response in responses:
+            with self.subTest(response=response), Upstream(connect_response=response) as upstream, cli(f"socks5://127.0.0.1:{upstream.port}") as core:
+                self.assertEqual(self.wire_reply(core,request),1)
+
+    def test_authentication_denial_is_forbidden(self):
+        request=b"\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\x90"
+        with Upstream(auth=True,reject=True) as upstream, cli(f"socks5://vless-core:secret@127.0.0.1:{upstream.port}") as core:
+            self.assertEqual(self.wire_reply(core,request),2)
+            self.assertNotIn("secret",core.log)
+
     def assert_rejected(self, upstream, expected, credentials=""):
         with cli(f"socks5://{credentials}127.0.0.1:{upstream.port}") as core:
             with self.assertRaises(AssertionError):
@@ -70,7 +115,7 @@ class SocksTests(unittest.TestCase):
                 self.assertNotIn("secret",core.log)
 
     def test_invalid_method_responses(self):
-        responses = ((b"", "method negotiation read failed"), (b"\x05", "method negotiation read failed"), (b"\x04\x00", "method negotiation read failed"), (b"\x05\xff", "rejected authentication methods"), (b"\x05\x01", "unsupported auth method"), (b"\x05\x02", "username/password length is invalid"))
+        responses = ((b"", "method negotiation read failed"), (b"\x05", "method negotiation read failed"), (b"\x04\x00", "method negotiation read failed"), (b"\x05\xff", "rejected authentication methods"), (b"\x05\x01", "unsupported auth method"), (b"\x05\x02", "unsupported auth method"))
         for response, expected in responses:
             with self.subTest(response=response.hex()), Upstream(method_response=response) as upstream:
                 self.assert_rejected(upstream,expected)

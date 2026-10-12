@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "utils.h"
 #include "xhttp_config.h"
@@ -283,7 +284,7 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
         char *next = strchr(extra_cursor, '&');
         if (next) *next = 0;
         char *equal = strchr(extra_cursor, '=');
-        if (equal) {
+        if (equal && cfg->protocol != CORE_PROTOCOL_SOCKS5) {
             *equal = 0; char key[MAX_QUERY_KEY_LENGTH + 1];
             if (normalize_query_key(extra_cursor, key, sizeof(key)) == 0 && !strcmp(key,"transport")) {
                 char decoded[4096],value[4096];
@@ -303,7 +304,7 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
     while (*extra_cursor) {
         char *next=strchr(extra_cursor,'&'); if (next) *next=0;
         char *equal=strchr(extra_cursor,'=');
-        if (equal) {
+        if (equal && cfg->protocol != CORE_PROTOCOL_SOCKS5) {
             *equal=0; char key[MAX_QUERY_KEY_LENGTH+1];
             if (normalize_query_key(extra_cursor,key,sizeof(key)) == 0 && !strcmp(key,"extra")) {
                 char decoded[4096];
@@ -353,6 +354,13 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
         if (percent_decode(eq + 1, decoded, sizeof(decoded)) != 0) {
             if (err && err_cap) snprintf(err,err_cap,"invalid query parameter encoding: %s",key);
             return -1;
+        }
+        if (cfg->protocol == CORE_PROTOCOL_SOCKS5) {
+            if (!strcmp(key,"security")) {
+                if (strcasecmp(decoded,"none")) { set_err(err,err_cap,"SOCKS5 security supports only none"); return -1; }
+            } else vc_log_warning("uri","field query.%s is not applied to SOCKS5",key);
+            if (!next) break;
+            cursor=next+1; continue;
         }
         if (strcmp(key, "extra") && strcmp(key,"headers") && strcmp(key,"downloadsettings") && !query_value_is_valid_utf8((const unsigned char *)decoded)) {
             if (err && err_cap) snprintf(err,err_cap,"invalid query parameter value: %s",key);
@@ -587,7 +595,9 @@ static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, siz
     char work[4096];
     memcpy(work, uri + 9, strlen(uri + 9) + 1);
 
-    char *end = strpbrk(work, "/?#");
+    char *fragment=strchr(work,'#'); if (fragment) *fragment=0;
+    char *query=strchr(work,'?'); if (query) *query++=0;
+    char *end = strchr(work, '/');
     if (end != NULL) {
         *end = '\0';
     }
@@ -624,7 +634,7 @@ static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, siz
         return -1;
     }
     snprintf(cfg->sni, sizeof(cfg->sni), "%s", cfg->server_host);
-    return 0;
+    return query && *query ? parse_query(cfg,query,err,err_cap) : 0;
 }
 
 int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {

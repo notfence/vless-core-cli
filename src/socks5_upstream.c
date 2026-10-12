@@ -5,6 +5,7 @@
 #include "socket_util.h"
 #include "connection_trace.h"
 #include "socks5_upstream.h"
+#include "socks5.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -63,6 +64,7 @@ static int connect_tcp_host(const char *host, uint16_t port, char *err, size_t e
 static int socks5_read_address_tail(int fd, uint8_t atyp) {
     uint8_t tmp[260];
     size_t tail = 0;
+    size_t domain_length=0;
 
     if (atyp == 0x01) {
         tail = 4 + 2;
@@ -73,6 +75,8 @@ static int socks5_read_address_tail(int fd, uint8_t atyp) {
         if (read_exact(fd, &len, 1) != 0) {
             return -1;
         }
+        if (!len) return -1;
+        domain_length=len;
         tail = (size_t)len + 2;
     } else {
         return -1;
@@ -81,10 +85,11 @@ static int socks5_read_address_tail(int fd, uint8_t atyp) {
     if (tail > sizeof(tmp)) {
         return -1;
     }
-    return read_exact(fd, tmp, tail);
+    if (read_exact(fd,tmp,tail)) return -1;
+    return domain_length && !socks5_domain_valid(tmp,domain_length) ? -1 : 0;
 }
 
-static int socks5_authenticate(int fd, const vless_config_t *cfg, char *err, size_t err_cap) {
+static int socks5_authenticate(int fd, const vless_config_t *cfg, char *err, size_t err_cap, uint8_t *failure) {
     int has_auth = (cfg->socks5_user[0] != '\0' || cfg->socks5_pass[0] != '\0');
     uint8_t hello[4];
     size_t n = 0;
@@ -109,13 +114,14 @@ static int socks5_authenticate(int fd, const vless_config_t *cfg, char *err, siz
         return -1;
     }
     if (resp[1] == 0xFF) {
+        *failure=2;
         set_errf(err, err_cap, "SOCKS5 server rejected authentication methods");
         return -1;
     }
     if (resp[1] == 0x00) {
         return 0;
     }
-    if (resp[1] != 0x02) {
+    if (resp[1] != 0x02 || !has_auth) {
         set_errf(err, err_cap, "SOCKS5 server selected unsupported auth method 0x%02x", resp[1]);
         return -1;
     }
@@ -145,14 +151,18 @@ static int socks5_authenticate(int fd, const vless_config_t *cfg, char *err, siz
     }
 
     uint8_t auth_resp[2];
-    if (read_exact(fd, auth_resp, sizeof(auth_resp)) != 0 || auth_resp[0] != 0x01 || auth_resp[1] != 0x00) {
+    if (read_exact(fd,auth_resp,sizeof(auth_resp)) || auth_resp[0] != 0x01) {
+        set_errf(err,err_cap,"SOCKS5 username/password auth failed"); return -1;
+    }
+    if (auth_resp[1] != 0x00) {
+        *failure=2;
         set_errf(err, err_cap, "SOCKS5 username/password auth failed");
         return -1;
     }
     return 0;
 }
 
-static int socks5_send_connect(int fd, const char *target_host, uint16_t target_port, char *err, size_t err_cap) {
+static int socks5_send_connect(int fd, const char *target_host, uint16_t target_port, char *err, size_t err_cap, uint8_t *failure) {
     uint8_t req[300];
     size_t n = 0;
     req[n++] = 0x05;
@@ -171,7 +181,7 @@ static int socks5_send_connect(int fd, const char *target_host, uint16_t target_
         n += 16;
     } else {
         size_t hlen = strlen(target_host);
-        if (hlen == 0 || hlen > 255) {
+        if (!socks5_domain_valid((const uint8_t *)target_host,hlen)) {
             set_errf(err, err_cap, "SOCKS5 target domain length is invalid");
             return -1;
         }
@@ -190,7 +200,7 @@ static int socks5_send_connect(int fd, const char *target_host, uint16_t target_
     }
 
     uint8_t resp[4];
-    if (read_exact(fd, resp, sizeof(resp)) != 0 || resp[0] != 0x05) {
+    if (read_exact(fd, resp, sizeof(resp)) != 0 || resp[0] != 0x05 || resp[2] != 0 || resp[1] > 8) {
         set_errf(err, err_cap, "SOCKS5 CONNECT response read failed");
         return -1;
     }
@@ -199,31 +209,31 @@ static int socks5_send_connect(int fd, const char *target_host, uint16_t target_
         return -1;
     }
     if (resp[1] != 0x00) {
+        *failure=resp[1];
         set_errf(err, err_cap, "SOCKS5 CONNECT rejected target with code 0x%02x", resp[1]);
         return -1;
     }
     return 0;
 }
 
-int socks5_upstream_connect(const vless_config_t *cfg, const char *target_host, uint16_t target_port, char *err, size_t err_cap) {
-    if (cfg == NULL || target_host == NULL || target_host[0] == '\0' || target_port == 0) {
+int socks5_upstream_connect(const vless_config_t *cfg, const char *target_host, uint16_t target_port, char *err, size_t err_cap, uint8_t *failure) {
+    uint8_t reply=1;
+    if (failure) *failure=reply;
+    if (cfg == NULL || target_host == NULL || !socks5_domain_valid((const uint8_t *)target_host,strlen(target_host)) || target_port == 0) {
         set_errf(err, err_cap, "invalid SOCKS5 upstream input");
         return -1;
     }
 
     int fd = connect_tcp_host(cfg->server_host, cfg->server_port, err, err_cap);
     if (fd < 0) {
+        if (failure) *failure=socks5_error_reply(errno);
         return -1;
     }
 
     core_trace_stage(CORE_TRACE_PROTOCOL);
-    if (socks5_authenticate(fd, cfg, err, err_cap) != 0) {
-        close(fd);
-        return -1;
-    }
-
-    if (socks5_send_connect(fd, target_host, target_port, err, err_cap) != 0) {
-        close(fd);
+    if (socks5_authenticate(fd,cfg,err,err_cap,&reply) || socks5_send_connect(fd,target_host,target_port,err,err_cap,&reply)) {
+        int saved=errno; close(fd); errno=saved;
+        if (failure) *failure=reply;
         return -1;
     }
     core_trace_stage(CORE_TRACE_CARRY);

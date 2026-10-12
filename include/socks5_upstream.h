@@ -6,6 +6,6 @@
 
 #include "types.h"
 
-int socks5_upstream_connect(const vless_config_t *cfg, const char *target_host, uint16_t target_port, char *err, size_t err_cap);
+int socks5_upstream_connect(const vless_config_t *cfg, const char *target_host, uint16_t target_port, char *err, size_t err_cap, uint8_t *failure);
 
 #endif

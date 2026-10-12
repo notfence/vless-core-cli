@@ -199,6 +199,12 @@ int main(void) {
     CHECK("uri/ipv6", parse("vless://00000000-0000-0000-0000-000000000001@[::1]:443") == 0 && strcmp(config.server_host, "::1") == 0);
     CHECK("uri/socks-default", parse("socks5://127.0.0.1#vless-core") == 0 && config.protocol == CORE_PROTOCOL_SOCKS5 && config.server_port == 1080);
     CHECK("uri/socks-auth", parse("socks5://vless%2Dcore:p%40ss@[::1]:1081#vless-core") == 0 && strcmp(config.socks5_user, "vless-core") == 0 && strcmp(config.socks5_pass, "p@ss") == 0);
+    CHECK("uri/socks-tls-not-supported",parse("socks5://127.0.0.1:1080?security=tls") < 0 && strstr(error,"security"));
+    CHECK("uri/socks-reality-not-supported",parse("socks5://127.0.0.1:1080?security=reality") < 0 && strstr(error,"security"));
+    CHECK("uri/socks-security-unknown",parse("socks5://127.0.0.1:1080?security=unknown") < 0 && strstr(error,"security"));
+    CHECK("uri/socks-duplicate-query",parse("socks5://127.0.0.1:1080?security=none&security=none") < 0 && strstr(error,"duplicate"));
+    CHECK("uri/socks-does-not-apply-transport-settings",parse("socks5://127.0.0.1:1080?security=NONE&network=xhttp&flow=invalid&allowInsecure=true&extra=not-json") == 0 && config.protocol == CORE_PROTOCOL_SOCKS5 && config.transport_mode == TRANSPORT_VISION && !config.flow[0] && !config.allow_insecure && !strcmp(config.security,"none"));
+    CHECK("uri/socks-fragment-does-not-contain-settings",parse("socks5://127.0.0.1:1080#vless-core?security=tls") == 0);
     CHECK("uri/extra", parse(PREFIX "type=xhttp&extra=%7B%22sessionPlacement%22%3A%22header%22%2C%22seqKey%22%3A%22X-vless-core%22%2C%22xPaddingBytes%22%3A%2210-20%22%2C%22scMaxEachPostBytes%22%3A%222000%22%7D") == 0 && strcmp(config.xhttp_session_placement, "header") == 0 && strcmp(config.xhttp_seq_key, "X-vless-core") == 0 && config.xhttp_padding_min == 10 && config.xhttp_padding_max == 20 && config.xhttp_max_each_post_min == 2000);
     CHECK("uri/ws-escaped-request-target",parse(PREFIX "type=ws&path=%2Fvless%20core%2F%D1%82%D0%B5%D1%81%D1%82%3Fx%3D%252F") == 0 && !strcmp(config.xhttp_path,"/vless%20core/%D1%82%D0%B5%D1%81%D1%82?x=%2F"));
     CHECK("uri/xhttp-escaped-request-target",parse(PREFIX "type=xhttp&path=%2Fvless%20core%3Fx%3Da%20b") == 0 && !strcmp(config.xhttp_path,"/vless%20core?x=a%20b"));
