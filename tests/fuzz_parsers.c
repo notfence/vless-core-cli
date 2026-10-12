@@ -131,15 +131,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (result || event.kind == 3) break;
         }
         if (db_append(&c.xhttp_net_cache, data, size) != 0) abort();
-        int status, chunked, upgrade, connection_upgrade;
+        int status, chunked;
         int64_t length;
         (void)parse_http_response_headers(NULL, -1, &c.xhttp_net_cache, &status, &chunked, &length, error, sizeof(error));
         c.xhttp_net_cache.len = 0;
         if (db_append(&c.xhttp_net_cache, data, size) != 0) abort();
         c.mode = CONN_MODE_WS;
-        char accept[64];
-        (void)parse_ws_upgrade_response(&c, &c.xhttp_net_cache, &status, accept, sizeof(accept), &upgrade,
-                                        &connection_upgrade, error, sizeof(error));
+        (void)core_ws_validate_upgrade(data,size,"vless-core","vless-core");
+        (void)parse_ws_upgrade_response(&c,&c.xhttp_net_cache,"vless-core","vless-core",error,sizeof(error));
         break;
     }
     case 5: {

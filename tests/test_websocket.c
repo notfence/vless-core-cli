@@ -2,6 +2,32 @@
 #include "websocket.h"
 #include "uri.h"
 
+static void upgrade_vectors(void) {
+    const char *accept="s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+    const char *valid="HTTP/1.1 101 Switching Protocols\r\nUpgrade: WebSocket\r\nConnection: keep-alive, UpGrAdE\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n";
+    char reply[1024]; size_t base=strlen(valid);
+    snprintf(reply,sizeof(reply),"%s\r\n",valid);
+    CHECK("ws/upgrade-standard-tokens",core_ws_validate_upgrade((const uint8_t *)reply,strlen(reply),accept,NULL) == 0);
+    for (size_t cut=0;cut<strlen(reply);cut++) CHECK("ws/upgrade-truncated",core_ws_validate_upgrade((const uint8_t *)reply,cut,accept,NULL) < 0);
+    const char *bad[]={"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n","Sec-WebSocket-Extensions: permessage-deflate\r\n","Sec-WebSocket-Protocol: other\r\n","Bad Header: value\r\n"," Folded: value\r\n","NoColon\r\n","Connection: \r\n","Connection: upgrade,\r\n","Upgrade: web socket\r\n"};
+    for (size_t i=0;i<sizeof(bad)/sizeof(*bad);i++) {
+        snprintf(reply,sizeof(reply),"%s%s\r\n",valid,bad[i]);
+        CHECK("ws/upgrade-malformed-or-unrequested",core_ws_validate_upgrade((const uint8_t *)reply,strlen(reply),accept,"vless-core") < 0);
+    }
+    snprintf(reply,sizeof(reply),"%sSec-WebSocket-Protocol: vless-core\r\n\r\n",valid);
+    CHECK("ws/upgrade-subprotocol-exact",core_ws_validate_upgrade((const uint8_t *)reply,strlen(reply),accept,"vless-core") == 0);
+    CHECK("ws/upgrade-subprotocol-not-offered",core_ws_validate_upgrade((const uint8_t *)reply,strlen(reply),accept,NULL) < 0);
+    CHECK("ws/upgrade-subprotocol-case-sensitive",core_ws_validate_upgrade((const uint8_t *)reply,strlen(reply),accept,"Vless-core") < 0);
+    snprintf(reply,sizeof(reply),"%sX-Other: value\r\n\r\n",valid); reply[base+12]=0;
+    CHECK("ws/upgrade-nul-rejected",core_ws_validate_upgrade((const uint8_t *)reply,base+18,accept,NULL) < 0);
+    uint8_t *maximum=malloc(32769); REQUIRE("ws/upgrade-boundary-fixture",maximum != NULL);
+    memcpy(maximum,valid,base); memcpy(maximum+base,"X-Pad: ",7);
+    memset(maximum+base+7,'x',32768-base-11); memcpy(maximum+32764,"\r\n\r\n",4);
+    CHECK("ws/upgrade-header-limit",core_ws_validate_upgrade(maximum,32768,accept,NULL) == 0);
+    CHECK("ws/upgrade-excessive-headers",core_ws_validate_upgrade(maximum,32769,accept,NULL) < 0);
+    free(maximum);
+}
+
 static int decode(const uint8_t *input, size_t length, size_t split, unsigned *events, size_t *payload) {
     core_ws_decoder_t decoder={0};
     size_t position=0;
@@ -19,6 +45,7 @@ static int decode(const uint8_t *input, size_t length, size_t split, unsigned *e
 }
 
 int main(void) {
+    upgrade_vectors();
     const uint8_t text[]={0x01,2,0xf0,0x9f,0x89,1,'x',0x80,2,0x98,0x80,0x8a,0,0x88,2,3,0xe8};
     unsigned events; size_t payload;
     for (size_t split=1;split<=sizeof(text);split++) CHECK("ws/fragmented-utf8-and-control",decode(text,sizeof(text),split,&events,&payload) == 0 && payload == 4 && events >= 4);

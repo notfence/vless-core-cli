@@ -24,7 +24,7 @@ def client_frame(connection):
     mask=exact(connection,4); payload=exact(connection,length)
     return header[0]&15,bytes(byte^mask[index%4] for index,byte in enumerate(payload))
 
-def upgrade(connection):
+def upgrade(connection, response=None):
     request=bytearray()
     while not request.endswith(b"\r\n\r\n"):
         request.extend(exact(connection,1))
@@ -33,10 +33,54 @@ def upgrade(connection):
     headers=dict((key.lower(),value.strip()) for key,value in (line.split(":",1) for line in lines[1:] if line))
     key=headers["sec-websocket-key"]
     accept=base64.b64encode(hashlib.sha1((key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
-    connection.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "+accept+b"\r\n\r\n")
+    reply=b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "+accept+b"\r\n\r\n"
+    connection.sendall(response(reply,headers,accept) if response else reply)
     return lines[0],headers
 
 class WebSocketTests(unittest.TestCase):
+    def test_invalid_upgrade_responses_are_rejected(self):
+        cases={
+            "version":lambda reply,headers,accept: reply.replace(b"HTTP/1.1",b"HTTP/potato"),
+            "http10":lambda reply,headers,accept: reply.replace(b"HTTP/1.1",b"HTTP/1.0"),
+            "connection-substring":lambda reply,headers,accept: reply.replace(b"Connection: Upgrade",b"Connection: notupgrade"),
+            "upgrade-substring":lambda reply,headers,accept: reply.replace(b"Upgrade: websocket",b"Upgrade: notwebsocket"),
+            "duplicate-accept":lambda reply,headers,accept: reply.replace(b"Sec-WebSocket-Accept: ",b"Sec-WebSocket-Accept: invalid\r\nSec-WebSocket-Accept: "),
+            "extensions":lambda reply,headers,accept: reply[:-2]+b"Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+            "protocol":lambda reply,headers,accept: reply[:-2]+b"Sec-WebSocket-Protocol: unrequested\r\n\r\n",
+            "invalid-header":lambda reply,headers,accept: reply[:-2]+b"Bad Header: value\r\n\r\n",
+            "folded-header":lambda reply,headers,accept: reply[:-2]+b" X-Other: value\r\n\r\n",
+            "accept-prefix":lambda reply,headers,accept: reply.replace(accept,accept+b"extra"),
+            "nul":lambda reply,headers,accept: reply[:-2]+b"X-Other: value\x00tail\r\n\r\n",
+        }
+        for name,response in cases.items():
+            def handler(connection):
+                upgrade(connection,response)
+                connection.sendall(frame(2,b"\x00\x00vless-core"))
+                connection.recv(65536)
+            with self.subTest(response=name), Server(handler) as server, cli(uri(server.port,"ws","none")) as core:
+                with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                    with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core")
+                self.assertIn("invalid WebSocket upgrade response",core.log)
+
+    def test_upgrade_token_lists_and_subprotocol_agreement(self):
+        for early in (0,16384):
+            def response(reply,headers,accept):
+                reply=reply.replace(b"Connection: Upgrade",b"Connection: keep-alive, UpGrAdE")
+                if "sec-websocket-protocol" in headers:
+                    reply=reply[:-2]+b"Sec-WebSocket-Protocol: "+headers["sec-websocket-protocol"].encode()+b"\r\n\r\n"
+                return reply
+            def handler(connection):
+                _,headers=upgrade(connection,response)
+                encoded=headers.get("sec-websocket-protocol")
+                if encoded: request=base64.urlsafe_b64decode(encoded+"="*(-len(encoded)%4))
+                else: _,request=client_frame(connection)
+                self.assertEqual(request[26:],b"vless-core")
+                connection.sendall(frame(2,b"\x00\x00"+request[26:]))
+                opcode,data=client_frame(connection)
+                self.assertEqual(opcode,8); connection.sendall(frame(8,data))
+            with self.subTest(early=early), Server(handler) as server, cli(uri(server.port,"ws","none",ed=early)) as core:
+                with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core")
+
     def test_close_handshake_drains_existing_message(self):
         closed=threading.Event(); payload=b"vless-core upload before Close"*5000
         def handler(connection):

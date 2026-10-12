@@ -16,4 +16,5 @@ typedef struct { unsigned opcode; const uint8_t *data; size_t length; } core_ws_
 int core_ws_decode(core_ws_decoder_t *state, const uint8_t *input, size_t length, size_t *consumed, core_ws_event_t *event);
 int core_ws_parameter(vless_config_t *config, const char *key, const char *value, char *error, size_t capacity);
 int core_ws_configure(vless_config_t *config, char *error, size_t capacity);
+int core_ws_validate_upgrade(const uint8_t *, size_t, const char *, const char *);
 #endif

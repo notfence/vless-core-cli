@@ -8,6 +8,72 @@
 #include <string.h>
 #include <strings.h>
 
+static int upgrade_token(const uint8_t *data, size_t length) {
+    if (!length) return 0;
+    for (size_t i=0;i<length;i++) {
+        unsigned byte=data[i];
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') ||
+              (byte && strchr("!#$%&'*+-.^_`|~",(int)byte)))) return 0;
+    }
+    return 1;
+}
+
+static int upgrade_tokens(const uint8_t *data, size_t length, const char *expected) {
+    if (!length) return -1;
+    int found=0;
+    for (size_t offset=0;offset<length;) {
+        while (offset < length && (data[offset] == ' ' || data[offset] == '\t')) offset++;
+        size_t start=offset;
+        while (offset < length && data[offset] != ',') offset++;
+        size_t end=offset;
+        while (end > start && (data[end-1] == ' ' || data[end-1] == '\t')) end--;
+        if (!upgrade_token(data+start,end-start)) return -1;
+        if (end-start == strlen(expected) && !strncasecmp((const char *)data+start,expected,end-start)) found=1;
+        if (offset < length && ++offset == length) return -1;
+    }
+    return found;
+}
+
+int core_ws_validate_upgrade(const uint8_t *data, size_t length, const char *accept, const char *protocol) {
+    if (!data || !accept || length > 32768 || length < 17 || memcmp(data,"HTTP/1.1 101 ",13)) return -1;
+    size_t offset=0;
+    while (offset+1 < length && !(data[offset] == '\r' && data[offset+1] == '\n')) {
+        if ((data[offset] < 0x20 && data[offset] != '\t') || data[offset] == 0x7f) return -1;
+        offset++;
+    }
+    if (offset+1 >= length) return -1;
+    offset+=2;
+    int has_upgrade=0,has_connection=0,has_accept=0,has_protocol=0;
+    while (offset+1 < length) {
+        size_t start=offset;
+        while (offset+1 < length && !(data[offset] == '\r' && data[offset+1] == '\n')) offset++;
+        if (offset+1 >= length) return -1;
+        size_t end=offset; offset+=2;
+        if (end == start) return offset == length && has_upgrade && has_connection && has_accept ? 0 : -1;
+        const uint8_t *colon=memchr(data+start,':',end-start);
+        if (!colon || !upgrade_token(data+start,(size_t)(colon-data-start))) return -1;
+        size_t name=(size_t)(colon-data-start),value_start=(size_t)(colon-data)+1;
+        while (value_start < end && (data[value_start] == ' ' || data[value_start] == '\t')) value_start++;
+        for (size_t i=value_start;i<end;i++) if ((data[i] < 0x20 && data[i] != '\t') || data[i] == 0x7f) return -1;
+        while (end > value_start && (data[end-1] == ' ' || data[end-1] == '\t')) end--;
+        const uint8_t *value=data+value_start; size_t value_length=end-value_start;
+        if (name == 7 && !strncasecmp((const char *)data+start,"Upgrade",name)) {
+            int result=upgrade_tokens(value,value_length,"websocket");
+            if (result < 0) return -1;
+            has_upgrade|=result;
+        } else if (name == 10 && !strncasecmp((const char *)data+start,"Connection",name)) {
+            int result=upgrade_tokens(value,value_length,"upgrade");
+            if (result < 0) return -1;
+            has_connection|=result;
+        } else if (name == 20 && !strncasecmp((const char *)data+start,"Sec-WebSocket-Accept",name)) {
+            if (has_accept++ || value_length != strlen(accept) || memcmp(value,accept,value_length)) return -1;
+        } else if (name == 22 && !strncasecmp((const char *)data+start,"Sec-WebSocket-Protocol",name)) {
+            if (has_protocol++ || !protocol || !*protocol || value_length != strlen(protocol) || memcmp(value,protocol,value_length)) return -1;
+        } else if (name == 24 && !strncasecmp((const char *)data+start,"Sec-WebSocket-Extensions",name)) return -1;
+    }
+    return -1;
+}
+
 static int utf8(core_ws_decoder_t *state, const uint8_t *input, size_t length) {
     for (size_t i=0;i<length;i++) {
         unsigned byte=input[i];

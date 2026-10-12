@@ -1601,71 +1601,21 @@ static int ws_conn_write_all(tls13_conn_t *c, const void *buf, size_t len) {
     return 0;
 }
 
-static int parse_ws_upgrade_response(tls13_conn_t *c, dynbuf_t *cache, int *status_code, char *accept, size_t accept_cap, int *has_upgrade,
-                                     int *has_connection_upgrade, char *err, size_t err_cap) {
-    *status_code = 0;
-    *has_upgrade = 0;
-    *has_connection_upgrade = 0;
-    if (accept_cap > 0) {
-        accept[0] = '\0';
-    }
-
+static int parse_ws_upgrade_response(tls13_conn_t *c, dynbuf_t *cache, const char *accept, const char *protocol, char *err, size_t err_cap) {
     for (;;) {
-        size_t hdr_bytes = find_double_crlf(cache->data, cache->len);
-        if (hdr_bytes > 0) {
-            char *headers = (char *)calloc(1, hdr_bytes + 1);
-            if (headers == NULL) {
-                set_err(err, err_cap, "oom");
-                return -1;
+        size_t headers=find_double_crlf(cache->data,cache->len);
+        if (headers) {
+            if (core_ws_validate_upgrade(cache->data,headers,accept,protocol)) {
+                set_err(err,err_cap,"invalid WebSocket upgrade response"); return -1;
             }
-            memcpy(headers, cache->data, hdr_bytes);
-
-            char *save = NULL;
-            char *line = strtok_r(headers, "\r\n", &save);
-            if (line == NULL || sscanf(line, "HTTP/%*s %d", status_code) != 1) {
-                free(headers);
-                set_err(err, err_cap, "invalid WebSocket HTTP status line");
-                return -1;
-            }
-
-            for (line = strtok_r(NULL, "\r\n", &save); line != NULL; line = strtok_r(NULL, "\r\n", &save)) {
-                char *colon = strchr(line, ':');
-                if (colon == NULL) {
-                    continue;
-                }
-                *colon = '\0';
-                char *key = line;
-                char *val = colon + 1;
-                trim_ascii(key);
-                trim_ascii(val);
-                if (strcasecmp(key, "Upgrade") == 0 && strcasecmp(val, "websocket") == 0) {
-                    *has_upgrade = 1;
-                } else if (strcasecmp(key, "Connection") == 0 && contains_case_insensitive(val, "upgrade")) {
-                    *has_connection_upgrade = 1;
-                } else if (strcasecmp(key, "Sec-WebSocket-Accept") == 0 && accept_cap > 0) {
-                    snprintf(accept, accept_cap, "%s", val);
-                }
-            }
-
-            free(headers);
-            db_consume(cache, hdr_bytes);
-            return 0;
+            db_consume(cache,headers); return 0;
         }
-
-        uint8_t tmp[4096];
-        size_t got = 0;
-        if (ws_conn_read_some(c, tmp, sizeof(tmp), &got) != 0 || got == 0) {
-            set_err(err, err_cap, "failed to read WebSocket upgrade response");
-            return -1;
+        if (cache->len >= 32768) { set_err(err,err_cap,"WebSocket response headers too large"); return -1; }
+        uint8_t input[4096]; size_t received=0;
+        if (ws_conn_read_some(c,input,sizeof(input),&received) || !received) {
+            set_err(err,err_cap,"failed to read WebSocket upgrade response"); return -1;
         }
-        if (db_append(cache, tmp, got) != 0) {
-            set_err(err, err_cap, "oom");
-            return -1;
-        }
-        if (cache->len > 32768) {
-            set_err(err, err_cap, "WebSocket response headers too large");
-            return -1;
-        }
+        if (db_append(cache,input,received)) { set_err(err,err_cap,"oom"); return -1; }
     }
 }
 
@@ -6232,15 +6182,12 @@ static int ws_upgrade(tls13_conn_t *c, const uint8_t *early, size_t early_length
         "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n%s%s%s\r\n",
         c->ws_path,c->ws_host,headers,key,early_length ? "Sec-WebSocket-Protocol: " : "",
         early_length ? encoded : "",early_length ? "\r\n" : "");
-    free(encoded);
     int result=length > 0 && (size_t)length < capacity ? ws_conn_write_all(c,request,(size_t)length) : -1;
     free(request);
-    if (result) { set_err(err,err_cap,"failed to send WebSocket upgrade request"); return -1; }
-    int status=0,upgrade=0,connection=0; char accept[96];
-    if (parse_ws_upgrade_response(c,&c->ws_net_cache,&status,accept,sizeof(accept),&upgrade,&connection,err,err_cap)) return -1;
-    if (status != 101 || !upgrade || !connection || strcmp(accept,expected)) {
-        set_err(err,err_cap,"invalid WebSocket upgrade response"); return -1;
-    }
+    if (result) { free(encoded); set_err(err,err_cap,"failed to send WebSocket upgrade request"); return -1; }
+    result=parse_ws_upgrade_response(c,&c->ws_net_cache,expected,encoded,err,err_cap);
+    free(encoded);
+    if (result) return -1;
     int flags=fcntl(c->fd,F_GETFL,0);
     if (flags < 0 || fcntl(c->fd,F_SETFL,flags|O_NONBLOCK)) return -1;
     c->ws_upgraded=1;
