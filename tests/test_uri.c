@@ -38,6 +38,20 @@ static void check_base64(void) {
     const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     uint8_t bytes[8], expected[8];
     size_t length;
+    const char *malformed[]={"A","A=","A===","AA=","AA===","AAA==","AAAA=","=","====","Zg===","Zh","Zh==","Zm9","Zm9="};
+    for (size_t i=0;i<sizeof(malformed)/sizeof(*malformed);i++) CHECK("utils/base64-canonical-padding-and-bits",base64url_decode(malformed[i],bytes,sizeof(bytes),&length) != 0);
+    for (unsigned final=0;final<64;final++) {
+        char encoded2[]={ 'A',alphabet[final],0 },encoded3[]={ 'A','A',alphabet[final],0 };
+        CHECK("utils/base64-unused-four-bits",(base64url_decode(encoded2,bytes,sizeof(bytes),&length) == 0) == !(final&15));
+        CHECK("utils/base64-unused-two-bits",(base64url_decode(encoded3,bytes,sizeof(bytes),&length) == 0) == !(final&3));
+    }
+    char target[32];
+    CHECK("utils/request-target-components",core_request_target("/a b?x=%2f#tag",target,sizeof(target)) == 0 && !strcmp(target,"/a%20b?x=%2f%23tag"));
+    CHECK("utils/request-target-exact-capacity",core_request_target("/a b",target,7) == 0 && !strcmp(target,"/a%20b"));
+    memset(target,'x',sizeof(target));
+    CHECK("utils/request-target-overflow-does-not-write",core_request_target("/a b",target,6) < 0 && target[0] == 'x' && target[6] == 'x');
+    CHECK("utils/request-path-query-only",core_http_path("?x=a b",target,sizeof(target),1) == 0 && !strcmp(target,"/?x=a%20b"));
+    CHECK("utils/request-target-controls",core_request_target("/a\rb",target,sizeof(target)) < 0 && core_request_target("/a\nb",target,sizeof(target)) < 0);
     for (unsigned value = 1; value <= 255; value++) {
         if (strchr(alphabet, (int)value) || value == '=') continue;
         for (size_t position = 0; position < 4; position++) {
@@ -186,6 +200,24 @@ int main(void) {
     CHECK("uri/socks-default", parse("socks5://127.0.0.1#vless-core") == 0 && config.protocol == CORE_PROTOCOL_SOCKS5 && config.server_port == 1080);
     CHECK("uri/socks-auth", parse("socks5://vless%2Dcore:p%40ss@[::1]:1081#vless-core") == 0 && strcmp(config.socks5_user, "vless-core") == 0 && strcmp(config.socks5_pass, "p@ss") == 0);
     CHECK("uri/extra", parse(PREFIX "type=xhttp&extra=%7B%22sessionPlacement%22%3A%22header%22%2C%22seqKey%22%3A%22X-vless-core%22%2C%22xPaddingBytes%22%3A%2210-20%22%2C%22scMaxEachPostBytes%22%3A%222000%22%7D") == 0 && strcmp(config.xhttp_session_placement, "header") == 0 && strcmp(config.xhttp_seq_key, "X-vless-core") == 0 && config.xhttp_padding_min == 10 && config.xhttp_padding_max == 20 && config.xhttp_max_each_post_min == 2000);
+    CHECK("uri/ws-escaped-request-target",parse(PREFIX "type=ws&path=%2Fvless%20core%2F%D1%82%D0%B5%D1%81%D1%82%3Fx%3D%252F") == 0 && !strcmp(config.xhttp_path,"/vless%20core/%D1%82%D0%B5%D1%81%D1%82?x=%2F"));
+    CHECK("uri/xhttp-escaped-request-target",parse(PREFIX "type=xhttp&path=%2Fvless%20core%3Fx%3Da%20b") == 0 && !strcmp(config.xhttp_path,"/vless%20core?x=a%20b"));
+    char boundary_uri[2048],boundary_path[256]; memset(boundary_path,'x',sizeof(boundary_path)-1); boundary_path[sizeof(boundary_path)-1]=0;
+    snprintf(boundary_uri,sizeof(boundary_uri),PREFIX "type=xhttp&path=%s",boundary_path);
+    CHECK("uri/plain-path-capacity-preserved",parse(boundary_uri) == 0 && strlen(config.xhttp_path) == 255);
+    memset(boundary_path,' ',85); boundary_path[85]=0;
+    snprintf(boundary_uri,sizeof(boundary_uri),PREFIX "type=ws&path=%s",boundary_path);
+    CHECK("uri/escaped-path-exact-capacity",parse(boundary_uri) == 0 && strlen(config.xhttp_path) == 255);
+    boundary_path[85]=' '; boundary_path[86]=0;
+    snprintf(boundary_uri,sizeof(boundary_uri),PREFIX "type=ws&path=%s",boundary_path);
+    CHECK("uri/escaped-path-capacity-error",parse(boundary_uri) < 0 && strstr(error,"path"));
+    const char *bad_path[]={"%2Fbad%25","%2Fbad%252","%2Fbad%25xx","%2Fbad%2500","%2Fbad%250D","%2Fbad%250a"};
+    for (size_t i=0;i<sizeof(bad_path)/sizeof(*bad_path);i++) {
+        char input[1024]; snprintf(input,sizeof(input),PREFIX "type=ws&path=%s",bad_path[i]);
+        CHECK("uri/ws-invalid-request-target",parse(input) != 0 && strstr(error,"path"));
+        snprintf(input,sizeof(input),PREFIX "type=xhttp&path=%s",bad_path[i]);
+        CHECK("uri/xhttp-invalid-request-target",parse(input) != 0 && strstr(error,"path"));
+    }
     CHECK("uri/extra-invalid-json", parse(PREFIX "type=xhttp&extra=%7B%22sessionPlacement%22%3A%22header%22") != 0);
     CHECK("uri/extra-nested-field-is-not-root", parse(PREFIX "type=xhttp&extra=%7B%22unknown%22%3A%7B%22sessionPlacement%22%3A%22header%22%7D%7D") == 0 && !strcmp(config.xhttp_session_placement,"path"));
     CHECK("uri/extra-explicit-priority-before", parse(PREFIX "type=xhttp&x_padding_bytes=10-20&extra=%7B%22xPaddingBytes%22%3A%2230-40%22%7D") == 0 && config.xhttp_padding_min == 10 && config.xhttp_padding_max == 20);

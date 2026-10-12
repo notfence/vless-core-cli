@@ -86,5 +86,11 @@ int main(void) {
     }
     snprintf(uri,sizeof(uri),"%spath=%%2Fvless-core%%3Fed%%3D100&ed=20",prefix);
     CHECK("ws/explicit-early-data-priority",parse_core_uri(uri,&config,error,sizeof(error)) == 0 && config.ws_early_data == 20 && !strcmp(config.xhttp_path,"/vless-core"));
+    char long_key[301]; memset(long_key,'x',sizeof(long_key)-1); long_key[sizeof(long_key)-1]=0;
+    snprintf(uri,sizeof(uri),"%spath=%%2Fvless-core%%3F%s%%3Dx%%26ed%%3D20",prefix,long_key);
+    CHECK("ws/oversized-embedded-query-key",parse_core_uri(uri,&config,error,sizeof(error)) < 0 && strstr(error,"path"));
+    long_key[230]=0;
+    snprintf(uri,sizeof(uri),"%spath=%%2Fvless-core%%3F%s%%3Dx%%26ed%%3D20",prefix,long_key);
+    CHECK("ws/bounded-embedded-query-key",parse_core_uri(uri,&config,error,sizeof(error)) == 0 && config.ws_early_data == 20 && strlen(config.xhttp_path) == 244);
     return test_result();
 }

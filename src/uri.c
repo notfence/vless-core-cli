@@ -687,6 +687,14 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         return -1;
     }
     if (cfg->transport_mode == TRANSPORT_WS && core_ws_configure(cfg,err,err_cap)) return -1;
+    if (cfg->transport_mode == TRANSPORT_WS || cfg->transport_mode == TRANSPORT_XHTTP) {
+        char escaped[sizeof(cfg->xhttp_path)],target[sizeof(cfg->xhttp_path)+2];
+        if (core_request_target(cfg->xhttp_path,escaped,sizeof(escaped)) ||
+            core_http_path(escaped,target,sizeof(target),cfg->transport_mode == TRANSPORT_XHTTP)) {
+            set_err(err,err_cap,"invalid or oversized request path"); return -1;
+        }
+        memcpy(cfg->xhttp_path,escaped,strlen(escaped)+1);
+    }
     if (cfg->flow[0] && strcmp(cfg->flow,"xtls-rprx-vision")) { set_err(err,err_cap,"unsupported flow"); return -1; }
     if (cfg->flow[0] && (cfg->transport_mode == TRANSPORT_WS || cfg->transport_mode == TRANSPORT_GRPC ||
         (cfg->transport_mode == TRANSPORT_XHTTP && !cfg->encryption_enabled))) vc_log_warning("uri","field query.flow is not applied to this transport");

@@ -93,29 +93,28 @@ int base64url_decode(const char *in, uint8_t *out, size_t out_cap, size_t *out_l
         ['-'] = 62, ['_'] = 63
     };
 
+    size_t length=strlen(in),data_length=length;
+    while (data_length && in[data_length-1] == '=') data_length--;
+    size_t padding=length-data_length,remainder=data_length%4;
+    if (padding > 2 || remainder == 1 || (padding && (!data_length || length%4 || padding != 4-remainder))) return -1;
+    for (size_t i=0;i<data_length;i++) {
+        unsigned char byte=(unsigned char)in[i];
+        if ((table[byte] == 0 && byte != 'A') || byte == '=') return -1;
+    }
+    if ((remainder == 2 && (table[(unsigned char)in[data_length-1]]&15)) ||
+        (remainder == 3 && (table[(unsigned char)in[data_length-1]]&3))) return -1;
+    size_t required=data_length/4*3+(remainder ? remainder-1 : 0);
+    if (required > out_cap) return -1;
     size_t olen = 0;
     uint32_t val = 0;
     int valb = -8;
 
-    for (size_t i = 0; in[i] != '\0'; i++) {
+    for (size_t i = 0; i < data_length; i++) {
         unsigned char c = (unsigned char)in[i];
-        if (c == '=') {
-            while (in[i] == '=') i++;
-            if (in[i] != '\0') {
-                return -1;
-            }
-            break;
-        }
         int8_t d = table[c];
-        if (d < 0 || (d == 0 && c != 'A')) {
-            return -1;
-        }
         val = (val << 6) | (uint32_t)d;
         valb += 6;
         if (valb >= 0) {
-            if (olen >= out_cap) {
-                return -1;
-            }
             out[olen++] = (uint8_t)((val >> valb) & 0xFF);
             valb -= 8;
         }
@@ -153,5 +152,50 @@ int percent_decode(const char *in, char *out, size_t out_cap) {
         }
     }
     out[oi] = '\0';
+    return 0;
+}
+
+static int request_byte(unsigned byte) {
+    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') ||
+        (byte && strchr("-._~!$&'()*+,;=:@/?",(int)byte));
+}
+
+int core_request_target(const char *input, char *output, size_t capacity) {
+    if (!input || !output || !capacity) return -1;
+    size_t size=0;
+    for (size_t i=0;input[i];i++) {
+        unsigned byte=(unsigned char)input[i]; size_t required=request_byte(byte) ? 1 : 3;
+        if (byte == '\r' || byte == '\n') return -1;
+        if (byte == '%') {
+            if (!input[i+1] || !input[i+2]) return -1;
+            int high=hex_value(input[i+1]),low=hex_value(input[i+2]);
+            if (high < 0 || low < 0 || !(high|low) || (high == 0 && (low == 10 || low == 13))) return -1;
+            i+=2; required=3;
+        }
+        if (required > capacity-1-size) return -1;
+        size+=required;
+    }
+    static const char hex[]="0123456789ABCDEF"; size_t offset=0;
+    for (size_t i=0;input[i];i++) {
+        unsigned byte=(unsigned char)input[i];
+        if (byte == '%') { memcpy(output+offset,input+i,3); offset+=3; i+=2; }
+        else if (request_byte(byte)) output[offset++]=(char)byte;
+        else { output[offset++]='%'; output[offset++]=hex[byte>>4]; output[offset++]=hex[byte&15]; }
+    }
+    output[offset]=0; return 0;
+}
+
+int core_http_path(const char *input, char *output, size_t capacity, int trailing) {
+    if (!input || !*input) input="/";
+    if (!output || capacity < 2) return -1;
+    if (*input == '/') { if (core_request_target(input,output,capacity)) return -1; }
+    else { output[0]='/'; if (core_request_target(input,output+1,capacity-1)) return -1; }
+    if (trailing) {
+        char *query=strchr(output,'?'); size_t size=strlen(output),path=query ? (size_t)(query-output) : size;
+        if (output[path-1] != '/') {
+            if (size+1 >= capacity) return -1;
+            memmove(output+path+1,output+path,size-path+1); output[path]='/';
+        }
+    }
     return 0;
 }

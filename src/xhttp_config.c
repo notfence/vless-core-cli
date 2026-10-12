@@ -4,6 +4,7 @@
 #include "xhttp_payload.h"
 #include "http_headers.h"
 #include "xhttp_download.h"
+#include "utils.h"
 #include <stddef.h>
 #include <ctype.h>
 #include <string.h>
@@ -289,6 +290,8 @@ static int cookie_collision(const vless_config_t *config, const char *name, int 
 }
 
 int core_xhttp_validate(const vless_config_t *config, char *error, size_t capacity) {
+    char escaped[sizeof(config->xhttp_path)],target[sizeof(config->xhttp_path)+2];
+    if (core_request_target(config->xhttp_path,escaped,sizeof(escaped)) || core_http_path(escaped,target,sizeof(target),1)) return invalid("path",error,capacity);
     if (config->xhttp_uplink_method[0] && (!core_http_token(config->xhttp_uplink_method) || !strcmp(config->xhttp_uplink_method,"OPTIONS"))) return invalid("uplinkHTTPMethod",error,capacity);
     if (!strcmp(config->xhttp_uplink_method,"HEAD") && !strcmp(config->xhttp_mode,"stream-one")) return invalid("uplinkHTTPMethod HEAD cannot carry a stream-one response",error,capacity);
     const char *placements[]={config->xhttp_session_placement,config->xhttp_seq_placement};

@@ -28,6 +28,30 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_ws_xhttp_escaped_paths_interoperate(self):
+        cert,_=certificate()
+        server_path="/vless core/тест"
+        client_path=server_path+"?name=a b&keep=%2F"
+        for transport in ("ws","xhttp"):
+            for security in (("none","tls") if transport == "ws" else ("none","tls","reality")):
+                protocols=("h2","http/1.1") if transport == "xhttp" and security == "tls" else (None,)
+                for protocol in protocols:
+                    parameters={"path":client_path}
+                    if protocol: parameters["alpn"]=protocol
+                    with self.subTest(transport=transport,security=security,alpn=protocol), Server() as target, xray_server(transport,security,path=server_path) as reference:
+                        with CountingProxy(reference.port) as captured, cli(uri(captured.port,transport,security,**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core escaped path")
+                            if security == "none":
+                                requests=[bytes(data).split(b"\r\n",1)[0] for data in captured.client_data]
+                                self.assertTrue(any(b"/vless%20core/%D1%82%D0%B5%D1%81%D1%82" in request for request in requests),requests)
+                                self.assertTrue(any(b"keep=%2F" in request for request in requests),requests)
+
+    def test_ws_xhttp_preserve_encoded_path_separator(self):
+        for transport in ("ws","xhttp"):
+            with self.subTest(transport=transport), Server() as target, xray_server(transport,"none",path="/vless/core") as reference:
+                with cli(uri(reference.port,transport,"none",path="/vless%2Fcore")) as core:
+                    with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core encoded separator")
+
     def test_http1_stream_upload_invalid_ack_aborts_session(self):
         acknowledged=threading.Event()
         def handler(connection):
@@ -1021,7 +1045,6 @@ class XrayTests(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stderr)
             for transport in ("tcp","ws","xhttp","grpc"):
                 parameters={"sni":identity}
-                if transport == "xhttp" and identity == "::1": parameters["host"]="[::1]"
                 with self.subTest(transport=transport,identity=identity,purpose=purpose), Server() as target, xray_server(transport,"tls",tls_certificate=cert) as reference, cli(uri(reference.port,transport,"tls",**parameters),environment={"VLESS_CA_BUNDLE":str(cert),"VLESS_TLS_MODE":"strict"}) as core:
                     if accepted:
                         with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core identity")

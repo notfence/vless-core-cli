@@ -241,16 +241,20 @@ int core_ws_configure(vless_config_t *config, char *error, size_t capacity) {
     for (const char *item=query+1;*item;) {
         const char *next=strchr(item,'&'),*end=next ? next : item+strlen(item);
         const char *equal=memchr(item,'=',(size_t)(end-item));
-        char key[256]={0},value[256]={0};
+        char key[sizeof(config->xhttp_path)]={0},value[sizeof(config->xhttp_path)]={0};
         size_t key_length=equal ? (size_t)(equal-item) : (size_t)(end-item);
+        if (key_length >= sizeof(key)) return error_field(error,capacity,"path");
         memcpy(key,item,key_length); key[key_length]=0;
-        char decoded[256];
+        char decoded[sizeof(config->xhttp_path)];
         if (percent_decode(key,decoded,sizeof(decoded))) return error_field(error,capacity,"path");
         if (!strcmp(decoded,"ed")) {
             if (seen++ || !equal) return error_field(error,capacity,"path.ed");
-            memcpy(value,equal+1,(size_t)(end-equal-1));
+            size_t value_length=(size_t)(end-equal-1);
+            if (value_length >= sizeof(value)) return error_field(error,capacity,"path.ed");
+            memcpy(value,equal+1,value_length);
             if (percent_decode(value,decoded,sizeof(decoded)) || integer(decoded,16384,&embedded)) return error_field(error,capacity,"path.ed");
         } else {
+            if ((size_t)(end-item)+1 >= sizeof(result)-used) return error_field(error,capacity,"path");
             result[used++]=strchr(result,'?') ? '&' : '?';
             memcpy(result+used,item,(size_t)(end-item)); used+=(size_t)(end-item); result[used]=0;
         }

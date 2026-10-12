@@ -131,6 +131,9 @@ int core_xhttp_download_parse(const core_json_t *root, vless_config_t *config, c
     }
     if (strcmp(config->xhttp_mode,"auto") && config->xhttp_mode[0] && strcmp(config->xhttp_mode,"packet-up") && strcmp(config->xhttp_mode,"stream-up") && strcmp(config->xhttp_mode,"stream-one")) return invalid("xhttpSettings.mode",error,capacity);
     strcpy(config->xhttp_mode,"packet-up");
+    char escaped[sizeof(config->xhttp_path)];
+    if (core_request_target(config->xhttp_path,escaped,sizeof(escaped))) return invalid("xhttpSettings.path",error,capacity);
+    memcpy(config->xhttp_path,escaped,strlen(escaped)+1);
     return core_xhttp_validate(config,error,capacity);
 }
 

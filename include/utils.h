@@ -8,5 +8,7 @@ int parse_uuid(const char *s, uint8_t out[16]);
 int hex_to_bytes(const char *hex, uint8_t *out, size_t out_cap, size_t *out_len);
 int base64url_decode(const char *in, uint8_t *out, size_t out_cap, size_t *out_len);
 int percent_decode(const char *in, char *out, size_t out_cap);
+int core_request_target(const char *, char *, size_t);
+int core_http_path(const char *, char *, size_t, int);
 
 #endif

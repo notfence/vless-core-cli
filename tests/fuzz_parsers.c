@@ -82,6 +82,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         (void)base64url_decode(text, decoded, capacity, &length);
         char escaped[256];
         (void)percent_decode(text, escaped, capacity);
+        (void)core_request_target(text,escaped,capacity);
+        (void)core_http_path(text,escaped,capacity,0);
+        (void)core_http_path(text,escaped,capacity,1);
         (void)parse_uuid(text, decoded);
         free(text);
         break;

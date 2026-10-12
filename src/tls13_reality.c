@@ -717,30 +717,7 @@ static int fd_read_some(int fd, uint8_t *buf, size_t cap, size_t *out_len) {
 }
 
 static int normalize_xhttp_path(const char *in, char *out, size_t out_cap) {
-    if (out_cap < 3) {
-        return -1;
-    }
-    const char *src = (in != NULL && in[0] != '\0') ? in : "/";
-    if (src[0] == '/') {
-        if (snprintf(out, out_cap, "%s", src) >= (int)out_cap) return -1;
-    } else {
-        if (snprintf(out, out_cap, "/%s", src) >= (int)out_cap) return -1;
-    }
-    size_t n = strlen(out);
-    if (n == 0) {
-        snprintf(out, out_cap, "/");
-        n = 1;
-    }
-    char *query=strchr(out,'?');
-    size_t path_length=query ? (size_t)(query-out) : n;
-    if (!path_length || out[path_length - 1] != '/') {
-        if (n + 1 >= out_cap) {
-            return -1;
-        }
-        memmove(out+path_length+1,out+path_length,n-path_length+1);
-        out[path_length] = '/';
-    }
-    return 0;
+    return core_http_path(in,out,out_cap,1);
 }
 
 static int random_xpadding_value(int min_len, int max_len, const char *method, char *buf, size_t cap) {
@@ -1462,20 +1439,13 @@ static int base64_encode(const uint8_t *in, size_t in_len, char *out, size_t out
 }
 
 static int normalize_ws_path(const char *in, char *out, size_t out_cap) {
-    if (out_cap < 2) {
-        return -1;
-    }
-    const char *src = (in != NULL && in[0] != '\0') ? in : "/";
-    int n = 0;
-    if (src[0] == '/') {
-        n = snprintf(out, out_cap, "%s", src);
-    } else {
-        n = snprintf(out, out_cap, "/%s", src);
-    }
-    if (n <= 0 || (size_t)n >= out_cap) {
-        return -1;
-    }
-    return 0;
+    return core_http_path(in,out,out_cap,0);
+}
+
+static int http_host(const char *input, char *output, size_t capacity) {
+    uint8_t address[16];
+    int size=snprintf(output,capacity,inet_pton(AF_INET6,input,address) == 1 ? "[%s]" : "%s",input);
+    return size < 0 || (size_t)size >= capacity ? -1 : 0;
 }
 
 static int ws_make_key(char out[25]) {
@@ -6059,7 +6029,7 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
     }
 
     const char *host = cfg->xhttp_host[0] != '\0' ? cfg->xhttp_host : (ws_tls ? c->remote_sni : cfg->server_host);
-    snprintf(c->ws_host, sizeof(c->ws_host), "%s", host);
+    if (http_host(host,c->ws_host,sizeof(c->ws_host))) { set_err(err,err_cap,"invalid ws host"); return -1; }
 
     int verify_peer = 0;
     if (ws_tls) {
@@ -6115,7 +6085,7 @@ static int xhttp_configure(const vless_config_t *cfg, tls13_conn_t *c, char *err
     }
 
     const char *xhost = cfg->xhttp_host[0] != '\0' ? cfg->xhttp_host : c->remote_sni;
-    snprintf(c->xhttp_host, sizeof(c->xhttp_host), "%s", xhost);
+    if (http_host(xhost,c->xhttp_host,sizeof(c->xhttp_host))) { set_err(err,err_cap,"invalid xhttp host"); return -1; }
     snprintf(c->xhttp_transport_mode, sizeof(c->xhttp_transport_mode), "%s", cfg->xhttp_mode);
     snprintf(c->xhttp_session_placement, sizeof(c->xhttp_session_placement), "%s",
              cfg->xhttp_session_placement[0] != '\0' ? cfg->xhttp_session_placement : "path");

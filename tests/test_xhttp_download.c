@@ -22,6 +22,8 @@ static int parent(const char *extra, const char *parameters, vless_config_t *con
 
 int main(void) {
     vless_config_t config,download; char error[256];
+    CHECK("download/escaped-request-target",parse("{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/vless core?keep=%2F\"}}",&config,error) == 0 && !strcmp(config.xhttp_path,"/vless%20core?keep=%2F"));
+    CHECK("download/invalid-escaped-path",parse("{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/bad%00\"}}",&config,error) < 0 && strstr(error,"path"));
     CHECK("download/plain-endpoint",parse("{\"address\":\"127.0.0.2\",\"port\":8080,\"network\":\"xhttp\",\"security\":\"none\",\"xhttpSettings\":{\"path\":\"/download\",\"host\":\"vless-core.test\"}}",&config,error) == 0 && !strcmp(config.server_host,"127.0.0.2") && config.server_port == 8080 && !strcmp(config.xhttp_path,"/download") && config.xhttp_download_only);
     CHECK("download/tls-independent-policy",parse("{\"address\":\"::1\",\"port\":443,\"network\":\"xhttp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"vless-core.test\",\"allowInsecure\":true,\"alpn\":[\"h2\",\"http/1.1\"]}}",&config,error) == 0 && !strcmp(config.server_host,"::1") && !strcmp(config.sni,"vless-core.test") && config.allow_insecure && !strcmp(config.alpn,"h2,http/1.1"));
     CHECK("download/nested-extra-priority",parse("{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/explicit\",\"extra\":{\"path\":\"/extra\",\"noGRPCHeader\":true}}}",&config,error) == 0 && !strcmp(config.xhttp_path,"/explicit") && config.xhttp_no_grpc_header);
