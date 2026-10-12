@@ -106,30 +106,30 @@ static int parse_cidr(const char *value, int *family, unsigned char *network, in
     snprintf(tmp, sizeof(tmp), "%s", value);
 
     char *slash = strchr(tmp, '/');
-    int has_prefix = slash != NULL;
-    int bits = -1;
-    if (slash != NULL) {
-        *slash++ = '\0';
-        char *end = NULL;
-        long parsed = strtol(slash, &end, 10);
-        if (end == slash || *end != '\0' || parsed < 0) {
-            return -1;
-        }
-        bits = (int)parsed;
-    }
+    if (slash) *slash++ = '\0';
+    unsigned maximum;
 
     if (inet_pton(AF_INET, tmp, network) == 1) {
-        if (!has_prefix) bits = 32;
-        if (bits > 32) return -1;
+        maximum = 32;
         *family = AF_INET;
     } else if (inet_pton(AF_INET6, tmp, network) == 1) {
-        if (!has_prefix) bits = 128;
-        if (bits > 128) return -1;
+        maximum = 128;
         *family = AF_INET6;
     } else {
         return -1;
     }
-    *prefix = bits;
+    unsigned bits = maximum;
+    if (slash) {
+        if (!*slash) return -1;
+        bits = 0;
+        for (const unsigned char *digit = (const unsigned char *)slash; *digit; digit++) {
+            if (*digit < '0' || *digit > '9') return -1;
+            unsigned value = *digit - '0';
+            if (bits > (maximum - value) / 10) return -1;
+            bits = bits * 10 + value;
+        }
+    }
+    *prefix = (int)bits;
     return 0;
 }
 

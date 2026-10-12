@@ -123,6 +123,17 @@ int main(void) {
     CHECK("routes/ipv6-zero-prefix", routing_config_parse("1;block;0;direct,cidr,::/0", &config, err, sizeof(err)) == 0 && expect_action(&config, "2001:db8::1", 443, ROUTE_ACTION_DIRECT) == 0);
     CHECK("routes/exact-cidrs", routing_config_parse("1;block;0;direct,cidr,192.0.2.1/32;direct,cidr,2001:db8::1/128", &config, err, sizeof(err)) == 0 && expect_action(&config, "192.0.2.1", 443, ROUTE_ACTION_DIRECT) == 0 && expect_action(&config, "192.0.2.2", 443, ROUTE_ACTION_BLOCK) == 0 && expect_action(&config, "2001:db8::2", 443, ROUTE_ACTION_BLOCK) == 0);
     CHECK("routes/invalid-prefix-boundaries", routing_config_parse("1;proxy;0;direct,cidr,192.0.2.1/33", &config, err, sizeof(err)) != 0 && routing_config_parse("1;proxy;0;direct,cidr,::1/129", &config, err, sizeof(err)) != 0);
+    const char *invalid_prefixes[]={"+0","-0","+32","","32x"," 0","0/0","4294967296","4294967328","4294967424","2147483648","9223372036854775807","9223372036854775808","18446744073709551615","18446744073709551616","999999999999999999999999999999"};
+    for (size_t i=0;i<sizeof(invalid_prefixes)/sizeof(*invalid_prefixes);i++) {
+        char invalid_policy[160];
+        snprintf(invalid_policy,sizeof(invalid_policy),"1;block;0;direct,cidr,192.0.2.1/%s",invalid_prefixes[i]);
+        CHECK("routes/ipv4-prefix-sign-junk-overflow-rejected",routing_config_parse(invalid_policy,&config,err,sizeof(err)) < 0);
+        snprintf(invalid_policy,sizeof(invalid_policy),"1;block;0;direct,cidr,2001:db8::1/%s",invalid_prefixes[i]);
+        CHECK("routes/ipv6-prefix-sign-junk-overflow-rejected",routing_config_parse(invalid_policy,&config,err,sizeof(err)) < 0);
+    }
+    CHECK("routes/bare-addresses-remain-exact",routing_config_parse("1;block;0;direct,cidr,192.0.2.1;direct,cidr,2001:db8::1",&config,err,sizeof(err)) == 0 && expect_action(&config,"192.0.2.1",443,ROUTE_ACTION_DIRECT) == 0 && expect_action(&config,"192.0.2.2",443,ROUTE_ACTION_BLOCK) == 0 && expect_action(&config,"2001:db8::2",443,ROUTE_ACTION_BLOCK) == 0);
+    CHECK("routes/prefix-leading-zeroes",routing_config_parse("1;block;0;direct,cidr,192.0.2.1/032;direct,cidr,2001:db8::1/00128",&config,err,sizeof(err)) == 0 && expect_action(&config,"192.0.2.2",443,ROUTE_ACTION_BLOCK) == 0);
+    CHECK("routes/first-matching-cidr-keeps-priority",routing_config_parse("1;block;0;proxy,cidr,192.0.2.0/24;direct,cidr,0.0.0.0/0",&config,err,sizeof(err)) == 0 && expect_action(&config,"192.0.2.1",443,ROUTE_ACTION_PROXY) == 0 && expect_action(&config,"198.51.100.1",443,ROUTE_ACTION_DIRECT) == 0);
     CHECK("routes/port-boundaries", routing_config_parse("1;block;0;direct,port,1-65535", &config, err, sizeof(err)) == 0 && expect_action(&config, "192.0.2.1", 1, ROUTE_ACTION_DIRECT) == 0 && expect_action(&config, "192.0.2.1", 65535, ROUTE_ACTION_DIRECT) == 0);
     int matched = -10; char domain[256];
     CHECK("routes/lan-priority", routing_config_parse("1;block;1;block,port,443", &config, err, sizeof(err)) == 0 && routing_decide(&config, "127.0.0.1", 443, NULL, domain, sizeof(domain), &matched) == ROUTE_ACTION_DIRECT && matched == -2);

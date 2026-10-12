@@ -3,6 +3,7 @@
 #include "uri.h"
 #include "json.h"
 #include "utils.h"
+#include "routing.h"
 #include "vision.h"
 #include "vless.h"
 #include "xhttp_download.h"
@@ -86,6 +87,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         (void)core_http_path(text,escaped,capacity,0);
         (void)core_http_path(text,escaped,capacity,1);
         (void)parse_uuid(text, decoded);
+        routing_config_t routes;
+        if (routing_config_parse(text,&routes,error,sizeof(error)) == 0) {
+            (void)routing_decide(&routes,"192.0.2.1",443,NULL,NULL,0,NULL);
+            (void)routing_decide(&routes,"2001:db8::1",443,NULL,NULL,0,NULL);
+        }
         free(text);
         break;
     }
