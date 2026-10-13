@@ -17,6 +17,15 @@ int __wrap_getsockopt(int fd, int level, int option, void *value, socklen_t *len
     return __real_getsockopt(fd,level,option,value,length);
 }
 int main(void) {
+    struct sockaddr_storage numeric; socklen_t numeric_length=0;
+    REQUIRE("socket/numeric-ipv4",core_numeric_address("127.0.0.1",443,&numeric,&numeric_length) == 1);
+    CHECK("socket/numeric-ipv4-port-and-size",numeric.ss_family == AF_INET && numeric_length == sizeof(struct sockaddr_in) && ntohs(((struct sockaddr_in *)&numeric)->sin_port) == 443);
+    REQUIRE("socket/numeric-ipv6",core_numeric_address("::1",8443,&numeric,&numeric_length) == 1);
+    CHECK("socket/numeric-ipv6-port-and-size",numeric.ss_family == AF_INET6 && numeric_length == sizeof(struct sockaddr_in6) && ntohs(((struct sockaddr_in6 *)&numeric)->sin6_port) == 8443 && IN6_IS_ADDR_LOOPBACK(&((struct sockaddr_in6 *)&numeric)->sin6_addr));
+    struct sockaddr_storage previous=numeric;
+    CHECK("socket/hostname-is-not-numeric",core_numeric_address("vless-core.test",80,&numeric,&numeric_length) == 0 && !memcmp(&numeric,&previous,sizeof(numeric)));
+    CHECK("socket/malformed-literal-is-not-numeric",core_numeric_address("127.0.0.256",80,&numeric,&numeric_length) == 0 && core_numeric_address("::gg",80,&numeric,&numeric_length) == 0);
+    CHECK("socket/numeric-invalid-output",core_numeric_address(NULL,80,&numeric,&numeric_length) < 0 && core_numeric_address("::1",80,NULL,&numeric_length) < 0 && core_numeric_address("::1",80,&numeric,NULL) < 0);
     struct sockaddr_in address = {.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
     for (mode = 1; mode <= 4; mode++) {
         int fd = socket(AF_INET,SOCK_STREAM,0); int flags = fcntl(fd,F_GETFL); interrupted = 0;

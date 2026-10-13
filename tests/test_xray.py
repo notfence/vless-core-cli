@@ -908,7 +908,8 @@ class XrayTests(unittest.TestCase):
                 self.assertTrue(reports,core.log)
                 result = dict(field.split("=",1) for field in reports[-1].split())
                 self.assertEqual((result["v"],result["success"],result["stage"]),("1","1","none"))
-                for field in ("dns_ms","tcp_ms","transport_ms","protocol_ms","carry_ms","total_ms"):
+                self.assertEqual(int(result["dns_ms"]),-1,core.log)
+                for field in ("tcp_ms","transport_ms","protocol_ms","carry_ms","total_ms"):
                     self.assertGreaterEqual(int(result[field]),0,(field,core.log))
 
     def test_transport_matrix(self):

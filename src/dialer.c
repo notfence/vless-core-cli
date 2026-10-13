@@ -59,12 +59,20 @@ core_dialer_t *core_dialer_start(const char *host, uint16_t port, int use_server
         }
         dialer->resolved[0]=dialer->resolved[1]=1;
     } else {
-        core_trace_stage(CORE_TRACE_DNS);
-        char service[16]; snprintf(service,sizeof(service),"%u",(unsigned)port);
-        for (size_t i=0;i<2;i++) {
-            struct addrinfo hints={.ai_family=i ? AF_INET : AF_INET6,.ai_socktype=SOCK_STREAM,.ai_protocol=IPPROTO_TCP};
-            dialer->queries[i]=core_resolver_start(host,service,&hints);
-            if (!dialer->queries[i]) { dialer->resolved[i]=1; dialer->dns_error[i]=EAI_SYSTEM; dialer->last_error=errno; }
+        struct sockaddr_storage address; socklen_t length;
+        int numeric=core_numeric_address(host,port,&address,&length);
+        if (numeric < 0) goto failure;
+        if (numeric) {
+            if (append_address(dialer,(void *)&address,length)) goto failure;
+            dialer->resolved[0]=dialer->resolved[1]=1;
+        } else {
+            core_trace_stage(CORE_TRACE_DNS);
+            char service[16]; snprintf(service,sizeof(service),"%u",(unsigned)port);
+            for (size_t i=0;i<2;i++) {
+                struct addrinfo hints={.ai_family=i ? AF_INET : AF_INET6,.ai_socktype=SOCK_STREAM,.ai_protocol=IPPROTO_TCP};
+                dialer->queries[i]=core_resolver_start(host,service,&hints);
+                if (!dialer->queries[i]) { dialer->resolved[i]=1; dialer->dns_error[i]=EAI_SYSTEM; dialer->last_error=errno; }
+            }
         }
     }
     return dialer;

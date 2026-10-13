@@ -361,7 +361,9 @@ static mux_actor_t *new_actor(mux_group_t *group, int budget, core_http2_stream_
     if (grpc_manager(manager)) actor->alive_period=manager->config.grpc_idle_timeout;
     else if (!actor->alive_period) actor->alive_period=45;
     if (actor->alive_period < 0) actor->alive_period=0;
-    actor->progress_stage=core_server_ip_count() && !manager->config.ignore_server_ips ? CORE_TRACE_TCP : CORE_TRACE_DNS;
+    struct sockaddr_storage numeric; socklen_t numeric_length;
+    actor->progress_stage=(core_server_ip_count() && !manager->config.ignore_server_ips) ||
+        core_numeric_address(manager->config.server_host,manager->config.server_port,&numeric,&numeric_length) == 1 ? CORE_TRACE_TCP : CORE_TRACE_DNS;
     core_trace_stage(actor->progress_stage);
     actor->trace_present=core_trace_snapshot(&actor->trace);
     if (!actor->trace_present && source && source->trace_present) { actor->trace=source->trace; actor->trace_present=1; }

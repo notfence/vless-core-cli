@@ -9,6 +9,7 @@
 #include "resolver.h"
 
 #include <errno.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -159,6 +160,25 @@ int core_connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t add
     int result = connect_with_timeout(fd, addr, addr_len, timeout_ms);
     if (result == 0) core_trace_stage(CORE_TRACE_TRANSPORT);
     return result;
+}
+
+int core_numeric_address(const char *host, uint16_t port, struct sockaddr_storage *address, socklen_t *length) {
+    if (!host || !address || !length) { errno=EINVAL; return -1; }
+    struct sockaddr_storage numeric={0};
+    struct sockaddr_in *v4=(void *)&numeric;
+    struct sockaddr_in6 *v6=(void *)&numeric;
+    if (inet_pton(AF_INET,host,&v4->sin_addr) == 1) {
+        v4->sin_family=AF_INET; v4->sin_port=htons(port); *length=sizeof(*v4);
+#ifdef __APPLE__
+        v4->sin_len=sizeof(*v4);
+#endif
+    } else if (inet_pton(AF_INET6,host,&v6->sin6_addr) == 1) {
+        v6->sin6_family=AF_INET6; v6->sin6_port=htons(port); *length=sizeof(*v6);
+#ifdef __APPLE__
+        v6->sin6_len=sizeof(*v6);
+#endif
+    } else return 0;
+    *address=numeric; return 1;
 }
 
 int core_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **addresses) {

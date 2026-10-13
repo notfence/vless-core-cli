@@ -26,6 +26,13 @@ typedef struct {
 
 static uint16_t expire_target_port;
 static uint64_t test_time;
+static unsigned numeric_lookups;
+int __real_core_getaddrinfo(const char *,const char *,const struct addrinfo *,struct addrinfo **);
+int __wrap_core_getaddrinfo(const char *host,const char *service,const struct addrinfo *hints,struct addrinfo **result) {
+    struct in_addr v4; struct in6_addr v6;
+    if (inet_pton(AF_INET,host,&v4) == 1 || inet_pton(AF_INET6,host,&v6) == 1) numeric_lookups++;
+    return __real_core_getaddrinfo(host,service,hints,result);
+}
 static uint64_t test_clock(void) { return test_time; }
 int __real_core_connect_with_timeout(int, const struct sockaddr *, socklen_t, int);
 int __wrap_core_connect_with_timeout(int fd, const struct sockaddr *address, socklen_t length, int timeout) {
@@ -134,5 +141,6 @@ int main(void) {
     for (int tcp = 0; tcp < 2; tcp++) for (int hold = 0; hold < 2; hold++) run_case(hold, tcp, 0, 0, 0, 0);
     for (int tcp = 0; tcp < 2; tcp++) { run_case(1, tcp, 1, 0, 0, 0); run_case(1, tcp, 0, 1, 0, 0); run_case(1, tcp, 0, 0, 1, 0); run_case(1, tcp, 0, 0, 0, 1); }
     puts("routing direct lease: OK");
+    CHECK("routing/numeric-controller-target-skips-resolver",!numeric_lookups);
     return test_result();
 }

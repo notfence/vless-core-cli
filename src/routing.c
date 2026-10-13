@@ -516,7 +516,17 @@ int routing_open_direct(const char *host,
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo *result = NULL;
-    int gai = core_getaddrinfo(host, port_text, &hints, &result);
+    struct sockaddr_storage numeric_address; socklen_t numeric_length;
+    struct addrinfo numeric={.ai_socktype=SOCK_STREAM,.ai_protocol=IPPROTO_TCP};
+    int numeric_host=core_numeric_address(host,port,&numeric_address,&numeric_length);
+    if (numeric_host < 0) { set_err(err,err_cap,"invalid direct address"); return -1; }
+    if (numeric_host && numeric_address.ss_family != AF_INET) {
+        errno=EAFNOSUPPORT; set_err(err,err_cap,"Direct route controller requires IPv4"); return -1;
+    }
+    int gai=0;
+    if (numeric_host) {
+        numeric.ai_family=AF_INET; numeric.ai_addr=(void *)&numeric_address; numeric.ai_addrlen=numeric_length; result=&numeric;
+    } else gai=core_getaddrinfo(host,port_text,&hints,&result);
     if (gai != 0) {
         set_err(err, err_cap, "direct DNS resolution failed");
         return -1;
@@ -574,7 +584,7 @@ int routing_open_direct(const char *host,
             (void)release_bypass(control_port, control_socket, ip);
         }
     }
-    freeaddrinfo(result);
+    if (result != &numeric) freeaddrinfo(result);
 
     if (fd < 0) {
         if (err != NULL && err_cap > 0) {

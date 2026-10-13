@@ -7,11 +7,20 @@
 static int fixture_mode, stalled_fd=-1;
 static uint64_t ipv4_delay, ipv6_delay, connect_times[8];
 static int connect_families[8], connect_count;
+static pthread_mutex_t blocked_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t blocked_ready=PTHREAD_COND_INITIALIZER;
+static unsigned blocked_workers;
+static int release_workers;
 int __real_getaddrinfo(const char *, const char *, const struct addrinfo *, struct addrinfo **);
 int __real_connect(int, const struct sockaddr *, socklen_t);
 int __real_poll(struct pollfd *, nfds_t, int);
 
 int __wrap_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **result) {
+    if (!strcmp(host,"blocked-vless-core.test")) {
+        pthread_mutex_lock(&blocked_lock); blocked_workers++; pthread_cond_broadcast(&blocked_ready);
+        while (!release_workers) pthread_cond_wait(&blocked_ready,&blocked_lock);
+        pthread_mutex_unlock(&blocked_lock); *result=NULL; return EAI_NONAME;
+    }
     if (strcmp(host,"vless-core.test")) return EAI_NONAME;
     uint64_t delay=hints->ai_family == AF_INET6 ? ipv6_delay : ipv4_delay;
     struct timespec wait={.tv_sec=delay/1000,.tv_nsec=(long)(delay%1000)*1000000};
@@ -49,8 +58,54 @@ static int listener(int family, uint16_t *port) {
     return fd;
 }
 
+static void numeric_without_resolver(void) {
+    core_resolver_query_t *queries[4];
+    struct addrinfo hints={.ai_family=AF_INET,.ai_socktype=SOCK_STREAM};
+    for (unsigned i=0;i<4;i++) REQUIRE("dial/busy-resolver-job",(queries[i]=core_resolver_start("blocked-vless-core.test","80",&hints)) != NULL);
+    pthread_mutex_lock(&blocked_lock);
+    while (blocked_workers != 4) pthread_cond_wait(&blocked_ready,&blocked_lock);
+    pthread_mutex_unlock(&blocked_lock);
+    for (unsigned i=0;i<2;i++) {
+        uint16_t port; int family=i ? AF_INET6 : AF_INET;
+        int server=listener(family,&port); connect_count=0; core_deadline_begin(150);
+        core_dialer_t *dialer=core_dialer_start(i ? "::1" : "127.0.0.1",port,0,150,NULL,0);
+        REQUIRE("dial/numeric-start",dialer);
+        CHECK("dial/numeric-does-not-queue-dns",!dialer->queries[0] && !dialer->queries[1] && dialer->resolved[0] && dialer->resolved[1] && dialer->count == 1);
+        int fd=core_dialer_next(dialer,NULL,NULL);
+        CHECK("dial/numeric-connects-with-all-dns-workers-busy",fd >= 0 && connect_count == 1 && connect_families[0] == family);
+        if (fd >= 0) close(fd);
+        core_dialer_free(dialer); core_deadline_end(); close(server);
+    }
+    uint16_t port; int server=listener(AF_INET6,&port);
+    struct sockaddr_storage preferred; socklen_t preferred_length;
+    REQUIRE("dial/numeric-preferred-address",core_numeric_address("::1",port,&preferred,&preferred_length) == 1);
+    core_deadline_begin(150);
+    core_dialer_t *cached=core_dialer_start("127.0.0.2",port,0,150,(void *)&preferred,preferred_length);
+    REQUIRE("dial/numeric-cached-start",cached);
+    struct sockaddr_storage selected; socklen_t selected_length;
+    int fd=core_dialer_next(cached,&selected,&selected_length);
+    CHECK("dial/numeric-preserves-cached-address-priority",fd >= 0 && selected.ss_family == AF_INET6 && !cached->queries[0] && !cached->queries[1]);
+    if (fd >= 0) close(fd);
+    core_dialer_free(cached); core_deadline_end();
+    REQUIRE("dial/numeric-pinned-address",core_set_server_ips("::1") == 0);
+    core_deadline_begin(150);
+    cached=core_dialer_start("127.0.0.2",port,1,150,NULL,0);
+    REQUIRE("dial/numeric-pinned-start",cached);
+    fd=core_dialer_next(cached,&selected,&selected_length);
+    CHECK("dial/pins-override-numeric-server-host",fd >= 0 && selected.ss_family == AF_INET6 && cached->count == 1);
+    if (fd >= 0) close(fd);
+    core_dialer_free(cached); core_deadline_end(); close(server);
+    pthread_mutex_lock(&blocked_lock); release_workers=1; pthread_cond_broadcast(&blocked_ready); pthread_mutex_unlock(&blocked_lock);
+    for (unsigned i=0;i<4;i++) {
+        struct addrinfo *addresses=NULL;
+        CHECK("dial/busy-resolver-job-completes",core_resolver_wait(queries[i],&addresses) == EAI_NONAME && !addresses);
+        core_resolver_release(queries[i]);
+    }
+}
+
 int main(void) {
     core_deadline_t deadline; REQUIRE("dial/deadline-attach", core_deadline_attach(&deadline) == 0);
+    numeric_without_resolver();
     for (int scenario=0;scenario<5;scenario++) {
         connect_count=0; stalled_fd=-1; fixture_mode=0;
         ipv4_delay=scenario == 4 ? 500 : 0; ipv6_delay=scenario == 0 ? 500 : scenario == 1 ? 20 : 0;
