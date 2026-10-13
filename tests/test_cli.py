@@ -11,6 +11,26 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_absolute_incoming_socks_budget(self):
+        def upstream(connection):
+            exact(connection,26); connection.sendall(b"\x00\x00")
+            while True:
+                data=connection.recv(4096)
+                if not data: return
+                connection.sendall(data)
+        with Server(upstream) as target, cli(uri(target.port,"tcp","none")) as core:
+            with socket.create_connection(("127.0.0.1",core.port),timeout=4) as connection:
+                started=time.monotonic(); connection.sendall(b"\x05")
+                time.sleep(4); connection.sendall(b"\x01")
+                time.sleep(4); connection.sendall(b"\x00")
+                self.assertEqual(exact(connection,2),b"\x05\x00")
+                self.assertEqual(exact(connection,10),b"\x05\x01\x00\x01"+bytes(6))
+                self.assertEqual(connection.recv(1),b"")
+                self.assertGreater(time.monotonic()-started,9)
+                self.assertLess(time.monotonic()-started,12)
+                self.assertFalse(target.connections)
+            with socks_connect(core.port,80) as connection: exchange(connection,b"vless-core recovered negotiation slot")
+
     def test_vless_response_header_uses_remaining_connection_budget(self):
         for initial in ("payload", "server", "fin", "addons"):
             def handler(connection):

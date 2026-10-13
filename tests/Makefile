@@ -85,6 +85,9 @@ $(HOST_BUILD_DIR)/test_xmux: $(HOST_BUILD_DIR)/test_xmux.o $(filter-out $(HOST_B
 $(HOST_BUILD_DIR)/test_grpc: $(HOST_BUILD_DIR)/test_grpc.o $(filter-out $(HOST_BUILD_DIR)/src/grpc.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=malloc
 
+$(HOST_BUILD_DIR)/test_socks5: $(HOST_BUILD_DIR)/test_socks5.o $(BASE_OBJ) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=recv,--wrap=send,--wrap=core_now_ms
+
 $(HOST_BUILD_DIR)/test_xhttp_payload: $(HOST_BUILD_DIR)/test_xhttp_payload.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes
 

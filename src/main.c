@@ -30,7 +30,6 @@
 
 #define VLESS_CORE_VERSION "1.1.5"
 #define MAX_CLIENT_CONNECTIONS 256
-#define SOCKS_HANDSHAKE_TIMEOUT_MS 10000
 #define SERVER_IP_LIST_MAX_LENGTH 511
 #ifndef VLESS_OPENSSL_PATCH_STATUS
 #define VLESS_OPENSSL_PATCH_STATUS "unpatched"
@@ -520,7 +519,6 @@ static void *client_worker_run(void *arg) {
     vless_config_t cfg = ctx->cfg;
     free(ctx);
 
-    core_set_socket_io_timeout(cfd, SOCKS_HANDSHAKE_TIMEOUT_MS);
     char target_host[512];
     uint16_t target_port = 0;
     int negotiation_result = socks5_negotiate_and_get_target(cfd, target_host, sizeof(target_host), &target_port);
@@ -529,7 +527,6 @@ static void *client_worker_run(void *arg) {
         close(cfd);
         return NULL;
     }
-    core_set_socket_io_timeout(cfd, 0);
 
     int socks_success_sent = 0;
     uint8_t first_payload[8192];

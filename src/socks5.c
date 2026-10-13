@@ -57,9 +57,11 @@ static int write_exact(int fd, const void *buf, size_t len) {
 
 int socks5_send_failure(int fd, uint8_t rep) {
     uint8_t resp[10] = {0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
-    core_deadline_pause();
+    core_deadline_scope_t scope;
+    if (core_deadline_scope_begin(&scope,100)) return -1;
     int result = write_exact(fd, resp, sizeof(resp));
-    core_deadline_resume();
+    int saved=errno;
+    core_deadline_scope_end(&scope); errno=saved;
     return result;
 }
 
@@ -68,7 +70,7 @@ int socks5_send_success(int fd) {
     return write_exact(fd, resp, sizeof(resp));
 }
 
-int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_t *port) {
+static int negotiate_target(int fd, char *host, size_t host_cap, uint16_t *port) {
     if (host == NULL || host_cap == 0 || port == NULL) {
         return -1;
     }
@@ -146,4 +148,16 @@ int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_
     }
     *port = (uint16_t)((pbuf[0] << 8) | pbuf[1]);
     return *port ? 0 : -1;
+}
+
+int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_t *port) {
+    int remaining=core_deadline_limit(SOCKS5_NEGOTIATION_TIMEOUT_MS);
+    if (!remaining) { errno=ETIMEDOUT; return -1; }
+    core_deadline_scope_t scope;
+    if (core_deadline_scope_begin(&scope,remaining)) return -1;
+    int result=negotiate_target(fd,host,host_cap,port);
+    if (!result && !core_deadline_remaining()) result=-1;
+    int saved=errno;
+    core_deadline_scope_end(&scope); errno=saved;
+    return result;
 }

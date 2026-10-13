@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define SOCKS5_NEGOTIATION_TIMEOUT_MS 10000
+
 enum { SOCKS5_NEGOTIATION_REJECTED = -2, SOCKS5_COMMAND_UNSUPPORTED = -3, SOCKS5_ADDRESS_UNSUPPORTED = -4 };
 
 int socks5_negotiate_and_get_target(int fd, char *host, size_t host_cap, uint16_t *port);

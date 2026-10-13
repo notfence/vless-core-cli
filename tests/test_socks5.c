@@ -1,10 +1,81 @@
 #include "check.h"
 #include "socks5.h"
+#include "socket_util.h"
+#include "deadline.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
+
+static int slow_io, interrupted_reads;
+static uint64_t slow_clock, slow_step;
+uint64_t __real_core_now_ms(void);
+ssize_t __real_recv(int,void *,size_t,int);
+ssize_t __real_send(int,const void *,size_t,int);
+uint64_t __wrap_core_now_ms(void) { return slow_io ? slow_clock : __real_core_now_ms(); }
+ssize_t __wrap_recv(int fd,void *data,size_t length,int flags) {
+    if (slow_io) {
+        slow_clock+=slow_step;
+        if (interrupted_reads) { interrupted_reads--; errno=EINTR; return -1; }
+        if (length > 1) length=1;
+    }
+    return __real_recv(fd,data,length,flags);
+}
+ssize_t __wrap_send(int fd,const void *data,size_t length,int flags) {
+    if (slow_io) { slow_clock+=slow_step; if (length > 1) length=1; }
+    return __real_send(fd,data,length,flags);
+}
+
+static void absolute_negotiation_budget(void) {
+    const uint8_t wire[]={5,1,0,5,1,0,1,127,0,0,1,0x1f,0x90};
+    for (unsigned scenario=0;scenario<4;scenario++) {
+        int pair[2]; REQUIRE("socks/absolute-budget-sockets",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        REQUIRE("socks/absolute-budget-feed",__real_send(pair[1],wire,sizeof(wire),0) == sizeof(wire));
+        slow_io=1; slow_clock=1000; slow_step=scenario == 2 ? 200 : 2000; interrupted_reads=scenario == 1 ? 2 : 0;
+        core_deadline_t outer;
+        if (scenario == 3) { REQUIRE("socks/outer-deadline-attach",core_deadline_attach(&outer) == 0); core_deadline_begin(3000); }
+        char host[64]="unchanged"; uint16_t port=0xbeef;
+        int result=socks5_negotiate_and_get_target(pair[0],host,sizeof(host),&port),failure=errno;
+        uint64_t elapsed=slow_clock-1000;
+        if (scenario == 2) {
+            CHECK("socks/partial-io-within-deadline",result == 0 && port == 8080 && !strcmp(host,"127.0.0.1") && elapsed < 10000);
+            CHECK("socks/negotiation-deadline-is-disabled-after-success",!core_deadline_active());
+        } else {
+            CHECK("socks/all-reads-writes-share-one-budget",result != 0 && failure == ETIMEDOUT && elapsed <= 10000 && port == 0xbeef);
+        }
+        if (scenario == 3) {
+            CHECK("socks/outer-deadline-restored-without-extension",core_deadline_active() && !core_deadline_remaining() && elapsed <= 5000);
+            core_deadline_end(); core_deadline_detach();
+        }
+        slow_io=0; close(pair[0]); close(pair[1]);
+    }
+}
+
+typedef struct { int fd,notify,result,error; } failure_case_t;
+static void *blocked_failure(void *opaque) {
+    failure_case_t *test=opaque;
+    test->result=socks5_send_failure(test->fd,1); test->error=errno;
+    uint8_t done=1; __real_send(test->notify,&done,1,0); return NULL;
+}
+
+static void bounded_failure_write(void) {
+    int pair[2],notification[2],size=4096;
+    REQUIRE("socks/blocked-reply-sockets",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0 && socketpair(AF_UNIX,SOCK_STREAM,0,notification) == 0);
+    REQUIRE("socks/blocked-reply-limit",setsockopt(pair[0],SOL_SOCKET,SO_SNDBUF,&size,sizeof(size)) == 0);
+    uint8_t bytes[4096]={0};
+    while (__real_send(pair[0],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {}
+    while (__real_send(pair[0],bytes,1,MSG_DONTWAIT) > 0) {}
+    failure_case_t test={.fd=pair[0],.notify=notification[1]}; pthread_t thread;
+    REQUIRE("socks/blocked-reply-worker",pthread_create(&thread,NULL,blocked_failure,&test) == 0);
+    int ready=core_wait_socket(notification[0],POLLIN,500);
+    CHECK("socks/failure-reply-has-bounded-wait",ready == 1);
+    shutdown(pair[1],SHUT_RDWR);
+    REQUIRE("socks/blocked-reply-worker-released",pthread_join(thread,NULL) == 0);
+    CHECK("socks/blocked-reply-reports-deadline",test.result < 0 && test.error == ETIMEDOUT);
+    close(pair[0]); close(pair[1]); close(notification[0]); close(notification[1]);
+}
 
 static int parse_wire(const uint8_t *wire, size_t length, char *host, size_t capacity, uint16_t *port) {
     int pair[2]; REQUIRE("socks/server-pair", socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
@@ -35,6 +106,8 @@ static void check_methods(const uint8_t *methods, uint8_t count, int accepted) {
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    absolute_negotiation_budget();
+    bounded_failure_write();
     const int errors[]={EACCES,EPERM,ENETDOWN,ENETUNREACH,EHOSTDOWN,EHOSTUNREACH,ECONNREFUSED,EAFNOSUPPORT,ETIMEDOUT,EIO,0};
     const uint8_t replies[]={2,2,3,3,4,4,5,8,1,1,1};
     for (size_t i=0;i<sizeof(errors)/sizeof(*errors);i++) CHECK("socks/system-error-replies",socks5_error_reply(errors[i]) == replies[i]);
