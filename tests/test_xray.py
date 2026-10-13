@@ -403,6 +403,47 @@ class XrayTests(unittest.TestCase):
                         minimum=((interval if interval is not None else 30)-15)/1000
                         self.assertTrue(all(right-left >= minimum for left,right in zip(posts,posts[1:])),posts)
 
+    def test_packet_up_streamed_body_preserves_sequences_and_bytes(self):
+        payload=bytes(range(251))*8356+b"vless-core last bytes"
+        cert,_=certificate()
+        for tls in (False,True):
+            for pooled in (False,True):
+                extra={"xmux":{"maxConnections":1}} if pooled else {}
+                with self.subTest(tls=tls,pooled=pooled), Server() as target, xray_server("xhttp","none",mode="packet-up") as reference:
+                    with CountingProxy(reference.port,tls=tls) as proxy:
+                        config=uri(proxy.port,"xhttp","tls" if tls else "none",mode="packet-up",alpn="http/1.1",extra=json.dumps(extra))
+                        with cli(config,environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                            with socks_connect(core.port,target.port) as tunnel:
+                                exchange(tunnel,b"vless-core warmup")
+                                exchange(tunnel,payload)
+                        packets=[]; streamed=0
+                        for channel in proxy.client_data:
+                            wire=bytes(channel); offset=0
+                            while offset<len(wire):
+                                end=wire.index(b"\r\n\r\n",offset)
+                                lines=wire[offset:end].split(b"\r\n"); offset=end+4
+                                if not lines[0].startswith(b"POST "): break
+                                headers=dict(line.lower().split(b":",1) for line in lines[1:])
+                                body=bytearray()
+                                if b"transfer-encoding" in headers:
+                                    self.assertEqual(headers[b"transfer-encoding"].strip(),b"chunked")
+                                    self.assertNotIn(b"content-length",headers); streamed+=1
+                                    while True:
+                                        end=wire.index(b"\r\n",offset); size=int(wire[offset:end],16); offset=end+2
+                                        if not size:
+                                            self.assertEqual(wire[offset:offset+2],b"\r\n"); offset+=2; break
+                                        body.extend(wire[offset:offset+size]); offset+=size
+                                        self.assertEqual(wire[offset:offset+2],b"\r\n"); offset+=2
+                                else:
+                                    size=int(headers[b"content-length"]); body.extend(wire[offset:offset+size]); offset+=size
+                                self.assertLessEqual(len(body),1000000)
+                                path=lines[0].split()[1].split(b"?",1)[0].rstrip(b"/")
+                                packets.append((int(path.rsplit(b"/",1)[1]),bytes(body)))
+                        packets.sort()
+                        self.assertGreater(streamed,0)
+                        self.assertEqual([sequence for sequence,_ in packets],list(range(len(packets))))
+                        self.assertTrue(b"".join(body for _,body in packets).endswith(b"vless-core warmup"+payload))
+
     def test_xhttp_custom_headers_and_grpc_policy(self):
         for mode in ("stream-one","stream-up","packet-up"):
             for no_grpc in (False,True):

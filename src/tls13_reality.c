@@ -67,6 +67,7 @@ typedef struct {
     size_t limit;
     size_t *handshake_bytes;
     int tls_budget;
+    core_buffer_budget_t *memory;
 } dynbuf_t;
 
 static pthread_mutex_t tls_buffer_lock=PTHREAD_MUTEX_INITIALIZER;
@@ -168,6 +169,7 @@ struct tls13_conn {
     core_xmux_stream_t *xmux_stream;
     struct tls13_conn *xmux_owner;
     int xmux_physical, xmux_async;
+    core_buffer_budget_t *input_memory, *output_memory;
     int relay_async,relay_raw_finish;
     dynbuf_t xmux_raw_input, xmux_plain_output, xmux_wire_output;
     size_t xmux_ssl_write_length;
@@ -509,7 +511,7 @@ static int db_reserve(dynbuf_t *b, size_t n) {
         if (b->handshake_bytes) *b->handshake_bytes+=retained;
         pthread_mutex_unlock(&tls_buffer_lock);
     }
-    uint8_t *tmp = b->tls_budget ? malloc(nc) : realloc(b->data,nc);
+    uint8_t *tmp = b->tls_budget ? malloc(nc) : b->memory ? core_buffer_realloc(b->memory,b->data,b->cap,nc) : realloc(b->data,nc);
     if (tmp == NULL) {
         if (b->tls_budget) {
             pthread_mutex_lock(&tls_buffer_lock); tls_buffer_bytes-=increase;
@@ -550,6 +552,9 @@ static int relay_write_wire(tls13_conn_t *c, const void *data, size_t length) {
 static void db_consume(dynbuf_t *b, size_t n) {
     if (n >= b->len) {
         b->len = 0;
+        if (b->memory && b->cap > 65536) {
+            core_buffer_free(b->memory,b->data,b->cap); b->data=NULL; b->cap=0;
+        }
         return;
     }
     memmove(b->data, b->data + n, b->len - n);
@@ -564,7 +569,8 @@ static void db_free(dynbuf_t *b) {
         if (b->data) OPENSSL_cleanse(b->data,b->cap);
     }
     if (b->data != NULL) {
-        free(b->data);
+        if (b->memory) core_buffer_free(b->memory,b->data,b->cap);
+        else free(b->data);
     }
     memset(b, 0, sizeof(*b));
 }
@@ -2672,18 +2678,22 @@ static const char xhttp_user_agent[]="Mozilla/5.0 (Windows NT 10.0; Win64; x64) 
 
 static int xhttp_packet_headers(tls13_conn_t *connection, const char *sequence, const uint8_t *data, size_t length, uint32_t header_limit,
                                 char path[2048], core_xhttp_payload_t *packet, char *error, size_t capacity) {
-    char *prefix=malloc(65537);
+    char *prefix=connection->output_memory ? core_buffer_alloc(connection->output_memory,65537) : malloc(65537);
     if (!prefix) { set_err(error,capacity,"XHTTP metadata allocation failed"); return -1; }
-    if (xhttp_prepare_request(connection,sequence,path,2048,prefix,65537) != 0) { free(prefix); set_err(error,capacity,"failed to build XHTTP packet metadata"); return -1; }
+    if (xhttp_prepare_request(connection,sequence,path,2048,prefix,65537) != 0) {
+        if (connection->output_memory) core_buffer_free(connection->output_memory,prefix,65537); else free(prefix);
+        set_err(error,capacity,"failed to build XHTTP packet metadata"); return -1;
+    }
     size_t reserve=strlen(path)+strlen(connection->xhttp_host)+strlen(connection->xhttp_uplink_method)+5;
     reserve+=strlen(":method:scheme:authority:path")+4*32;
     reserve+=strlen("user-agent")+strlen(xhttp_user_agent)+32;
     reserve+=strlen("accept")+3+32+strlen("cache-control")+8+32+strlen("pragma")+8+32;
     reserve+=strlen("content-length")+20+32;
     size_t budget=header_limit > reserve ? (size_t)header_limit-reserve : 0;
-    core_xhttp_payload_options_t options={.placement=connection->xhttp_uplink_data_placement,.key=connection->xhttp_uplink_data_key,.chunks=connection->xhttp_uplink_chunks};
+    core_xhttp_payload_options_t options={.placement=connection->xhttp_uplink_data_placement,.key=connection->xhttp_uplink_data_key,.chunks=connection->xhttp_uplink_chunks,.memory=connection->output_memory};
     int result=core_xhttp_payload_build(&options,data,length,prefix,budget,packet,error,capacity);
-    free(prefix); return result;
+    if (connection->output_memory) core_buffer_free(connection->output_memory,prefix,65537); else free(prefix);
+    return result;
 }
 
 static int h2_append_regular_header(dynbuf_t *block, const char *name, size_t name_len, const char *value, size_t value_len) {
@@ -2715,10 +2725,12 @@ static int h2_append_regular_header(dynbuf_t *block, const char *name, size_t na
         strcmp(lname, "transfer-encoding") == 0 || strcmp(lname, "upgrade") == 0) {
         return 0;
     }
-    char *text=malloc(value_len+1);
+    char *text=block->memory ? core_buffer_alloc(block->memory,value_len+1) : malloc(value_len+1);
     if (!text) return -1;
     memcpy(text,value,value_len); text[value_len]=0;
-    int result=hpack_append_literal_new_name(block,lname,text); free(text); return result;
+    int result=hpack_append_literal_new_name(block,lname,text);
+    if (block->memory) core_buffer_free(block->memory,text,value_len+1); else free(text);
+    return result;
 }
 
 static int h2_append_http1_header_lines(dynbuf_t *block, const char *headers, int omit_content_type) {
@@ -2746,7 +2758,7 @@ static int h2_append_http1_header_lines(dynbuf_t *block, const char *headers, in
 static int h2_send_xhttp_request_headers(tls13_conn_t *c, uint32_t stream_id, const char *method, const char *path,
                                          const char *extra_headers, size_t content_len, int has_body, int streaming_body, char *err,
                                          size_t err_cap) {
-    dynbuf_t block = {0};
+    dynbuf_t block = {.limit=1024U*1024U,.memory=c->output_memory};
     int rc = 0;
 
     if (strcmp(method, "GET") == 0) {
@@ -2779,9 +2791,9 @@ static int h2_send_xhttp_request_headers(tls13_conn_t *c, uint32_t stream_id, co
         rc = hpack_append_literal_new_name(&block, "pragma", "no-cache");
     }
     if (rc == 0 && extra_headers != NULL && extra_headers[0] != '\0') {
-        rc = h2_append_http1_header_lines(&block, extra_headers,has_body && streaming_body && !c->xhttp_no_grpc_header);
+        rc = h2_append_http1_header_lines(&block, extra_headers,has_body && streaming_body == 1 && !c->xhttp_no_grpc_header);
     }
-    if (rc == 0 && has_body && streaming_body && !c->xhttp_no_grpc_header) {
+    if (rc == 0 && has_body && streaming_body == 1 && !c->xhttp_no_grpc_header) {
         rc = hpack_append_literal_new_name(&block, "content-type", "application/grpc");
     }
     if (rc == 0 && has_body && !streaming_body) {
@@ -2976,12 +2988,12 @@ static int xhttp_h2_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *len
     uint32_t stream_id = c->h2_next_stream_id;
     c->h2_next_stream_id += 2;
     h2_response_entry_t *entry=h2_response_get(c,stream_id,1);
-    if (!entry) { free(packet.headers); set_err(err,err_cap,"failed to allocate h2 response state"); return -1; }
+    if (!entry) { core_xhttp_payload_clear(&packet); set_err(err,err_cap,"failed to allocate h2 response state"); return -1; }
     entry->request_ended=!packet.body_size;
     const char *method = c->xhttp_uplink_method;
     int result=h2_send_xhttp_request_headers(c,stream_id,method,request_path,packet.headers,packet.body_size,packet.body_size != 0,0,err,err_cap);
     if (!result && packet.body_size) result=h2_send_xhttp_body(c,stream_id,buf,packet.body_size,err,err_cap);
-    free(packet.headers); return result;
+    core_xhttp_payload_clear(&packet); return result;
 }
 
 static int xhttp_h2_start_mode(tls13_conn_t *c, char *err, size_t err_cap) {
@@ -3084,7 +3096,7 @@ static int h2_send_grpc_request_headers(tls13_conn_t *c, char *err, size_t err_c
         return -1;
     }
 
-    dynbuf_t block = {0};
+    dynbuf_t block = {.limit=1024U*1024U,.memory=c->output_memory};
     int rc = hpack_append_indexed(&block, 3);
     if (rc == 0) {
         rc = hpack_append_indexed(&block, c->mode == CONN_MODE_GRPC_PLAIN ? 6 : 7);
@@ -3160,19 +3172,21 @@ static int xhttp_http1_headers(tls13_conn_t *connection, const char *method, con
                                const char *keep_alive, dynbuf_t *request) {
     char line[4096]; int size=snprintf(line,sizeof(line),"%s %s HTTP/1.1\r\nHost: %s\r\n",method,path,connection->xhttp_host);
     if (size < 0 || (size_t)size >= sizeof(line) || db_append(request,line,(size_t)size) != 0) return -1;
-    size_t capacity=strlen(source)+1024; char *headers=malloc(capacity);
+    size_t capacity=strlen(source)+1024;
+    char *headers=request->memory ? core_buffer_alloc(request->memory,capacity) : malloc(capacity);
     if (!headers) return -1;
     memcpy(headers,source,strlen(source)+1); int result=0;
     if (!core_http_header_get(headers,"User-Agent",NULL)) result=core_http_header_set(headers,capacity,"User-Agent","vless-core/1.0");
     if (!result && !core_http_header_get(headers,"Accept",NULL)) result=core_http_header_set(headers,capacity,"Accept","*/*");
     if (!result && body_mode == 2 && !connection->xhttp_no_grpc_header) result=core_http_header_set(headers,capacity,"Content-Type","application/grpc");
-    if (!result && body_mode == 1 && !core_http_header_get(headers,"Content-Type",NULL)) result=core_http_header_set(headers,capacity,"Content-Type","application/octet-stream");
-    if (!result && body_mode == 2) result=core_http_header_set(headers,capacity,"Transfer-Encoding","chunked");
+    if (!result && (body_mode == 1 || body_mode == 3) && !core_http_header_get(headers,"Content-Type",NULL)) result=core_http_header_set(headers,capacity,"Content-Type","application/octet-stream");
+    if (!result && (body_mode == 2 || body_mode == 3)) result=core_http_header_set(headers,capacity,"Transfer-Encoding","chunked");
     if (!result && body_mode == 1) { snprintf(line,sizeof(line),"%zu",body_size); result=core_http_header_set(headers,capacity,"Content-Length",line); }
     if (!result) result=core_http_header_set(headers,capacity,"Connection",keep_alive);
     if (!result) result=db_append(request,headers,strlen(headers));
     if (!result) result=db_append(request,"\r\n",2);
-    free(headers); return result;
+    if (request->memory) core_buffer_free(request->memory,headers,capacity); else free(headers);
+    return result;
 }
 
 static int xhttp_send_plain_stream_request(tls13_conn_t *c, int fd, char *err, size_t err_cap) {
@@ -3276,7 +3290,7 @@ static int xhttp_post_packet_plain(tls13_conn_t *c, const uint8_t *buf, size_t *
 
     dynbuf_t request={0};
     if (xhttp_http1_packet_request(c,request_path,packet.headers,packet.body_size,"close",&request) != 0) {
-        free(packet.headers); db_free(&request);
+        core_xhttp_payload_clear(&packet); db_free(&request);
         close(fd);
         set_err(err, err_cap, "xhttp POST request too large");
         return -1;
@@ -3290,7 +3304,7 @@ static int xhttp_post_packet_plain(tls13_conn_t *c, const uint8_t *buf, size_t *
         rc=xhttp_read_http1_response(NULL,fd,err,err_cap);
     }
 
-    free(packet.headers); db_free(&request); close(fd);
+    core_xhttp_payload_clear(&packet); db_free(&request); close(fd);
     return rc;
 }
 
@@ -3347,7 +3361,7 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length
 
     dynbuf_t request={0};
     if (xhttp_http1_packet_request(c,request_path,packet.headers,packet.body_size,"close",&request) != 0) {
-        free(packet.headers); db_free(&request);
+        core_xhttp_payload_clear(&packet); db_free(&request);
         SSL_shutdown(ssl);
         SSL_free(ssl);
         SSL_CTX_free(ctx);
@@ -3364,7 +3378,7 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length
         rc=xhttp_read_http1_response(ssl,fd,err,err_cap);
     }
 
-    free(packet.headers); db_free(&request);
+    core_xhttp_payload_clear(&packet); db_free(&request);
     SSL_shutdown(ssl);
     SSL_free(ssl);
     SSL_CTX_free(ctx);
@@ -6323,7 +6337,8 @@ static int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, s
     return 0;
 }
 
-int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *err, size_t err_cap) {
+static int tls13_connect_budgeted(const vless_config_t *cfg, tls13_conn_t **out, char *err, size_t err_cap,
+                                  core_buffer_budget_t *output_memory, core_buffer_budget_t *input_memory) {
     *out = NULL;
     tls13_conn_t *c = (tls13_conn_t *)calloc(1, sizeof(*c));
     if (c == NULL) {
@@ -6334,6 +6349,17 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
     c->ignore_server_ips=cfg->ignore_server_ips;
     c->xhttp_upload_fd = -1;
     c->mode = CONN_MODE_REALITY;
+    c->input_memory=input_memory; c->output_memory=output_memory;
+    c->hpack.memory=input_memory;
+    if (cfg->xhttp_physical_only || cfg->grpc_physical_only) {
+        c->h2_net_cache=(dynbuf_t){.limit=65536,.memory=input_memory};
+        c->xmux_raw_input=(dynbuf_t){.limit=65536,.memory=input_memory};
+        c->h2_header_block=(dynbuf_t){.limit=1024U*1024U,.memory=input_memory};
+        c->app_cache.memory=input_memory; c->app_cache.limit=65536;
+        c->xmux_plain_output=(dynbuf_t){.limit=256U*1024U,.memory=output_memory};
+        c->xmux_wire_output=(dynbuf_t){.limit=32768,.memory=output_memory};
+        c->h2_send_buf=(dynbuf_t){.limit=1024U*1024U,.memory=output_memory};
+    }
 
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
         if (!cfg->xhttp_physical_only) {
@@ -6404,6 +6430,10 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
 
     *out = c;
     return 0;
+}
+
+int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *err, size_t err_cap) {
+    return tls13_connect_budgeted(cfg,out,err,err_cap,NULL,NULL);
 }
 
 void tls13_reality_close(tls13_conn_t *c) {
@@ -6782,12 +6812,13 @@ int tls13_finish_write(tls13_conn_t *c, int raw) {
     return result;
 }
 
-static int xmux_transport_open(const vless_config_t *config, void **output, int *http2, char *error, size_t capacity) {
+static int xmux_transport_open_budgeted(const vless_config_t *config, void **output, int *http2, char *error, size_t capacity,
+                                       core_buffer_budget_t *upload, core_buffer_budget_t *download) {
     vless_config_t physical_config=*config;
     physical_config.xmux.present=0; physical_config.xhttp_physical_only=1;
     physical_config.grpc_physical_only=config->transport_mode == TRANSPORT_GRPC;
     tls13_conn_t *connection=NULL;
-    if (tls13_reality_connect(&physical_config,&connection,error,capacity) != 0) return -1;
+    if (tls13_connect_budgeted(&physical_config,&connection,error,capacity,upload,download) != 0) return -1;
     *output=connection; *http2=tls13_uses_h2(connection);
     if (!*http2) connection->h2_next_stream_id=3;
     int flags=fcntl(connection->fd,F_GETFL,0);
@@ -6795,6 +6826,10 @@ static int xmux_transport_open(const vless_config_t *config, void **output, int 
     if (connection->ssl) SSL_set_mode(connection->ssl,SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER|SSL_MODE_ENABLE_PARTIAL_WRITE);
     connection->xmux_async=1;
     return 0;
+}
+
+static int xmux_transport_open(const vless_config_t *config, void **output, int *http2, char *error, size_t capacity) {
+    return xmux_transport_open_budgeted(config,output,http2,error,capacity,NULL,NULL);
 }
 
 static void xmux_transport_close(void *opaque) { tls13_reality_close(opaque); }
@@ -6820,13 +6855,14 @@ static int xmux_transport_send_frame(void *opaque, uint8_t type, uint8_t flags, 
     if (type != 0 || stream != connection->xmux_http1_id || connection->xmux_plain_output.len+length+32 > 256U*1024U) return -1;
     size_t before=connection->xmux_plain_output.len;
     int result=0;
-    if (connection->xmux_http1_role == 1 || connection->xmux_http1_role == 2) {
+    if (connection->xmux_http1_role == 1 || connection->xmux_http1_role == 2 || connection->xmux_http1_role == 4) {
         char chunk[32]; int size=snprintf(chunk,sizeof(chunk),"%zx\r\n",length);
         if (size < 0 || (size_t)size >= sizeof(chunk)) return -1;
         result=db_append(&connection->xmux_plain_output,chunk,(size_t)size);
     }
     if (!result) result=db_append(&connection->xmux_plain_output,data,length);
-    if (!result && (connection->xmux_http1_role == 1 || connection->xmux_http1_role == 2)) result=db_append(&connection->xmux_plain_output,"\r\n",2);
+    if (!result && (connection->xmux_http1_role == 1 || connection->xmux_http1_role == 2 || connection->xmux_http1_role == 4)) result=db_append(&connection->xmux_plain_output,"\r\n",2);
+    if (!result && connection->xmux_http1_role == 4 && length && (flags&1)) result=db_append(&connection->xmux_plain_output,"0\r\n\r\n",5);
     if (!result) connection->xmux_enqueued+=connection->xmux_plain_output.len-before;
     return result;
 }
@@ -6857,9 +6893,15 @@ static int xmux_transport_flush(void *opaque) {
         if (connection->tls_send_record_limit && limit >= connection->tls_send_record_limit) limit=connection->tls_send_record_limit-1;
         size_t length=connection->xmux_plain_output.len < limit ? connection->xmux_plain_output.len : limit;
         uint8_t *record=NULL; size_t record_length=0;
+        size_t temporary=2*(length+22);
+        if (connection->output_memory && core_buffer_hold(connection->output_memory,temporary)) return -1;
         if (encrypt_record(connection,connection->c_app_key,connection->c_app_iv,&connection->c_app_seq,0x17,
-                           connection->xmux_plain_output.data,length,&record,&record_length) != 0) return -1;
+                           connection->xmux_plain_output.data,length,&record,&record_length) != 0) {
+            if (connection->output_memory) core_buffer_drop(connection->output_memory,temporary);
+            return -1;
+        }
         int result=db_append(&connection->xmux_wire_output,record,record_length); free(record);
+        if (connection->output_memory) core_buffer_drop(connection->output_memory,temporary);
         if (result != 0) return -1;
         connection->xmux_wire_plain_length=length;
         db_consume(&connection->xmux_plain_output,length);
@@ -6877,6 +6919,7 @@ static int xmux_transport_flush(void *opaque) {
 
 static int xmux_transport_collect(void *opaque) {
     tls13_conn_t *connection=opaque;
+    if (tls13_uses_h2(connection) && h2_cached_frame_ready(connection)) return 1;
     if (connection->mode == CONN_MODE_GRPC_PLAIN) {
         if (h2_cached_frame_ready(connection)) return 1;
         uint8_t input[8192];
@@ -6887,9 +6930,11 @@ static int xmux_transport_collect(void *opaque) {
     if (!tls13_uses_h2(connection)) {
         if (connection->h2_net_cache.len >= 65536 || connection->xmux_http1_eof) return 0;
         uint8_t data[16384]; int size;
+        size_t capacity=65536-connection->h2_net_cache.len;
+        if (capacity > sizeof(data)) capacity=sizeof(data);
         if (connection->ssl) {
             ERR_clear_error();
-            size=SSL_read(connection->ssl,data,sizeof(data));
+            size=SSL_read(connection->ssl,data,(int)capacity);
             if (size <= 0) {
                 int error=SSL_get_error(connection->ssl,size);
                 connection->xmux_read_wants_write=error == SSL_ERROR_WANT_WRITE;
@@ -6902,7 +6947,7 @@ static int xmux_transport_collect(void *opaque) {
                 }
             }
         } else {
-            size=(int)core_recv(connection->fd,data,sizeof(data),MSG_DONTWAIT);
+            size=(int)core_recv(connection->fd,data,capacity,MSG_DONTWAIT);
             if (size < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
         }
         if (size > 0) return db_append(&connection->h2_net_cache,data,(size_t)size);
@@ -6918,10 +6963,16 @@ static int xmux_transport_collect(void *opaque) {
             if (connection->xmux_raw_input.len < length+5) break;
             if (record[0] == 0x17) {
                 uint8_t *plain=NULL,inner=0; size_t plain_length=0;
+                size_t temporary=2U*16640U;
+                if (connection->input_memory && core_buffer_hold(connection->input_memory,temporary)) return -1;
                 if (decrypt_record(connection,connection->s_app_key,connection->s_app_iv,&connection->s_app_seq,record[0],record+5,length,
-                                   &plain,&plain_length,&inner) != 0) return -1;
+                                   &plain,&plain_length,&inner) != 0) {
+                    if (connection->input_memory) core_buffer_drop(connection->input_memory,temporary);
+                    return -1;
+                }
                 int result=tls_application_plain(connection,inner,plain,plain_length,&connection->h2_net_cache);
-                free(plain); if (result != 0) return -1;
+                free(plain); if (connection->input_memory) core_buffer_drop(connection->input_memory,temporary);
+                if (result != 0) return -1;
             }
             db_consume(&connection->xmux_raw_input,length+5);
             if (h2_cached_frame_ready(connection)) return 1;
@@ -6951,8 +7002,9 @@ static int xmux_transport_read_frame(void *opaque, core_xmux_frame_t *frame, siz
             frame->event=event.kind; frame->status=event.status; frame->close_connection=event.close_connection;
             frame->id=connection->xmux_http1_id; frame->length=event.length;
             if (event.length) {
+                if (connection->input_memory && core_buffer_hold(connection->input_memory,event.length)) return -1;
                 frame->data=malloc(event.length);
-                if (!frame->data) return -1;
+                if (!frame->data) { if (connection->input_memory) core_buffer_drop(connection->input_memory,event.length); return -1; }
                 memcpy(frame->data,connection->h2_net_cache.data+event.offset,event.length);
             }
             if (event.kind == 3) connection->xmux_http1_id=0;
@@ -6966,14 +7018,24 @@ static int xmux_transport_read_frame(void *opaque, core_xmux_frame_t *frame, siz
         size_t length=((size_t)connection->h2_net_cache.data[0]<<16)|((size_t)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2];
         if (length > capacity) return 1;
     }
-    return h2_read_frame(connection,&frame->type,&frame->flags,&frame->id,&frame->data,&frame->length);
+    size_t length=((size_t)connection->h2_net_cache.data[0]<<16)|((size_t)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2];
+    if (connection->input_memory && core_buffer_hold(connection->input_memory,length)) return -1;
+    int result=h2_read_frame(connection,&frame->type,&frame->flags,&frame->id,&frame->data,&frame->length);
+    if (result && connection->input_memory) core_buffer_drop(connection->input_memory,length);
+    return result;
+}
+
+static void xmux_transport_release_frame(void *opaque, core_http2_frame_t *frame) {
+    tls13_conn_t *connection=opaque;
+    free(frame->data);
+    if (connection->input_memory && frame->length) core_buffer_drop(connection->input_memory,frame->length);
 }
 
 static int xmux_transport_request(void *opaque, const vless_config_t *config, const char *session, uint64_t sequence,
                                   int role, const uint8_t *data, size_t length, uint32_t *id, uint32_t header_limit, size_t *consumed, size_t *body_size) {
     tls13_conn_t *physical=opaque;
     tls13_conn_t request=*physical;
-    request.h2_send_buf=(dynbuf_t){0}; request.xmux_owner=physical;
+    request.h2_send_buf=(dynbuf_t){.limit=1024U*1024U,.memory=physical->output_memory}; request.xmux_owner=physical;
     if (config->transport_mode == TRANSPORT_GRPC) {
         if (role != 1 || physical->h2_next_stream_id > 0x7ffffffdU) return -1;
         *id=request.h2_stream_id=physical->h2_next_stream_id; physical->h2_next_stream_id+=2;
@@ -6988,34 +7050,37 @@ static int xmux_transport_request(void *opaque, const vless_config_t *config, co
     char path[2048],headers[16384],seq[32];
     snprintf(seq,sizeof(seq),"%llu",(unsigned long long)sequence);
     core_xhttp_payload_t packet={0};
-    if (role == 3) {
+    if (role == 3 || role == 4) {
         if (xhttp_packet_headers(&request,seq,data,length,header_limit,path,&packet,error,sizeof(error)) != 0) { vc_log_warning("xhttp","%s",error); return -1; }
         *consumed=packet.consumed; *body_size=packet.body_size;
+        if (role == 4) { *consumed=0; *body_size=SIZE_MAX; }
     } else if (xhttp_prepare_request(&request,"",path,sizeof(path),headers,sizeof(headers)) != 0) return -1;
-    if (physical->h2_next_stream_id > 0x7ffffffdU) { free(packet.headers); return -1; }
+    if (physical->h2_next_stream_id > 0x7ffffffdU) { core_xhttp_payload_clear(&packet); return -1; }
     *id=physical->h2_next_stream_id; physical->h2_next_stream_id+=2;
     const char *method=role == 0 ? "GET" : request.xhttp_uplink_method;
     if (!tls13_uses_h2(physical)) {
-        if (physical->xmux_http1_id || physical->h2_net_cache.len || physical->xmux_http1_eof) { free(packet.headers); return -1; }
-        if (role == 3) {
-            dynbuf_t message={0};
-            int result=xhttp_http1_packet_request(&request,path,packet.headers,packet.body_size,config->xmux.present ? "keep-alive" : "close",&message);
+        if (physical->xmux_http1_id || physical->h2_net_cache.len || physical->xmux_http1_eof) { core_xhttp_payload_clear(&packet); return -1; }
+        if (role == 3 || role == 4) {
+            dynbuf_t message={.limit=256U*1024U,.memory=physical->output_memory};
+            int result=role == 4 ? xhttp_http1_headers(&request,method,path,packet.headers,3,0,config->xmux.present ? "keep-alive" : "close",&message) :
+                xhttp_http1_packet_request(&request,path,packet.headers,packet.body_size,config->xmux.present ? "keep-alive" : "close",&message);
             if (!result) { result=db_append(&physical->xmux_plain_output,message.data,message.len); if (!result) physical->xmux_enqueued+=message.len; }
-            db_free(&message); free(packet.headers);
+            db_free(&message); core_xhttp_payload_clear(&packet);
             if (result) return -1;
             physical->xmux_http1_response=(core_http1_response_t){0};
             physical->xmux_http1_id=*id; physical->xmux_http1_role=role; return 0;
         }
-        dynbuf_t message={0};
+        dynbuf_t message={.limit=256U*1024U,.memory=physical->output_memory};
         int result=xhttp_http1_headers(&request,method,path,headers,role == 0 ? 0 : 2,0,role == 0 ? "keep-alive" : "close",&message);
         if (!result) { result=db_append(&physical->xmux_plain_output,message.data,message.len); if (!result) physical->xmux_enqueued+=message.len; }
         db_free(&message); if (result) return -1;
         physical->xmux_http1_response=(core_http1_response_t){0};
         physical->xmux_http1_id=*id; physical->xmux_http1_role=role; return 0;
     }
-    int has_body=role == 3 ? packet.body_size != 0 : role != 0;
-    int result=h2_send_xhttp_request_headers(&request,*id,method,path,role == 3 ? packet.headers : headers,role == 3 ? packet.body_size : length,has_body,role != 0 && role != 3,error,sizeof(error));
-    free(packet.headers); db_free(&request.h2_send_buf); return result;
+    int has_body=role == 4 || (role == 3 ? packet.body_size != 0 : role != 0);
+    int streaming=role == 4 ? 2 : role != 0 && role != 3;
+    int result=h2_send_xhttp_request_headers(&request,*id,method,path,role == 3 || role == 4 ? packet.headers : headers,role == 3 ? packet.body_size : length,has_body,streaming,error,sizeof(error));
+    core_xhttp_payload_clear(&packet); db_free(&request.h2_send_buf); return result;
 }
 
 static int xmux_transport_session(const vless_config_t *config, char *session, size_t capacity) {
@@ -7026,6 +7091,7 @@ static int xmux_transport_session(const vless_config_t *config, char *session, s
 
 static const core_xmux_backend_t xmux_backend={
     .open=xmux_transport_open,.close=xmux_transport_close,.fd=xmux_transport_fd,.events=xmux_transport_events,.collect=xmux_transport_collect,
+    .open_budgeted=xmux_transport_open_budgeted,.release_frame=xmux_transport_release_frame,
     .read_frame=xmux_transport_read_frame,.send_frame=xmux_transport_send_frame,.flush=xmux_transport_flush,
     .pending=xmux_transport_pending,.enqueued=xmux_transport_enqueued,.flushed=xmux_transport_flushed,.request=xmux_transport_request,.session=xmux_transport_session,
 };

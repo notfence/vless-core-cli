@@ -8,6 +8,7 @@
 #include "socket_util.h"
 #include "hpack.h"
 #include "http2.h"
+#include "http2_queue.h"
 #include "grpc.h"
 #include "core_log.h"
 #include "server_ips.h"
@@ -28,8 +29,10 @@
 #define XMUX_TOTAL_LIMIT (16U*1024U*1024U)
 #define XMUX_TX_RESERVE (64U*1024U)
 #define XMUX_CANCEL_DRAIN_MS 2000U
+#define XMUX_PACKET_IDLE_MS 8U
+#define XMUX_PACKET_AGE_MS 100U
 
-typedef struct { uint8_t *data; size_t start, length, capacity; } mux_queue_t;
+typedef core_http2_queue_t mux_queue_t;
 typedef struct mux_actor mux_actor_t;
 typedef struct mux_manager mux_manager_t;
 typedef struct mux_group mux_group_t;
@@ -41,6 +44,7 @@ typedef struct mux_request {
     core_http2_response_t response;
     int64_t send_window, receive_window;
     size_t remaining;
+    uint64_t packet_idle_ms,packet_until_ms;
 } mux_request_t;
 
 struct core_http2_stream {
@@ -55,9 +59,11 @@ struct core_http2_stream {
     mux_queue_t tx, rx;
     uint32_t down_id, up_id;
     size_t consumed, reserved_upload;
+    size_t permanent_upload;
     int notify[2], notified, ready, failed, eof, closed, references;
     int first_actor;
     mux_manager_t *waiting_manager;
+    mux_manager_t *waiting_download;
     int finish_requested, finish_sent, relay_async;
     uint64_t finish_fence;
     core_connection_trace_t trace;
@@ -86,6 +92,7 @@ struct mux_actor {
     int64_t send_window, receive_window;
     uint32_t peer_window, peer_frame, peer_concurrency, peer_header_limit;
     size_t net_accounted;
+    core_buffer_budget_t input_memory, output_memory;
     uint64_t enqueued, flushed;
     uint64_t idle_pending_ms;
     char error[160];
@@ -113,6 +120,13 @@ static mux_manager_t *managers;
 static core_http2_stream_t *streams;
 static size_t upload_bytes, download_bytes, actor_count, stream_count;
 static void signal_stream(core_http2_stream_t *stream);
+static int update_upload_budget(core_http2_stream_t *stream);
+static size_t last_upload_room=CORE_BUFFER_TOTAL_LIMIT;
+
+static void wake_admission(void) {
+    for (core_http2_stream_t *stream=streams;stream;stream=stream->next)
+        if (stream->waiting_manager) signal_stream(stream);
+}
 
 static int grpc_manager(const mux_manager_t *manager) { return manager->config.transport_mode == TRANSPORT_GRPC; }
 
@@ -159,24 +173,11 @@ static int random_range(core_range_t range) {
 }
 
 static int queue_append(mux_queue_t *queue, const uint8_t *data, size_t length, size_t limit) {
-    if (length > limit-queue->length) return -1;
-    if (queue->start+queue->length+length > queue->capacity) {
-        if (queue->start) { memmove(queue->data,queue->data+queue->start,queue->length); queue->start=0; }
-        if (queue->length+length > queue->capacity) {
-            size_t capacity=queue->capacity ? queue->capacity : 4096;
-            while (capacity < queue->length+length && capacity < limit) capacity=capacity > limit/2 ? limit : capacity*2;
-            uint8_t *replacement=realloc(queue->data,capacity);
-            if (!replacement) return -1;
-            queue->data=replacement; queue->capacity=capacity;
-        }
-    }
-    if (length) memcpy(queue->data+queue->start+queue->length,data,length);
-    queue->length+=length; return 0;
+    return core_http2_queue_append(queue,data,length,limit);
 }
 
 static void queue_consume(mux_queue_t *queue, size_t length) {
-    queue->length-=length; queue->start+=length;
-    if (!queue->length) queue->start=0;
+    core_http2_queue_consume(queue,length);
 }
 
 static int notification_pair(int pair[2]) {
@@ -203,9 +204,14 @@ static void signal_stream(core_http2_stream_t *stream) {
 
 static void notify_write_capacity(size_t previous) {
     size_t boundary=XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE;
+    size_t room=core_buffer_available(CORE_BUFFER_UPLOAD);
+    size_t threshold=core_http2_queue_reservation(128U*1024U);
+    if (room < threshold) { core_http2_queue_cache_clear(); room=core_buffer_available(CORE_BUFFER_UPLOAD); }
     if ((previous >= boundary && upload_bytes < boundary) ||
-        (previous > boundary-128U*1024U && upload_bytes <= boundary-128U*1024U))
+        (previous > boundary-128U*1024U && upload_bytes <= boundary-128U*1024U) ||
+        (last_upload_room < threshold && room >= threshold))
         for (core_http2_stream_t *stream=streams;stream;stream=stream->next) signal_stream(stream);
+    last_upload_room=room;
 }
 
 static void fail_stream(core_http2_stream_t *stream, const char *error) {
@@ -224,7 +230,8 @@ static void release_stream(core_http2_stream_t *stream) {
     size_t previous=upload_bytes;
     upload_bytes-=stream->tx.length+stream->reserved_upload; download_bytes-=stream->rx.length;
     notify_write_capacity(previous);
-    free(stream->tx.data); free(stream->rx.data); free(stream); stream_count--;
+    core_http2_queue_clear(&stream->tx); core_http2_queue_clear(&stream->rx); free(stream); stream_count--;
+    wake_admission();
 }
 
 static void account_output(mux_actor_t *actor) {
@@ -265,19 +272,37 @@ static int request_active(mux_actor_t *actor) {
     return count;
 }
 
+static int packet_role(int role) { return role == 3 || role == 4; }
+
 static int start_request(mux_actor_t *actor, core_http2_stream_t *stream, int role, size_t payload) {
     if ((unsigned)request_active(actor) >= actor->peer_concurrency || upload_bytes > XMUX_TOTAL_LIMIT-65536 || actor->net_accounted >= 64U*1024U) return 1;
+    size_t minimum=actor->output_memory.minimum;
+    if (actor->manager->backend->open_budgeted && core_buffer_budget_init(&actor->output_memory,CORE_BUFFER_UPLOAD,CORE_BUFFER_REQUEST_RESERVE)) return 1;
     mux_request_t *request=calloc(1,sizeof(*request));
-    if (!request) return -1;
+    if (!request) { core_buffer_budget_init(&actor->output_memory,CORE_BUFFER_UPLOAD,minimum); return -1; }
+    if (role == 3 && strcmp(stream->config.xhttp_uplink_data_placement,"body") && strcmp(stream->config.xhttp_uplink_data_placement,"auto") &&
+        stream->config.xhttp_uplink_data_placement[0] && payload > 49152) payload=49152;
+    uint8_t *copy=NULL;
     const uint8_t *data=payload ? stream->tx.data+stream->tx.start : NULL;
+    if (payload > core_http2_queue_span(&stream->tx)) {
+        copy=core_buffer_alloc(&actor->output_memory,payload);
+        if (!copy) { free(request); core_buffer_budget_init(&actor->output_memory,CORE_BUFFER_UPLOAD,minimum); return -1; }
+        core_http2_queue_copy(&stream->tx,copy,payload); data=copy;
+    }
     size_t consumed=payload,body=payload;
     const vless_config_t *config=role == 0 ? &actor->manager->config : &stream->config;
     int result=actor->manager->backend->request(actor->physical,config,stream->session,stream->sequence,role,data,payload,&request->id,actor->peer_header_limit,&consumed,&body);
-    if (!result && (consumed > payload || (payload && !consumed) || (body && body != consumed))) result=-1;
-    if (!result && role == 3 && !body) { queue_consume(&stream->tx,consumed); upload_bytes-=consumed; }
+    core_buffer_free(&actor->output_memory,copy,payload);
+    core_buffer_budget_init(&actor->output_memory,CORE_BUFFER_UPLOAD,minimum);
+    if (!result && (role == 4 ? consumed || body != SIZE_MAX : consumed > payload || (payload && !consumed) || (body && body != consumed))) result=-1;
+    if (!result && role == 3 && !body) {
+        size_t previous=upload_bytes;
+        queue_consume(&stream->tx,consumed); upload_bytes-=consumed; update_upload_budget(stream); notify_write_capacity(previous);
+    }
     account_output(actor);
     if (result) { free(request); return -1; }
-    request->stream=stream; request->role=role; request->remaining=body;
+    request->stream=stream; request->role=role; request->remaining=role == 4 ? (size_t)stream->packet_limit : body;
+    if (role == 4) { uint64_t now=core_now_ms(); request->packet_until_ms=now > UINT64_MAX-XMUX_PACKET_AGE_MS ? UINT64_MAX : now+XMUX_PACKET_AGE_MS; }
     request->send_ended=role == 0 || (role == 3 && !body);
     request->send_window=actor->peer_window;
     unsigned initial_window=grpc_manager(actor->manager) ? (unsigned)actor->manager->config.grpc_initial_window : CORE_HTTP2_STREAM_LIMIT;
@@ -306,7 +331,7 @@ static int start_request(mux_actor_t *actor, core_http2_stream_t *stream, int ro
     if (role == 0 || role == 1) stream->download_fence=actor->enqueued;
     if (role == 1 || role == 2) stream->upload_fence=actor->enqueued;
     if (role == 3 && !body) stream->write_fence=actor->enqueued;
-    if (role == 3) { stream->sequence++; stream->last_post_ms=core_now_ms(); stream->next_post_ms=0; }
+    if (packet_role(role)) { stream->sequence++; stream->last_post_ms=core_now_ms(); stream->next_post_ms=0; }
     return 0;
 }
 
@@ -317,11 +342,21 @@ static mux_actor_t *new_actor(mux_group_t *group, int budget, core_http2_stream_
     if (actor_count >= 512) { errno=EAGAIN; return NULL; }
     mux_actor_t *actor=calloc(1,sizeof(*actor));
     if (!actor) return NULL;
+    actor->header_block.memory.direction=CORE_BUFFER_DOWNLOAD;
+    actor->input_memory.direction=CORE_BUFFER_DOWNLOAD;
+    actor->header_block.account=&actor->input_memory;
+    actor->hpack.memory=&actor->input_memory;
+    if (manager->backend->open_budgeted &&
+        (core_buffer_budget_init(&actor->input_memory,CORE_BUFFER_DOWNLOAD,CORE_BUFFER_PROTOCOL_RESERVE) ||
+         core_buffer_budget_init(&actor->output_memory,CORE_BUFFER_UPLOAD,CORE_BUFFER_OUTPUT_RESERVE))) {
+        core_buffer_budget_clear(&actor->input_memory); core_buffer_budget_clear(&actor->output_memory);
+        free(actor); errno=EAGAIN; return NULL;
+    }
     actor->manager=manager; actor->group=group; actor->opening=1; actor->http2=1; actor->connect_until_ms=core_now_ms()+(unsigned)budget;
     actor->send_window=65535; actor->receive_window=65535;
     actor->peer_window=65535; actor->peer_frame=16384; actor->peer_concurrency=UINT32_MAX;
     actor->peer_header_limit=8192;
-    if (notification_pair(actor->wake) != 0) { free(actor); return NULL; }
+    if (notification_pair(actor->wake) != 0) { core_buffer_budget_clear(&actor->input_memory); core_buffer_budget_clear(&actor->output_memory); free(actor); return NULL; }
     actor->alive_period=manager->config.xmux.keep_alive_period;
     if (grpc_manager(manager)) actor->alive_period=manager->config.grpc_idle_timeout;
     else if (!actor->alive_period) actor->alive_period=45;
@@ -335,7 +370,8 @@ static mux_actor_t *new_actor(mux_group_t *group, int budget, core_http2_stream_
     pthread_t thread;
     int status=pthread_create(&thread,NULL,actor_worker,actor);
     if (status != 0) {
-        manager->actors=actor->next; actor_count--; close(actor->wake[0]); close(actor->wake[1]); free(actor); errno=status; return NULL;
+        manager->actors=actor->next; actor_count--; close(actor->wake[0]); close(actor->wake[1]);
+        core_buffer_budget_clear(&actor->input_memory); core_buffer_budget_clear(&actor->output_memory); free(actor); errno=status; return NULL;
     }
     pthread_detach(thread); return actor;
 }
@@ -512,7 +548,8 @@ static int process_frame(mux_actor_t *actor, const core_http2_frame_t *frame) {
         actor->receive_window-=(int64_t)length; request->receive_window-=(int64_t)length;
         core_http2_stream_t *stream=request->stream;
         if ((request->role == 0 || request->role == 1) && !stream->closed) {
-            if (body > XMUX_TOTAL_LIMIT-download_bytes || queue_append(&stream->rx,data+skip,body,XMUX_STREAM_LIMIT) != 0) return -1;
+            if (!stream->rx.memory.charged) stream->rx.memory.direction=CORE_BUFFER_DOWNLOAD;
+            if (body > XMUX_TOTAL_LIMIT-download_bytes || queue_append(&stream->rx,skip ? data+skip : data,body,XMUX_STREAM_LIMIT) != 0) return -1;
             download_bytes+=body; stream->consumed+=length-body; signal_stream(stream);
         } else {
             if (window_update(actor,0,(uint32_t)length) != 0 || window_update(actor,frame->id,(uint32_t)length) != 0) return -1;
@@ -535,9 +572,11 @@ static int process_frame(mux_actor_t *actor, const core_http2_frame_t *frame) {
             if (flags&4) return finish_headers(actor,frame->id,flags,data,length);
             actor->header_id=frame->id; actor->header_flags=flags;
         } else if (actor->header_id != frame->id) return -1;
+        if (!actor->header_block.memory.charged) actor->header_block.memory.direction=CORE_BUFFER_DOWNLOAD;
         if (queue_append(&actor->header_block,data,length,1024U*1024U) != 0) return -1;
         if (flags&4) {
-            int result=finish_headers(actor,frame->id,actor->header_flags,actor->header_block.data+actor->header_block.start,actor->header_block.length);
+            const uint8_t *block=actor->header_block.length ? actor->header_block.data+actor->header_block.start : NULL;
+            int result=finish_headers(actor,frame->id,actor->header_flags,block,actor->header_block.length);
             actor->header_id=0; queue_consume(&actor->header_block,actor->header_block.length); return result;
         }
     } else if (frame->type == 4) {
@@ -632,13 +671,22 @@ static int advance_streams(mux_actor_t *actor) {
             }
         }
         if (stream->failed || (stream->closed && !stream->tx.length)) continue;
+        if (stream->upload == actor) {
+            for (mux_request_t *request=actor->requests;request;request=request->next) {
+                if (request->stream != stream || request->role != 4 || request->send_ended || request->ended) continue;
+                int idle=!stream->tx.length && (stream->finish_requested || (request->packet_idle_ms && now >= request->packet_idle_ms));
+                if (!idle && now < request->packet_until_ms) continue;
+                if (send_frame(actor,0,1,request->id,NULL,0)) return -1;
+                request->send_ended=1; request->remaining=0; stream->write_fence=actor->enqueued; signal_stream(stream);
+            }
+        }
         if (stream->download == actor && !stream->down_id) {
             if (now >= stream->until_ms) { fail_stream(stream,"XHTTP connection deadline expired"); continue; }
             int role=grpc_manager(actor->manager) || !strcmp(stream->config.xhttp_mode,"stream-one") ? 1 : 0;
             if ((unsigned)request_active(actor) >= actor->peer_concurrency || actor->draining) {
                 mux_actor_t *replacement=group_channel(actor->group,(int)(stream->until_ms-now),stream,1);
                 if (!replacement) {
-                    if (grpc_manager(actor->manager) && errno == EAGAIN) continue;
+                    if (errno == EAGAIN) continue;
                     fail_stream(stream,"XHTTP download channel allocation failed"); continue;
                 }
                 stream->download=replacement;
@@ -653,7 +701,7 @@ static int advance_streams(mux_actor_t *actor) {
         if (!grpc_manager(actor->manager) && stream->upload == actor && stream->down_id && !stream->up_id && !strcmp(stream->config.xhttp_mode,"stream-up")) {
             if ((unsigned)request_active(actor) >= actor->peer_concurrency || actor->draining) {
                 mux_actor_t *replacement=group_channel(actor->group,(int)(stream->until_ms > now ? stream->until_ms-now : 1),stream,1);
-                if (!replacement) { fail_stream(stream,"XHTTP upload channel allocation failed"); continue; }
+                if (!replacement) { if (errno != EAGAIN) fail_stream(stream,"XHTTP upload channel allocation failed"); continue; }
                 stream->upload=replacement; stream->write_fence=stream->upload_fence=0; wake_actor(replacement); continue;
             }
             int result=start_request(actor,stream,2,0);
@@ -665,7 +713,7 @@ static int advance_streams(mux_actor_t *actor) {
         mux_request_t *request=NULL;
         if (!strcmp(stream->config.xhttp_mode,"packet-up")) {
             for (mux_request_t *entry=actor->requests;entry;entry=entry->next)
-                if (entry->stream == stream && entry->role == 3 && !entry->ended && (entry->remaining || !actor->http2)) request=entry;
+                if (entry->stream == stream && packet_role(entry->role) && !entry->ended && (entry->remaining || !actor->http2)) request=entry;
             if (request && !request->remaining) continue;
             if (!request) {
                 if (stream->write_fence > actor->flushed) continue;
@@ -676,7 +724,7 @@ static int advance_streams(mux_actor_t *actor) {
                     if (stream->write_fence > actor->flushed) continue;
                     actor->group->retired=1;
                     mux_actor_t *replacement=choose_actor(actor->manager,30000,NULL);
-                    if (!replacement) { fail_stream(stream,"XHTTP upload rotation failed"); continue; }
+                    if (!replacement) { if (errno != EAGAIN) fail_stream(stream,"XHTTP upload rotation failed"); continue; }
                     if (stream->upload->group != stream->download->group) stream->upload->group->running--;
                     stream->upload=replacement;
                     stream->write_fence=stream->upload_fence=0;
@@ -686,31 +734,38 @@ static int advance_streams(mux_actor_t *actor) {
                 if (actor->draining || (!actor->http2 && request_active(actor))) {
                     if (stream->write_fence > actor->flushed) continue;
                     mux_actor_t *replacement=group_channel(actor->group,30000,NULL,1);
-                    if (!replacement) { fail_stream(stream,"XHTTP packet channel allocation failed"); continue; }
+                    if (!replacement) { if (errno != EAGAIN) fail_stream(stream,"XHTTP packet channel allocation failed"); continue; }
                     stream->upload=replacement; stream->write_fence=stream->upload_fence=0; wake_actor(replacement); continue;
                 }
-                size_t packet=stream->tx.length;
+                int streamed=stream->relay_async && stream->packet_limit > 128*1024 && stream->tx.length >= 64U*1024U &&
+                    (!stream->config.xhttp_uplink_data_placement[0] || !strcmp(stream->config.xhttp_uplink_data_placement,"body") || !strcmp(stream->config.xhttp_uplink_data_placement,"auto"));
+                size_t packet=streamed ? 0 : stream->tx.length;
                 if (packet > (size_t)stream->packet_limit) packet=(size_t)stream->packet_limit;
                 if (packet > 128U*1024U) packet=128U*1024U;
-                int result=start_request(actor,stream,3,packet);
+                int result=start_request(actor,stream,streamed ? 4 : 3,packet);
                 if (result < 0) return -1;
                 if (result > 0) continue;
                 request=actor->requests;
             }
         } else request=find_request(actor,stream->up_id);
-        if (!request || request->send_ended || (request->role == 3 && (request->ended || !request->remaining)) || actor->send_window <= 0 || request->send_window <= 0 || actor->net_accounted >= 64U*1024U) continue;
+        if (!request || request->send_ended || (packet_role(request->role) && (request->ended || !request->remaining)) || actor->send_window <= 0 || request->send_window <= 0 || actor->net_accounted >= 64U*1024U) continue;
         size_t length=stream->tx.length;
-        if (request->role == 3 && length > request->remaining) length=request->remaining;
+        size_t span=core_http2_queue_span(&stream->tx);
+        if (length > span) length=span;
+        if (packet_role(request->role) && length > request->remaining) length=request->remaining;
         if (length > actor->peer_frame) length=actor->peer_frame;
         if (length > 16384) length=16384;
         if ((int64_t)length > actor->send_window) length=(size_t)actor->send_window;
         if ((int64_t)length > request->send_window) length=(size_t)request->send_window;
-        uint8_t flags=request->role == 3 && length == request->remaining ? 1 : 0;
+        uint8_t flags=packet_role(request->role) && length == request->remaining ? 1 : 0;
+        size_t previous=upload_bytes;
         upload_bytes-=length;
         if (send_frame(actor,0,flags,request->id,stream->tx.data+stream->tx.start,length) != 0) { upload_bytes+=length; return -1; }
         stream->write_fence=actor->enqueued;
-        queue_consume(&stream->tx,length); actor->send_window-=length; request->send_window-=length;
-        if (request->role == 3) request->remaining-=length;
+        queue_consume(&stream->tx,length); update_upload_budget(stream); notify_write_capacity(previous);
+        actor->send_window-=length; request->send_window-=length;
+        if (packet_role(request->role)) request->remaining-=length;
+        if (request->role == 4) request->packet_idle_ms=stream->tx.length ? 0 : now > UINT64_MAX-XMUX_PACKET_IDLE_MS ? UINT64_MAX : now+XMUX_PACKET_IDLE_MS;
         if (flags&1) request->send_ended=1;
         signal_stream(stream);
     }
@@ -720,7 +775,7 @@ static int advance_streams(mux_actor_t *actor) {
         if (packet) {
             int pending=0;
             for (mux_request_t *request=actor->requests;request;request=request->next)
-                if (request->stream == stream && request->role == 3 && request->remaining) pending=1;
+                if (request->stream == stream && packet_role(request->role) && !request->send_ended) pending=1;
             if (pending) continue;
         } else {
             mux_request_t *request=find_request(actor,stream->up_id);
@@ -734,7 +789,7 @@ static int advance_streams(mux_actor_t *actor) {
     mux_request_t **cursor=&actor->requests;
     while (*cursor) {
         mux_request_t *request=*cursor; core_http2_stream_t *stream=request->stream;
-        if (stream->closed || stream->failed || (request->ended && (request->role == 3 || request->send_ended))) {
+        if (stream->closed || stream->failed || (request->ended && (packet_role(request->role) || request->send_ended))) {
             if (!actor->http2 && !request->ended) {
                 actor->draining=1;
                 if (move_waiting_streams(actor) != 0) return -1;
@@ -783,8 +838,11 @@ static void *actor_worker(void *opaque) {
         core_deadline_begin(now < actor->connect_until_ms ? (int)(actor->connect_until_ms-now) : 1);
         if (actor->trace_present) { core_trace_bind(&actor->trace); core_trace_observe(trace_progress,actor); }
         if (now >= actor->connect_until_ms) snprintf(actor->error,sizeof(actor->error),"XHTTP connection deadline expired");
-        else if (backend->open(&actor->manager->config,&actor->physical,&http2,actor->error,sizeof(actor->error)) != 0 && !actor->error[0])
-            snprintf(actor->error,sizeof(actor->error),"XMUX physical connection failed");
+        else {
+            int opened=backend->open_budgeted ? backend->open_budgeted(&actor->manager->config,&actor->physical,&http2,actor->error,sizeof(actor->error),&actor->output_memory,&actor->input_memory) :
+                backend->open(&actor->manager->config,&actor->physical,&http2,actor->error,sizeof(actor->error));
+            if (opened && !actor->error[0]) snprintf(actor->error,sizeof(actor->error),"XMUX physical connection failed");
+        }
         core_trace_detach(); core_deadline_end();
     }
     pthread_mutex_lock(&mux_lock); actor->opening=0;
@@ -823,7 +881,8 @@ static void *actor_worker(void *opaque) {
             if (result != 0) break;
             received_frame=1;
             pthread_mutex_lock(&mux_lock); actor->last_input_ms=core_now_ms();
-            result=process_frame(actor,&frame); pthread_mutex_unlock(&mux_lock); free(frame.data);
+            result=process_frame(actor,&frame); pthread_mutex_unlock(&mux_lock);
+            if (backend->release_frame) backend->release_frame(actor->physical,&frame); else free(frame.data);
             if (result < 0) { if (!actor->error[0]) snprintf(actor->error,sizeof(actor->error),"XHTTP response frame %u rejected",frame.type); break; }
         }
         if (result < 0) { if (!actor->error[0]) snprintf(actor->error,sizeof(actor->error),"XHTTP response decoding failed"); mark_failed(actor); break; }
@@ -832,10 +891,16 @@ static void *actor_worker(void *opaque) {
         if (maintain_ping(actor,now) != 0) actor->failed=1;
         size_t pending=actor->net_accounted;
         int progressed=received_frame || actor->enqueued != enqueued_before || actor->flushed != flushed_before;
+        int wait=progressed ? 0 : 10;
+        if (wait) for (mux_request_t *request=actor->requests;request;request=request->next) {
+            if (request->role != 4 || request->send_ended || request->ended) continue;
+            uint64_t due=request->packet_until_ms;
+            if (!request->stream->tx.length && request->packet_idle_ms && request->packet_idle_ms < due) due=request->packet_idle_ms;
+            if (due > now && due-now < (unsigned)wait) wait=(int)(due-now);
+        }
         pthread_mutex_unlock(&mux_lock);
         short events=backend->events ? backend->events(actor->physical) : (short)(POLLIN|(pending ? POLLOUT : 0));
         struct pollfd descriptors[2]={{.fd=actor->wake[0],.events=POLLIN},{.fd=backend->fd(actor->physical),.events=events}};
-        int wait=progressed ? 0 : 10;
         if (grpc_manager(actor->manager) && !in_use && !actor->requests && !pending) {
             uint64_t due=actor->idle_pending_ms+60000;
             if (actor->alive_period && actor->manager->config.grpc_permit_without_stream) {
@@ -855,12 +920,44 @@ static void *actor_worker(void *opaque) {
     while (request) { mux_request_t *next=request->next; release_stream(request->stream); free(request); request=next; }
     pthread_mutex_unlock(&mux_lock);
     if (actor->physical) backend->close(actor->physical);
-    actor->physical=NULL; core_hpack_clear(&actor->hpack); free(actor->header_block.data); core_deadline_detach();
+    actor->physical=NULL; core_hpack_clear(&actor->hpack); core_http2_queue_clear(&actor->header_block);
+    core_buffer_budget_clear(&actor->input_memory); core_buffer_budget_clear(&actor->output_memory); core_deadline_detach();
     pthread_mutex_lock(&mux_lock); size_t previous=upload_bytes; upload_bytes-=actor->net_accounted; actor->net_accounted=0;
     notify_write_capacity(previous);
     actor->stopped=1; close(actor->wake[0]); close(actor->wake[1]); actor_count--;
+    wake_admission();
     collect_stopped_actors();
     pthread_mutex_unlock(&mux_lock); return NULL;
+}
+
+static int allocate_channels(core_http2_stream_t *stream, mux_manager_t *manager, mux_manager_t *download_manager, int budget) {
+    size_t window=grpc_manager(manager) && stream->config.grpc_initial_window ? (size_t)stream->config.grpc_initial_window : CORE_HTTP2_STREAM_LIMIT;
+    size_t credit=core_http2_queue_reservation(window);
+    size_t protocol=manager->backend->open_budgeted ? CORE_BUFFER_PROTOCOL_RESERVE*(download_manager != manager ? 2U : 1U) : 0;
+    size_t output_protocol=manager->backend->open_budgeted ? CORE_BUFFER_OUTPUT_RESERVE*(download_manager != manager ? 2U : 1U)+CORE_BUFFER_REQUEST_RESERVE-CORE_BUFFER_OUTPUT_RESERVE : 0;
+    size_t upload_credit=core_http2_queue_reservation(CORE_HTTP2_STREAM_LIMIT);
+    size_t room=core_buffer_available(CORE_BUFFER_DOWNLOAD);
+    size_t output_room=core_buffer_available(CORE_BUFFER_UPLOAD);
+    if (credit > room || protocol > room-credit || upload_credit > output_room || output_protocol > output_room-upload_credit) {
+        core_http2_queue_cache_clear(); room=core_buffer_available(CORE_BUFFER_DOWNLOAD);
+        output_room=core_buffer_available(CORE_BUFFER_UPLOAD);
+    }
+    if (credit > room || protocol > room-credit || upload_credit > output_room || output_protocol > output_room-upload_credit ||
+        core_buffer_budget_init(&stream->rx.memory,CORE_BUFFER_DOWNLOAD,credit)) { errno=EAGAIN; return -1; }
+    if (core_buffer_budget_init(&stream->tx.memory,CORE_BUFFER_UPLOAD,upload_credit)) {
+        core_buffer_budget_clear(&stream->rx.memory); errno=EAGAIN; return -1;
+    }
+    stream->permanent_upload=upload_credit;
+    mux_actor_t *upload=choose_actor(manager,budget,stream);
+    mux_actor_t *download=upload && download_manager != manager ? choose_actor(download_manager,budget,stream) : upload;
+    if (!upload || !download) {
+        int saved=errno;
+        if (upload && !upload->group->running && !request_active(upload)) { upload->failed=1; wake_actor(upload); }
+        core_buffer_budget_clear(&stream->rx.memory); core_buffer_budget_clear(&stream->tx.memory); stream->permanent_upload=0; errno=saved; return -1;
+    }
+    stream->download=download; stream->upload=upload; upload->group->running++;
+    if (download->group != upload->group) download->group->running++;
+    wake_actor(upload); wake_actor(download); return 0;
 }
 
 core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core_http2_backend_t *backend, char *error, size_t capacity) {
@@ -879,29 +976,23 @@ core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core
     pthread_mutex_lock(&mux_lock);
     mux_manager_t *manager=stream_count < 256 ? get_manager(config,backend) : NULL;
     if (stream_count >= 256) errno=EAGAIN;
-    mux_actor_t *actor=manager ? choose_actor(manager,core_deadline_active() ? core_deadline_remaining() : 30000,stream) : NULL;
-    mux_manager_t *down_manager=actor && independent ? get_manager(&download_config,backend) : manager;
-    mux_actor_t *down_actor=actor && independent ? (down_manager ? choose_actor(down_manager,core_deadline_active() ? core_deadline_remaining() : 30000,stream) : NULL) : actor;
-    int waiting=manager && grpc_manager(manager) && !actor && errno == EAGAIN;
-    if (actor && down_actor) {
-        stream->download=down_actor; stream->upload=actor; actor->group->running++;
-        if (down_actor->group != actor->group) down_actor->group->running++;
-        stream->next=streams; streams=stream; stream_count++; wake_actor(actor); wake_actor(down_actor);
-    } else if (waiting) {
-        stream->waiting_manager=manager;
+    mux_manager_t *down_manager=manager && independent ? get_manager(&download_config,backend) : manager;
+    int bound=manager && down_manager && !allocate_channels(stream,manager,down_manager,core_deadline_active() ? core_deadline_remaining() : 30000);
+    int waiting=manager && down_manager && !bound && errno == EAGAIN;
+    if (bound || waiting) {
+        if (waiting) { stream->waiting_manager=manager; stream->waiting_download=down_manager; }
         stream->next=streams; streams=stream; stream_count++;
     }
+    mux_actor_t *actor=stream->download;
     pthread_mutex_unlock(&mux_lock);
-    if ((!actor || !down_actor) && !waiting) { if (error && capacity) snprintf(error,capacity,"XHTTP channel allocation failed: %s",strerror(errno)); close(stream->notify[0]); close(stream->notify[1]); free(stream); return NULL; }
+    if (!bound && !waiting) { if (error && capacity) snprintf(error,capacity,"XHTTP channel allocation failed: %s",strerror(errno)); core_buffer_budget_clear(&stream->rx.memory); close(stream->notify[0]); close(stream->notify[1]); free(stream); return NULL; }
     for (;;) {
         pthread_mutex_lock(&mux_lock);
         if (stream->waiting_manager && !stream->download) {
             int budget=core_deadline_active() ? core_deadline_remaining() : 30000;
-            mux_actor_t *available=choose_actor(stream->waiting_manager,budget,stream);
-            if (available) {
-                stream->download=stream->upload=available; available->group->running++;
-                stream->waiting_manager=NULL; wake_actor(available);
-            } else if (errno != EAGAIN) fail_stream(stream,"gRPC physical channel allocation failed");
+            if (!allocate_channels(stream,stream->waiting_manager,stream->waiting_download,budget)) {
+                stream->waiting_manager=stream->waiting_download=NULL;
+            } else if (errno != EAGAIN) fail_stream(stream,"physical channel allocation failed");
         }
         int ready=stream->ready == 1,failed=stream->failed;
         actor=stream->download;
@@ -952,11 +1043,33 @@ void core_http2_drain_notifications(core_http2_stream_t *stream) {
     pthread_mutex_unlock(&mux_lock);
 }
 
+static size_t allocated_write_capacity(const core_http2_stream_t *stream) {
+    size_t available=core_buffer_available(CORE_BUFFER_UPLOAD);
+    if (available < core_http2_queue_reservation(128U*1024U)) {
+        core_http2_queue_cache_clear(); available=core_buffer_available(CORE_BUFFER_UPLOAD);
+    }
+    available+=stream->tx.memory.charged;
+    size_t low=0,high=XMUX_STREAM_LIMIT-stream->tx.length;
+    while (low < high) {
+        size_t middle=low+(high-low+1)/2;
+        if (core_http2_queue_reservation(stream->tx.length+middle) <= available) low=middle;
+        else high=middle-1;
+    }
+    return low;
+}
+
+static int update_upload_budget(core_http2_stream_t *stream) {
+    size_t minimum=stream->reserved_upload ? core_http2_queue_reservation(stream->tx.length+stream->reserved_upload) : 0;
+    if (minimum < stream->permanent_upload && !stream->closed) minimum=stream->permanent_upload;
+    return core_buffer_budget_init(&stream->tx.memory,CORE_BUFFER_UPLOAD,minimum);
+}
+
 size_t core_http2_write_capacity(const core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
     size_t capacity=stream && !stream->closed && !stream->failed && !stream->finish_requested ? XMUX_STREAM_LIMIT-stream->tx.length-stream->reserved_upload : 0;
     size_t global=upload_bytes < XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE ? XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE-upload_bytes : 0;
     if (capacity > global) capacity=global;
+    if (capacity) { size_t actual=allocated_write_capacity(stream); if (capacity > actual) capacity=actual; }
     pthread_mutex_unlock(&mux_lock); return capacity;
 }
 
@@ -965,14 +1078,20 @@ int core_http2_reserve_write(core_http2_stream_t *stream, size_t capacity) {
     size_t global=upload_bytes < XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE ? XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE-upload_bytes : 0;
     int available=stream && !stream->closed && !stream->failed && !stream->finish_requested && !stream->reserved_upload &&
         capacity <= XMUX_STREAM_LIMIT-stream->tx.length && capacity <= global;
-    if (available) { stream->reserved_upload=capacity; upload_bytes+=capacity; }
+    if (available && capacity > allocated_write_capacity(stream)) available=0;
+    if (available) {
+        stream->reserved_upload=capacity;
+        if (update_upload_budget(stream)) { stream->reserved_upload=0; available=0; }
+        else upload_bytes+=capacity;
+    }
     pthread_mutex_unlock(&mux_lock); return available;
 }
 
 void core_http2_release_write(core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
     size_t previous=upload_bytes;
-    upload_bytes-=stream->reserved_upload; stream->reserved_upload=0; notify_write_capacity(previous);
+    upload_bytes-=stream->reserved_upload; stream->reserved_upload=0;
+    update_upload_budget(stream); notify_write_capacity(previous);
     pthread_mutex_unlock(&mux_lock);
 }
 
@@ -998,6 +1117,7 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
         if (block && queue_append(&stream->tx,data+offset,block,XMUX_STREAM_LIMIT) != 0) { pthread_mutex_unlock(&mux_lock); return -1; }
         size_t reserved=block < stream->reserved_upload ? block : stream->reserved_upload;
         stream->reserved_upload-=reserved; upload_bytes+=block-reserved; offset+=block; wake_actor(stream->upload);
+        update_upload_budget(stream);
         pthread_mutex_unlock(&mux_lock);
         if (offset < length && wait_for_output(stream) <= 0) return -1;
     }
@@ -1006,7 +1126,7 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
         int failed=stream->failed || stream->closed;
         int pending=stream->tx.length || stream->upload->opening || stream->write_fence > stream->upload->flushed;
         if (wait_ack) for (mux_request_t *request=stream->upload->requests;request;request=request->next)
-            if (request->stream == stream && request->role == 3 && !request->ended) pending=1;
+            if (request->stream == stream && packet_role(request->role) && !request->ended) pending=1;
         if (!pending && stream->rx.length) signal_stream(stream);
         pthread_mutex_unlock(&mux_lock);
         if (failed) { core_trace_failure(CORE_TRACE_TRANSPORT); return -1; }
@@ -1026,7 +1146,7 @@ int core_http2_read(core_http2_stream_t *stream, uint8_t *data, size_t capacity,
     stream->notified=0;
     size_t take=stream->rx.length < capacity ? stream->rx.length : capacity;
     if (take) {
-        memcpy(data,stream->rx.data+stream->rx.start,take); queue_consume(&stream->rx,take);
+        core_http2_queue_copy(&stream->rx,data,take); queue_consume(&stream->rx,take);
         download_bytes-=take; stream->consumed+=take; *length=take; wake_actor(stream->download);
     }
     int result=take ? 0 : stream->failed ? -1 : stream->eof ? 0 : 1;
@@ -1055,9 +1175,10 @@ void core_http2_close(core_http2_stream_t *stream) {
     if (!stream->closed) {
         stream->closed=1; close(stream->notify[0]); close(stream->notify[1]);
         size_t previous=upload_bytes;
-        upload_bytes-=stream->tx.length+stream->reserved_upload; stream->reserved_upload=0; queue_consume(&stream->tx,stream->tx.length);
+        upload_bytes-=stream->tx.length+stream->reserved_upload; stream->reserved_upload=0; core_http2_queue_clear(&stream->tx);
         notify_write_capacity(previous);
-        stream->consumed+=stream->rx.length; download_bytes-=stream->rx.length; queue_consume(&stream->rx,stream->rx.length);
+        stream->consumed+=stream->rx.length; download_bytes-=stream->rx.length; core_http2_queue_clear(&stream->rx);
+        wake_admission();
         if (stream->download) {
             stream->download->group->running--; wake_actor(stream->download); wake_actor(stream->upload);
             if (stream->upload->group != stream->download->group) stream->upload->group->running--;

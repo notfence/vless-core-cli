@@ -1,6 +1,7 @@
 #ifndef CORE_HTTP2_POOL_H
 #define CORE_HTTP2_POOL_H
 #include "types.h"
+#include "buffer_budget.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -16,11 +17,13 @@ typedef struct {
 } core_http2_frame_t;
 typedef struct {
     int (*open)(const vless_config_t *, void **, int *, char *, size_t);
+    int (*open_budgeted)(const vless_config_t *, void **, int *, char *, size_t, core_buffer_budget_t *, core_buffer_budget_t *);
     void (*close)(void *);
     int (*fd)(void *);
     short (*events)(void *);
     int (*collect)(void *);
     int (*read_frame)(void *, core_http2_frame_t *, size_t);
+    void (*release_frame)(void *, core_http2_frame_t *);
     int (*send_frame)(void *, uint8_t, uint8_t, uint32_t, const uint8_t *, size_t);
     int (*flush)(void *);
     size_t (*pending)(void *);

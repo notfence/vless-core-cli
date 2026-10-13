@@ -110,6 +110,34 @@ static void custom_request_headers(void) {
         db_free(&connection.xmux_plain_output); db_free(&connection.h2_send_buf);
     }
 }
+static void streamed_packet_wire(void) {
+    for (int http2=0;http2<2;http2++) {
+        tls13_conn_t connection={.mode=http2 ? CONN_MODE_XHTTP_TLS_H2 : CONN_MODE_XHTTP_PLAIN,.xmux_physical=1,.xmux_async=1,.h2_next_stream_id=1};
+        vless_config_t config={.transport_mode=TRANSPORT_XHTTP,.server_port=443};
+        strcpy(config.server_host,"vless-core.test"); strcpy(config.xhttp_mode,"packet-up"); strcpy(config.xhttp_path,"/vless-core");
+        strcpy(config.xhttp_uplink_data_placement,"body");
+        uint32_t id=0; size_t consumed=1,body=0;
+        REQUIRE("xhttp/streamed-packet-headers",xmux_transport_request(&connection,&config,"vless-core",7,4,NULL,0,&id,65536,&consumed,&body) == 0);
+        CHECK("xhttp/streamed-packet-body-contract",!consumed && body == SIZE_MAX && id == 1);
+        if (http2) {
+            const uint8_t *headers=connection.xmux_plain_output.data+9; size_t length=connection.xmux_plain_output.len-9;
+            CHECK("xhttp/streamed-packet-no-content-length",request_header_value(headers,length,"content-length","") == 0);
+            CHECK("xhttp/streamed-packet-not-grpc",request_header_value(headers,length,"content-type","application/grpc") == 0);
+            CHECK("xhttp/streamed-packet-awaits-body",!(connection.xmux_plain_output.data[4]&1));
+        } else {
+            REQUIRE("xhttp/streamed-packet-header-termination",db_append(&connection.xmux_plain_output,"",1) == 0);
+            CHECK("xhttp/streamed-packet-http1-chunked",strstr((char *)connection.xmux_plain_output.data,"Transfer-Encoding: chunked\r\n") != NULL && !strstr((char *)connection.xmux_plain_output.data,"Content-Length:") && !strstr((char *)connection.xmux_plain_output.data,"application/grpc"));
+            db_consume(&connection.xmux_plain_output,connection.xmux_plain_output.len);
+            REQUIRE("xhttp/streamed-packet-http1-data",xmux_transport_send_frame(&connection,0,0,id,(uint8_t *)"vless-core",10) == 0);
+            REQUIRE("xhttp/streamed-packet-http1-end",xmux_transport_send_frame(&connection,0,1,id,NULL,0) == 0);
+            CHECK("xhttp/streamed-packet-http1-exact-body",connection.xmux_plain_output.len == 20 && !memcmp(connection.xmux_plain_output.data,"a\r\nvless-core\r\n0\r\n\r\n",20));
+            db_consume(&connection.xmux_plain_output,connection.xmux_plain_output.len);
+            REQUIRE("xhttp/streamed-packet-http1-limit-end",xmux_transport_send_frame(&connection,0,1,id,(uint8_t *)"vless-core",10) == 0);
+            CHECK("xhttp/streamed-packet-http1-limit-terminator",connection.xmux_plain_output.len == 20 && !memcmp(connection.xmux_plain_output.data,"a\r\nvless-core\r\n0\r\n\r\n",20));
+        }
+        db_free(&connection.xmux_plain_output); db_free(&connection.h2_send_buf);
+    }
+}
 static void zero_minimum_post_interval(void) {
     tls13_conn_t connection={.xhttp_post_intervals={0,100},.xhttp_last_post_ms=1000}; char error[160];
     pacing_clock=1001; pacing_random=201; pacing_waits=0; pacing_interrupted=1;
@@ -781,9 +809,33 @@ static void http2_single_wire_vectors(void) {
     clear_conn(&connection);
 }
 
+static void pooled_input_backpressure(void) {
+    int partial_pair[2]; REQUIRE("xmux/http1-partial-cache-sockets",socketpair(AF_UNIX,SOCK_STREAM,0,partial_pair) == 0);
+    tls13_conn_t partial={.fd=partial_pair[0],.mode=CONN_MODE_XHTTP_PLAIN,.h2_net_cache={.limit=65536}};
+    uint8_t partial_data[16384]={0};
+    for (unsigned i=0;i<3;i++) REQUIRE("xmux/http1-partial-cache-fill",db_append(&partial.h2_net_cache,partial_data,sizeof(partial_data)) == 0);
+    REQUIRE("xmux/http1-partial-cache-prefix",db_append(&partial.h2_net_cache,partial_data,16000) == 0);
+    REQUIRE("xmux/http1-partial-cache-feed",write_exact(partial_pair[1],partial_data,sizeof(partial_data)) == 0);
+    CHECK("xmux/http1-partial-cache-bounded-collect",xmux_transport_collect(&partial) >= 0 && partial.h2_net_cache.len == 65536);
+    CHECK("xmux/http1-full-cache-does-not-read",xmux_transport_collect(&partial) == 0 && partial.h2_net_cache.len == 65536);
+    db_free(&partial.h2_net_cache); close(partial_pair[0]); close(partial_pair[1]);
+    int pair[2]; REQUIRE("h2/backpressure-sockets",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    tls13_conn_t connection={.fd=pair[0],.mode=CONN_MODE_XHTTP_REALITY,.tls_auth_state=4,.xmux_physical=1,.xmux_async=1};
+    REQUIRE("h2/backpressure-cipher",configure_tls_cipher(&connection,0x1303) == 0);
+    uint8_t frame[16384]={0}; frame[1]=0x3f; frame[2]=0xf7; frame[8]=1;
+    REQUIRE("h2/backpressure-initial-frame",db_append(&connection.h2_net_cache,frame,sizeof(frame)) == 0);
+    core_http2_frame_t incoming;
+    CHECK("h2/backpressure-parser-paused",xmux_transport_read_frame(&connection,&incoming,0) == 1);
+    uint8_t *record=NULL; size_t length=0; uint64_t sequence=0;
+    REQUIRE("h2/backpressure-extra-record",encrypt_record(&connection,connection.s_app_key,connection.s_app_iv,&sequence,23,frame,sizeof(frame),&record,&length) == 0);
+    REQUIRE("h2/backpressure-peer-write",write_exact(pair[1],record,length) == 0); free(record);
+    CHECK("h2/backpressure-collection-bounded",xmux_transport_collect(&connection) >= 0 && connection.h2_net_cache.len == sizeof(frame));
+    clear_conn(&connection); close(pair[0]); close(pair[1]);
+}
+
 int main(int argc, char **argv) {
     if (signal(SIGPIPE,SIG_IGN) == SIG_ERR) return 2;
-    if (argc == 1) pooled_receive_window();
+    if (argc == 1) { pooled_receive_window(); pooled_input_backpressure(); }
     if (argc == 3 && !strcmp(argv[1],"--xhttp-post")) {
         vless_config_t config; tls13_conn_t *connection=NULL; char error[256]={0};
         if (parse_core_uri(argv[2],&config,error,sizeof(error)) || tls13_reality_connect(&config,&connection,error,sizeof(error))) { fprintf(stderr,"%s\n",error); return 2; }
@@ -808,6 +860,7 @@ int main(int argc, char **argv) {
     xhttp_http1_vectors();
     hpack_status_vectors();
     custom_request_headers();
+    streamed_packet_wire();
     zero_minimum_post_interval();
     exact_read_drains_buffered_http2();
     tls13_conn_t oversized_h2={.mode=CONN_MODE_GRPC_PLAIN}; core_http2_frame_t invalid_frame;

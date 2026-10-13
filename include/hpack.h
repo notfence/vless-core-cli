@@ -2,6 +2,7 @@
 #define CORE_HPACK_H
 #include <stddef.h>
 #include <stdint.h>
+#include "buffer_budget.h"
 
 #define CORE_HPACK_TABLE_LIMIT 4096
 #define CORE_HPACK_HEADER_LIMIT 65536
@@ -11,6 +12,7 @@ typedef struct {
     core_hpack_entry_t entries[128];
     size_t count, size, maximum;
     int initialized;
+    core_buffer_budget_t *memory;
 } core_hpack_decoder_t;
 typedef struct {
     int status;

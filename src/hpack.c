@@ -27,9 +27,21 @@ void core_hpack_init(core_hpack_decoder_t *decoder) {
     decoder->initialized = 1;
 }
 
+static void *hpack_alloc(core_hpack_decoder_t *decoder, size_t length) {
+    return decoder->memory ? core_buffer_alloc(decoder->memory,length) : malloc(length);
+}
+
+static void hpack_free(core_hpack_decoder_t *decoder, void *data, size_t length) {
+    if (decoder->memory) core_buffer_free(decoder->memory,data,length);
+    else free(data);
+}
+
 void core_hpack_clear(core_hpack_decoder_t *decoder) {
     if (!decoder) return;
-    for (size_t i = 0; i < decoder->count; i++) { free(decoder->entries[i].name); free(decoder->entries[i].value); }
+    for (size_t i = 0; i < decoder->count; i++) {
+        hpack_free(decoder,decoder->entries[i].name,decoder->entries[i].name_length+1);
+        hpack_free(decoder,decoder->entries[i].value,decoder->entries[i].value_length+1);
+    }
     memset(decoder, 0, sizeof(*decoder));
 }
 
@@ -37,7 +49,7 @@ static void evict_to(core_hpack_decoder_t *decoder, size_t size) {
     while (decoder->count && decoder->size > size) {
         core_hpack_entry_t *entry = &decoder->entries[--decoder->count];
         decoder->size -= entry->size;
-        free(entry->name); free(entry->value); memset(entry, 0, sizeof(*entry));
+        hpack_free(decoder,entry->name,entry->name_length+1); hpack_free(decoder,entry->value,entry->value_length+1); memset(entry, 0, sizeof(*entry));
     }
 }
 
@@ -56,24 +68,24 @@ static int lookup(const core_hpack_decoder_t *decoder, uint32_t index, const cha
 static int insert(core_hpack_decoder_t *decoder, const char *name, size_t name_length, const char *value, size_t value_length) {
     size_t size=name_length+value_length+32;
     if (size > decoder->maximum) { evict_to(decoder,0); return 0; }
-    char *name_copy=malloc(name_length+1),*value_copy=malloc(value_length+1);
-    if (!name_copy || !value_copy) { free(name_copy); free(value_copy); return -1; }
+    char *name_copy=hpack_alloc(decoder,name_length+1),*value_copy=hpack_alloc(decoder,value_length+1);
+    if (!name_copy || !value_copy) { hpack_free(decoder,name_copy,name_length+1); hpack_free(decoder,value_copy,value_length+1); return -1; }
     memcpy(name_copy,name,name_length); name_copy[name_length]=0;
     memcpy(value_copy,value,value_length); value_copy[value_length]=0;
     evict_to(decoder,decoder->maximum-size);
-    if (decoder->count >= sizeof(decoder->entries)/sizeof(*decoder->entries)) { free(name_copy); free(value_copy); return -1; }
+    if (decoder->count >= sizeof(decoder->entries)/sizeof(*decoder->entries)) { hpack_free(decoder,name_copy,name_length+1); hpack_free(decoder,value_copy,value_length+1); return -1; }
     memmove(decoder->entries+1,decoder->entries,decoder->count*sizeof(*decoder->entries));
     decoder->entries[0]=(core_hpack_entry_t){.name=name_copy,.value=value_copy,.size=size,.name_length=name_length,.value_length=value_length};
     decoder->count++; decoder->size+=size; return 0;
 }
 
-static int read_allocated_string(const uint8_t *block, size_t length, size_t *offset, char **text, size_t *decoded_length) {
+static int read_allocated_string(core_hpack_decoder_t *decoder, const uint8_t *block, size_t length, size_t *offset, char **text, size_t *decoded_length) {
     size_t start=*offset,decoded=0;
     if (core_hpack_read_string(block,length,offset,NULL,0,&decoded) || decoded > CORE_HPACK_HEADER_LIMIT) return -1;
-    *text=malloc(decoded+1);
+    *text=hpack_alloc(decoder,decoded+1);
     if (!*text) return -1;
     size_t verify=start,actual=0;
-    if (core_hpack_read_string(block,length,&verify,*text,decoded+1,&actual) || actual != decoded) { free(*text); *text=NULL; return -1; }
+    if (core_hpack_read_string(block,length,&verify,*text,decoded+1,&actual) || actual != decoded) { hpack_free(decoder,*text,decoded+1); *text=NULL; return -1; }
     *decoded_length=decoded; return 0;
 }
 
@@ -135,7 +147,10 @@ static int emit_header(core_hpack_headers_t *headers, const char *name, size_t n
 
 int core_hpack_decode(core_hpack_decoder_t *decoder, const uint8_t *block, size_t length, core_hpack_headers_t *headers) {
     if (!decoder || !headers || (!block && length)) return -1;
-    if (!decoder->initialized) core_hpack_init(decoder);
+    if (!decoder->initialized) {
+        core_buffer_budget_t *memory=decoder->memory;
+        core_hpack_init(decoder); decoder->memory=memory;
+    }
     memset(headers,0,sizeof(*headers));
     size_t offset=0; int saw_header=0,invalid=0;
     while (offset < length) {
@@ -156,14 +171,14 @@ int core_hpack_decode(core_hpack_decoder_t *decoder, const uint8_t *block, size_
         if (index) {
             if (lookup(decoder,index,&name,&name_length,&value,&value_length)) return -1;
         } else {
-            if (read_allocated_string(block,length,&offset,&owned_name,&name_length)) return -1;
+            if (read_allocated_string(decoder,block,length,&offset,&owned_name,&name_length)) return -1;
             name=owned_name;
         }
-        if (read_allocated_string(block,length,&offset,&owned_value,&value_length)) { free(owned_name); return -1; }
+        if (read_allocated_string(decoder,block,length,&offset,&owned_value,&value_length)) { hpack_free(decoder,owned_name,name_length+1); return -1; }
         value=owned_value;
         if (emit_header(headers,name,name_length,value,value_length)) invalid=1;
         int result=first&0x40 ? insert(decoder,name,name_length,value,value_length) : 0;
-        free(owned_name); free(owned_value);
+        hpack_free(decoder,owned_name,name_length+1); hpack_free(decoder,owned_value,value_length+1);
         if (result) return -1;
     }
     return invalid ? -2 : 0;

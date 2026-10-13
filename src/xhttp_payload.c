@@ -23,6 +23,20 @@ static int fail(char *error, size_t capacity, const char *text) {
 static size_t digits(size_t number) { size_t count=1; while (number >= 10) { number/=10; count++; } return count; }
 static size_t encoded_size(size_t bytes) { return bytes/3*4+(bytes%3 ? bytes%3+1 : 0); }
 
+static void *payload_alloc(core_buffer_budget_t *memory, size_t length) {
+    return memory ? core_buffer_alloc(memory,length) : malloc(length);
+}
+
+static void payload_free(core_buffer_budget_t *memory, void *data, size_t length) {
+    if (memory) core_buffer_free(memory,data,length);
+    else free(data);
+}
+
+void core_xhttp_payload_clear(core_xhttp_payload_t *packet) {
+    payload_free(packet->memory,packet->headers,packet->header_capacity);
+    memset(packet,0,sizeof(*packet));
+}
+
 static size_t payload_cost(size_t bytes, const size_t *chunks, size_t count, size_t key_size, int cookie) {
     size_t encoded=encoded_size(bytes),offset=0,index=0;
     size_t cost=encoded+(cookie ? 38 : 0);
@@ -56,13 +70,15 @@ int core_xhttp_payload_build(const core_xhttp_payload_options_t *options, const 
     if (!result) return fail(error,capacity,"missing XHTTP packet output");
     memset(result,0,sizeof(*result));
     if (!options || !options->placement || !prefix || length > 16U*1024U*1024U || (length && !data)) return fail(error,capacity,"invalid XHTTP packet input");
+    result->memory=options->memory;
     size_t initial;
     if (prefix_cost(prefix,&initial) != 0) return fail(error,capacity,"invalid XHTTP packet headers");
     if (budget > 65536) budget=65536;
     if (initial >= budget || strlen(prefix) >= budget) return fail(error,capacity,"XHTTP metadata exceeds the request header limit");
     int body=!strcmp(options->placement,"body") || !strcmp(options->placement,"auto") || !options->placement[0];
     if (body) {
-        result->headers=malloc(strlen(prefix)+1);
+        result->header_capacity=strlen(prefix)+1;
+        result->headers=payload_alloc(options->memory,result->header_capacity);
         if (!result->headers) return fail(error,capacity,"XHTTP packet allocation failed");
         memcpy(result->headers,prefix,strlen(prefix)+1); result->consumed=result->body_size=length; return 0;
     }
@@ -90,10 +106,11 @@ int core_xhttp_payload_build(const core_xhttp_payload_options_t *options, const 
         else high=middle-1;
     }
     if (length && !low) return fail(error,capacity,"XHTTP uplinkDataKey/chunk size cannot fit the request header limit");
-    char *encoded=malloc(4*((low+2)/3)+1),*headers=malloc(budget+1);
-    if (!encoded || !headers) { free(encoded); free(headers); return fail(error,capacity,"XHTTP packet allocation failed"); }
+    size_t encoded_capacity=4*((low+2)/3)+1,header_capacity=budget+1;
+    char *encoded=payload_alloc(options->memory,encoded_capacity),*headers=payload_alloc(options->memory,header_capacity);
+    if (!encoded || !headers) { payload_free(options->memory,encoded,encoded_capacity); payload_free(options->memory,headers,header_capacity); return fail(error,capacity,"XHTTP packet allocation failed"); }
     int encoded_length=low ? EVP_EncodeBlock((unsigned char *)encoded,data,(int)low) : 0;
-    if (encoded_length < 0) { free(encoded); free(headers); return fail(error,capacity,"XHTTP packet encoding failed"); }
+    if (encoded_length < 0) { payload_free(options->memory,encoded,encoded_capacity); payload_free(options->memory,headers,header_capacity); return fail(error,capacity,"XHTTP packet encoding failed"); }
     for (int index=0;index<encoded_length;index++) {
         if (encoded[index] == '+') encoded[index]='-';
         else if (encoded[index] == '/') encoded[index]='_';
@@ -106,10 +123,10 @@ int core_xhttp_payload_build(const core_xhttp_payload_options_t *options, const 
         size_t take=(size_t)encoded_length-offset; if (take > chunks[index]) take=chunks[index];
         int added=cookie ? snprintf(headers+used,budget+1-used,"%s%s_%zu=%.*s",index ? "; " : "",key,index,(int)take,encoded+offset)
                          : snprintf(headers+used,budget+1-used,"%s-%zu: %.*s\r\n",key,index,(int)take,encoded+offset);
-        if (added < 0 || (size_t)added > budget-used) { free(encoded); free(headers); return fail(error,capacity,"XHTTP packet headers exceed capacity"); }
+        if (added < 0 || (size_t)added > budget-used) { payload_free(options->memory,encoded,encoded_capacity); payload_free(options->memory,headers,header_capacity); return fail(error,capacity,"XHTTP packet headers exceed capacity"); }
         used+=(size_t)added; offset+=take;
     }
-    if (cookie && encoded_length) { if (used+2 > budget) { free(encoded); free(headers); return fail(error,capacity,"XHTTP cookie headers exceed capacity"); } memcpy(headers+used,"\r\n",2); used+=2; }
-    headers[used]=0; free(encoded);
-    result->headers=headers; result->consumed=low; return 0;
+    if (cookie && encoded_length) { if (used+2 > budget) { payload_free(options->memory,encoded,encoded_capacity); payload_free(options->memory,headers,header_capacity); return fail(error,capacity,"XHTTP cookie headers exceed capacity"); } memcpy(headers+used,"\r\n",2); used+=2; }
+    headers[used]=0; payload_free(options->memory,encoded,encoded_capacity);
+    result->headers=headers; result->header_capacity=header_capacity; result->consumed=low; return 0;
 }
