@@ -8,8 +8,9 @@
 #include "vless.h"
 #include "xhttp_download.h"
 #include "xhttp_padding.h"
+#include "cli_args.h"
 
-static const char *const fuzz_names[] = {"uri", "hpack", "h2", "grpc", "http", "xhttp", "ws", "vision", "tls"};
+static const char *const fuzz_names[] = {"uri", "hpack", "h2", "grpc", "http", "xhttp", "ws", "vision", "tls", "arguments"};
 static size_t fuzz_target;
 
 int LLVMFuzzerInitialize(int *argc, char ***argv) {
@@ -49,6 +50,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                      .h2_peer_initial_window = H2_DEFAULT_WINDOW, .h2_peer_stream_window = H2_DEFAULT_WINDOW,
                      .h2_peer_conn_window = H2_DEFAULT_WINDOW};
     switch (fuzz_target) {
+    case 9: {
+        char *input=malloc(size+1);
+        if (!input) abort();
+        memcpy(input,data,size); input[size]=0;
+        char *arguments[64]={"vless-core"}; int count=1;
+        for (size_t offset=0;offset<size && count<64;) {
+            arguments[count++]=input+offset;
+            offset+=strlen(input+offset)+1;
+        }
+        core_cli_args_t parsed;
+        (void)core_cli_args_parse(count,arguments,&parsed,error,sizeof(error));
+        core_cli_args_scrub(count,arguments);
+        free(input);
+        break;
+    }
     case 0: {
         char *text = malloc(size + 1);
         if (!text) abort();

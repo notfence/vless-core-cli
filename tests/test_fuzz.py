@@ -39,6 +39,10 @@ def seeds():
                        b'{"xmux":{"maxConnections":1,"maxConcurrency":1}}',
                        b'{"mode":"packet-up","uplinkDataPlacement":"cookie","sessionIDPlacement":"cookie","sessionIDKey":"x_data_0"}'))
     return {
+        "arguments":[b"--uri\x00socks5://127.0.0.1:1080#vless-core\x00--listen-port\x001080",
+                     b"--connection-fd\x000\x00--listen-port\x0065535\x00--route-control-port\x000",
+                     b"--uri-fd\x002147483648",b"--connect-timeout-ms\x00-1",b"--listen-port\x0065536",
+                     b"--listen-port\x001080\x00--listen-port\x001081",b"--uri\x00--help\x00--uri\x00vless-core"],
         "uri":[prefix+b"security=none&type=tcp#vless-core",prefix+b"security=tls&type=ws&host=vless-core.test&path=%2Fvless-core",
                prefix+b"security=tls&type=grpc&serviceName=vless-core",prefix+b"security=tls&type=xhttp&mode=stream-one&path=%2Fvless-core&extra=%7B%22xPaddingBytes%22%3A%22100-1000%22%7D",
                b"socks5://vless-core:password@127.0.0.1:1080#vless-core",b"socks5://[::1]:1080#vless-core",b"AA==",b"%00%ff%2f",b"Zh==",b"Zm9=",b"AAAA=",

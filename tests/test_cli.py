@@ -338,6 +338,47 @@ class CliTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertNotEqual(self.invoke(args).returncode,0)
 
+    def test_strict_startup_argument_grammar(self):
+        secret="vless-core-private-startup-value"
+        config=f"socks5://user:{secret}@127.0.0.1:1080#vless-core"
+        listen=str(fixtures.port())
+        cases=[]
+        for value in (listen+"junk","+"+listen," "+listen,"-"+listen,str((1<<32)+int(listen)),"18446744073709551616"):
+            cases.append((["--uri",config,"--listen-port",value],"--listen-port"))
+        for option,value in (("--route-control-port","0"),("--connect-timeout-ms","30000"),("--uri-fd","0"),("--connection-fd","0")):
+            for invalid in ("+"+value," "+value,"0junk","18446744073709551616"):
+                prefix=["--listen-port",listen] if option.endswith("-fd") else ["--uri",config,"--listen-port",listen]
+                cases.append(([*prefix,option,invalid],option))
+        for option,value in (("--listen-port",listen),("--route-control-port","0"),("--connect-timeout-ms","30000"),("--routing","1;direct;0"),("--route-control-socket","/tmp/vless-core"),("--xray-version","26.6.27")):
+            base=["--uri",config,"--listen-port",listen]
+            cases.append(([*base,option,value,option,value],option))
+            cases.append(([*base,option],option))
+        cases += [(["--uri",config,"--listen-port",listen,"--unknown-startup-option"],"unknown"),
+                  (["--uri",config,"--listen-port",listen,secret],"unknown")]
+        for args,field in cases:
+            with self.subTest(field=field,args=args):
+                with subprocess.Popen([str(BUILD/"vless-core-test"),*args],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True) as process:
+                    stalled=False
+                    try: stdout,stderr=process.communicate(timeout=0.7)
+                    except subprocess.TimeoutExpired:
+                        stalled=True; process.kill(); stdout,stderr=process.communicate(timeout=2)
+                    self.assertFalse(stalled,"invalid arguments did not exit before starting work")
+                    self.assertNotEqual(process.returncode,0)
+                    self.assertNotIn("listening on",stdout+stderr)
+                    self.assertIn(field,stdout+stderr)
+                    self.assertNotIn(secret,stdout+stderr)
+
+    def test_argument_validation_precedes_configuration_fd_read(self):
+        with subprocess.Popen([str(BUILD/"vless-core-test"),"--uri-fd","0","--listen-port",str(fixtures.port()),"--unknown-startup-option"],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True) as process:
+            stalled=False
+            try: process.wait(timeout=0.7)
+            except subprocess.TimeoutExpired: stalled=True; process.kill(); process.wait(timeout=2)
+            stdout=process.stdout.read(); stderr=process.stderr.read()
+            self.assertFalse(stalled,"configuration was read before argument validation")
+            self.assertNotEqual(process.returncode,0)
+            self.assertIn("unknown",stderr)
+            self.assertNotIn("listening on",stdout+stderr)
+
     def test_invalid_base64_keys(self):
         for key in ("!"*43,"A"*42+"!","A"*43+"=!","A"*43+"=A","A"*42+"%20","A"*42+"%2B","A"*42+"%2F","A"*42+"%C2%A0"):
             for parameter, expected in (("security=reality&pbk=","pbk is required"),("encryption=mlkem768x25519plus.native.1rtt.","invalid VLESS encryption relay key")):

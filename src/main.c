@@ -11,8 +11,10 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include <openssl/crypto.h>
 
 #include "core_log.h"
+#include "cli_args.h"
 #include "connection_trace.h"
 #include "deadline.h"
 #include "resolver.h"
@@ -1187,11 +1189,17 @@ static int read_uri_from_fd(int fd, char out[CORE_URI_MAX_LENGTH + 1]) {
     for (;;) {
         uint8_t buffer[1024];
         ssize_t count = read(fd, buffer, sizeof(buffer));
-        if (count < 0 && errno == EINTR) continue;
-        if (count < 0) return -1;
-        if (count == 0) break;
-        if ((size_t)count > CORE_URI_MAX_LENGTH - used || memchr(buffer, '\0', (size_t)count) != NULL) return -1;
+        if (count <= 0) {
+            OPENSSL_cleanse(buffer,sizeof(buffer));
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) return -1;
+            break;
+        }
+        if ((size_t)count > CORE_URI_MAX_LENGTH - used || memchr(buffer, '\0', (size_t)count) != NULL) {
+            OPENSSL_cleanse(buffer,sizeof(buffer)); return -1;
+        }
         memcpy(out + used, buffer, (size_t)count);
+        OPENSSL_cleanse(buffer,sizeof(buffer));
         used += (size_t)count;
     }
     out[used] = '\0';
@@ -1201,43 +1209,47 @@ static int read_uri_from_fd(int fd, char out[CORE_URI_MAX_LENGTH + 1]) {
 static int read_connection_from_fd(int fd, char uri[CORE_URI_MAX_LENGTH + 1],
                                    char server_ips[SERVER_IP_LIST_MAX_LENGTH + 1]) {
     char input[CORE_URI_MAX_LENGTH + SERVER_IP_LIST_MAX_LENGTH + 3];
+    int result=-1;
     size_t used = 0;
     for (;;) {
         ssize_t count = read(fd, input + used, sizeof(input) - 1 - used);
         if (count < 0 && errno == EINTR) continue;
-        if (count < 0) return -1;
+        if (count < 0) goto input_cleanup;
         if (count == 0) break;
-        if ((size_t)count > sizeof(input) - 1 - used) return -1;
+        if ((size_t)count > sizeof(input) - 1 - used) goto input_cleanup;
         used += (size_t)count;
         if (used == sizeof(input) - 1) {
             char extra;
             do {
                 count = read(fd, &extra, 1);
             } while (count < 0 && errno == EINTR);
-            if (count != 0) return -1;
+            OPENSSL_cleanse(&extra,sizeof(extra));
+            if (count != 0) goto input_cleanup;
             break;
         }
     }
-    if (used == 0 || memchr(input, '\0', used) != NULL) return -1;
+    if (used == 0 || memchr(input, '\0', used) != NULL) goto input_cleanup;
     input[used] = '\0';
 
     char *separator = memchr(input, '\n', used);
     if (separator == NULL || separator == input || separator == input + used - 1 ||
         memchr(separator + 1, '\n', (size_t)((input + used) - (separator + 1))) != NULL ||
         memchr(input, '\r', used) != NULL) {
-        return -1;
+        goto input_cleanup;
     }
 
     size_t uri_length = (size_t)(separator - input);
     size_t server_ips_length = (size_t)((input + used) - (separator + 1));
-    if (uri_length > CORE_URI_MAX_LENGTH || server_ips_length > SERVER_IP_LIST_MAX_LENGTH) return -1;
+    if (uri_length > CORE_URI_MAX_LENGTH || server_ips_length > SERVER_IP_LIST_MAX_LENGTH) goto input_cleanup;
 
     memcpy(uri, input, uri_length);
     uri[uri_length] = '\0';
     memcpy(server_ips, separator + 1, server_ips_length);
     server_ips[server_ips_length] = '\0';
-    memset(input, 0, sizeof(input));
-    return 0;
+    result=0;
+input_cleanup:
+    OPENSSL_cleanse(input,sizeof(input));
+    return result;
 }
 
 static const char *tls_mode_startup_label(int allow_insecure) {
@@ -1256,6 +1268,7 @@ static const char *tls_mode_startup_label(int allow_insecure) {
 
 int main(int argc, char **argv) {
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        core_cli_args_scrub(argc,argv);
         vc_log_error("startup", "failed to ignore SIGPIPE: %s", strerror(errno));
         return 1;
     }
@@ -1269,161 +1282,81 @@ int main(int argc, char **argv) {
     memset(uri_storage, 0, sizeof(uri_storage));
     char server_ips_storage[SERVER_IP_LIST_MAX_LENGTH + 1];
     memset(server_ips_storage, 0, sizeof(server_ips_storage));
-    int uri_supplied = 0;
-    const char *routing_text = NULL;
-    const char *xray_ver = getenv("XRAY_VER");
-    const char *server_ips = NULL;
-    int listen_port = 0;
-
+    vless_config_t cfg={0};
+    core_cli_args_t arguments;
+    char argument_error[160]={0};
+    if (core_cli_args_parse(argc,argv,&arguments,argument_error,sizeof(argument_error))) {
+        vc_log_error("startup","%s",argument_error); goto startup_failure;
+    }
+    if (arguments.action) {
+        core_cli_args_scrub(argc,argv);
+        if (arguments.action == CORE_CLI_HELP) usage(prog);
+        else if (arguments.action == CORE_CLI_VERSION) printf("vless-core %s\n",VLESS_CORE_VERSION);
+        else printf("%s\n",VLESS_OPENSSL_PATCH_STATUS);
+        return 0;
+    }
+    const char *routing_text=arguments.routing;
+    const char *xray_ver=arguments.xray_version ? arguments.xray_version : getenv("XRAY_VER");
+    const char *server_ips=arguments.server_ips;
+    int listen_port=arguments.listen_port;
     routing_config_init(&g_routing);
-    g_connect_timeout_ms = 30000;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--uri") == 0 && i + 1 < argc) {
-            char *argument = argv[++i];
-            if (uri_supplied) {
-                memset(argument, 0, strlen(argument));
-                vc_log_error("startup", "only one URI source may be configured");
-                return 1;
-            }
-            size_t uri_length = strlen(argument);
-            if (uri_length > CORE_URI_MAX_LENGTH) {
-                memset(argument, 0, uri_length);
-                vc_log_error("startup", "invalid URI: URI is too long");
-                return 1;
-            }
-            memcpy(uri_storage, argument, uri_length + 1);
-            memset(argument, 0, uri_length);
-            uri_supplied = 1;
-        } else if (strcmp(argv[i], "--uri-fd") == 0 && i + 1 < argc) {
-            if (uri_supplied) {
-                vc_log_error("startup", "only one URI source may be configured");
-                return 1;
-            }
-            char *end = NULL;
-            long value = strtol(argv[++i], &end, 10);
-            if (end == argv[i] || *end != '\0' || value < 0 || value > INT_MAX) {
-                vc_log_error("startup", "invalid URI file descriptor");
-                return 1;
-            }
-            int uri_fd = (int)value;
-            int read_result = read_uri_from_fd(uri_fd, uri_storage);
-            close(uri_fd);
-            if (read_result != 0) {
-                vc_log_error("startup", "failed to read URI from file descriptor");
-                return 1;
-            }
-            uri_supplied = 1;
-        } else if (strcmp(argv[i], "--connection-fd") == 0 && i + 1 < argc) {
-            if (uri_supplied || server_ips != NULL) {
-                vc_log_error("startup", "only one connection source may be configured");
-                return 1;
-            }
-            char *end = NULL;
-            long value = strtol(argv[++i], &end, 10);
-            if (end == argv[i] || *end != '\0' || value < 0 || value > INT_MAX) {
-                vc_log_error("startup", "invalid connection file descriptor");
-                return 1;
-            }
-            int connection_fd = (int)value;
-            int read_result = read_connection_from_fd(connection_fd, uri_storage, server_ips_storage);
-            close(connection_fd);
-            if (read_result != 0) {
-                vc_log_error("startup", "failed to read connection data from file descriptor");
-                return 1;
-            }
-            server_ips = server_ips_storage;
-            uri_supplied = 1;
-        } else if (strcmp(argv[i], "--listen-port") == 0 && i + 1 < argc) {
-            listen_port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--connect-timeout-ms") == 0) {
-            if (i + 1 >= argc) { vc_log_error("startup", "missing connection timeout"); return 1; }
-            char *end = NULL;
-            errno = 0;
-            const char *argument = argv[++i];
-            long timeout = strtol(argument, &end, 10);
-            if (errno || end == argument || *end || timeout < 1 || timeout > 300000) {
-                vc_log_error("startup", "invalid connection timeout (expected 1-300000 ms)"); return 1;
-            }
-            g_connect_timeout_ms = (int)timeout;
-        } else if (strcmp(argv[i], "--routing") == 0 && i + 1 < argc) {
-            routing_text = argv[++i];
-        } else if (strcmp(argv[i], "--route-control-port") == 0 && i + 1 < argc) {
-            g_route_control_port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--route-control-socket") == 0 && i + 1 < argc) {
-            g_route_control_socket = argv[++i];
-        } else if (strcmp(argv[i], "--server-ips") == 0 && i + 1 < argc) {
-            if (server_ips != NULL) {
-                vc_log_error("startup", "only one server IP source may be configured");
-                return 1;
-            }
-            server_ips = argv[++i];
-        } else if (strcmp(argv[i], "--xray-version") == 0 && i + 1 < argc) {
-            xray_ver = argv[++i];
-        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
-            printf("vless-core %s\n", VLESS_CORE_VERSION);
-            return 0;
-        } else if (strcmp(argv[i], "--openssl-patch-status") == 0) {
-            printf("%s\n", VLESS_OPENSSL_PATCH_STATUS);
-            return 0;
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            usage(prog);
-            return 0;
-        }
-    }
-
-    if (!uri_supplied || listen_port <= 0 || listen_port > 65535) {
-        usage(prog);
-        return 1;
-    }
-    if (g_route_control_port < 0 || g_route_control_port > 65535) {
-        vc_log_error("startup", "invalid route control port");
-        return 1;
+    g_connect_timeout_ms=arguments.connect_timeout;
+    g_route_control_port=arguments.route_port; g_route_control_socket=arguments.route_socket;
+    if (arguments.source == CORE_CLI_URI_ARGUMENT) {
+        size_t length=strlen(arguments.uri);
+        if (length > CORE_URI_MAX_LENGTH) { vc_log_error("startup","invalid URI: URI is too long"); goto startup_failure; }
+        memcpy(uri_storage,arguments.uri,length+1); core_cli_args_scrub(argc,argv);
     }
     if (g_route_control_port > 0 && g_route_control_socket != NULL) {
-        vc_log_error("startup", "only one route control endpoint may be configured");
-        return 1;
+        vc_log_error("startup","only one route control endpoint may be configured"); goto startup_failure;
     }
     if (g_route_control_socket != NULL) {
         size_t path_length = strlen(g_route_control_socket);
         if (path_length == 0 || path_length >= ROUTING_CONTROL_SOCKET_PATH_MAX ||
             g_route_control_socket[0] != '/') {
             vc_log_error("startup", "invalid route control socket path");
-            return 1;
+            goto startup_failure;
         }
         for (size_t i = 0; i < path_length; i++) {
             unsigned char c = (unsigned char)g_route_control_socket[i];
             if (c < 0x20 || c == 0x7f) {
                 vc_log_error("startup", "invalid route control socket path");
-                return 1;
+                goto startup_failure;
             }
         }
     }
     if (xray_ver != NULL && tls13_reality_set_xray_version(xray_ver) != 0) {
         vc_log_error("startup", "invalid Xray version (expected x.y.z, each component 0-255)");
-        return 1;
+        goto startup_failure;
     }
 
     char routing_err[256] = {0};
     if (routing_config_parse(routing_text, &g_routing, routing_err, sizeof(routing_err)) != 0) {
         vc_log_error("startup", "invalid routing policy: %s", routing_err);
-        return 1;
+        goto startup_failure;
     }
 
-    vless_config_t cfg;
+    if (arguments.source == CORE_CLI_URI_FD || arguments.source == CORE_CLI_CONNECTION_FD) {
+        int read_result=arguments.source == CORE_CLI_URI_FD ? read_uri_from_fd(arguments.source_fd,uri_storage) :
+            read_connection_from_fd(arguments.source_fd,uri_storage,server_ips_storage);
+        close(arguments.source_fd);
+        if (read_result) { vc_log_error("startup","failed to read configuration from %s",arguments.source == CORE_CLI_URI_FD ? "--uri-fd" : "--connection-fd"); goto startup_failure; }
+        if (arguments.source == CORE_CLI_CONNECTION_FD) server_ips=server_ips_storage;
+    }
     char err[256] = {0};
     if (parse_core_uri(uri_storage, &cfg, err, sizeof(err)) != 0) {
         vc_log_error("startup", "invalid URI: %s", err);
-        memset(uri_storage, 0, sizeof(uri_storage));
-        return 1;
+        OPENSSL_cleanse(uri_storage,sizeof(uri_storage));
+        goto startup_failure;
     }
-    memset(uri_storage, 0, sizeof(uri_storage));
+    OPENSSL_cleanse(uri_storage,sizeof(uri_storage));
     if (server_ips != NULL) {
         if (core_set_server_ips(server_ips) != 0) {
             vc_log_error("startup", "invalid pre-resolved server IP list");
-            return 1;
+            goto startup_failure;
         }
     }
-    memset(server_ips_storage, 0, sizeof(server_ips_storage));
+    OPENSSL_cleanse(server_ips_storage,sizeof(server_ips_storage));
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) {
@@ -1556,4 +1489,9 @@ int main(int argc, char **argv) {
 
     close(lfd);
     return listener_result;
+startup_failure:
+    core_cli_args_scrub(argc,argv);
+    OPENSSL_cleanse(uri_storage,sizeof(uri_storage)); OPENSSL_cleanse(server_ips_storage,sizeof(server_ips_storage));
+    OPENSSL_cleanse(&cfg,sizeof(cfg));
+    return 1;
 }

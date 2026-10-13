@@ -35,6 +35,9 @@ static void test_start_failure(int allocation, int transient) {
 }
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    char private_uri[]="socks5://user:vless-core-private-value@127.0.0.1:1080#vless-core";
+    char *invalid_args[]={"vless-core-test","--uri",private_uri,"--unknown-option"};
+    CHECK("startup/invalid-arguments-clear-uri",vc_program_main(4,invalid_args) != 0 && !memcmp(private_uri,(char[sizeof(private_uri)]){0},sizeof(private_uri)));
     for (int i = 0; i < 256; i++) REQUIRE("clients/acquire", acquire_client_slot());
     CHECK("clients/limit-256", !acquire_client_slot() && g_active_client_count == 256);
     for (int i = 0; i < 256; i++) release_client_slot();
