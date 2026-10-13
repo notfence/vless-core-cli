@@ -49,6 +49,20 @@ static void clear_conn(tls13_conn_t *c) {
     core_hpack_clear(&c->hpack);
 }
 
+static void pooled_receive_window(void) {
+    int pair[2]; REQUIRE("h2/pooled-preface-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    tls13_conn_t connection={.mode=CONN_MODE_GRPC_PLAIN,.fd=pair[0],.xmux_physical=1,.xmux_async=1};
+    char error[128];
+    REQUIRE("h2/pooled-preface-write",h2_send_client_preface(&connection,error,sizeof(error)) == 0);
+    uint8_t preface[24]; REQUIRE("h2/pooled-preface-readable",read_exact(pair[1],preface,sizeof(preface)) == 0);
+    CHECK("h2/pooled-preface-valid",!memcmp(preface,"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",sizeof(preface)));
+    const uint8_t *frame=connection.xmux_plain_output.data;
+    REQUIRE("h2/pooled-settings-frame",connection.xmux_plain_output.len == 33 && frame[2] == 24 && frame[3] == 4 && !frame[4]);
+    uint32_t window=((uint32_t)frame[11]<<24)|((uint32_t)frame[12]<<16)|((uint32_t)frame[13]<<8)|frame[14];
+    CHECK("h2/pooled-advertises-bounded-receive-window",frame[9] == 0 && frame[10] == 4 && window == 256U*1024U);
+    clear_conn(&connection); close(pair[0]); close(pair[1]);
+}
+
 static void grpc_pooled_buffer_readiness(void) {
     tls13_conn_t c={.grpc_transport=1}; unsigned char fixture=0;
     c.xmux_stream=(core_http2_stream_t *)&fixture; pooled_fixture_pending=0;
@@ -751,6 +765,7 @@ static void http2_single_wire_vectors(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 1) pooled_receive_window();
     if (argc == 3 && !strcmp(argv[1],"--xhttp-post")) {
         vless_config_t config; tls13_conn_t *connection=NULL; char error[256]={0};
         if (parse_core_uri(argv[2],&config,error,sizeof(error)) || tls13_reality_connect(&config,&connection,error,sizeof(error))) { fprintf(stderr,"%s\n",error); return 2; }

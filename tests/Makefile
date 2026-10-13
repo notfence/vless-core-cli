@@ -80,7 +80,7 @@ $(HOST_BUILD_DIR)/test_dialer: $(HOST_BUILD_DIR)/test_dialer.o $(filter-out $(HO
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=getaddrinfo,--wrap=connect,--wrap=poll
 
 $(HOST_BUILD_DIR)/test_xmux: $(HOST_BUILD_DIR)/test_xmux.o $(filter-out $(HOST_BUILD_DIR)/src/http2_pool.o,$(BASE_OBJ)) $(NETWORK_GUARD)
-	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=core_now_ms,--wrap=RAND_bytes
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=core_now_ms,--wrap=RAND_bytes,--wrap=core_poll
 
 $(HOST_BUILD_DIR)/test_grpc: $(HOST_BUILD_DIR)/test_grpc.o $(filter-out $(HOST_BUILD_DIR)/src/grpc.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=malloc

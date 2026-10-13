@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define CORE_HTTP2_STREAM_LIMIT (256U*1024U)
+
 typedef struct core_http2_stream core_http2_stream_t;
 typedef struct {
     uint8_t type, flags;

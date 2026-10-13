@@ -2234,7 +2234,7 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
         return -1;
     }
 
-    uint32_t initial_window = c->grpc_physical_only ? c->grpc_initial_window : c->xmux_physical ? 65535 : H2_CLIENT_INITIAL_WINDOW;
+    uint32_t initial_window = c->grpc_physical_only ? c->grpc_initial_window : c->xmux_physical ? CORE_HTTP2_STREAM_LIMIT : H2_CLIENT_INITIAL_WINDOW;
     uint8_t settings[24] = {
         0x00,
         0x04,

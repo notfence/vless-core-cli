@@ -24,7 +24,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
-#define XMUX_STREAM_LIMIT (256U*1024U)
+#define XMUX_STREAM_LIMIT CORE_HTTP2_STREAM_LIMIT
 #define XMUX_TOTAL_LIMIT (16U*1024U*1024U)
 #define XMUX_TX_RESERVE (64U*1024U)
 #define XMUX_CANCEL_DRAIN_MS 2000U
@@ -231,6 +231,7 @@ static void account_output(mux_actor_t *actor) {
     size_t pending=actor->physical ? actor->manager->backend->pending(actor->physical) : 0;
     size_t previous=upload_bytes;
     size_t previous_actor=actor->net_accounted;
+    uint64_t previous_flushed=actor->flushed;
     if (actor->physical && actor->manager->backend->enqueued && actor->manager->backend->flushed) {
         actor->enqueued=actor->manager->backend->enqueued(actor->physical);
         actor->flushed=actor->manager->backend->flushed(actor->physical);
@@ -238,7 +239,8 @@ static void account_output(mux_actor_t *actor) {
     upload_bytes-=actor->net_accounted; upload_bytes+=pending; actor->net_accounted=pending;
     notify_write_capacity(previous);
     if (previous_actor)
-        for (core_http2_stream_t *stream=streams;stream;stream=stream->next) if (stream->upload == actor) signal_stream(stream);
+        for (core_http2_stream_t *stream=streams;stream;stream=stream->next)
+            if (stream->upload == actor && stream->write_fence > previous_flushed && stream->write_fence <= actor->flushed) signal_stream(stream);
 }
 
 static int send_frame(mux_actor_t *actor, uint8_t type, uint8_t flags, uint32_t id, const uint8_t *data, size_t length) {
@@ -278,7 +280,7 @@ static int start_request(mux_actor_t *actor, core_http2_stream_t *stream, int ro
     request->stream=stream; request->role=role; request->remaining=body;
     request->send_ended=role == 0 || (role == 3 && !body);
     request->send_window=actor->peer_window;
-    unsigned initial_window=grpc_manager(actor->manager) ? (unsigned)actor->manager->config.grpc_initial_window : 65535;
+    unsigned initial_window=grpc_manager(actor->manager) ? (unsigned)actor->manager->config.grpc_initial_window : CORE_HTTP2_STREAM_LIMIT;
     if (!initial_window) initial_window=256U*1024U;
     request->receive_window=initial_window;
     if (role == 0 || role == 1) {
@@ -608,6 +610,12 @@ static int move_waiting_streams(mux_actor_t *actor) {
     return 0;
 }
 
+static int receive_credit_due(const mux_actor_t *actor, const core_http2_stream_t *stream, const mux_request_t *request) {
+    return !actor->http2 || actor->manager->config.transport_mode != TRANSPORT_XHTTP ||
+        stream->consumed >= 16384 || actor->receive_window <= 16384 || !request || request->receive_window <= 16384 ||
+        request->ended || stream->closed || stream->failed;
+}
+
 static int advance_streams(mux_actor_t *actor) {
     uint64_t now=core_now_ms();
     if (!actor->http2) {
@@ -618,8 +626,10 @@ static int advance_streams(mux_actor_t *actor) {
         if (stream->download == actor && stream->consumed && stream->down_id) {
             uint32_t amount=(uint32_t)stream->consumed;
             mux_request_t *request=find_request(actor,stream->down_id);
-            if (window_update(actor,0,amount) != 0 || (request && !request->ended && !stream->closed && window_update(actor,stream->down_id,amount) != 0)) return -1;
-            actor->receive_window+=amount; if (request) request->receive_window+=amount; stream->consumed=0;
+            if (receive_credit_due(actor,stream,request)) {
+                if (window_update(actor,0,amount) != 0 || (request && !request->ended && !stream->closed && window_update(actor,stream->down_id,amount) != 0)) return -1;
+                actor->receive_window+=amount; if (request) request->receive_window+=amount; stream->consumed=0;
+            }
         }
         if (stream->failed || (stream->closed && !stream->tx.length)) continue;
         if (stream->download == actor && !stream->down_id) {
@@ -784,6 +794,8 @@ static void *actor_worker(void *opaque) {
     actor->last_input_ms=core_now_ms(); pthread_mutex_unlock(&mux_lock);
     while (!actor_failed(actor)) {
         pthread_mutex_lock(&mux_lock);
+        uint64_t enqueued_before=actor->enqueued,flushed_before=actor->flushed;
+        int received_frame=0;
         int result=advance_streams(actor);
         int in_use=0;
         for (core_http2_stream_t *stream=streams;stream;stream=stream->next)
@@ -809,6 +821,7 @@ static void *actor_worker(void *opaque) {
             pthread_mutex_unlock(&mux_lock);
             result=backend->read_frame(actor->physical,&frame,capacity);
             if (result != 0) break;
+            received_frame=1;
             pthread_mutex_lock(&mux_lock); actor->last_input_ms=core_now_ms();
             result=process_frame(actor,&frame); pthread_mutex_unlock(&mux_lock); free(frame.data);
             if (result < 0) { if (!actor->error[0]) snprintf(actor->error,sizeof(actor->error),"XHTTP response frame %u rejected",frame.type); break; }
@@ -817,10 +830,12 @@ static void *actor_worker(void *opaque) {
         uint64_t now=core_now_ms();
         pthread_mutex_lock(&mux_lock);
         if (maintain_ping(actor,now) != 0) actor->failed=1;
-        size_t pending=actor->net_accounted; pthread_mutex_unlock(&mux_lock);
+        size_t pending=actor->net_accounted;
+        int progressed=received_frame || actor->enqueued != enqueued_before || actor->flushed != flushed_before;
+        pthread_mutex_unlock(&mux_lock);
         short events=backend->events ? backend->events(actor->physical) : (short)(POLLIN|(pending ? POLLOUT : 0));
         struct pollfd descriptors[2]={{.fd=actor->wake[0],.events=POLLIN},{.fd=backend->fd(actor->physical),.events=events}};
-        int wait=10;
+        int wait=progressed ? 0 : 10;
         if (grpc_manager(actor->manager) && !in_use && !actor->requests && !pending) {
             uint64_t due=actor->idle_pending_ms+60000;
             if (actor->alive_period && actor->manager->config.grpc_permit_without_stream) {

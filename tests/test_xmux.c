@@ -2,12 +2,22 @@
 #include "../src/http2_pool.c"
 #include "check.h"
 
-typedef struct { size_t pending; int frames, last_type, flags[16]; uint32_t last_id, ids[16]; uint64_t enqueued, flushed; } wire_t;
+typedef struct { size_t pending; int frames, last_type, flags[16]; uint32_t last_id, ids[16], increment, request_id; uint64_t enqueued, flushed; } wire_t;
 static int session_failure;
 static uint64_t pacing_clock;
 static uint32_t pacing_random;
+static mux_actor_t *scheduling_actor;
+static int scheduling_waits[3],scheduling_polls;
 uint64_t __real_core_now_ms(void);
 int __real_RAND_bytes(unsigned char *,int);
+int __real_core_poll(struct pollfd *,nfds_t,int);
+int __wrap_core_poll(struct pollfd *descriptors,nfds_t count,int timeout) {
+    if (!scheduling_actor) return __real_core_poll(descriptors,count,timeout);
+    for (nfds_t i=0;i<count;i++) descriptors[i].revents=0;
+    scheduling_waits[scheduling_polls++]=timeout;
+    if (scheduling_polls == 3) scheduling_actor->failed=1;
+    return 0;
+}
 uint64_t __wrap_core_now_ms(void) { return pacing_clock ? pacing_clock : __real_core_now_ms(); }
 int __wrap_RAND_bytes(unsigned char *data,int length) {
     if (!pacing_clock) return __real_RAND_bytes(data,length);
@@ -25,8 +35,8 @@ static int fixture_session(const vless_config_t *config, char *session, size_t c
 }
 static size_t fixture_pending(void *opaque) { return ((wire_t *)opaque)->pending; }
 static int fixture_send(void *opaque, uint8_t type, uint8_t flags, uint32_t id, const uint8_t *data, size_t length) {
-    (void)data;
     wire_t *wire=opaque; wire->pending+=length+9; wire->enqueued+=length+9;
+    if (type == 8 && length == 4) wire->increment=((uint32_t)data[0]<<24)|((uint32_t)data[1]<<16)|((uint32_t)data[2]<<8)|data[3];
     if (wire->frames < 16) { wire->flags[wire->frames]=flags; wire->ids[wire->frames]=id; }
     wire->frames++; wire->last_type=type; wire->last_id=id; return 0;
 }
@@ -35,6 +45,134 @@ static const core_xmux_backend_t fixture_backend={.send_frame=fixture_send,.pend
 static uint64_t fixture_enqueued(void *opaque) { return ((wire_t *)opaque)->enqueued; }
 static uint64_t fixture_flushed(void *opaque) { return ((wire_t *)opaque)->flushed; }
 static const core_http2_backend_t finish_backend={.send_frame=fixture_send,.pending=fixture_pending,.enqueued=fixture_enqueued,.flushed=fixture_flushed};
+
+static wire_t scheduling_wire;
+static int scheduling_open(const vless_config_t *config,void **physical,int *http2,char *error,size_t capacity) {
+    (void)config; (void)error; (void)capacity; *physical=&scheduling_wire; *http2=1; return 0;
+}
+static void scheduling_close(void *physical) { (void)physical; }
+static int scheduling_fd(void *physical) { (void)physical; return -1; }
+static int scheduling_collect(void *physical) { (void)physical; return 0; }
+static int scheduling_frame(void *physical,core_http2_frame_t *frame,size_t capacity) {
+    (void)physical; (void)frame; (void)capacity; return 1;
+}
+static int scheduling_flush(void *physical) {
+    wire_t *wire=physical; wire->flushed=wire->enqueued; wire->pending=0; return 0;
+}
+
+static void worker_progress_policy(void) {
+    core_http2_backend_t backend=finish_backend;
+    backend.open=scheduling_open; backend.close=scheduling_close; backend.fd=scheduling_fd;
+    backend.collect=scheduling_collect; backend.read_frame=scheduling_frame; backend.flush=scheduling_flush;
+    for (int blocked=0;blocked<2;blocked++) {
+        mux_manager_t manager={.backend=&backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
+        mux_group_t group={.manager=&manager};
+        mux_actor_t actor={.manager=&manager,.group=&group,.peer_frame=16384,.peer_concurrency=UINT32_MAX,
+            .send_window=blocked ? 0 : 65535,.connect_until_ms=core_now_ms()+1000};
+        core_http2_stream_t stream={.download=&actor,.upload=&actor,.ready=1,.references=2,.down_id=1,.up_id=1};
+        strcpy(stream.config.xhttp_mode,"stream-one");
+        mux_request_t *request=calloc(1,sizeof(*request));
+        REQUIRE("xmux/worker-progress-request",request != NULL);
+        request->stream=&stream; request->id=1; request->role=1; request->send_window=65535; actor.requests=request;
+        REQUIRE("xmux/worker-progress-notifications",notification_pair(stream.notify) == 0 && notification_pair(actor.wake) == 0);
+        uint8_t payload[32768]={0};
+        REQUIRE("xmux/worker-progress-upload",queue_append(&stream.tx,payload,sizeof(payload),XMUX_STREAM_LIMIT) == 0);
+        memset(&scheduling_wire,0,sizeof(scheduling_wire)); scheduling_polls=0;
+        streams=&stream; upload_bytes=sizeof(payload); actor_count=1; scheduling_actor=&actor;
+        actor_worker(&actor); scheduling_actor=NULL;
+        CHECK("xmux/worker-progress-bounded-passes",scheduling_polls == 3 && !actor_count && upload_bytes == stream.tx.length);
+        if (blocked) {
+            CHECK("xmux/worker-blocked-upload-still-waits",scheduling_waits[0] == 10 && scheduling_waits[1] == 10 && scheduling_waits[2] == 10 && stream.tx.length == sizeof(payload));
+        } else {
+            CHECK("xmux/worker-ready-upload-no-poll-delay",scheduling_waits[0] == 0 && scheduling_waits[1] == 0);
+            CHECK("xmux/worker-idle-does-not-spin",scheduling_waits[2] == 10 && !stream.tx.length);
+        }
+        free(stream.tx.data); close(stream.notify[0]); close(stream.notify[1]); streams=NULL; upload_bytes=0;
+    }
+}
+
+static int receive_request(void *physical,const vless_config_t *config,const char *session,uint64_t sequence,int role,const uint8_t *data,size_t length,uint32_t *id,uint32_t limit,size_t *consumed,size_t *body) {
+    int result=pacing_request(physical,config,session,sequence,role,data,length,id,limit,consumed,body);
+    wire_t *wire=physical; *id=wire->request_id+=2; return result;
+}
+
+static void receive_capacity_policy(void) {
+    wire_t wire={.request_id=UINT32_MAX};
+    core_http2_backend_t backend=finish_backend; backend.request=receive_request;
+    mux_manager_t manager={.backend=&backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
+    mux_group_t group={.manager=&manager};
+    mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.peer_concurrency=UINT32_MAX,.peer_window=65535,.receive_window=65535};
+    actor.validation.settings_received=1;
+    core_http2_stream_t stream={.download=&actor,.upload=&actor,.ready=1,.references=1},sibling={.download=&actor,.upload=&actor,.ready=1,.references=1};
+    REQUIRE("xmux/receive-window-notifications",notification_pair(stream.notify) == 0 && notification_pair(sibling.notify) == 0 && notification_pair(actor.wake) == 0);
+    REQUIRE("xmux/receive-window-request",start_request(&actor,&stream,1,0) == 0);
+    mux_request_t *request=actor.requests; request->response.headers=1;
+    CHECK("xmux/receive-window-matches-bounded-queue",request->receive_window == 256U*1024U && actor.receive_window == 256U*1024U && wire.increment == 256U*1024U-65535);
+    if (request->receive_window == 256U*1024U) {
+        uint8_t payload[16384]={0}; core_http2_frame_t data={.type=0,.id=request->id,.data=payload,.length=sizeof(payload)};
+        for (size_t i=0;i<16;i++) REQUIRE("xmux/receive-window-full-credit",process_frame(&actor,&data) == 0);
+        CHECK("xmux/receive-window-no-early-refund",stream.rx.length == 256U*1024U && !request->receive_window && !actor.receive_window && download_bytes == stream.rx.length && wire.frames == 1);
+        streams=&stream; uint8_t output[16384]; size_t received;
+        for (size_t i=0;i<8;i++) REQUIRE("xmux/receive-window-consumption",core_http2_read(&stream,output,sizeof(output),&received) == 0 && received == sizeof(output));
+        CHECK("xmux/receive-window-consumption-only-credit",!request->receive_window && stream.consumed == 128U*1024U && download_bytes == 128U*1024U);
+        REQUIRE("xmux/receive-window-replenishment",advance_streams(&actor) == 0);
+        CHECK("xmux/receive-window-replenishes-consumed-bytes",request->receive_window == 128U*1024U && actor.receive_window == 128U*1024U && wire.frames == 3 && wire.increment == 128U*1024U && !stream.consumed);
+        REQUIRE("xmux/receive-window-second-request",start_request(&actor,&sibling,1,0) == 0);
+        CHECK("xmux/receive-window-connection-scales-with-streams",actor.requests->receive_window == 256U*1024U && actor.receive_window == 384U*1024U && wire.increment == 256U*1024U && actor.receive_slots == 2);
+    }
+    while (actor.requests) { mux_request_t *next=actor.requests->next; free(actor.requests); actor.requests=next; }
+    free(stream.rx.data); close(stream.notify[0]); close(stream.notify[1]); close(sibling.notify[0]); close(sibling.notify[1]); close(actor.wake[0]); close(actor.wake[1]);
+    streams=NULL; upload_bytes=download_bytes=0;
+}
+
+static void flush_notification_policy(void) {
+    wire_t wire={.enqueued=113,.flushed=113}; mux_manager_t manager={.backend=&finish_backend};
+    mux_actor_t actor={.manager=&manager,.physical=&wire,.net_accounted=13,.flushed=100};
+    core_http2_stream_t complete={.upload=&actor,.write_fence=110},future={.upload=&actor,.write_fence=120},idle={.upload=&actor,.write_fence=90};
+    REQUIRE("h2/flush-notification-channels",notification_pair(complete.notify) == 0 && notification_pair(future.notify) == 0 && notification_pair(idle.notify) == 0);
+    complete.next=&future; future.next=&idle; streams=&complete; upload_bytes=13;
+    account_output(&actor);
+    CHECK("h2/flush-notifies-completed-write",complete.notified && core_wait_socket(complete.notify[0],POLLIN,0) == 1);
+    CHECK("h2/flush-does-not-wake-unfinished-write",!future.notified && core_wait_socket(future.notify[0],POLLIN,0) == 0);
+    CHECK("h2/control-flush-does-not-wake-idle-reader",!idle.notified && core_wait_socket(idle.notify[0],POLLIN,0) == 0);
+    core_http2_drain_notifications(&complete); wire.enqueued=wire.flushed=126; actor.net_accounted=13; upload_bytes=13;
+    account_output(&actor);
+    CHECK("h2/next-flush-notifies-next-write",future.notified && !complete.notified && !idle.notified);
+    close(complete.notify[0]); close(complete.notify[1]); close(future.notify[0]); close(future.notify[1]); close(idle.notify[0]); close(idle.notify[1]);
+    streams=NULL; upload_bytes=0;
+}
+
+static void receive_credit_batching(void) {
+    wire_t wire={0}; mux_manager_t manager={.backend=&finish_backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
+    mux_group_t group={.manager=&manager};
+    mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.peer_frame=16384,.send_window=65535,.receive_window=256U*1024U-5};
+    core_http2_stream_t stream={.download=&actor,.upload=&actor,.ready=1,.down_id=1,.up_id=1,.references=1,.consumed=5};
+    strcpy(stream.config.xhttp_mode,"stream-one");
+    mux_request_t request={.stream=&stream,.id=1,.role=1,.send_window=65535,.receive_window=256U*1024U-5}; actor.requests=&request;
+    REQUIRE("xmux/credit-batch-notifications",notification_pair(stream.notify) == 0 && notification_pair(actor.wake) == 0);
+    REQUIRE("xmux/credit-batch-upload",queue_append(&stream.tx,(const uint8_t *)"up",2,XMUX_STREAM_LIMIT) == 0);
+    streams=&stream; upload_bytes=2;
+    REQUIRE("xmux/credit-batch-small-consumption",advance_streams(&actor) == 0);
+    CHECK("xmux/credit-batch-retains-small-refund",stream.consumed == 5 && request.receive_window == 256U*1024U-5 && actor.receive_window == 256U*1024U-5);
+    CHECK("xmux/credit-batch-does-not-block-upload",!stream.tx.length && wire.frames == 1 && wire.last_type == 0);
+    if (stream.consumed == 5) {
+        stream.consumed+=16379; request.receive_window-=16379; actor.receive_window-=16379;
+        REQUIRE("xmux/credit-batch-threshold",advance_streams(&actor) == 0);
+        CHECK("xmux/credit-batch-refunds-consumed-block",!stream.consumed && request.receive_window == 256U*1024U && actor.receive_window == 256U*1024U && wire.frames == 3 && wire.increment == 16384);
+        stream.consumed=5; request.receive_window=256U*1024U-5; actor.receive_window=16384;
+        REQUIRE("xmux/credit-batch-low-connection-window",advance_streams(&actor) == 0);
+        CHECK("xmux/credit-batch-connection-no-deadlock",!stream.consumed && actor.receive_window == 16389 && request.receive_window == 256U*1024U && wire.increment == 5);
+        stream.consumed=7; request.receive_window=16384; actor.receive_window=256U*1024U-7;
+        REQUIRE("xmux/credit-batch-low-stream-window",advance_streams(&actor) == 0);
+        CHECK("xmux/credit-batch-stream-no-deadlock",!stream.consumed && request.receive_window == 16391 && actor.receive_window == 256U*1024U && wire.increment == 7);
+        stream.consumed=3; request.receive_window=256U*1024U-3; actor.receive_window=256U*1024U-3; request.ended=1;
+        int frames=wire.frames;
+        REQUIRE("xmux/credit-batch-ended-stream",advance_streams(&actor) == 0);
+        CHECK("xmux/credit-batch-ended-refunds-connection-only",!stream.consumed && actor.receive_window == 256U*1024U && wire.frames == frames+1 && !wire.last_id);
+    }
+    free(stream.tx.data); close(stream.notify[0]); close(stream.notify[1]); close(actor.wake[0]); close(actor.wake[1]);
+    streams=NULL; upload_bytes=0;
+}
 
 static void directional_finish(void) {
     wire_t wire={0}; mux_manager_t manager={.backend=&finish_backend}; manager.config.transport_mode=TRANSPORT_GRPC;
@@ -216,6 +354,10 @@ static void http2_wire_vectors(void) {
 }
 
 int main(void) {
+    worker_progress_policy();
+    receive_capacity_policy();
+    flush_notification_policy();
+    receive_credit_batching();
     asynchronous_relay_deadline();
     http2_wire_vectors();
     cancelled_stream_cleanup();

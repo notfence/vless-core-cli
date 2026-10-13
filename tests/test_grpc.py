@@ -1,6 +1,7 @@
 import struct
 import json
 import socket
+import select
 import threading
 import time
 import unittest
@@ -159,33 +160,39 @@ class GrpcTests(unittest.TestCase):
     def test_reply_is_readable_before_upload_window_recovers(self):
         reply=b"vless-core readable while upload stalled"
         for transport in ("grpc","xhttp"):
-            consumed=threading.Event(); completed=threading.Event()
+            recovered=threading.Event(); reply_read=threading.Event(); completed=threading.Event(); settings_acknowledged=threading.Event()
             def handle(connection):
                 self.assertEqual(exact(connection,24),b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
                 connection.sendall(frame(4,payload=struct.pack("!HI",4,1024)))
-                count=0; responded=False
+                count=0; response_stream=0; uploaded=0
                 while not completed.is_set():
+                    if reply_read.is_set() and not recovered.is_set():
+                        connection.sendall(frame(8,payload=(1048576).to_bytes(4,"big"))+frame(8,stream=response_stream,payload=(1048576).to_bytes(4,"big")))
+                        recovered.set()
+                    if not (transport == "xhttp" and connection.pending()) and not select.select([connection],[],[],0.01)[0]: continue
                     header=exact(connection,9); size=int.from_bytes(header[:3],"big")
                     kind,flags=header[3:5]; stream=int.from_bytes(header[5:],"big"); exact(connection,size)
                     if kind == 4 and not flags&1: connection.sendall(frame(4,1))
+                    if kind == 4 and flags&1: settings_acknowledged.set()
                     if kind == 0:
-                        count+=1
+                        count+=1; uploaded+=size
                         if count == 2:
+                            self.assertEqual(uploaded,1024)
                             body=b"\x00\x00"+reply
                             connection.sendall(frame(1,4,stream,GRPC_HEADERS if transport == "grpc" else b"\x88")+frame(0,stream=stream,payload=envelope(body) if transport == "grpc" else body))
-                            responded=True
-                    if kind == 8 and stream and responded:
-                        consumed.set()
-                        connection.sendall(frame(8,payload=(1048576).to_bytes(4,"big"))+frame(8,stream=stream,payload=(1048576).to_bytes(4,"big")))
+                            response_stream=stream
             options={"mode":"stream-one","extra":json.dumps({"xmux":{"maxConnections":1}})} if transport == "xhttp" else {}
             cert,_=certificate()
             with self.subTest(transport=transport), Server(handle,tls=transport == "xhttp") as peer:
                 with cli(uri(peer.port,transport,"tls" if transport == "xhttp" else "none",**options),extra=["--connect-timeout-ms","1000"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
                     try:
                         with socks_connect(core.port,80) as tunnel:
+                            self.assertTrue(settings_acknowledged.wait(1))
                             tunnel.sendall(b"x"*65536)
                             self.assertEqual(exact(tunnel,len(reply)),reply)
-                            self.assertTrue(consumed.wait(1))
+                            self.assertFalse(recovered.is_set())
+                            reply_read.set()
+                            self.assertTrue(recovered.wait(1))
                         self.assertNotIn("VLESS response deadline expired",core.log)
                     finally: completed.set()
 
