@@ -5561,7 +5561,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     uint16_t server_group = 0;
     int got_server_hello = 0;
 
-    for (int attempts = 0; attempts < 16 && !got_server_hello; attempts++) {
+    while (!got_server_hello) {
         uint8_t rtype = 0;
         uint8_t *pl = NULL;
         size_t pl_len = 0;
@@ -5572,6 +5572,9 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         }
 
         if (rtype == 0x16) {
+            if (!pl_len) {
+                free(pl); db_free(&plain_hs); set_err(err,err_cap,"empty TLS handshake record before ServerHello"); goto handshake_failure;
+            }
             if (db_append(&plain_hs, pl, pl_len) != 0) {
                 free(pl);
                 db_free(&plain_hs);

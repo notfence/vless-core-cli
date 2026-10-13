@@ -309,6 +309,72 @@ class XrayTests(unittest.TestCase):
                     result=subprocess.run([str(BUILD/"test_tls_state"),uri(listen,"tcp","tls",fp=fingerprint)],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=15)
                     self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
 
+    def test_server_hello_record_fragmentation(self):
+        cert,key=certificate()
+        context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version=context.maximum_version=ssl.TLSVersion.TLSv1_3
+        context.load_cert_chain(cert,key)
+        for fragment in (0,4,1,"truncated","oversized","empty"):
+            def handle(connection):
+                incoming,outgoing=ssl.MemoryBIO(),ssl.MemoryBIO()
+                peer=context.wrap_bio(incoming,outgoing,server_side=True)
+                initial=True
+                while True:
+                    header=exact(connection,5)
+                    incoming.write(header+exact(connection,int.from_bytes(header[3:5],"big")))
+                    complete=False
+                    try:
+                        peer.do_handshake(); complete=True
+                    except ssl.SSLWantReadError:
+                        pass
+                    data=outgoing.read()
+                    if initial and data:
+                        offset=0
+                        while offset<len(data):
+                            record=data[offset:offset+5]
+                            length=int.from_bytes(record[3:5],"big")
+                            payload=data[offset+5:offset+5+length]
+                            if record[0] == 22:
+                                if fragment == "truncated":
+                                    connection.sendall(record[:3]+b"\x00\x07"+payload[:7]); return
+                                if fragment == "oversized":
+                                    connection.sendall(record[:3]+b"\x00\x04\x02\x10\x00\x00"); return
+                                if fragment == "empty":
+                                    connection.sendall(record[:3]+b"\x00\x00"); return
+                                if fragment:
+                                    for start in range(0,length,fragment):
+                                        part=payload[start:start+fragment]
+                                        connection.sendall(record[:3]+len(part).to_bytes(2,"big")+part)
+                                else:
+                                    connection.sendall(record+payload)
+                            else:
+                                connection.sendall(record+payload)
+                            offset+=length+5
+                        initial=False
+                    elif data:
+                        connection.sendall(data)
+                    if complete: return
+            with self.subTest(fragment=fragment), Server(handle) as server:
+                result=subprocess.run([str(BUILD/"test_tls_state"),uri(server.port,"tcp","tls")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=5)
+                self.assertEqual(result.returncode,0 if isinstance(fragment,int) else 1,result.stdout+result.stderr)
+                if isinstance(fragment,str):
+                    expected={"truncated":"failed to read ServerHello record","oversized":"TLS ServerHello exceeds handshake limit","empty":"empty TLS handshake record before ServerHello"}[fragment]
+                    self.assertIn(expected,result.stderr)
+
+    def test_fragmented_server_hello_keeps_connection_deadline(self):
+        def handler(connection):
+            header=exact(connection,5); exact(connection,int.from_bytes(header[3:5],"big"))
+            connection.sendall(b"\x16\x03\x03\x00\x04\x02\x00\xff\xff")
+            for _ in range(30):
+                time.sleep(0.03); connection.sendall(b"\x16\x03\x03\x00\x01\x00")
+        with Server(handler) as server, cli(uri(server.port,"tcp","tls"),extra=["--connect-timeout-ms","200"]) as core:
+            started=time.monotonic()
+            with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                with socks_connect(core.port,80): pass
+            self.assertGreater(time.monotonic()-started,0.15)
+            self.assertLess(time.monotonic()-started,0.9)
+
+
     def test_xhttp_download_does_not_inherit_insecure_tls(self):
         shared={"sessionIDPlacement":"header","seqPlacement":"header"}
         for pooled in (False,True):
