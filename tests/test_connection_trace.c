@@ -56,6 +56,23 @@ int main(void) {
     core_trace_restore(&transferred);
     CHECK("trace/transfer-preserves-identity-and-phase", trace.id == transferred.id && trace.stage == CORE_TRACE_TRANSPORT);
     core_trace_observe(NULL,NULL); core_trace_detach();
+    REQUIRE("trace/error-attach",core_trace_attach(&trace) == 0);
+    core_trace_stage(CORE_TRACE_TRANSPORT); errno=ENOTTY;
+    core_connection_error_t failure=core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_TLS,EPROTO),reported;
+    core_trace_error_set(failure); errno=ECONNREFUSED;
+    core_trace_failure(CORE_TRACE_TCP);
+    CHECK("trace/tls-cause-survives-cleanup-and-exhaustion",core_trace_error_get(&reported) && reported.kind == CORE_FAILURE_TLS &&
+        reported.stage == CORE_TRACE_TRANSPORT && reported.system_error == EPROTO && trace.failed_stage == CORE_TRACE_TRANSPORT && errno == ECONNREFUSED);
+    CHECK("trace/error-identity",core_trace_id() == trace.id && core_trace_id() != 0);
+    core_trace_snapshot(&transferred); core_trace_error_clear();
+    CHECK("trace/successful-retry-clears-failure",!core_trace_error_get(&reported) && trace.failed_stage == CORE_TRACE_NONE);
+    core_trace_restore(&transferred); core_trace_complete(0);
+    REQUIRE("trace/error-format",core_trace_format(&trace,text,sizeof(text)) > 0);
+    CHECK("trace/error-keeps-v1-fields",strstr(text,"success=0 stage=transport ") && !strstr(text,"category=") && !strstr(text,"system="));
+    core_trace_detach();
+    CHECK("trace/unattached-error-is-empty",!core_trace_error_get(&reported) && reported.stage == CORE_TRACE_NONE && !core_trace_id());
+    CHECK("trace/resource-and-deadline-classification",core_connection_error(CORE_TRACE_TCP,CORE_FAILURE_SYSTEM,ENOMEM).kind == CORE_FAILURE_RESOURCE &&
+        core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_TLS,ETIMEDOUT).kind == CORE_FAILURE_DEADLINE);
     for (int stage = 0; stage < CORE_TRACE_STAGE_COUNT; stage++) {
         REQUIRE("trace/failure-attach", core_trace_attach(&trace) == 0);
         trace.now_ms = fake_clock;

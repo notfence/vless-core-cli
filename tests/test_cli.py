@@ -11,6 +11,39 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_tls_failures_are_not_tcp_refusals(self):
+        def alert(connection):
+            connection.recv(65536)
+            connection.sendall(b"\x15\x03\x03\x00\x02\x02\x28")
+        for transport,pins in ((transport,pins) for transport in ("tcp","ws","xhttp","grpc") for pins in ([],["--server-ips","127.0.0.1,127.0.0.2"])):
+            with self.subTest(transport=transport,pinned=bool(pins)), Server(alert) as upstream, cli(uri(upstream.port,transport,"tls",allowInsecure="1"),pins) as core:
+                with socket.create_connection(("127.0.0.1",core.port),timeout=4) as tunnel:
+                    tunnel.sendall(b"\x05\x01\x00"); self.assertEqual(exact(tunnel,2),b"\x05\x00")
+                    tunnel.sendall(b"\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x50")
+                    self.assertEqual(exact(tunnel,10)[1],1)
+                self.wait_for_probe(core,"transport")
+                self.assertRegex(core.log,r"upstream connect failed: .* id=1 stage=transport category=tls system=\d+")
+
+    def test_vless_response_failure_reasons_and_identity(self):
+        cases=((b"","no response received"),(b"\x00","truncated header"),(b"\x00\x03x","truncated addons"))
+        for response,reason in cases:
+            def handler(connection):
+                exact(connection,26); connection.sendall(response)
+            with self.subTest(reason=reason), Server(handler) as upstream, cli(uri(upstream.port)) as core:
+                with socks_connect(core.port,80) as tunnel: self.assertEqual(tunnel.recv(1),b"")
+                self.wait_for_probe(core,"protocol")
+                self.assertIn(f"VLESS response read failed: {reason} id=1 stage=protocol category=eof system=0",core.log)
+
+    def test_transport_reset_is_not_a_clean_truncated_response(self):
+        def handler(connection):
+            exact(connection,26)
+            connection.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack("ii",1,0))
+        with Server(handler) as upstream, cli(uri(upstream.port)) as core:
+            with socks_connect(core.port,80) as tunnel: self.assertEqual(tunnel.recv(1),b"")
+            self.wait_for_probe(core,"transport")
+            self.assertRegex(core.log,r"VLESS response read failed: transport failure before the complete header id=1 stage=transport category=system system=\d+")
+            self.assertNotIn("truncated header",core.log)
+
     def test_absolute_incoming_socks_budget(self):
         def upstream(connection):
             exact(connection,26); connection.sendall(b"\x00\x00")
@@ -459,9 +492,13 @@ class CliTests(unittest.TestCase):
             target_port = reserved.getsockname()[1]
             for transport in ("tcp","ws","xhttp","grpc"):
                 with self.subTest(transport=transport), cli(uri(target_port,transport,"tls")) as core:
-                    with self.assertRaises(AssertionError):
-                        socks_connect(core.port,8080)
+                    with socket.create_connection(("127.0.0.1",core.port),timeout=4) as tunnel:
+                        tunnel.sendall(b"\x05\x01\x00"); self.assertEqual(exact(tunnel,2),b"\x05\x00")
+                        tunnel.sendall(b"\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\x90")
+                        self.assertEqual(exact(tunnel,10)[1],5)
                     self.assertIn("tcp connect failed",core.log)
+                    self.wait_for_probe(core,"tcp")
+                    self.assertRegex(core.log,r"upstream connect failed: .* id=1 stage=tcp category=system system=\d+")
                     self.assertIsNone(core.process.poll(),core.log)
 
     def test_ipv6_direct_and_vless_server(self):

@@ -21,6 +21,7 @@ struct core_resolver_query {
     struct addrinfo hints;
     struct addrinfo *addresses;
     int error;
+    int system_error;
     int done;
     int started;
     unsigned references;
@@ -52,8 +53,9 @@ static void *resolver_worker(void *unused) {
         pthread_mutex_unlock(&resolver_lock);
         struct addrinfo *addresses = NULL;
         int error = getaddrinfo(query->host, query->service, &query->hints, &addresses);
+        int system_error=error == EAI_SYSTEM ? (errno ? errno : EIO) : 0;
         pthread_mutex_lock(&resolver_lock);
-        query->addresses = addresses; query->error = error; query->done = 1;
+        query->addresses = addresses; query->error = error; query->system_error=system_error; query->done = 1;
         pthread_cond_signal(&query->ready);
         int release = --query->references == 0;
         pthread_mutex_unlock(&resolver_lock);
@@ -112,15 +114,17 @@ core_resolver_query_t *core_resolver_start(const char *host, const char *service
 
 int core_resolver_result(core_resolver_query_t *query, struct addrinfo **addresses, int *error) {
     if (!query || !addresses || !error) { errno = EINVAL; return -1; }
+    int saved=errno;
     pthread_mutex_lock(&resolver_lock);
     int done = query->done;
-    if (done) { *addresses = query->addresses; query->addresses = NULL; *error = query->error; }
+    if (done) { *addresses = query->addresses; query->addresses = NULL; *error = query->error; if (*error == EAI_SYSTEM) saved=query->system_error; }
     pthread_mutex_unlock(&resolver_lock);
-    return done;
+    errno=saved; return done;
 }
 
 void core_resolver_release(core_resolver_query_t *query) {
     if (!query) return;
+    int saved=errno;
     pthread_mutex_lock(&resolver_lock);
     if (!query->started && !query->done) {
         core_resolver_query_t **cursor = &resolver_head, *previous = NULL;
@@ -134,6 +138,7 @@ void core_resolver_release(core_resolver_query_t *query) {
     int release = --query->references == 0;
     pthread_mutex_unlock(&resolver_lock);
     if (release) resolver_free(query);
+    errno=saved;
 }
 
 int core_resolver_wait(core_resolver_query_t *query, struct addrinfo **addresses) {
@@ -146,7 +151,8 @@ int core_resolver_wait(core_resolver_query_t *query, struct addrinfo **addresses
         if (query->done) {
             *addresses = query->addresses; query->addresses = NULL;
             int error = query->error;
-            pthread_mutex_unlock(&resolver_lock); return error;
+            int cause=query->system_error;
+            pthread_mutex_unlock(&resolver_lock); if (error == EAI_SYSTEM) errno=cause; return error;
         }
 #ifdef __APPLE__
         struct timespec until = {.tv_sec=wait/1000,.tv_nsec=(long)(wait%1000)*1000000};

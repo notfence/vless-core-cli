@@ -305,6 +305,19 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
             path.write_text(json.dumps(config))
             return [str(XRAY),"run","-c",str(path)]
         process = stack.enter_context(start_listener(command,"xray","started"))
+        if security == "reality":
+            encryption="none"
+            if decryption != "none":
+                parts=decryption.split(".")
+                if len(parts) != 4 or parts[0] != "mlkem768x25519plus" or parts[1] not in ("native","xorpub","random") or parts[3] != KEY:
+                    raise AssertionError("unsupported reference readiness encryption configuration")
+                encryption=f"{parts[0]}.{parts[1]}.1rtt.{PUBLIC_KEY}"
+            health_settings=dict(transport_parameters)
+            if transport == "xhttp" and "path" in health_settings:
+                health_settings["path"]=urllib.parse.urlsplit(health_settings["path"]).path
+            with Server() as health, xray_client(process.port,transport,security,mode,flow,encryption,health_settings) as client:
+                with socks_connect(client.port,health.port) as connection:
+                    exchange(connection,b"vless-core reference readiness")
         yield process
 
 @contextlib.contextmanager

@@ -16,6 +16,7 @@ int __real_connect(int, const struct sockaddr *, socklen_t);
 int __real_poll(struct pollfd *, nfds_t, int);
 
 int __wrap_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **result) {
+    if (!strcmp(host,"resource-vless-core.test")) { *result=NULL; errno=EMFILE; return EAI_SYSTEM; }
     if (!strcmp(host,"blocked-vless-core.test")) {
         pthread_mutex_lock(&blocked_lock); blocked_workers++; pthread_cond_broadcast(&blocked_ready);
         while (!release_workers) pthread_cond_wait(&blocked_ready,&blocked_lock);
@@ -103,8 +104,21 @@ static void numeric_without_resolver(void) {
     }
 }
 
+static void dns_system_failure(void) {
+    core_connection_trace_t trace; core_connection_error_t failure;
+    REQUIRE("dial/dns-resource-trace",core_trace_attach(&trace) == 0);
+    core_deadline_begin(1000);
+    core_dialer_t *dialer=core_dialer_start("resource-vless-core.test",443,0,1000,NULL,0);
+    REQUIRE("dial/dns-resource-start",dialer != NULL);
+    CHECK("dial/dns-system-cause-survives-worker-transfer",core_dialer_next(dialer,NULL,NULL) < 0 && errno == EMFILE);
+    core_dialer_free(dialer);
+    CHECK("dial/dns-resource-not-host-unreachable",core_trace_error_get(&failure) && failure.stage == CORE_TRACE_DNS && failure.kind == CORE_FAILURE_RESOURCE && failure.system_error == EMFILE);
+    core_deadline_end(); core_trace_detach();
+}
+
 int main(void) {
     core_deadline_t deadline; REQUIRE("dial/deadline-attach", core_deadline_attach(&deadline) == 0);
+    dns_system_failure();
     numeric_without_resolver();
     for (int scenario=0;scenario<5;scenario++) {
         connect_count=0; stalled_fd=-1; fixture_mode=0;

@@ -515,6 +515,35 @@ static void relay_tcp_pair(int fd_a, int fd_b) {
     }
 }
 
+static void connection_log_failure(const char *message, const char *detail, core_connection_error_t failure) {
+    core_trace_error_set(failure);
+    vc_log_error("connection","%s%s%s id=%llu stage=%s category=%s system=%d",message,detail ? ": " : "",detail ? detail : "",
+        (unsigned long long)core_trace_id(),core_trace_stage_name(failure.stage),core_failure_name(failure.kind),failure.system_error);
+}
+
+static core_connection_error_t connection_failure(int cause) {
+    core_connection_error_t failure;
+    if (!core_trace_error_get(&failure)) {
+        core_connection_trace_t trace;
+        core_trace_stage_t stage=core_trace_snapshot(&trace) && trace.stage != CORE_TRACE_NONE ? trace.stage : CORE_TRACE_TRANSPORT;
+        failure=core_connection_error(stage,CORE_FAILURE_SYSTEM,cause ? cause : EIO);
+    }
+    return failure;
+}
+
+static void response_failure(const vless_response_t *response, int transport_error, int cause) {
+    if (core_deadline_active() && !core_deadline_remaining()) {
+        connection_log_failure("VLESS response deadline expired",NULL,core_connection_error(CORE_TRACE_PROTOCOL,CORE_FAILURE_DEADLINE,ETIMEDOUT));
+    } else if (transport_error) {
+        core_connection_error_t failure;
+        if (!core_trace_error_get(&failure)) failure=core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,cause ? cause : EIO);
+        connection_log_failure("VLESS response read failed","transport failure before the complete header",failure);
+    } else {
+        connection_log_failure("VLESS response read failed",!response->header_bytes ? "no response received" :
+            response->header_bytes < 2 ? "truncated header" : "truncated addons",core_connection_error(CORE_TRACE_PROTOCOL,CORE_FAILURE_EOF,0));
+    }
+}
+
 static void *client_worker_run(void *arg) {
     client_ctx_t *ctx = (client_ctx_t *)arg;
     int cfd = ctx->client_fd;
@@ -603,8 +632,9 @@ static void *client_worker_run(void *arg) {
                                             sizeof(direct_err));
         if (direct_fd < 0) {
             uint8_t failure=socks5_error_reply(errno);
-            vc_log_error("routing", "direct connect failed for %s:%u: %s",
-                         target_host, (unsigned)target_port, direct_err);
+            core_trace_error_set(connection_failure(errno));
+            vc_log_error("routing", "direct connect failed for %s:%u: %s id=%llu",
+                         target_host, (unsigned)target_port, direct_err,(unsigned long long)core_trace_id());
             if (!socks_success_sent) {
                 socks5_send_failure(cfd,failure);
             }
@@ -671,9 +701,10 @@ static void *client_worker_run(void *arg) {
         uint8_t failure=1;
         int upstream_fd = socks5_upstream_connect(&cfg,upstream_target,target_port,err,sizeof(err),&failure);
         if (upstream_fd < 0) {
-            vc_log_error("socks5", "upstream connect failed for %s:%u via %s:%u: %s",
+            core_trace_error_set(connection_failure(errno));
+            vc_log_error("socks5", "upstream connect failed for %s:%u via %s:%u: %s id=%llu",
                          upstream_target, (unsigned)target_port,
-                         cfg.server_host, (unsigned)cfg.server_port, err);
+                         cfg.server_host, (unsigned)cfg.server_port, err,(unsigned long long)core_trace_id());
             if (!socks_success_sent) {
                 socks5_send_failure(cfd,failure);
             }
@@ -711,8 +742,9 @@ static void *client_worker_run(void *arg) {
     tls13_conn_t *tls = NULL;
     core_deadline_begin(g_connect_timeout_ms);
     if (tls13_reality_connect(&cfg, &tls, err, sizeof(err)) != 0) {
-        uint8_t failure=socks5_error_reply(errno);
-        vc_log_error("connection", "upstream connect failed: %s", err);
+        core_connection_error_t result=connection_failure(errno);
+        uint8_t failure=result.kind == CORE_FAILURE_SYSTEM ? socks5_error_reply(result.system_error) : 1;
+        connection_log_failure("upstream connect failed",err,result);
         if (!socks_success_sent) {
             socks5_send_failure(cfd,failure);
         }
@@ -722,10 +754,11 @@ static void *client_worker_run(void *arg) {
 
     vless_encryption_conn_t *encryption = NULL;
     core_trace_stage(CORE_TRACE_PROTOCOL);
+    errno=0;
     if (cfg.encryption_enabled &&
         vless_encryption_connect(&cfg, tls, &encryption, err,
                                  sizeof(err)) != 0) {
-        vc_log_error("connection", "VLESS encryption handshake failed: %s", err);
+        connection_log_failure("VLESS encryption handshake failed",err,core_connection_error(CORE_TRACE_PROTOCOL,CORE_FAILURE_PROTOCOL,errno ? errno : EPROTO));
         if (!socks_success_sent) {
             socks5_send_failure(cfd, 0x01);
         }
@@ -949,7 +982,10 @@ static void *client_worker_run(void *arg) {
 
     while (1) {
         if (!got_vless_response && core_deadline_active() && !core_deadline_remaining()) break;
-        if (!upstream_failed && (tls13_flush(tls) || tls13_tick(tls))) { upstream_failed=client_eof=upstream_eof=1; }
+        if (!upstream_failed && (tls13_flush(tls) || tls13_tick(tls))) {
+            if (!got_vless_response) response_failure(&response,1,errno);
+            upstream_failed=client_eof=upstream_eof=1;
+        }
         if (output_length) {
             ssize_t sent=core_send(cfd,output,output_length,MSG_DONTWAIT);
             if (sent > 0) { output_length-=(size_t)sent; memmove(output,output+sent,output_length); }
@@ -1036,6 +1072,7 @@ static void *client_worker_run(void *arg) {
         if (upstream_ready) {
             int drained = tls13_drain_h2_input(tls);
             if (drained < 0) {
+                if (!got_vless_response) response_failure(&response,1,errno);
                 upstream_failed=client_eof=upstream_eof=1; continue;
             }
             if (tls13_uses_h2(tls) || tls13_uses_async_io(tls)) {
@@ -1065,7 +1102,7 @@ static void *client_worker_run(void *arg) {
                               : upstream_read(tls, encryption, tbuf,
                                               sizeof(tbuf), &got);
             if (read_rc < 0) {
-                if (!got_vless_response) vc_log_error("connection","VLESS response read failed: transport closed before the complete header");
+                if (!got_vless_response) response_failure(&response,1,errno);
                 upstream_failed=client_eof=upstream_eof=1; continue;
             }
             if (read_rc > 0) {
@@ -1073,7 +1110,7 @@ static void *client_worker_run(void *arg) {
             }
             if (!got) {
                 if (!got_vless_response) {
-                    vc_log_error("connection","VLESS response read failed: truncated header"); break;
+                    response_failure(&response,0,0); break;
                 }
                 if (use_vision && !vision_unpad_complete(&vunpad)) { vc_log_error("connection","truncated Vision response"); break; }
                 upstream_eof=1;
@@ -1087,7 +1124,7 @@ static void *client_worker_run(void *arg) {
                 if (waiting_initial_payload) { core_deadline_resume(); waiting_initial_payload=0; }
                 size_t consumed=0;
                 int parsed=vless_consume_response(&response,tbuf,got,&consumed);
-                if (parsed < 0) { vc_log_error("connection","VLESS response read failed: invalid version"); break; }
+                if (parsed < 0) { connection_log_failure("VLESS response read failed","invalid version",core_connection_error(CORE_TRACE_PROTOCOL,CORE_FAILURE_PROTOCOL,EPROTO)); break; }
                 got-=consumed;
                 if (got) memmove(tbuf,tbuf+consumed,got);
                 if (!parsed) continue;
@@ -1135,7 +1172,8 @@ static void *client_worker_run(void *arg) {
     }
 
     if (!got_vless_response && core_deadline_active() && !core_deadline_remaining()) {
-        vc_log_error("connection","VLESS response deadline expired"); core_trace_failure(CORE_TRACE_PROTOCOL);
+        core_connection_error_t failure;
+        if (!core_trace_error_get(&failure) || failure.kind != CORE_FAILURE_DEADLINE) response_failure(&response,0,ETIMEDOUT);
     }
     if (use_vision) {
         vision_unpad_free(&vunpad);

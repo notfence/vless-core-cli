@@ -118,10 +118,47 @@ void core_trace_failure(core_trace_stage_t stage) {
     int saved_errno = errno;
     core_connection_trace_t *trace = trace_current();
     if (trace && !trace->finished && stage >= 0 && stage < CORE_TRACE_STAGE_COUNT) {
-        trace->failed_stage = stage;
+        trace->failed_stage = trace->error.kind ? trace->error.stage : stage;
         if (trace->stage_observer) trace->stage_observer(stage,trace->observer_context);
     }
     errno = saved_errno;
+}
+
+core_connection_error_t core_connection_error(core_trace_stage_t stage, core_failure_kind_t kind, int system_error) {
+    if (system_error == ETIMEDOUT) kind=CORE_FAILURE_DEADLINE;
+    else if (system_error == ENOMEM || system_error == ENOBUFS || system_error == EMFILE || system_error == ENFILE) kind=CORE_FAILURE_RESOURCE;
+    return (core_connection_error_t){stage,kind,system_error};
+}
+
+void core_trace_error_set(core_connection_error_t error) {
+    int saved=errno; core_connection_trace_t *trace=trace_current();
+    if (trace && !trace->finished && error.kind && error.stage >= 0 && error.stage < CORE_TRACE_STAGE_COUNT) {
+        trace->error=error; trace->failed_stage=error.stage;
+        if (trace->stage_observer) trace->stage_observer(error.stage,trace->observer_context);
+    }
+    errno=saved;
+}
+
+int core_trace_error_get(core_connection_error_t *error) {
+    int saved=errno; core_connection_trace_t *trace=trace_current();
+    if (error) *error=trace ? trace->error : (core_connection_error_t){.stage=CORE_TRACE_NONE};
+    errno=saved; return error && error->kind;
+}
+
+void core_trace_error_clear(void) {
+    int saved=errno; core_connection_trace_t *trace=trace_current();
+    if (trace && !trace->finished) { trace->error=(core_connection_error_t){.stage=CORE_TRACE_NONE}; trace->failed_stage=CORE_TRACE_NONE; }
+    errno=saved;
+}
+
+uint64_t core_trace_id(void) {
+    int saved=errno; core_connection_trace_t *trace=trace_current(); uint64_t id=trace ? trace->id : 0;
+    errno=saved; return id;
+}
+
+const char *core_failure_name(core_failure_kind_t kind) {
+    static const char *const names[]={"none","system","tls","protocol","eof","deadline","resource"};
+    return kind >= CORE_FAILURE_NONE && kind <= CORE_FAILURE_RESOURCE ? names[kind] : "none";
 }
 
 const char *core_trace_stage_name(core_trace_stage_t stage) {
@@ -148,7 +185,7 @@ void core_trace_complete(int success) {
         trace->total_ms = now >= trace->started_ms ? now - trace->started_ms : 0;
         trace->success = success != 0;
         trace->finished = 1;
-        if (success) trace->failed_stage = CORE_TRACE_NONE;
+        if (success) { trace->failed_stage = CORE_TRACE_NONE; trace->error=(core_connection_error_t){.stage=CORE_TRACE_NONE}; }
         else if (trace->failed_stage == CORE_TRACE_NONE) trace->failed_stage = trace->stage;
         char text[384];
         if (core_trace_format(trace, text, sizeof(text)) >= 0) {

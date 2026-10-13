@@ -22,7 +22,7 @@ typedef struct {
 typedef struct { int fd, flags; size_t index; } dialer_attempt_t;
 struct core_dialer {
     core_resolver_query_t *queries[2];
-    int resolved[2], dns_error[2];
+    int resolved[2], dns_error[2], dns_system_error[2];
     dialer_address_t addresses[DIALER_ADDRESS_LIMIT];
     size_t count;
     dialer_attempt_t attempts[2];
@@ -71,7 +71,7 @@ core_dialer_t *core_dialer_start(const char *host, uint16_t port, int use_server
             for (size_t i=0;i<2;i++) {
                 struct addrinfo hints={.ai_family=i ? AF_INET : AF_INET6,.ai_socktype=SOCK_STREAM,.ai_protocol=IPPROTO_TCP};
                 dialer->queries[i]=core_resolver_start(host,service,&hints);
-                if (!dialer->queries[i]) { dialer->resolved[i]=1; dialer->dns_error[i]=EAI_SYSTEM; dialer->last_error=errno; }
+                if (!dialer->queries[i]) { dialer->resolved[i]=1; dialer->dns_error[i]=EAI_SYSTEM; dialer->dns_system_error[i]=dialer->last_error=errno; }
             }
         }
     }
@@ -85,6 +85,7 @@ static int collect_addresses(core_dialer_t *dialer) {
         if (dialer->resolved[i]) continue;
         struct addrinfo *addresses=NULL; int error;
         if (!core_resolver_result(dialer->queries[i],&addresses,&error)) continue;
+        dialer->dns_system_error[i]=error == EAI_SYSTEM ? errno : 0;
         core_resolver_release(dialer->queries[i]); dialer->queries[i]=NULL;
         dialer->resolved[i]=1; dialer->dns_error[i]=error;
         int result=0;
@@ -161,7 +162,11 @@ int core_dialer_next(core_dialer_t *dialer, struct sockaddr_storage *address, so
         }
         if (!active && candidate == SIZE_MAX && dialer->resolved[0] && dialer->resolved[1]) {
             errno=dialer->last_error;
-            if (!dialer->count) { core_trace_failure(CORE_TRACE_DNS); errno=EHOSTUNREACH; }
+            if (!dialer->count) {
+                int cause=dialer->dns_system_error[0] ? dialer->dns_system_error[0] : dialer->dns_system_error[1];
+                errno=cause ? cause : EHOSTUNREACH;
+                core_trace_error_set(core_connection_error(CORE_TRACE_DNS,cause == EAGAIN ? CORE_FAILURE_RESOURCE : CORE_FAILURE_SYSTEM,errno));
+            }
             break;
         }
         int wait=(int)(dialer->until_ms-now);

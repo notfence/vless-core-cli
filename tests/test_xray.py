@@ -733,13 +733,15 @@ class XrayTests(unittest.TestCase):
 
     def test_xmux_new_clients_during_continuous_upload(self):
         def receive(connection):
+            connection.sendall(exact(connection,1))
             while connection.recv(16384): time.sleep(0.001)
         cert,_=certificate()
         for security in ("tls","reality"):
             with self.subTest(security=security), Server(receive) as receiver, Server() as target, xray_server("xhttp",security) as reference:
                 config=uri(reference.port,"xhttp",security,mode="stream-one",extra=json.dumps({"xmux":{"maxConnections":1}}))
-                with cli(config,extra=["--connect-timeout-ms","1000"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                with cli(config,extra=["--connect-timeout-ms","5000"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
                     with socks_connect(core.port,receiver.port) as background:
+                        background.sendall(b"\x00"); self.assertEqual(exact(background,1),b"\x00")
                         stopped=threading.Event(); started=threading.Event(); errors=[]
                         def upload():
                             try:

@@ -1104,11 +1104,14 @@ static int tls_peer_leaf_pin_hex(SSL *ssl, char pin_hex[65], char *err, size_t e
 
 static int xhttp_tofu_verify_or_store(SSL *ssl, const char *pin_key, int log_ok, char *err, size_t err_cap) {
     char peer_pin[65];
-    if (tls_peer_leaf_pin_hex(ssl, peer_pin, err, err_cap) != 0) {
-        return -1;
-    }
-
-    return tofu_verify_or_store_pin("xhttp", pin_key, peer_pin, log_ok, err, err_cap);
+    int saved=errno; errno=0;
+    int result=tls_peer_leaf_pin_hex(ssl,peer_pin,err,err_cap);
+    if (!result) result=tofu_verify_or_store_pin("xhttp",pin_key,peer_pin,log_ok,err,err_cap);
+    if (result) {
+        int cause=errno ? errno : EPROTO;
+        core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_TLS,cause)); errno=cause;
+    } else errno=saved;
+    return result;
 }
 
 static int alpn_csv_has_token(const char *csv, const char *token) {
@@ -1289,7 +1292,9 @@ static int open_tls_socket_once(int fd, const char *connect_host, const char *sn
         return -1;
     }
     core_set_socket_io_timeout(fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
+    errno=0;
     if (ssl_budget_call(ssl, NULL, 0, 0) != 1) {
+        int failure=errno ? errno : EPROTO;
         unsigned long e = ERR_get_error();
         *retry_with_aes = SSL_get_current_cipher(ssl) == NULL;
         long verify_rc = X509_V_OK;
@@ -1305,6 +1310,7 @@ static int open_tls_socket_once(int fd, const char *connect_host, const char *sn
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         close(fd);
+        errno=failure;
         if (err != NULL && err_cap > 0) {
             if (verify_peer) {
                 if (verify_rc != X509_V_OK) {
@@ -1348,6 +1354,7 @@ static int open_tls_socket(int use_server_ips, const char *connect_host, uint16_
     if (!dialer) { set_connect_err(err,err_cap,"tcp address resolution failed"); return -1; }
     struct sockaddr_storage address; socklen_t length=0;
     int fd,first=1,failed_handshake=0;
+    core_connection_error_t failure={0};
     while ((fd=core_dialer_next(dialer,&address,&length)) >= 0) {
         int aes=(first && *use_aes_fallback) || tls_address_aes_cached(connect_host,connect_port,sni,(const struct sockaddr *)&address,length);
         first=0;
@@ -1358,16 +1365,20 @@ static int open_tls_socket(int use_server_ips, const char *connect_host, uint16_
                 *use_aes_fallback=offer == TLS_CIPHER_OFFER_AES;
                 if (*use_aes_fallback) cache_tls_address_aes(connect_host,connect_port,sni,(const struct sockaddr *)&address,length);
                 if (err && err_cap) *err=0;
-                core_dialer_free(dialer); log_tls_cipher_once(SSL_get_cipher_name(*out_ssl)); return 0;
+                core_dialer_free(dialer); core_trace_error_clear(); log_tls_cipher_once(SSL_get_cipher_name(*out_ssl)); return 0;
             }
             failed_handshake=1;
+            failure=core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_TLS,errno ? errno : EPROTO);
             if (attempt || !retry || (core_deadline_active() && !core_deadline_remaining())) break;
             offer=offer == TLS_CIPHER_OFFER_CHACHA ? TLS_CIPHER_OFFER_AES : TLS_CIPHER_OFFER_CHACHA;
             fd=tcp_connect_address(address.ss_family,SOCK_STREAM,IPPROTO_TCP,(const struct sockaddr *)&address,length);
             if (fd < 0) break;
         }
     }
-    int saved=errno; core_dialer_free(dialer); errno=saved;
+    int saved=errno; core_dialer_free(dialer);
+    if (failure.kind && saved != ETIMEDOUT) saved=failure.system_error;
+    if (failed_handshake) core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,failure.kind,saved));
+    errno=saved;
     if (!failed_handshake || saved == ETIMEDOUT) set_connect_err(err,err_cap,saved == ETIMEDOUT ? "TLS connection budget exhausted" : "tcp connect failed");
     return -1;
 }
@@ -5810,14 +5821,16 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     OPENSSL_cleanse(client_priv,sizeof(client_priv)); OPENSSL_cleanse(shared,sizeof(shared));
     tls_handshake_material_clear(c);
     return 0;
-handshake_failure:
+handshake_failure: {
+    int saved=errno;
     OPENSSL_cleanse(client_priv,sizeof(client_priv)); OPENSSL_cleanse(shared,sizeof(shared));
     tls_handshake_material_clear(c);
     OPENSSL_cleanse(c->c_app_traffic,sizeof(c->c_app_traffic)); OPENSSL_cleanse(c->s_app_traffic,sizeof(c->s_app_traffic));
     OPENSSL_cleanse(c->c_app_key,sizeof(c->c_app_key)); OPENSSL_cleanse(c->s_app_key,sizeof(c->s_app_key));
     OPENSSL_cleanse(c->c_app_iv,sizeof(c->c_app_iv)); OPENSSL_cleanse(c->s_app_iv,sizeof(c->s_app_iv));
     if (err && err_cap && !*err) set_err(err,err_cap,errno == ENOBUFS || errno == EMSGSIZE ? "TLS handshake memory or message limit exceeded" : "TLS handshake failed");
-    return -1;
+    errno=saved; return -1;
+}
 }
 
 static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, char *err, size_t err_cap) {
@@ -5841,8 +5854,9 @@ static int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cip
 #endif
     int result = run_tls_handshake_with_key(cfg, c, cipher_offer, hybrid_key,
                                           hybrid_key != NULL ? hybrid_pub : NULL, err, err_cap);
+    int saved=errno;
     EVP_PKEY_free(hybrid_key);
-    return result;
+    errno=saved; return result;
 }
 
 static const char *tls_cipher_suite_name(uint16_t suite) {
@@ -5901,28 +5915,34 @@ static int connect_manual_tls_endpoint(const vless_config_t *cfg, tls13_conn_t *
         TLS_CIPHER_OFFER_AES,
     };
     size_t first_offer = start_with_aes ? 1 : 0;
+    core_connection_error_t failure={0};
 
     for (size_t i = first_offer; i < sizeof(offer_order) / sizeof(offer_order[0]); i++) {
         tls_cipher_offer_t offer = offer_order[i];
         reset_manual_tls_handshake(c);
         c->fd = i == first_offer ? initial_fd : tcp_connect_address(address->sa_family, socktype, protocol, address, address_len);
         if (c->fd < 0) {
+            if (failure.kind && errno != ETIMEDOUT) { core_trace_error_set(failure); errno=failure.system_error; return -1; }
             set_connect_err(err, err_cap, "tcp connect failed");
             return -1;
         }
 
         core_set_socket_io_timeout(c->fd, CORE_TLS_HANDSHAKE_TIMEOUT_MS);
         char attempt_err[256] = {0};
+        errno=0;
         if (run_tls_handshake(cfg, c, offer, attempt_err, sizeof(attempt_err)) == 0) {
             core_set_socket_io_timeout(c->fd, 0);
             *successful_offer = offer;
+            core_trace_error_clear();
             return 0;
         }
 
+        failure=core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_TLS,errno ? errno : EPROTO);
         close(c->fd);
         c->fd = -1;
         set_err(err, err_cap, attempt_err[0] != '\0' ? attempt_err : "TLS handshake failed");
     }
+    core_trace_error_set(failure); errno=failure.system_error;
     return -1;
 }
 
@@ -5947,6 +5967,7 @@ static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *
         cached ? (const struct sockaddr *)&cached_address : NULL, cached_length);
     if (!dialer) { set_connect_err(err, err_cap, "tcp resolve failed"); return -1; }
     char last_err[256] = {0};
+    core_connection_error_t failure={0};
     struct sockaddr_storage address; socklen_t length;
     int fd;
     while ((fd = core_dialer_next(dialer, &address, &length)) >= 0) {
@@ -5956,12 +5977,18 @@ static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *
             remember_manual_tls_success(cfg, c, sni, (const struct sockaddr *)&address, length, offer);
             core_dialer_free(dialer); return 0;
         }
+        core_trace_error_get(&failure);
+        if (!failure.kind) failure=core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_TLS,errno ? errno : EPROTO);
         if (cached && sockaddr_equal((const struct sockaddr *)&cached_address, cached_length,
                                      (const struct sockaddr *)&address, length))
             invalidate_cached_tls_endpoint(cfg, sni, (const struct sockaddr *)&address, length);
     }
-    core_dialer_free(dialer);
-    if (last_err[0]) set_err(err, err_cap, last_err);
+    int saved=errno; core_dialer_free(dialer);
+    if (failure.kind && saved != ETIMEDOUT) saved=failure.system_error;
+    if (failure.kind) core_trace_error_set(core_connection_error(failure.stage,failure.kind,saved));
+    errno=saved;
+    if (saved == ETIMEDOUT) set_err(err,err_cap,"TLS connection budget exhausted");
+    else if (last_err[0]) set_err(err, err_cap, last_err);
     else set_connect_err(err, err_cap, "tcp connect failed");
     return -1;
 }
@@ -6066,6 +6093,7 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
         const unsigned char *selected=NULL; unsigned int selected_length=0;
         SSL_get0_alpn_selected(c->ssl,&selected,&selected_length);
         if (selected_length && (selected_length != 8 || memcmp(selected,"http/1.1",8))) {
+            core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_TLS,EPROTO)); errno=EPROTO;
             set_err(err,err_cap,"WebSocket server selected incompatible ALPN"); return -1;
         }
         if (mode == TLS_VERIFY_MODE_TOFU) {
@@ -6286,6 +6314,7 @@ static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *er
     }
 
     if (!ssl_selected_alpn_is_h2(c->ssl)) {
+        core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_TLS,EPROTO)); errno=EPROTO;
         set_err(err, err_cap, "grpc requires HTTP/2 ALPN");
         return -1;
     }
@@ -6436,15 +6465,24 @@ static int tls13_connect_budgeted(const vless_config_t *cfg, tls13_conn_t **out,
 }
 
 int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *err, size_t err_cap) {
-    return tls13_connect_budgeted(cfg,out,err,err_cap,NULL,NULL);
+    int result=tls13_connect_budgeted(cfg,out,err,err_cap,NULL,NULL);
+    int saved=errno;
+    core_connection_error_t failure;
+    if (result && !core_trace_error_get(&failure)) {
+        core_connection_trace_t trace;
+        core_trace_stage_t stage=core_trace_snapshot(&trace) && trace.stage != CORE_TRACE_NONE ? trace.stage : CORE_TRACE_TRANSPORT;
+        core_trace_error_set(core_connection_error(stage,CORE_FAILURE_SYSTEM,saved ? saved : EIO));
+    }
+    errno=saved; return result;
 }
 
 void tls13_reality_close(tls13_conn_t *c) {
     if (c == NULL) {
         return;
     }
+    int saved=errno;
     core_grpc_clear(&c->grpc_decoder); db_free(&c->grpc_net_cache);
-    if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); OPENSSL_cleanse(c,sizeof(*c)); free(c); return; }
+    if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); OPENSSL_cleanse(c,sizeof(*c)); free(c); errno=saved; return; }
     h2_response_clear(c);
     if (!c->send_closed && c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
         int upload_fd = strcmp(c->xhttp_transport_mode, "stream-one") == 0 ? c->fd : c->xhttp_upload_fd;
@@ -6491,6 +6529,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     db_free(&c->xmux_raw_input); db_free(&c->xmux_plain_output); db_free(&c->xmux_wire_output);
     OPENSSL_cleanse(c,sizeof(*c));
     free(c);
+    errno=saved;
 }
 
 static int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len) {

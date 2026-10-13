@@ -73,6 +73,45 @@ static int scheduling_flush(void *physical) {
     wire_t *wire=physical; wire->flushed=wire->enqueued; wire->pending=0; return 0;
 }
 
+static pthread_mutex_t close_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t close_ready=PTHREAD_COND_INITIALIZER;
+static int close_entered,close_allowed,close_returned;
+static void private_close(void *physical) {
+    (void)physical;
+    pthread_mutex_lock(&close_lock); close_entered=1; pthread_cond_broadcast(&close_ready);
+    while (!close_allowed) pthread_cond_wait(&close_ready,&close_lock);
+    pthread_mutex_unlock(&close_lock);
+}
+static void *private_close_owner(void *stream) {
+    errno=ENOTTY; core_http2_close(stream);
+    pthread_mutex_lock(&close_lock); close_returned=1; pthread_cond_broadcast(&close_ready); pthread_mutex_unlock(&close_lock);
+    return (void *)(uintptr_t)(errno != ENOTTY);
+}
+static void private_close_completes_cleanup(void) {
+    static core_http2_backend_t backend;
+    backend=finish_backend; backend.open=scheduling_open; backend.close=private_close; backend.fd=scheduling_fd;
+    backend.collect=scheduling_collect; backend.read_frame=scheduling_frame; backend.flush=scheduling_flush;
+    backend.request=pacing_request; backend.session=fixture_session; scheduling_wire=(wire_t){0};
+    vless_config_t config={.transport_mode=TRANSPORT_XHTTP,.server_port=1};
+    strcpy(config.server_host,"127.0.0.1"); strcpy(config.xhttp_mode,"stream-one");
+    char error[160]; core_http2_stream_t *stream=core_http2_connect(&config,&backend,error,sizeof(error));
+    REQUIRE("xmux/private-close-connect",stream != NULL);
+    pthread_t owner; REQUIRE("xmux/private-close-owner",pthread_create(&owner,NULL,private_close_owner,stream) == 0);
+    pthread_mutex_lock(&close_lock);
+    while (!close_entered) pthread_cond_wait(&close_ready,&close_lock);
+    CHECK("xmux/private-close-waits-for-physical-cleanup",!close_returned);
+    close_allowed=1; pthread_cond_broadcast(&close_ready); pthread_mutex_unlock(&close_lock);
+    void *result=NULL; pthread_join(owner,&result);
+    CHECK("xmux/private-close-preserves-error",!result);
+    pthread_mutex_lock(&mux_lock); size_t actors=actor_count,clients=stream_count; pthread_mutex_unlock(&mux_lock);
+    CHECK("xmux/private-close-releases-worker-and-stream",!actors && !clients);
+    uint64_t until=core_now_ms()+1000;
+    while (actors && core_now_ms() < until) {
+        core_poll(NULL,0,1); pthread_mutex_lock(&mux_lock); actors=actor_count; pthread_mutex_unlock(&mux_lock);
+    }
+    REQUIRE("xmux/private-close-fixture-drained",!actors);
+}
+
 static void worker_progress_policy(void) {
     core_http2_backend_t backend=finish_backend;
     backend.open=scheduling_open; backend.close=scheduling_close; backend.fd=scheduling_fd;
@@ -505,6 +544,7 @@ static void drained_queue_memory(void) {
 }
 
 int main(void) {
+    private_close_completes_cleanup();
     memory_admission_policy();
     drained_queue_memory();
     worker_progress_policy();
@@ -549,6 +589,11 @@ int main(void) {
     mux_request_t second={.stream=&sibling,.id=5,.role=1,.response={.headers=1},.send_window=65535,.receive_window=65535}; first.next=&second;
     core_xmux_frame_t reset={.type=3,.id=3,.data=(uint8_t[]){0,0,0,8},.length=4};
     CHECK("xmux/reset-isolated", process_frame(&actor,&reset) == 0 && stream.failed && !sibling.failed && !actor.failed);
+    core_connection_trace_t trace; core_connection_error_t failure;
+    REQUIRE("xmux/failure-trace",core_trace_attach(&trace) == 0); core_trace_stage(CORE_TRACE_PROTOCOL); errno=ECONNREFUSED;
+    CHECK("xmux/stream-failure-preserves-category-and-cause",core_xmux_read(&stream,output,sizeof(output),&length) < 0 && errno == EPROTO &&
+        core_trace_error_get(&failure) && failure.kind == CORE_FAILURE_PROTOCOL && failure.stage == CORE_TRACE_TRANSPORT && failure.system_error == EPROTO && !sibling.failed);
+    core_trace_detach();
     stream.failed=0; first.ended=first.reset=0;
     core_xmux_frame_t goaway={.type=7,.data=(uint8_t[]){0,0,0,3,0,0,0,0},.length=8};
     CHECK("xmux/goaway-drains-accepted-streams", process_frame(&actor,&goaway) == 0 && actor.draining && !stream.failed && sibling.failed);

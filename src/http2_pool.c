@@ -16,6 +16,7 @@
 #include "xhttp_download.h"
 #include "blake3.h"
 #include <openssl/rand.h>
+#include <openssl/crypto.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -67,6 +68,7 @@ struct core_http2_stream {
     int finish_requested, finish_sent, relay_async;
     uint64_t finish_fence;
     core_connection_trace_t trace;
+    core_connection_error_t failure;
     int trace_present;
 };
 
@@ -85,6 +87,7 @@ struct mux_actor {
     uint32_t latest_stream;
     uint8_t header_flags;
     int wake[2], opening, failed, draining, stopped, http2;
+    int thread_started,closing,close_waiters;
     int trace_present;
     int alive_period, receive_slots;
     uint64_t connect_until_ms, last_input_ms, ping_deadline_ms;
@@ -96,6 +99,7 @@ struct mux_actor {
     uint64_t enqueued, flushed;
     uint64_t idle_pending_ms;
     char error[160];
+    core_connection_error_t failure;
 };
 
 struct mux_group {
@@ -116,6 +120,7 @@ struct mux_manager {
 };
 
 static pthread_mutex_t mux_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t workers_stopped=PTHREAD_COND_INITIALIZER;
 static mux_manager_t *managers;
 static core_http2_stream_t *streams;
 static size_t upload_bytes, download_bytes, actor_count, stream_count;
@@ -131,11 +136,13 @@ static void wake_admission(void) {
 static int grpc_manager(const mux_manager_t *manager) { return manager->config.transport_mode == TRANSPORT_GRPC; }
 
 static int actor_failed(mux_actor_t *actor) {
-    pthread_mutex_lock(&mux_lock); int failed=actor->failed; pthread_mutex_unlock(&mux_lock); return failed;
+    pthread_mutex_lock(&mux_lock); int failed=actor->failed || actor->closing; pthread_mutex_unlock(&mux_lock); return failed;
 }
 
-static void mark_failed(mux_actor_t *actor) {
-    pthread_mutex_lock(&mux_lock); actor->failed=1; pthread_mutex_unlock(&mux_lock);
+static void mark_failed(mux_actor_t *actor, core_failure_kind_t kind, int cause) {
+    pthread_mutex_lock(&mux_lock);
+    if (!actor->failure.kind) actor->failure=core_connection_error(CORE_TRACE_TRANSPORT,kind,cause ? cause : EIO);
+    actor->failed=1; pthread_mutex_unlock(&mux_lock);
 }
 
 static void trace_progress(core_trace_stage_t stage, void *opaque) {
@@ -153,7 +160,7 @@ static void collect_stopped_actors(void) {
             mux_actor_t *actor=*cursor; int used=0;
             for (core_http2_stream_t *stream=streams;stream;stream=stream->next)
                 if (stream->download == actor || stream->upload == actor) { used=1; break; }
-            if (actor->stopped && !used) { *cursor=actor->next; free(actor); }
+            if (actor->stopped && !used && !actor->close_waiters) { *cursor=actor->next; free(actor); }
             else cursor=&actor->next;
         }
         mux_group_t **group=&manager->groups;
@@ -214,12 +221,23 @@ static void notify_write_capacity(size_t previous) {
     last_upload_room=room;
 }
 
-static void fail_stream(core_http2_stream_t *stream, const char *error) {
+static void fail_stream_error(core_http2_stream_t *stream, const char *error, core_connection_error_t failure) {
     if (!stream->failed) {
+        stream->failure=failure;
         stream->failed=1; snprintf(stream->error,sizeof(stream->error),"%s",error);
-        vc_log_warning(stream->config.transport_mode == TRANSPORT_GRPC ? "grpc" : "xhttp","%s",error);
+        vc_log_warning(stream->config.transport_mode == TRANSPORT_GRPC ? "grpc" : "xhttp","%s id=%llu stage=%s category=%s system=%d",
+            error,(unsigned long long)stream->trace.id,core_trace_stage_name(failure.stage),core_failure_name(failure.kind),failure.system_error);
         signal_stream(stream);
     }
+}
+
+static void fail_stream(core_http2_stream_t *stream, const char *error) {
+    fail_stream_error(stream,error,core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_PROTOCOL,EPROTO));
+}
+
+static void stream_error(const core_http2_stream_t *stream) {
+    core_connection_error_t failure=stream->failure.kind ? stream->failure : core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,ECANCELED);
+    core_trace_error_set(failure); errno=failure.system_error;
 }
 
 static void release_stream(core_http2_stream_t *stream) {
@@ -375,7 +393,7 @@ static mux_actor_t *new_actor(mux_group_t *group, int budget, core_http2_stream_
         manager->actors=actor->next; actor_count--; close(actor->wake[0]); close(actor->wake[1]);
         core_buffer_budget_clear(&actor->input_memory); core_buffer_budget_clear(&actor->output_memory); free(actor); errno=status; return NULL;
     }
-    pthread_detach(thread); return actor;
+    actor->thread_started=1; pthread_detach(thread); return actor;
 }
 
 static mux_group_t *choose_group(mux_manager_t *manager) {
@@ -683,7 +701,7 @@ static int advance_streams(mux_actor_t *actor) {
             }
         }
         if (stream->download == actor && !stream->down_id) {
-            if (now >= stream->until_ms) { fail_stream(stream,"XHTTP connection deadline expired"); continue; }
+            if (now >= stream->until_ms) { fail_stream_error(stream,"XHTTP connection deadline expired",core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_DEADLINE,ETIMEDOUT)); continue; }
             int role=grpc_manager(actor->manager) || !strcmp(stream->config.xhttp_mode,"stream-one") ? 1 : 0;
             if ((unsigned)request_active(actor) >= actor->peer_concurrency || actor->draining) {
                 mux_actor_t *replacement=group_channel(actor->group,(int)(stream->until_ms-now),stream,1);
@@ -834,16 +852,23 @@ static int stop_idle_actor(mux_actor_t *actor, int in_use, uint64_t now) {
 static void *actor_worker(void *opaque) {
     mux_actor_t *actor=opaque; const core_http2_backend_t *backend=actor->manager->backend;
     core_deadline_t deadline; int http2=0;
-    if (core_deadline_attach(&deadline) != 0) snprintf(actor->error,sizeof(actor->error),"failed to attach connection deadline");
+    if (core_deadline_attach(&deadline) != 0) {
+        snprintf(actor->error,sizeof(actor->error),"failed to attach connection deadline");
+        actor->failure=core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_RESOURCE,ENOMEM);
+    }
     else {
         uint64_t now=core_now_ms();
         core_deadline_begin(now < actor->connect_until_ms ? (int)(actor->connect_until_ms-now) : 1);
         if (actor->trace_present) { core_trace_bind(&actor->trace); core_trace_observe(trace_progress,actor); }
-        if (now >= actor->connect_until_ms) snprintf(actor->error,sizeof(actor->error),"XHTTP connection deadline expired");
+        if (now >= actor->connect_until_ms) {
+            snprintf(actor->error,sizeof(actor->error),"XHTTP connection deadline expired");
+            actor->failure=core_connection_error(actor->progress_stage,CORE_FAILURE_DEADLINE,ETIMEDOUT);
+        }
         else {
             int opened=backend->open_budgeted ? backend->open_budgeted(&actor->manager->config,&actor->physical,&http2,actor->error,sizeof(actor->error),&actor->output_memory,&actor->input_memory) :
                 backend->open(&actor->manager->config,&actor->physical,&http2,actor->error,sizeof(actor->error));
             if (opened && !actor->error[0]) snprintf(actor->error,sizeof(actor->error),"XMUX physical connection failed");
+            if (opened && !core_trace_error_get(&actor->failure)) actor->failure=core_connection_error(actor->progress_stage,CORE_FAILURE_SYSTEM,errno ? errno : EIO);
         }
         core_trace_detach(); core_deadline_end();
     }
@@ -860,18 +885,18 @@ static void *actor_worker(void *opaque) {
         int in_use=0;
         for (core_http2_stream_t *stream=streams;stream;stream=stream->next)
             if (!stream->closed && (stream->download == actor || stream->upload == actor)) in_use=1;
-        if (result < 0) actor->failed=1;
+        if (result < 0) { actor->failed=1; actor->failure=core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_PROTOCOL,errno ? errno : EPROTO); }
         int done=stop_idle_actor(actor,in_use,core_now_ms());
         pthread_mutex_unlock(&mux_lock);
         if (actor_failed(actor) || done) break;
-        if (backend->flush(actor->physical) < 0) { snprintf(actor->error,sizeof(actor->error),"XHTTP physical send failed"); mark_failed(actor); break; }
+        if (backend->flush(actor->physical) < 0) { int cause=errno; snprintf(actor->error,sizeof(actor->error),"XHTTP physical send failed"); mark_failed(actor,CORE_FAILURE_SYSTEM,cause); break; }
         pthread_mutex_lock(&mux_lock); account_output(actor);
         for (core_http2_stream_t *stream=streams;stream;stream=stream->next)
             if ((stream->download == actor || stream->upload == actor) && stream->ready == 2 &&
                 !stream->download->opening && !stream->upload->opening && stream->download_fence <= stream->download->flushed && stream->upload_fence <= stream->upload->flushed) { stream->ready=1; signal_stream(stream); }
         pthread_mutex_unlock(&mux_lock);
         int collected=backend->collect(actor->physical);
-        if (collected < 0) { snprintf(actor->error,sizeof(actor->error),"XHTTP physical receive failed"); mark_failed(actor); break; }
+        if (collected < 0) { int cause=errno; snprintf(actor->error,sizeof(actor->error),"XHTTP physical receive failed"); mark_failed(actor,CORE_FAILURE_SYSTEM,cause); break; }
         core_http2_frame_t frame;
         for (;;) {
             size_t capacity=65535;
@@ -887,7 +912,7 @@ static void *actor_worker(void *opaque) {
             if (backend->release_frame) backend->release_frame(actor->physical,&frame); else free(frame.data);
             if (result < 0) { if (!actor->error[0]) snprintf(actor->error,sizeof(actor->error),"XHTTP response frame %u rejected",frame.type); break; }
         }
-        if (result < 0) { if (!actor->error[0]) snprintf(actor->error,sizeof(actor->error),"XHTTP response decoding failed"); mark_failed(actor); break; }
+        if (result < 0) { if (!actor->error[0]) snprintf(actor->error,sizeof(actor->error),"XHTTP response decoding failed"); mark_failed(actor,CORE_FAILURE_PROTOCOL,EPROTO); break; }
         uint64_t now=core_now_ms();
         pthread_mutex_lock(&mux_lock);
         if (maintain_ping(actor,now) != 0) actor->failed=1;
@@ -911,22 +936,25 @@ static void *actor_worker(void *opaque) {
             }
             wait=due > now ? (int)(due-now) : 0;
         }
-        if (core_poll(descriptors,2,wait) < 0) { mark_failed(actor); break; }
+        if (core_poll(descriptors,2,wait) < 0) { mark_failed(actor,CORE_FAILURE_SYSTEM,errno); break; }
         if (descriptors[0].revents) { uint8_t bytes[128]; while (recv(actor->wake[0],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {} }
     }
     pthread_mutex_lock(&mux_lock);
     if (actor->failed) vc_log_warning("xhttp","%s",actor->error[0] ? actor->error : "XHTTP channel state failed");
     for (core_http2_stream_t *stream=streams;stream;stream=stream->next)
-        if (!stream->closed && (stream->download == actor || stream->upload == actor)) fail_stream(stream,actor->error[0] ? actor->error : "XHTTP physical connection failed");
+        if (!stream->closed && (stream->download == actor || stream->upload == actor)) fail_stream_error(stream,actor->error[0] ? actor->error : "XHTTP physical connection failed",
+            actor->failure.kind ? actor->failure : core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_PROTOCOL,EPROTO));
     mux_request_t *request=actor->requests; actor->requests=NULL;
     while (request) { mux_request_t *next=request->next; release_stream(request->stream); free(request); request=next; }
     pthread_mutex_unlock(&mux_lock);
     if (actor->physical) backend->close(actor->physical);
     actor->physical=NULL; core_hpack_clear(&actor->hpack); core_http2_queue_clear(&actor->header_block);
     core_buffer_budget_clear(&actor->input_memory); core_buffer_budget_clear(&actor->output_memory); core_deadline_detach();
+    OPENSSL_thread_stop();
     pthread_mutex_lock(&mux_lock); size_t previous=upload_bytes; upload_bytes-=actor->net_accounted; actor->net_accounted=0;
     notify_write_capacity(previous);
     actor->stopped=1; close(actor->wake[0]); close(actor->wake[1]); actor_count--;
+    pthread_cond_broadcast(&workers_stopped);
     wake_admission();
     collect_stopped_actors();
     pthread_mutex_unlock(&mux_lock); return NULL;
@@ -1006,22 +1034,23 @@ core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core
         if (!stream->first_actor) core_trace_stage(CORE_TRACE_TRANSPORT);
         pthread_mutex_unlock(&mux_lock);
         if (ready) return stream;
-        if (failed) break;
+        if (failed) { core_trace_error_set(stream->failure); errno=stream->failure.system_error; break; }
         if (core_now_ms() >= stream->until_ms) {
             if (error && capacity) snprintf(error,capacity,"XHTTP connection deadline expired");
+            core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_DEADLINE,ETIMEDOUT));
             errno=ETIMEDOUT; break;
         }
         int notified=core_wait_socket(stream->notify[0],POLLIN,100);
         if (!notified && core_now_ms() < stream->until_ms && (!core_deadline_active() || core_deadline_remaining())) continue;
         if (notified <= 0) {
             if (error && capacity) snprintf(error,capacity,"XHTTP connection deadline expired");
-            pthread_mutex_lock(&mux_lock); core_trace_failure(actor ? actor->progress_stage : CORE_TRACE_TRANSPORT); pthread_mutex_unlock(&mux_lock);
+            pthread_mutex_lock(&mux_lock); core_trace_error_set(core_connection_error(actor ? actor->progress_stage : CORE_TRACE_TRANSPORT,CORE_FAILURE_DEADLINE,ETIMEDOUT)); pthread_mutex_unlock(&mux_lock);
             errno=ETIMEDOUT; break;
         }
         uint8_t byte; (void)recv(stream->notify[0],&byte,1,MSG_DONTWAIT);
         pthread_mutex_lock(&mux_lock); stream->notified=0; pthread_mutex_unlock(&mux_lock);
     }
-    core_http2_close(stream); return NULL;
+    int saved=errno; core_http2_close(stream); errno=saved; return NULL;
 }
 
 int core_http2_fd(const core_http2_stream_t *stream) { return stream ? stream->notify[0] : -1; }
@@ -1108,20 +1137,22 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
     int wait_ack=!stream->config.xmux.present && stream->config.transport_mode == TRANSPORT_XHTTP &&
         !strcmp(stream->config.xhttp_mode,"packet-up");
     while (offset < length) {
-        if (core_deadline_active() && !core_deadline_remaining()) return -1;
+        if (core_deadline_active() && !core_deadline_remaining()) { errno=ETIMEDOUT; core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_DEADLINE,errno)); return -1; }
         pthread_mutex_lock(&mux_lock);
-        if (stream->failed || stream->closed || stream->finish_requested) { pthread_mutex_unlock(&mux_lock); core_trace_failure(CORE_TRACE_TRANSPORT); return -1; }
+        if (stream->failed || stream->closed || stream->finish_requested) { pthread_mutex_unlock(&mux_lock); stream_error(stream); return -1; }
         size_t available=XMUX_STREAM_LIMIT-stream->tx.length;
         size_t global=upload_bytes < XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE ? XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE-upload_bytes : 0;
         global+=stream->reserved_upload;
         if (available > global) available=global;
         size_t block=length-offset; if (block > available) block=available;
-        if (block && queue_append(&stream->tx,data+offset,block,XMUX_STREAM_LIMIT) != 0) { pthread_mutex_unlock(&mux_lock); return -1; }
+        if (block && queue_append(&stream->tx,data+offset,block,XMUX_STREAM_LIMIT) != 0) {
+            int cause=errno; pthread_mutex_unlock(&mux_lock); core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,cause)); errno=cause; return -1;
+        }
         size_t reserved=block < stream->reserved_upload ? block : stream->reserved_upload;
         stream->reserved_upload-=reserved; upload_bytes+=block-reserved; offset+=block; wake_actor(stream->upload);
         update_upload_budget(stream);
         pthread_mutex_unlock(&mux_lock);
-        if (offset < length && wait_for_output(stream) <= 0) return -1;
+        if (offset < length && wait_for_output(stream) <= 0) { core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,errno ? errno : ETIMEDOUT)); return -1; }
     }
     while (!stream->relay_async && (core_deadline_active() || wait_ack)) {
         pthread_mutex_lock(&mux_lock);
@@ -1131,9 +1162,9 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
             if (request->stream == stream && packet_role(request->role) && !request->ended) pending=1;
         if (!pending && stream->rx.length) signal_stream(stream);
         pthread_mutex_unlock(&mux_lock);
-        if (failed) { core_trace_failure(CORE_TRACE_TRANSPORT); return -1; }
+        if (failed) { stream_error(stream); return -1; }
         if (!pending) break;
-        if (wait_for_output(stream) <= 0) { core_trace_failure(CORE_TRACE_TRANSPORT); return -1; }
+        if (wait_for_output(stream) <= 0) { core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,errno ? errno : ETIMEDOUT)); return -1; }
         pthread_mutex_lock(&mux_lock);
         uint8_t bytes[128]; while (recv(stream->notify[0],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {}
         stream->notified=0; pthread_mutex_unlock(&mux_lock);
@@ -1153,7 +1184,7 @@ int core_http2_read(core_http2_stream_t *stream, uint8_t *data, size_t capacity,
     }
     int result=take ? 0 : stream->failed ? -1 : stream->eof ? 0 : 1;
     if (stream->rx.length || stream->failed || stream->eof) signal_stream(stream);
-    if (stream->failed) core_trace_failure(CORE_TRACE_TRANSPORT);
+    if (result < 0) stream_error(stream);
     pthread_mutex_unlock(&mux_lock); return result;
 }
 
@@ -1161,6 +1192,7 @@ int core_http2_finish_write(core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
     int result=!stream || stream->failed || stream->closed ? -1 : 0;
     if (!result) { stream->finish_requested=1; wake_actor(stream->upload); }
+    else if (stream) stream_error(stream);
     pthread_mutex_unlock(&mux_lock); return result;
 }
 
@@ -1168,12 +1200,21 @@ int core_http2_finish_pending(const core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
     int result=!stream ? -1 : stream->failed ? stream->rx.length ? 0 : -1 : stream->finish_requested &&
         (!stream->finish_sent || stream->finish_fence > stream->upload->flushed);
+    if (result < 0 && stream) stream_error(stream);
     pthread_mutex_unlock(&mux_lock); return result;
 }
 
 void core_http2_close(core_http2_stream_t *stream) {
     if (!stream) return;
+    int saved=errno;
     pthread_mutex_lock(&mux_lock);
+    mux_actor_t *private_actors[2]={0}; size_t private_count=0;
+    if (!stream->closed && stream->config.transport_mode == TRANSPORT_XHTTP) {
+        mux_actor_t *actors[]={stream->download,stream->upload};
+        for (size_t i=0;i<2;i++) if (actors[i] && actors[i]->thread_started && !actors[i]->manager->config.xmux.present && (!i || actors[i] != actors[0])) {
+            private_actors[private_count++]=actors[i]; actors[i]->close_waiters++; actors[i]->closing=1; wake_actor(actors[i]);
+        }
+    }
     if (!stream->closed) {
         stream->closed=1; close(stream->notify[0]); close(stream->notify[1]);
         size_t previous=upload_bytes;
@@ -1188,5 +1229,10 @@ void core_http2_close(core_http2_stream_t *stream) {
         release_stream(stream);
         collect_stopped_actors();
     }
-    pthread_mutex_unlock(&mux_lock);
+    for (size_t i=0;i<private_count;i++) {
+        while (!private_actors[i]->stopped) pthread_cond_wait(&workers_stopped,&mux_lock);
+        private_actors[i]->close_waiters--;
+    }
+    if (private_count) collect_stopped_actors();
+    pthread_mutex_unlock(&mux_lock); errno=saved;
 }

@@ -12,6 +12,7 @@ static uint64_t fake_now(void) { return fixture_now; }
 int __real_getaddrinfo(const char *, const char *, const struct addrinfo *, struct addrinfo **);
 
 int __wrap_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **addresses) {
+    if (!strcmp(host,"resource-vless-core.test")) { *addresses=NULL; errno=EMFILE; return EAI_SYSTEM; }
     if (!strcmp(host, "vless-core-slow.test")) {
         pthread_mutex_lock(&fixture_lock); fixture_active++;
         while (!fixture_unblocked) pthread_cond_wait(&fixture_ready, &fixture_lock);
@@ -25,6 +26,11 @@ int __wrap_getaddrinfo(const char *host, const char *service, const struct addri
 int main(void) {
     REQUIRE("dns/pool-init", core_resolver_init() == 0 && resolver_workers == 4);
     struct addrinfo hints = {.ai_family=AF_INET,.ai_socktype=SOCK_STREAM};
+    core_resolver_query_t *resource=core_resolver_start("resource-vless-core.test","80",&hints);
+    REQUIRE("dns/resource-start",resource != NULL);
+    struct addrinfo *resource_addresses=NULL; errno=EBADF;
+    CHECK("dns/wait-preserves-worker-system-cause",core_resolver_wait(resource,&resource_addresses) == EAI_SYSTEM && errno == EMFILE);
+    core_resolver_release(resource);
     core_resolver_query_t *running[4];
     for (int i=0;i<4;i++) REQUIRE("dns/slow-start", (running[i]=core_resolver_start("vless-core-slow.test","80",&hints)) != NULL);
     uint64_t end = core_now_ms() + 1000;
