@@ -2,6 +2,7 @@
 #include "check.h"
 #include "../src/tls13_reality.c"
 #include "uri.h"
+#include <signal.h>
 #include <sys/wait.h>
 static int io_failure;
 static int pooled_fixture_pending=-1;
@@ -327,14 +328,25 @@ static void hpack_response_phases(void) {
 }
 static void wait_tls_fixture(tls13_conn_t *c) {
     if (SSL_pending(c->ssl) > 0) return;
-    fd_set rfds; FD_ZERO(&rfds); FD_SET(c->fd, &rfds);
-    struct timeval timeout = {2,0};
-    REQUIRE("xhttp/tls-fixture-input", select(c->fd + 1, &rfds, NULL, NULL, &timeout) > 0);
+    REQUIRE("xhttp/tls-fixture-input",core_wait_socket(c->fd,POLLIN,2000) > 0);
+}
+static int xhttp_fixture_try_read(tls13_conn_t *c, uint8_t *data, size_t capacity, size_t *length) {
+    *length=0;
+    if (xmux_transport_collect(c) < 0) return -1;
+    for (;;) {
+        core_http2_frame_t frame;
+        int result=xmux_transport_read_frame(c,&frame,capacity);
+        if (result) return result;
+        if (frame.event == 1) { free(frame.data); if (frame.status != 200) return -1; continue; }
+        if (frame.event != 2 && frame.event != 3) { free(frame.data); return -1; }
+        if (frame.length) memcpy(data,frame.data,frame.length);
+        *length=frame.length; free(frame.data); return 0;
+    }
 }
 static int xhttp_fixture_read(tls13_conn_t *c, uint8_t *data, size_t capacity, size_t *length) {
     uint64_t until=core_now_ms()+2000;
     for (;;) {
-        int result=tls13_read_app(c,data,capacity,length);
+        int result=xhttp_fixture_try_read(c,data,capacity,length);
         if (result != 1) return result;
         uint64_t now=core_now_ms();
         if (now >= until || core_wait_socket(c->fd,POLLIN,(int)(until-now)) <= 0) return -1;
@@ -343,8 +355,13 @@ static int xhttp_fixture_read(tls13_conn_t *c, uint8_t *data, size_t capacity, s
 static int live_xhttp_chunks(const char *uri) {
     vless_config_t cfg; char error[256]; tls13_conn_t *c = NULL;
     REQUIRE("xhttp/tls-fixture-config", parse_core_uri(uri, &cfg, error, sizeof(error)) == 0);
-    REQUIRE("xhttp/tls-fixture-connect", tls13_reality_connect(&cfg, &c, error, sizeof(error)) == 0);
-    REQUIRE("xhttp/tls-fixture-h1", c->mode == CONN_MODE_XHTTP_TLS);
+    void *physical=NULL; int http2=0;
+    REQUIRE("xhttp/tls-fixture-connect",xmux_transport_open(&cfg,&physical,&http2,error,sizeof(error)) == 0);
+    c=physical;
+    REQUIRE("xhttp/tls-fixture-h1", !http2 && c->mode == CONN_MODE_XHTTP_TLS);
+    uint32_t id; size_t consumed,body;
+    REQUIRE("xhttp/tls-fixture-request",xmux_transport_request(c,&cfg,"vless-core",0,0,NULL,0,&id,65536,&consumed,&body) == 0);
+    REQUIRE("xhttp/tls-fixture-flush",xmux_transport_flush(c) == 0 && !xmux_transport_pending(c));
     core_set_socket_io_timeout(c->fd, 500);
     int flags = fcntl(c->fd, F_GETFL, 0);
     uint8_t data[64]; size_t length = 0;
@@ -352,8 +369,8 @@ static int live_xhttp_chunks(const char *uri) {
     CHECK("xhttp/tls-first-chunk", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && length == 3 && memcmp(data, "abc", 3) == 0);
     for (int stage = 0; stage < 4; stage++) {
         if (stage) wait_tls_fixture(c);
-        CHECK("xhttp/tls-incomplete-chunk-yields", tls13_read_app(c, data, sizeof(data), &length) == 1 && length == 0);
-        CHECK("xhttp/tls-incomplete-chunk-not-pending", !tls13_has_pending_app(c));
+        CHECK("xhttp/tls-incomplete-chunk-yields", xhttp_fixture_try_read(c, data, sizeof(data), &length) == 1 && length == 0);
+        CHECK("xhttp/tls-incomplete-chunk-not-pending", xhttp_fixture_try_read(c,data,sizeof(data),&length) == 1 && !length);
         CHECK("xhttp/tls-socket-flags-restored", fcntl(c->fd, F_GETFL, 0) == flags);
         REQUIRE("xhttp/tls-fixture-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
     }
@@ -362,11 +379,11 @@ static int live_xhttp_chunks(const char *uri) {
     REQUIRE("xhttp/tls-body-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
     wait_tls_fixture(c);
     CHECK("xhttp/tls-fragmented-chunk-tail", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && length == 3 && memcmp(data, "pn!", 3) == 0);
-    CHECK("xhttp/tls-chunk-ending-yields", tls13_read_app(c, data, sizeof(data), &length) == 1 && length == 0);
-    CHECK("xhttp/tls-chunk-ending-not-pending", !tls13_has_pending_app(c));
+    CHECK("xhttp/tls-chunk-ending-yields", xhttp_fixture_try_read(c, data, sizeof(data), &length) == 1 && length == 0);
+    CHECK("xhttp/tls-chunk-ending-not-pending", xhttp_fixture_try_read(c,data,sizeof(data),&length) == 1 && !length);
     REQUIRE("xhttp/tls-end-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
     wait_tls_fixture(c);
-    CHECK("xhttp/tls-chunked-eof", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && !length && c->xhttp_eof);
+    CHECK("xhttp/tls-chunked-eof", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && !length && !c->xmux_http1_id);
     CHECK("xhttp/tls-final-flags-restored", fcntl(c->fd, F_GETFL, 0) == flags);
     tls13_reality_close(c);
     return test_result();
@@ -765,6 +782,7 @@ static void http2_single_wire_vectors(void) {
 }
 
 int main(int argc, char **argv) {
+    if (signal(SIGPIPE,SIG_IGN) == SIG_ERR) return 2;
     if (argc == 1) pooled_receive_window();
     if (argc == 3 && !strcmp(argv[1],"--xhttp-post")) {
         vless_config_t config; tls13_conn_t *connection=NULL; char error[256]={0};

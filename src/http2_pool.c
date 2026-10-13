@@ -740,7 +740,7 @@ static int advance_streams(mux_actor_t *actor) {
                 if (move_waiting_streams(actor) != 0) return -1;
             }
             if (!(request->ended && request->send_ended) && !request->reset && send_frame(actor,3,0,request->id,(const uint8_t[]){0,0,0,8},4) != 0) return -1;
-            *cursor=request->next; free(request); release_stream(stream);
+            *cursor=request->next; free(request); signal_stream(stream); release_stream(stream);
         } else cursor=&request->next;
     }
     return 0;
@@ -984,6 +984,8 @@ static int wait_for_output(core_http2_stream_t *stream) {
 
 int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t length) {
     size_t offset=0;
+    int wait_ack=!stream->config.xmux.present && stream->config.transport_mode == TRANSPORT_XHTTP &&
+        !strcmp(stream->config.xhttp_mode,"packet-up");
     while (offset < length) {
         if (core_deadline_active() && !core_deadline_remaining()) return -1;
         pthread_mutex_lock(&mux_lock);
@@ -999,10 +1001,12 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
         pthread_mutex_unlock(&mux_lock);
         if (offset < length && wait_for_output(stream) <= 0) return -1;
     }
-    while (!stream->relay_async && core_deadline_active()) {
+    while (!stream->relay_async && (core_deadline_active() || wait_ack)) {
         pthread_mutex_lock(&mux_lock);
         int failed=stream->failed || stream->closed;
         int pending=stream->tx.length || stream->upload->opening || stream->write_fence > stream->upload->flushed;
+        if (wait_ack) for (mux_request_t *request=stream->upload->requests;request;request=request->next)
+            if (request->stream == stream && request->role == 3 && !request->ended) pending=1;
         if (!pending && stream->rx.length) signal_stream(stream);
         pthread_mutex_unlock(&mux_lock);
         if (failed) { core_trace_failure(CORE_TRACE_TRANSPORT); return -1; }

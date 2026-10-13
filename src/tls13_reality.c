@@ -6336,8 +6336,7 @@ int tls13_reality_connect(const vless_config_t *cfg, tls13_conn_t **out, char *e
     c->mode = CONN_MODE_REALITY;
 
     if (cfg->transport_mode == TRANSPORT_XHTTP) {
-        if ((!cfg->xhttp_physical_only && cfg->xhttp_download_settings[0]) || cfg->xmux.present || (!cfg->xhttp_physical_only && !strcmp(cfg->security,"tls") &&
-            !strcmp(cfg->alpn,"http/1.1") && strcmp(cfg->xhttp_mode,"packet-up"))) {
+        if (!cfg->xhttp_physical_only) {
             c->xmux_stream = core_xmux_connect(cfg, &xmux_backend, err, err_cap);
             if (!c->xmux_stream) { free(c); return -1; }
             c->fd = core_xmux_fd(c->xmux_stream);
@@ -6946,6 +6945,8 @@ static int xmux_transport_read_frame(void *opaque, core_xmux_frame_t *frame, siz
         core_http1_event_t event;
         int result=core_http1_next(&connection->xmux_http1_response,connection->h2_net_cache.data,connection->h2_net_cache.len,
                                    connection->xmux_http1_eof,capacity,&event);
+        if (result < 0) vc_log_error("xhttp","%s response failed: invalid or truncated HTTP/1.1 response",
+                                     connection->xmux_http1_role ? "upload" : "download");
         if (!result) {
             frame->event=event.kind; frame->status=event.status; frame->close_connection=event.close_connection;
             frame->id=connection->xmux_http1_id; frame->length=event.length;

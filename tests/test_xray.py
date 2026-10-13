@@ -452,6 +452,16 @@ class XrayTests(unittest.TestCase):
                         with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,f"vless-core unpooled {index}".encode())
                     self.assertEqual(len(proxy.client_data),channels*4)
 
+    def test_xhttp_http2_connections_without_pooling(self):
+        cert,_=certificate()
+        for security in ("tls","reality"):
+            for mode in ("stream-one","stream-up","packet-up"):
+                with self.subTest(security=security,mode=mode), Server() as target, xray_server("xhttp",security,mode=mode) as reference, CountingProxy(reference.port) as proxy:
+                    with cli(uri(proxy.port,"xhttp",security,mode=mode),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                        for index in range(4):
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,f"vless-core private {index}".encode())
+                        self.assertEqual(len(proxy.client_data),4)
+
     def test_xhttp_payload_placements(self):
         cert,_=certificate()
         for placement in ("body","auto","header","cookie"):
@@ -884,8 +894,6 @@ class XrayTests(unittest.TestCase):
         cases = [(status,block,fragmented) for status,block in cases for fragmented in (False,True)]
         request = b"vless-core request"
         reply = b"vless-core huffman response"
-        def frame(kind, flags, payload, stream=1):
-            return len(payload).to_bytes(3,"big")+bytes([kind,flags])+stream.to_bytes(4,"big")+payload
         def read_frame(connection):
             header = exact(connection,9)
             size = int.from_bytes(header[:3],"big")
@@ -898,14 +906,18 @@ class XrayTests(unittest.TestCase):
                 with self.subTest(transport=transport,status=status,fragmented=fragmented):
                     def handler(connection):
                         self.assertEqual(exact(connection,24),b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-                        received = bytearray()
+                        received = bytearray(); response_stream=None
                         while not received.endswith(request):
                             kind, _, stream, payload = read_frame(connection)
                             if kind == 0:
-                                self.assertEqual(stream,1)
+                                if response_stream is None: response_stream=stream
+                                self.assertEqual(stream,response_stream)
+                                self.assertTrue(stream&1)
                                 if not received:
                                     self.assertTrue(payload.startswith(b"\x00"))
                                 received.extend(payload)
+                        def frame(kind, flags, payload, stream=None):
+                            return len(payload).to_bytes(3,"big")+bytes([kind,flags])+(response_stream if stream is None else stream).to_bytes(4,"big")+payload
                         data = b"\x00\x00"+reply
                         trailer = b""
                         response_block=block
@@ -945,24 +957,27 @@ class XrayTests(unittest.TestCase):
         first = threading.Event()
         first_payload, second_payload = b"vless-core first", b"vless-core second"
         reply = b"vless-core complete"
-        def frame(kind, flags, payload, stream=1):
-            return len(payload).to_bytes(3,"big")+bytes([kind,flags])+stream.to_bytes(4,"big")+payload
-        def read_data(connection):
-            while True:
-                header = exact(connection,9)
-                size = int.from_bytes(header[:3],"big")
-                self.assertLessEqual(size,1048576)
-                payload = exact(connection,size)
-                if header[3] == 0:
-                    self.assertEqual(int.from_bytes(header[5:],"big"),1)
-                    return payload
         def handler(connection):
+            pending=bytearray(); response_stream=None
+            def read_data(length):
+                nonlocal response_stream
+                while len(pending) < length:
+                    header=exact(connection,9); size=int.from_bytes(header[:3],"big")
+                    self.assertLessEqual(size,16384)
+                    payload=exact(connection,size)
+                    if header[3] == 0:
+                        stream=int.from_bytes(header[5:],"big")
+                        if response_stream is None: response_stream=stream
+                        self.assertEqual(stream,response_stream); pending.extend(payload)
+                result=bytes(pending[:length]); del pending[:length]; return result
             self.assertEqual(exact(connection,24),b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-            self.assertTrue(read_data(connection).startswith(b"\x00"))
+            self.assertEqual(read_data(26)[0],0)
+            def frame(kind, flags, payload, stream=None):
+                return len(payload).to_bytes(3,"big")+bytes([kind,flags])+(response_stream if stream is None else stream).to_bytes(4,"big")+payload
             connection.sendall(frame(4,0,b"",0)+frame(1,4,b"\x88")+frame(0,0,b"\x00\x00"))
-            self.assertEqual(read_data(connection),first_payload)
+            self.assertEqual(read_data(len(first_payload)),first_payload)
             first.set()
-            self.assertEqual(read_data(connection),second_payload)
+            self.assertEqual(read_data(len(second_payload)),second_payload)
             connection.sendall(frame(0,0,reply)+frame(0,1,b""))
         cert, _ = certificate()
         with Server(handler,tls=True) as target:

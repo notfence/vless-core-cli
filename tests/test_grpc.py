@@ -159,7 +159,7 @@ class GrpcPeer(Server):
 class GrpcTests(unittest.TestCase):
     def test_reply_is_readable_before_upload_window_recovers(self):
         reply=b"vless-core readable while upload stalled"
-        for transport in ("grpc","xhttp"):
+        for transport, pooled in (("grpc",True),("xhttp",True),("xhttp",False)):
             recovered=threading.Event(); reply_read=threading.Event(); completed=threading.Event(); settings_acknowledged=threading.Event()
             def handle(connection):
                 self.assertEqual(exact(connection,24),b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
@@ -181,9 +181,10 @@ class GrpcTests(unittest.TestCase):
                             body=b"\x00\x00"+reply
                             connection.sendall(frame(1,4,stream,GRPC_HEADERS if transport == "grpc" else b"\x88")+frame(0,stream=stream,payload=envelope(body) if transport == "grpc" else body))
                             response_stream=stream
-            options={"mode":"stream-one","extra":json.dumps({"xmux":{"maxConnections":1}})} if transport == "xhttp" else {}
+            options={"mode":"stream-one"} if transport == "xhttp" else {}
+            if transport == "xhttp" and pooled: options["extra"]=json.dumps({"xmux":{"maxConnections":1}})
             cert,_=certificate()
-            with self.subTest(transport=transport), Server(handle,tls=transport == "xhttp") as peer:
+            with self.subTest(transport=transport,pooled=pooled), Server(handle,tls=transport == "xhttp") as peer:
                 with cli(uri(peer.port,transport,"tls" if transport == "xhttp" else "none",**options),extra=["--connect-timeout-ms","1000"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
                     try:
                         with socks_connect(core.port,80) as tunnel:
