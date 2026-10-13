@@ -36,6 +36,7 @@ struct vless_encryption_conn {
     size_t incoming_raw_header_len;
     size_t incoming_raw_skip;
     uint8_t *input;
+    size_t input_capacity;
     size_t input_len;
     size_t input_off;
     int read_eof;
@@ -46,7 +47,7 @@ struct vless_encryption_conn {
     uint64_t cache_generation;
     int incoming_deferred;
     uint8_t *prewrite;
-    size_t prewrite_length;
+    size_t prewrite_length,prewrite_capacity;
 };
 
 typedef struct {
@@ -115,6 +116,12 @@ static void set_err(char *err, size_t cap, const char *msg) {
     }
 }
 
+static void clear_free(void *memory, size_t capacity) {
+    int saved=errno;
+    if (memory) { OPENSSL_cleanse(memory,capacity); free(memory); }
+    errno=saved;
+}
+
 static int random_range(int min, int max) {
     if (min > max) { int temporary=min; min=max; max=temporary; }
     if (min == max) return min;
@@ -178,6 +185,7 @@ static int aead_seal(vless_aead_t *aead, const uint8_t *nonce_override,
                      const uint8_t *plain, size_t plain_len,
                      const uint8_t *aad, size_t aad_len,
                      uint8_t *out, size_t *out_len) {
+    *out_len=0;
     uint8_t nonce[12];
     if (nonce_override != NULL) {
         memcpy(nonce, nonce_override, sizeof(nonce));
@@ -188,6 +196,7 @@ static int aead_seal(vless_aead_t *aead, const uint8_t *nonce_override,
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (ctx == NULL) {
+        OPENSSL_cleanse(nonce,sizeof(nonce));
         return -1;
     }
     int n = 0;
@@ -212,7 +221,9 @@ static int aead_seal(vless_aead_t *aead, const uint8_t *nonce_override,
         total += 16;
     }
     EVP_CIPHER_CTX_free(ctx);
+    OPENSSL_cleanse(nonce,sizeof(nonce));
     if (!ok) {
+        OPENSSL_cleanse(out,plain_len+16);
         return -1;
     }
     *out_len = (size_t)total;
@@ -223,6 +234,7 @@ static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
                      const uint8_t *ciphertext, size_t ciphertext_len,
                      const uint8_t *aad, size_t aad_len,
                      uint8_t *out, size_t *out_len) {
+    *out_len=0;
     if (ciphertext_len < 16) {
         return -1;
     }
@@ -237,6 +249,8 @@ static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
     size_t data_len = ciphertext_len - 16;
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (ctx == NULL) {
+        OPENSSL_cleanse(nonce,sizeof(nonce));
+        OPENSSL_cleanse(out,data_len);
         return -1;
     }
     int n = 0;
@@ -260,7 +274,9 @@ static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
         total += n;
     }
     EVP_CIPHER_CTX_free(ctx);
+    OPENSSL_cleanse(nonce,sizeof(nonce));
     if (!ok) {
+        OPENSSL_cleanse(out,data_len);
         return -1;
     }
     *out_len = (size_t)total;
@@ -361,8 +377,10 @@ static int aes_ctr_init(EVP_CIPHER_CTX **out, const uint8_t *key,
     if (ctx == NULL ||
         EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, derived, iv) != 1) {
         EVP_CIPHER_CTX_free(ctx);
+        OPENSSL_cleanse(derived,sizeof(derived));
         return -1;
     }
+    OPENSSL_cleanse(derived,sizeof(derived));
     *out = ctx;
     return 0;
 }
@@ -426,69 +444,40 @@ static int xor_raw_headers(EVP_CIPHER_CTX *ctr, uint8_t *data, size_t len,
 
 static int build_relays(const vless_config_t *cfg, const uint8_t iv[16],
                         uint8_t *out, uint8_t nfs_key[32]) {
-    EVP_CIPHER_CTX *previous_ctr = NULL;
-    size_t off = 0;
-
-    for (size_t i = 0; i < cfg->encryption_relay_count; i++) {
-        const vless_encryption_relay_t *relay = &cfg->encryption_relays[i];
-        size_t relay_len = relay->key_len == 32 ? 32 : 1088;
-        uint8_t current_key[32];
-
+    EVP_CIPHER_CTX *previous_ctr=NULL,*public_ctr=NULL;
+    EVP_PKEY *private_key=NULL;
+    uint8_t current_key[32]={0},hash[32]={0};
+    size_t off=0; int result=-1;
+    for (size_t i=0;i<cfg->encryption_relay_count;i++) {
+        const vless_encryption_relay_t *relay=&cfg->encryption_relays[i];
+        size_t relay_len=relay->key_len == 32 ? 32 : 1088;
         if (relay->key_len == 32) {
-            EVP_PKEY *private_key = NULL;
-            if (x25519_generate(&private_key, out + off) != 0 ||
-                x25519_derive(private_key, relay->key, current_key) != 0) {
-                EVP_PKEY_free(private_key);
-                EVP_CIPHER_CTX_free(previous_ctr);
-                return -1;
-            }
-            EVP_PKEY_free(private_key);
-        } else if (mlkem_encapsulate_public(relay->key, out + off,
-                                            current_key) != 0) {
-            EVP_CIPHER_CTX_free(previous_ctr);
-            return -1;
+            if (x25519_generate(&private_key,out+off) || x25519_derive(private_key,relay->key,current_key)) goto cleanup;
+            EVP_PKEY_free(private_key); private_key=NULL;
+        } else if (mlkem_encapsulate_public(relay->key,out+off,current_key)) goto cleanup;
+        if (cfg->encryption_xor_mode) {
+            if (aes_ctr_init(&public_ctr,relay->key,relay->key_len,iv) || aes_ctr_xor(public_ctr,out+off,relay_len)) goto cleanup;
+            EVP_CIPHER_CTX_free(public_ctr); public_ctr=NULL;
         }
-
-        if (cfg->encryption_xor_mode != 0) {
-            EVP_CIPHER_CTX *public_ctr = NULL;
-            if (aes_ctr_init(&public_ctr, relay->key, relay->key_len, iv) != 0 ||
-                aes_ctr_xor(public_ctr, out + off, relay_len) != 0) {
-                EVP_CIPHER_CTX_free(public_ctr);
-                EVP_CIPHER_CTX_free(previous_ctr);
-                return -1;
-            }
-            EVP_CIPHER_CTX_free(public_ctr);
-        }
-        if (previous_ctr != NULL &&
-            aes_ctr_xor(previous_ctr, out + off, 32) != 0) {
-            EVP_CIPHER_CTX_free(previous_ctr);
-            return -1;
-        }
-
-        if (i + 1 < cfg->encryption_relay_count) {
-            uint8_t hash[32];
-            blake3_hash(cfg->encryption_relays[i + 1].key,
-                        cfg->encryption_relays[i + 1].key_len, hash);
-            memcpy(out + off + relay_len, hash, sizeof(hash));
-            EVP_CIPHER_CTX_free(previous_ctr);
-            previous_ctr = NULL;
-            if (aes_ctr_init(&previous_ctr, current_key, sizeof(current_key),
-                             iv) != 0 ||
-                aes_ctr_xor(previous_ctr, out + off + relay_len,
-                            sizeof(hash)) != 0) {
-                EVP_CIPHER_CTX_free(previous_ctr);
-                return -1;
-            }
-            off += relay_len + sizeof(hash);
-        } else {
-            memcpy(nfs_key, current_key, sizeof(current_key));
-            off += relay_len;
-        }
+        if (previous_ctr && aes_ctr_xor(previous_ctr,out+off,32)) goto cleanup;
+        if (i+1 < cfg->encryption_relay_count) {
+            blake3_hash(cfg->encryption_relays[i+1].key,cfg->encryption_relays[i+1].key_len,hash);
+            memcpy(out+off+relay_len,hash,sizeof(hash));
+            EVP_CIPHER_CTX_free(previous_ctr); previous_ctr=NULL;
+            if (aes_ctr_init(&previous_ctr,current_key,sizeof(current_key),iv) ||
+                aes_ctr_xor(previous_ctr,out+off+relay_len,sizeof(hash))) goto cleanup;
+            off+=relay_len+sizeof(hash);
+        } else { memcpy(nfs_key,current_key,sizeof(current_key)); off+=relay_len; }
+        OPENSSL_cleanse(current_key,sizeof(current_key));
     }
-    EVP_CIPHER_CTX_free(previous_ctr);
-    return 0;
+    result=0;
+cleanup: {
+    int saved=errno;
+    EVP_PKEY_free(private_key); EVP_CIPHER_CTX_free(public_ctr); EVP_CIPHER_CTX_free(previous_ctr);
+    OPENSSL_cleanse(current_key,sizeof(current_key)); OPENSSL_cleanse(hash,sizeof(hash));
+    errno=saved; return result;
 }
-
+}
 static int transport_read_exact(tls13_conn_t *transport,
                                 uint8_t *buf, size_t len) {
     return tls13_read_exact_app(transport, buf, len);
@@ -497,250 +486,154 @@ static int transport_read_exact(tls13_conn_t *transport,
 int vless_encryption_connect(const vless_config_t *cfg, tls13_conn_t *transport,
                              vless_encryption_conn_t **out,
                              char *err, size_t err_cap) {
-    *out = NULL;
-    if (!cfg->encryption_enabled || cfg->encryption_relay_count == 0) {
-        set_err(err, err_cap, "VLESS encryption is not configured");
-        return -1;
+    struct {
+        uint8_t client_iv[16],nfs_key[32],identity[32],cached_pfs[64],cached_ticket[16],pfs_key[64],ticket[16];
+        uint8_t client_pfs_public[1216],encrypted_server_pfs[1136],server_pfs_public[1120];
+        uint8_t encrypted_ticket[32],encrypted_length[18],decoded_length[2];
+        vless_aead_t nfs_aead;
+        EVP_PKEY *mlkem_key,*x25519_key;
+        vless_encryption_conn_t *connection;
+        uint8_t *hello,*peer_padding,*decoded_padding;
+        size_t hello_length,peer_padding_length,decoded_padding_capacity;
+    } handshake={0};
+    int result=-1;
+    *out=NULL;
+    if (!cfg->encryption_enabled || !cfg->encryption_relay_count) {
+        set_err(err,err_cap,"VLESS encryption is not configured"); goto cleanup;
     }
-    size_t relays_len = 0;
-    for (size_t i = 0; i < cfg->encryption_relay_count; i++) {
-        relays_len += cfg->encryption_relays[i].key_len == 32 ? 32 : 1088;
-        if (i + 1 < cfg->encryption_relay_count) {
-            relays_len += 32;
-        }
+    size_t relays_len=0;
+    for (size_t i=0;i<cfg->encryption_relay_count;i++) {
+        relays_len+=cfg->encryption_relays[i].key_len == 32 ? 32 : 1088;
+        if (i+1 < cfg->encryption_relay_count) relays_len+=32;
     }
-
     int padding_lengths[14],padding_gaps[14]; size_t padding_count=0;
     int padding_len=padding_create(cfg,padding_lengths,padding_gaps,&padding_count);
-    if (padding_len < 0) { set_err(err,err_cap,"invalid VLESS encryption padding"); return -1; }
-    const size_t pfs_exchange_len = 18 + 1184 + 32 + 16;
-    size_t hello_len = 16 + relays_len + pfs_exchange_len +
-                       (size_t)padding_len;
-    uint8_t *hello = (uint8_t *)calloc(1, hello_len);
-    if (hello == NULL || RAND_bytes(hello, 16) != 1) {
-        free(hello);
-        set_err(err, err_cap, "failed to allocate VLESS encryption hello");
-        return -1;
+    if (padding_len < 0) { set_err(err,err_cap,"invalid VLESS encryption padding"); goto cleanup; }
+    const size_t pfs_exchange_len=18+1184+32+16;
+    handshake.hello_length=16+relays_len+pfs_exchange_len+(size_t)padding_len;
+    handshake.hello=calloc(1,handshake.hello_length);
+    if (!handshake.hello || RAND_bytes(handshake.hello,16) != 1) {
+        set_err(err,err_cap,"failed to allocate VLESS encryption hello"); goto cleanup;
     }
-    uint8_t client_iv[16];
-    memcpy(client_iv, hello, sizeof(client_iv));
-
-    uint8_t nfs_key[32];
-    if (build_relays(cfg, hello, hello + 16, nfs_key) != 0) {
-        free(hello);
-        set_err(err, err_cap, "failed to build VLESS encryption relay");
-        return -1;
+    memcpy(handshake.client_iv,handshake.hello,sizeof(handshake.client_iv));
+    if (build_relays(cfg,handshake.hello,handshake.hello+16,handshake.nfs_key)) {
+        set_err(err,err_cap,"failed to build VLESS encryption relay"); goto cleanup;
     }
-
-    vless_aead_t nfs_aead;
-    aead_init(&nfs_aead, hello, 16, nfs_key, sizeof(nfs_key));
-
-    uint8_t identity[32],cached_pfs[64],cached_ticket[16];
-    cache_identity(cfg,identity);
-    uint64_t generation=cfg->encryption_zero_rtt ? cache_load(identity,cached_pfs,cached_ticket) : 0;
+    aead_init(&handshake.nfs_aead,handshake.hello,16,handshake.nfs_key,sizeof(handshake.nfs_key));
+    cache_identity(cfg,handshake.identity);
+    uint64_t generation=cfg->encryption_zero_rtt ? cache_load(handshake.identity,handshake.cached_pfs,handshake.cached_ticket) : 0;
     if (generation) {
-        vless_encryption_conn_t *connection=calloc(1,sizeof(*connection));
-        size_t offset=16+relays_len,written=0;
-        uint8_t length[2]={0,32};
-        if (!connection || aead_seal(&nfs_aead,NULL,length,2,NULL,0,hello+offset,&written) || written != 18 ||
-            aead_seal(&nfs_aead,NULL,cached_ticket,16,NULL,0,hello+offset+18,&written) || written != 32) {
-            free(connection); free(hello); OPENSSL_cleanse(cached_pfs,sizeof(cached_pfs));
-            OPENSSL_cleanse(cached_ticket,sizeof(cached_ticket)); set_err(err,err_cap,"failed to resume VLESS encryption"); return -1;
+        handshake.connection=calloc(1,sizeof(*handshake.connection));
+        size_t offset=16+relays_len,written=0; uint8_t length[2]={0,32};
+        if (!handshake.connection ||
+            aead_seal(&handshake.nfs_aead,NULL,length,2,NULL,0,handshake.hello+offset,&written) || written != 18 ||
+            aead_seal(&handshake.nfs_aead,NULL,handshake.cached_ticket,16,NULL,0,handshake.hello+offset+18,&written) || written != 32) {
+            set_err(err,err_cap,"failed to resume VLESS encryption"); goto cleanup;
         }
+        vless_encryption_conn_t *connection=handshake.connection;
         connection->transport=transport;
-        memcpy(connection->united_key,cached_pfs,64); memcpy(connection->united_key+64,nfs_key,32);
+        memcpy(connection->united_key,handshake.cached_pfs,64); memcpy(connection->united_key+64,handshake.nfs_key,32);
         connection->united_key_len=96;
-        memcpy(connection->cache_identity,identity,32); connection->cache_generation=generation;
-        aead_init(&connection->outgoing,hello+offset+18,32,connection->united_key,96);
-        connection->incoming_deferred=1; connection->prewrite=hello; connection->prewrite_length=offset+50;
-        OPENSSL_cleanse(cached_pfs,sizeof(cached_pfs)); OPENSSL_cleanse(cached_ticket,sizeof(cached_ticket));
-        if (cfg->encryption_xor_mode == 2 && aes_ctr_init(&connection->outgoing_header_ctr,connection->united_key,96,client_iv)) {
-            vless_encryption_close(connection); set_err(err,err_cap,"failed to initialize resumed VLESS encryption"); return -1;
+        memcpy(connection->cache_identity,handshake.identity,32); connection->cache_generation=generation;
+        aead_init(&connection->outgoing,handshake.hello+offset+18,32,connection->united_key,96);
+        connection->incoming_deferred=1;
+        connection->prewrite=handshake.hello; connection->prewrite_length=offset+50;
+        connection->prewrite_capacity=handshake.hello_length; handshake.hello=NULL;
+        if (cfg->encryption_xor_mode == 2 && aes_ctr_init(&connection->outgoing_header_ctr,connection->united_key,96,handshake.client_iv)) {
+            set_err(err,err_cap,"failed to initialize resumed VLESS encryption"); goto cleanup;
         }
-        OPENSSL_cleanse(nfs_key,sizeof(nfs_key)); OPENSSL_cleanse(&nfs_aead,sizeof(nfs_aead));
-        *out=connection; return 0;
+        *out=connection; handshake.connection=NULL; result=0; goto cleanup;
     }
-
-    uint8_t client_pfs_public[1216];
-    EVP_PKEY *mlkem_key = mlkem_generate(client_pfs_public);
-    EVP_PKEY *x25519_key = NULL;
-    if (mlkem_key == NULL ||
-        x25519_generate(&x25519_key, client_pfs_public + 1184) != 0) {
-        EVP_PKEY_free(mlkem_key);
-        EVP_PKEY_free(x25519_key);
-        free(hello);
-        set_err(err, err_cap, "ML-KEM-768 is unavailable");
-        return -1;
+    handshake.mlkem_key=mlkem_generate(handshake.client_pfs_public);
+    if (!handshake.mlkem_key || x25519_generate(&handshake.x25519_key,handshake.client_pfs_public+1184)) {
+        set_err(err,err_cap,"ML-KEM-768 is unavailable"); goto cleanup;
     }
-
-    size_t off = 16 + relays_len;
-    uint8_t length_bytes[2] = {
-        (uint8_t)((pfs_exchange_len - 18) >> 8),
-        (uint8_t)(pfs_exchange_len - 18),
-    };
-    size_t written = 0;
-    if (aead_seal(&nfs_aead, NULL, length_bytes, sizeof(length_bytes),
-                  NULL, 0, hello + off, &written) != 0 ||
-        written != 18) {
-        goto handshake_error;
+    size_t offset=16+relays_len,written=0;
+    uint8_t length_bytes[2]={(uint8_t)((pfs_exchange_len-18)>>8),(uint8_t)(pfs_exchange_len-18)};
+    if (aead_seal(&handshake.nfs_aead,NULL,length_bytes,sizeof(length_bytes),NULL,0,handshake.hello+offset,&written) || written != 18) goto send_failure;
+    offset+=written;
+    if (aead_seal(&handshake.nfs_aead,NULL,handshake.client_pfs_public,sizeof(handshake.client_pfs_public),
+        NULL,0,handshake.hello+offset,&written) || written != sizeof(handshake.client_pfs_public)+16) goto send_failure;
+    offset+=written;
+    uint8_t padding_length_bytes[2]={(uint8_t)(((size_t)padding_len-18)>>8),(uint8_t)((size_t)padding_len-18)};
+    if (aead_seal(&handshake.nfs_aead,NULL,padding_length_bytes,sizeof(padding_length_bytes),NULL,0,handshake.hello+offset,&written) || written != 18) goto send_failure;
+    offset+=written;
+    size_t padding_plain_len=(size_t)padding_len-34;
+    if (aead_seal(&handshake.nfs_aead,NULL,handshake.hello+offset,padding_plain_len,NULL,0,handshake.hello+offset,&written) ||
+        written != padding_plain_len+16) goto send_failure;
+    offset+=written;
+    if (offset != handshake.hello_length || padding_write(transport,handshake.hello,handshake.hello_length,
+        16+relays_len+pfs_exchange_len,padding_lengths,padding_gaps,padding_count)) goto send_failure;
+    clear_free(handshake.hello,handshake.hello_length); handshake.hello=NULL;
+    static const uint8_t max_nonce[12]={255,255,255,255,255,255,255,255,255,255,255,255};
+    size_t plain_len=0;
+    if (transport_read_exact(transport,handshake.encrypted_server_pfs,sizeof(handshake.encrypted_server_pfs)) ||
+        aead_open(&handshake.nfs_aead,max_nonce,handshake.encrypted_server_pfs,sizeof(handshake.encrypted_server_pfs),
+            NULL,0,handshake.server_pfs_public,&plain_len) || plain_len != sizeof(handshake.server_pfs_public)) {
+        set_err(err,err_cap,"invalid VLESS encryption server key"); goto cleanup;
     }
-    off += written;
-    if (aead_seal(&nfs_aead, NULL, client_pfs_public,
-                  sizeof(client_pfs_public), NULL, 0,
-                  hello + off, &written) != 0 ||
-        written != sizeof(client_pfs_public) + 16) {
-        goto handshake_error;
+    if (mlkem_decapsulate(handshake.mlkem_key,handshake.server_pfs_public,handshake.pfs_key) ||
+        x25519_derive(handshake.x25519_key,handshake.server_pfs_public+1088,handshake.pfs_key+32)) {
+        set_err(err,err_cap,"VLESS encryption key exchange failed"); goto cleanup;
     }
-    off += written;
-
-    uint8_t padding_length_bytes[2] = {
-        (uint8_t)(((size_t)padding_len - 18) >> 8),
-        (uint8_t)((size_t)padding_len - 18),
-    };
-    if (aead_seal(&nfs_aead, NULL, padding_length_bytes,
-                  sizeof(padding_length_bytes), NULL, 0,
-                  hello + off, &written) != 0 ||
-        written != 18) {
-        goto handshake_error;
+    handshake.connection=calloc(1,sizeof(*handshake.connection));
+    if (!handshake.connection) { set_err(err,err_cap,"failed to allocate VLESS encryption state"); goto cleanup; }
+    vless_encryption_conn_t *connection=handshake.connection;
+    connection->transport=transport;
+    memcpy(connection->united_key,handshake.pfs_key,sizeof(handshake.pfs_key));
+    memcpy(connection->united_key+sizeof(handshake.pfs_key),handshake.nfs_key,sizeof(handshake.nfs_key));
+    connection->united_key_len=sizeof(handshake.pfs_key)+sizeof(handshake.nfs_key);
+    aead_init(&connection->outgoing,handshake.client_pfs_public,sizeof(handshake.client_pfs_public),connection->united_key,connection->united_key_len);
+    aead_init(&connection->incoming,handshake.server_pfs_public,sizeof(handshake.server_pfs_public),connection->united_key,connection->united_key_len);
+    if (transport_read_exact(transport,handshake.encrypted_ticket,sizeof(handshake.encrypted_ticket)) ||
+        aead_open(&connection->incoming,NULL,handshake.encrypted_ticket,sizeof(handshake.encrypted_ticket),NULL,0,handshake.ticket,&plain_len) ||
+        plain_len != sizeof(handshake.ticket) ||
+        transport_read_exact(transport,handshake.encrypted_length,sizeof(handshake.encrypted_length)) ||
+        aead_open(&connection->incoming,NULL,handshake.encrypted_length,sizeof(handshake.encrypted_length),NULL,0,handshake.decoded_length,&plain_len) ||
+        plain_len != sizeof(handshake.decoded_length)) {
+        set_err(err,err_cap,"invalid VLESS encryption server hello"); goto cleanup;
     }
-    off += written;
-    size_t padding_plain_len = (size_t)padding_len - 34;
-    if (aead_seal(&nfs_aead, NULL, hello + off, padding_plain_len,
-                  NULL, 0, hello + off, &written) != 0 ||
-        written != padding_plain_len + 16) {
-        goto handshake_error;
+    handshake.peer_padding_length=((size_t)handshake.decoded_length[0]<<8)|handshake.decoded_length[1];
+    if (handshake.peer_padding_length < 16 || handshake.peer_padding_length > 65535) {
+        set_err(err,err_cap,"invalid VLESS encryption server padding"); goto cleanup;
     }
-    off += written;
-    if (off != hello_len ||
-        padding_write(transport,hello,hello_len,16+relays_len+pfs_exchange_len,padding_lengths,padding_gaps,padding_count) != 0) {
-        goto handshake_error;
+    handshake.decoded_padding_capacity=handshake.peer_padding_length-16;
+    if (!handshake.decoded_padding_capacity) handshake.decoded_padding_capacity=1;
+    handshake.peer_padding=malloc(handshake.peer_padding_length);
+    handshake.decoded_padding=malloc(handshake.decoded_padding_capacity);
+    if (!handshake.peer_padding || !handshake.decoded_padding ||
+        transport_read_exact(transport,handshake.peer_padding,handshake.peer_padding_length) ||
+        aead_open(&connection->incoming,NULL,handshake.peer_padding,handshake.peer_padding_length,NULL,0,handshake.decoded_padding,&plain_len)) {
+        set_err(err,err_cap,"invalid VLESS encryption server padding"); goto cleanup;
     }
-    free(hello);
-    hello = NULL;
-
-    uint8_t encrypted_server_pfs[1136];
-    uint8_t server_pfs_public[1120];
-    static const uint8_t max_nonce[12] = {
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    };
-    size_t plain_len = 0;
-    if (transport_read_exact(transport, encrypted_server_pfs,
-                             sizeof(encrypted_server_pfs)) != 0 ||
-        aead_open(&nfs_aead, max_nonce, encrypted_server_pfs,
-                  sizeof(encrypted_server_pfs), NULL, 0,
-                  server_pfs_public, &plain_len) != 0 ||
-        plain_len != sizeof(server_pfs_public)) {
-        set_err(err, err_cap, "invalid VLESS encryption server key");
-        goto cleanup_keys;
-    }
-
-    uint8_t pfs_key[64];
-    if (mlkem_decapsulate(mlkem_key, server_pfs_public, pfs_key) != 0 ||
-        x25519_derive(x25519_key, server_pfs_public + 1088,
-                     pfs_key + 32) != 0) {
-        set_err(err, err_cap, "VLESS encryption key exchange failed");
-        goto cleanup_keys;
-    }
-
-    vless_encryption_conn_t *conn =
-        (vless_encryption_conn_t *)calloc(1, sizeof(*conn));
-    if (conn == NULL) {
-        set_err(err, err_cap, "failed to allocate VLESS encryption state");
-        goto cleanup_keys;
-    }
-    conn->transport = transport;
-    memcpy(conn->united_key, pfs_key, sizeof(pfs_key));
-    memcpy(conn->united_key + sizeof(pfs_key), nfs_key, sizeof(nfs_key));
-    conn->united_key_len = sizeof(pfs_key) + sizeof(nfs_key);
-    aead_init(&conn->outgoing, client_pfs_public,
-              sizeof(client_pfs_public), conn->united_key,
-              conn->united_key_len);
-    aead_init(&conn->incoming, server_pfs_public,
-              sizeof(server_pfs_public), conn->united_key,
-              conn->united_key_len);
-
-    uint8_t encrypted_ticket[32];
-    uint8_t ticket[16];
-    uint8_t encrypted_length[18];
-    uint8_t decoded_length[2];
-    if (transport_read_exact(transport, encrypted_ticket,
-                             sizeof(encrypted_ticket)) != 0 ||
-        aead_open(&conn->incoming, NULL, encrypted_ticket,
-                  sizeof(encrypted_ticket), NULL, 0,
-                  ticket, &plain_len) != 0 ||
-        plain_len != sizeof(ticket) ||
-        transport_read_exact(transport, encrypted_length,
-                             sizeof(encrypted_length)) != 0 ||
-        aead_open(&conn->incoming, NULL, encrypted_length,
-                  sizeof(encrypted_length), NULL, 0,
-                  decoded_length, &plain_len) != 0 ||
-        plain_len != sizeof(decoded_length)) {
-        vless_encryption_close(conn);
-        set_err(err, err_cap, "invalid VLESS encryption server hello");
-        goto cleanup_keys;
-    }
-
-    size_t peer_padding_len =
-        ((size_t)decoded_length[0] << 8) | decoded_length[1];
-    if (peer_padding_len < 16 || peer_padding_len > 65535) {
-        vless_encryption_close(conn);
-        set_err(err, err_cap, "invalid VLESS encryption server padding");
-        goto cleanup_keys;
-    }
-    uint8_t *peer_padding = (uint8_t *)malloc(peer_padding_len);
-    uint8_t *decoded_padding =
-        (uint8_t *)malloc(peer_padding_len - 16);
-    if (peer_padding == NULL || decoded_padding == NULL ||
-        transport_read_exact(transport, peer_padding,
-                             peer_padding_len) != 0 ||
-        aead_open(&conn->incoming, NULL, peer_padding,
-                  peer_padding_len, NULL, 0,
-                  decoded_padding, &plain_len) != 0) {
-        free(peer_padding);
-        free(decoded_padding);
-        vless_encryption_close(conn);
-        set_err(err, err_cap, "invalid VLESS encryption server padding");
-        goto cleanup_keys;
-    }
-    free(peer_padding);
-    free(decoded_padding);
-
     if (cfg->encryption_xor_mode == 2 &&
-        (aes_ctr_init(&conn->outgoing_header_ctr, conn->united_key,
-                      conn->united_key_len, client_iv) != 0 ||
-         aes_ctr_init(&conn->incoming_header_ctr, conn->united_key,
-                      conn->united_key_len, ticket) != 0)) {
-        vless_encryption_close(conn);
-        set_err(err, err_cap, "failed to initialize VLESS random mode");
-        goto cleanup_keys;
+        (aes_ctr_init(&connection->outgoing_header_ctr,connection->united_key,connection->united_key_len,handshake.client_iv) ||
+         aes_ctr_init(&connection->incoming_header_ctr,connection->united_key,connection->united_key_len,handshake.ticket))) {
+        set_err(err,err_cap,"failed to initialize VLESS random mode"); goto cleanup;
     }
-
-    if (cfg->encryption_zero_rtt) cache_store(identity,pfs_key,ticket,((unsigned)ticket[0]<<8)|ticket[1]);
-    OPENSSL_cleanse(pfs_key,sizeof(pfs_key)); OPENSSL_cleanse(ticket,sizeof(ticket));
-    OPENSSL_cleanse(nfs_key,sizeof(nfs_key));
-
-    EVP_PKEY_free(mlkem_key);
-    EVP_PKEY_free(x25519_key);
-    *out = conn;
-    return 0;
-
-handshake_error:
-    set_err(err, err_cap, "failed to send VLESS encryption hello");
-cleanup_keys:
-    EVP_PKEY_free(mlkem_key);
-    EVP_PKEY_free(x25519_key);
-    free(hello);
-    return -1;
+    if (cfg->encryption_zero_rtt) cache_store(handshake.identity,handshake.pfs_key,handshake.ticket,((unsigned)handshake.ticket[0]<<8)|handshake.ticket[1]);
+    *out=connection; handshake.connection=NULL; result=0; goto cleanup;
+send_failure:
+    set_err(err,err_cap,"failed to send VLESS encryption hello");
+cleanup: {
+    int saved=errno;
+    clear_free(handshake.hello,handshake.hello_length);
+    clear_free(handshake.peer_padding,handshake.peer_padding_length);
+    clear_free(handshake.decoded_padding,handshake.decoded_padding_capacity);
+    vless_encryption_close(handshake.connection);
+    EVP_PKEY_free(handshake.mlkem_key); EVP_PKEY_free(handshake.x25519_key);
+    OPENSSL_cleanse(&handshake,sizeof(handshake));
+    errno=saved; return result;
 }
-
+}
 void vless_encryption_close(vless_encryption_conn_t *conn) {
     if (conn == NULL) {
         return;
     }
-    free(conn->input);
-    free(conn->record_data);
-    free(conn->prewrite);
+    int saved=errno;
+    clear_free(conn->input,conn->input_capacity);
+    clear_free(conn->record_data,conn->record_length);
+    clear_free(conn->prewrite,conn->prewrite_capacity);
     EVP_CIPHER_CTX_free(conn->outgoing_header_ctr);
     EVP_CIPHER_CTX_free(conn->incoming_header_ctr);
     OPENSSL_cleanse(conn->united_key, sizeof(conn->united_key));
@@ -748,6 +641,7 @@ void vless_encryption_close(vless_encryption_conn_t *conn) {
     OPENSSL_cleanse(&conn->incoming, sizeof(conn->incoming));
     OPENSSL_cleanse(conn,sizeof(*conn));
     free(conn);
+    errno=saved;
 }
 
 int vless_encryption_write(vless_encryption_conn_t *conn,
@@ -759,7 +653,8 @@ int vless_encryption_write(vless_encryption_conn_t *conn,
             chunk = 8192;
         }
         size_t record_len = 5 + chunk + 16;
-        uint8_t *packet = (uint8_t *)malloc(conn->prewrite_length+record_len);
+        size_t packet_capacity=conn->prewrite_length+record_len;
+        uint8_t *packet = (uint8_t *)malloc(packet_capacity);
         if (packet == NULL) {
             return -1;
         }
@@ -781,7 +676,8 @@ int vless_encryption_write(vless_encryption_conn_t *conn,
         if (ok) {
             ok = tls13_write_app(conn->transport,packet,conn->prewrite_length+record_len) == 0;
         }
-        free(packet); free(conn->prewrite); conn->prewrite=NULL; conn->prewrite_length=0;
+        clear_free(packet,packet_capacity); clear_free(conn->prewrite,conn->prewrite_capacity);
+        conn->prewrite=NULL; conn->prewrite_length=conn->prewrite_capacity=0;
         if (!ok) {
             cache_invalidate(conn);
             return -1;
@@ -811,7 +707,7 @@ int vless_encryption_write_raw(vless_encryption_conn_t *conn,
     if (rc == 0) {
         rc = tls13_write_app(conn->transport, encoded, len);
     }
-    free(encoded);
+    clear_free(encoded,len);
     return rc;
 }
 
@@ -855,20 +751,22 @@ static int read_record(vless_encryption_conn_t *conn) {
     if (result < 0 || !received) { cache_invalidate(conn); return -1; }
     conn->record_received+=received;
     if (conn->record_received < conn->record_length) return 2;
-    uint8_t *plain=malloc(conn->record_length-16);
+    size_t plain_capacity=conn->record_length-16;
+    uint8_t *plain=malloc(plain_capacity);
     if (!plain) { cache_invalidate(conn); return -1; }
     size_t plain_len = 0;
     int rc = aead_open(&conn->incoming, NULL, conn->record_data, conn->record_length,
                        conn->record_header, sizeof(conn->record_header), plain, &plain_len);
-    free(conn->record_data); conn->record_data=NULL;
+    clear_free(conn->record_data,conn->record_length); conn->record_data=NULL;
     conn->record_header_length=conn->record_length=conn->record_received=0;
     if (rc != 0) {
         cache_invalidate(conn);
-        free(plain);
+        clear_free(plain,plain_capacity);
         return -1;
     }
-    free(conn->input);
+    clear_free(conn->input,conn->input_capacity);
     conn->input = plain;
+    conn->input_capacity=plain_capacity;
     conn->input_len = plain_len;
     conn->input_off = 0;
     conn->cache_generation=0;

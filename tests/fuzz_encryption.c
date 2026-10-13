@@ -56,7 +56,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t length) {
         aead_init(&writer->outgoing,context,sizeof(context),key,sizeof(key));
         if (data[0]&4 && aes_ctr_init(&writer->outgoing_header_ctr,key,sizeof(key),context)) abort();
         if (reader->incoming_deferred) {
-            writer->prewrite=calloc(1,sizeof(context)); writer->prewrite_length=sizeof(context);
+            writer->prewrite=calloc(1,sizeof(context)); writer->prewrite_length=writer->prewrite_capacity=sizeof(context);
             if (!writer->prewrite) abort();
         }
         if (vless_encryption_write(writer,data,length)) abort();
