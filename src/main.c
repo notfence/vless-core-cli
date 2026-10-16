@@ -1135,6 +1135,7 @@ static void *client_worker_run(void *arg) {
 
             if (use_vision) {
                 if (allow_raw_vision && tls13_reality_is_raw_direct(tls)) {
+                    vision_observe_tls(&vwrap,1,tbuf,got);
                     if (!received_reply) { received_reply = 1; core_trace_complete(1); }
                     memcpy(output+output_length,tbuf,got); output_length+=got;
                     if (!downstream_direct) {
@@ -1154,6 +1155,7 @@ static void *client_worker_run(void *arg) {
 
                 if (plain_len > 0 && !received_reply) { received_reply = 1; core_trace_complete(1); }
                 if (plain_len > 256U*1024U-output_length) { free(plain); break; }
+                vision_observe_tls(&vwrap,1,plain,plain_len);
                 if (plain_len) { memcpy(output+output_length,plain,plain_len); output_length+=plain_len; }
                 free(plain);
 

@@ -215,9 +215,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     case 7: {
         uint8_t uuid[16] = {0};
+        vision_wrap_t whole,fragmented; vision_wrap_init(&whole,uuid); vision_wrap_init(&fragmented,uuid);
+        size_t step = size ? 1 + data[size - 1] % 64 : 1;
+        for (int server=0;server<2;server++) {
+            vision_observe_tls(&whole,server,data,size);
+            for (size_t offset=0;offset<size;offset+=step) {
+                size_t count=size-offset < step ? size-offset : step;
+                vision_observe_tls(&fragmented,server,data+offset,count);
+            }
+            if (whole.tls_disabled != fragmented.tls_disabled || whole.client_hello_seen != fragmented.client_hello_seen ||
+                whole.server_hello_seen != fragmented.server_hello_seen || whole.tls13_confirmed != fragmented.tls13_confirmed) abort();
+        }
         vision_unpad_t unpad;
         vision_unpad_init(&unpad, uuid);
-        size_t step = size ? 1 + data[size - 1] % 64 : 1;
         for (size_t off = 0; off < size; off += step) {
             uint8_t *plain = NULL;
             size_t length = 0, count = size - off < step ? size - off : step;

@@ -115,12 +115,151 @@ static void vision_terminal_reads(const uint8_t uuid[16]) {
     }
 }
 
+static size_t client_hello_record(uint8_t hello[59]) {
+    memset(hello,0,59);
+    const uint8_t prefix[]={22,3,3,0,54,1,0,0,50,3,3}; memcpy(hello,prefix,sizeof(prefix));
+    const uint8_t tail[]={0,0,2,0x13,3,1,0,0,7,0,43,0,3,2,3,4}; memcpy(hello+43,tail,sizeof(tail));
+    return 59;
+}
+
+static void vision_unconfirmed_tls(const uint8_t uuid[16]) {
+    uint8_t hello[59]; size_t length=client_hello_record(hello);
+    const uint8_t app[]={23,3,3,0,1,42}; const size_t fragments[]={1,4,59};
+    for (size_t sample=0;sample<sizeof(fragments)/sizeof(fragments[0]);sample++) {
+        vision_wrap_t wrap; vision_wrap_init(&wrap,uuid);
+        vision_unpad_t receive; vision_unpad_init(&receive,uuid);
+        for (size_t offset=0;offset<length;) {
+            size_t count=length-offset < fragments[sample] ? length-offset : fragments[sample];
+            uint8_t *output=NULL,*plain=NULL; size_t output_length=0,plain_length=0; int direct=0;
+            REQUIRE("vision/client-hello-fragment-wrap",vision_wrap_payload(&wrap,hello+offset,count,&output,&output_length) == 0);
+            REQUIRE("vision/client-hello-fragment-unpad",vision_unpad_feed(&receive,output,output_length,&plain,&plain_length,&direct) == 0);
+            CHECK("vision/client-hello-forwarded-immediately",plain_length == count && !memcmp(plain,hello+offset,count) && !direct);
+            free(output); free(plain); offset+=count;
+        }
+        CHECK("vision/client-hello-recognized-across-writes",wrap.client_hello_seen);
+        for (unsigned application=0;application<2;application++) {
+            uint8_t *output=NULL; size_t output_length=0;
+            REQUIRE("vision/unconfirmed-app-wrap",vision_wrap_payload(&wrap,app,sizeof(app),&output,&output_length) == 0);
+            CHECK("vision/no-direct-without-server-hello",!wrap.direct_sent); free(output);
+        }
+        vision_unpad_free(&receive);
+    }
+}
+
+static size_t server_hello_record(uint8_t hello[95], unsigned cipher, unsigned version) {
+    memset(hello,0,95); hello[0]=22; hello[1]=hello[2]=3; hello[5]=2; hello[9]=hello[10]=3;
+    memset(hello+11,0x41,32); hello[44]=(uint8_t)(cipher>>8); hello[45]=(uint8_t)cipher;
+    size_t length=49;
+    if (version != 0x0303) {
+        const uint8_t extension[]={0,43,0,2,(uint8_t)(version>>8),(uint8_t)version,0,51,0,36,0,29,0,32};
+        memcpy(hello+length,extension,sizeof(extension)); length+=sizeof(extension);
+        for (unsigned i=0;i<32;i++) hello[length++]=(uint8_t)(i+1);
+    }
+    hello[48]=(uint8_t)(length-49); hello[4]=(uint8_t)(length-5); hello[8]=(uint8_t)(length-9);
+    return length;
+}
+
+static void vision_confirmed_tls(const uint8_t uuid[16]) {
+    uint8_t client[59],server[95],app[37]={23,3,3,0,32}; size_t client_length=client_hello_record(client);
+    memset(app+5,0x41,sizeof(app)-5);
+    const unsigned ciphers[]={0x1301,0x1302,0x1303,0x1304,0x1305,0xc02f};
+    const size_t fragments[]={1,4,95};
+    CHECK("vision/small-observer-state",sizeof(vision_wrap_t) <= 512);
+    for (unsigned version=0x0303;version<=0x0304;version++) for (size_t cipher=0;cipher<sizeof(ciphers)/sizeof(ciphers[0]);cipher++)
+        for (size_t sample=0;sample<sizeof(fragments)/sizeof(fragments[0]);sample++) {
+        vision_wrap_t wrap; vision_wrap_init(&wrap,uuid); uint8_t *output=NULL; size_t output_length=0;
+        REQUIRE("vision/confirmed-client-hello",vision_wrap_payload(&wrap,client,client_length,&output,&output_length) == 0); free(output);
+        size_t server_length=server_hello_record(server,ciphers[cipher],version);
+        for (size_t offset=0;offset<server_length;) {
+            size_t count=server_length-offset < fragments[sample] ? server_length-offset : fragments[sample];
+            vision_observe_tls(&wrap,1,server+offset,count); offset+=count;
+            if (offset < server_length) CHECK("vision/server-hello-confirmed-only-when-complete",!wrap.server_hello_seen && !wrap.tls13_confirmed);
+        }
+        int eligible=version == 0x0304 && ciphers[cipher] <= 0x1304;
+        CHECK("vision/server-version-and-cipher",wrap.server_hello_seen && wrap.tls13_confirmed == eligible && !wrap.tls_disabled);
+        int packets=wrap.packets_left;
+        for (size_t offset=0;offset<sizeof(app);offset++) {
+            REQUIRE("vision/fragmented-application-wrap",vision_wrap_payload(&wrap,app+offset,1,&output,&output_length) == 0);
+            if (offset+1 < sizeof(app)) CHECK("vision/partial-record-does-not-end-padding",!wrap.direct_sent && wrap.padding_active && wrap.packets_left == packets);
+            else CHECK("vision/direct-only-on-application-record-boundary",wrap.direct_sent == eligible && !wrap.padding_active && output[0] == (eligible ? 2 : 1));
+            free(output);
+        }
+    }
+    for (unsigned variant=0;variant<3;variant++) {
+        vision_wrap_t wrap; vision_wrap_init(&wrap,uuid); uint8_t *output=NULL; size_t output_length=0;
+        REQUIRE("vision/incomplete-client-hello",vision_wrap_payload(&wrap,client,client_length,&output,&output_length) == 0); free(output);
+        size_t server_length=server_hello_record(server,0x1303,variant ? 0x0303 : 0x0304);
+        const uint8_t pattern[]={0,43,0,2,3,4};
+        if (variant == 1) memcpy(server+11,pattern,sizeof(pattern));
+        if (variant == 2) server[46]=1;
+        vision_observe_tls(&wrap,1,server,server_length-(variant ? 0 : 1));
+        REQUIRE("vision/incomplete-server-app-wrap",vision_wrap_payload(&wrap,app,sizeof(app),&output,&output_length) == 0); free(output);
+        CHECK("vision/no-direct-for-unconfirmed-or-malformed-server",!wrap.direct_sent && !wrap.tls13_confirmed);
+        if (!variant) {
+            vision_observe_tls(&wrap,1,server+server_length-1,1);
+            REQUIRE("vision/completed-server-app-wrap",vision_wrap_payload(&wrap,app,sizeof(app),&output,&output_length) == 0); free(output);
+            CHECK("vision/late-server-hello-enables-direct",wrap.direct_sent);
+        }
+    }
+    vision_wrap_t wrap; vision_wrap_init(&wrap,uuid); uint8_t *output=NULL; size_t output_length=0;
+    for (size_t offset=5;offset<client_length;offset++) {
+        uint8_t record[]={22,3,3,0,1,client[offset]};
+        REQUIRE("vision/handshake-fragmented-across-records",vision_wrap_payload(&wrap,record,sizeof(record),&output,&output_length) == 0); free(output);
+    }
+    CHECK("vision/client-hello-across-records-recognized",wrap.client_hello_seen && !wrap.tls_disabled);
+    vision_wrap_init(&wrap,uuid);
+    REQUIRE("vision/coalesced-client-hello",vision_wrap_payload(&wrap,client,client_length,&output,&output_length) == 0); free(output);
+    size_t server_length=server_hello_record(server,0x1303,0x0304);
+    for (size_t offset=5;offset<server_length;offset++) {
+        uint8_t record[]={22,3,3,0,1,server[offset]}; vision_observe_tls(&wrap,1,record,sizeof(record));
+    }
+    CHECK("vision/server-hello-across-records-recognized",wrap.tls13_confirmed && !wrap.tls_disabled);
+    uint8_t coalesced[39]; memcpy(coalesced,app,sizeof(app)); memcpy(coalesced+sizeof(app),app,2);
+    REQUIRE("vision/coalesced-next-record-header",vision_wrap_payload(&wrap,coalesced,sizeof(coalesced),&output,&output_length) == 0); free(output);
+    CHECK("vision/no-direct-before-coalesced-tail",!wrap.direct_sent && wrap.padding_active);
+    REQUIRE("vision/coalesced-next-record-complete",vision_wrap_payload(&wrap,app+2,sizeof(app)-2,&output,&output_length) == 0); free(output);
+    CHECK("vision/coalesced-tail-direct",wrap.direct_sent);
+    vision_wrap_init(&wrap,uuid);
+    REQUIRE("vision/retry-client-hello",vision_wrap_payload(&wrap,client,client_length,&output,&output_length) == 0); free(output);
+    static const uint8_t retry[]={0xcf,0x21,0xad,0x74,0xe5,0x9a,0x61,0x11,0xbe,0x1d,0x8c,0x02,0x1e,0x65,0xb8,0x91,
+        0xc2,0xa2,0x11,0x16,0x7a,0xbb,0x8c,0x5e,0x07,0x9e,0x09,0xe2,0xc8,0xa8,0x33,0x9c};
+    memcpy(server+11,retry,sizeof(retry)); vision_observe_tls(&wrap,1,server,server_length);
+    CHECK("vision/retry-is-not-final-server-hello",!wrap.server_hello_seen && !wrap.tls13_confirmed);
+    server_length=server_hello_record(server,0x1303,0x0304); vision_observe_tls(&wrap,1,server,server_length);
+    CHECK("vision/final-server-hello-after-retry",wrap.server_hello_seen && wrap.tls13_confirmed && !wrap.tls_disabled);
+    const size_t record_size=16389,record_count=9,total=record_size*record_count;
+    uint8_t *large=malloc(total),*recovered=malloc(total); REQUIRE("vision/large-tls-fixture",large && recovered);
+    for (size_t i=0;i<record_count;i++) {
+        const uint8_t header[]={23,3,3,0x40,0}; memcpy(large+i*record_size,header,sizeof(header));
+        memset(large+i*record_size+5,(int)(i+1),record_size-5);
+    }
+    vision_unpad_t unpad; vision_unpad_init(&unpad,uuid);
+    vision_wrap_init(&wrap,uuid);
+    REQUIRE("vision/large-client-hello",vision_wrap_payload(&wrap,client,client_length,&output,&output_length) == 0);
+    uint8_t *plain=NULL; size_t plain_length=0; int direct=0;
+    REQUIRE("vision/large-client-hello-delivered",vision_unpad_feed(&unpad,output,output_length,&plain,&plain_length,&direct) == 0);
+    free(output); free(plain); vision_observe_tls(&wrap,1,server,server_length);
+    REQUIRE("vision/large-tls-wrap",vision_wrap_payload(&wrap,large,total,&output,&output_length) == 0);
+    size_t received=0; int transitioned=0;
+    for (size_t offset=0;offset<output_length;) {
+        size_t count=output_length-offset < 8192 ? output_length-offset : 8192;
+        REQUIRE("vision/large-tls-unpad",vision_unpad_feed(&unpad,output+offset,count,&plain,&plain_length,&direct) == 0);
+        REQUIRE("vision/large-tls-output-bounds",plain_length <= total-received);
+        if (plain_length) memcpy(recovered+received,plain,plain_length);
+        received+=plain_length; transitioned+=direct; offset+=count; free(plain);
+    }
+    CHECK("vision/large-tls-direct-preserves-every-byte",wrap.direct_sent && transitioned == 1 && received == total && !memcmp(large,recovered,total) && vision_unpad_complete(&unpad));
+    vision_unpad_free(&unpad); free(output); free(large); free(recovered);
+}
+
 int main(void) {
     response_vectors();
     vless_config_t cfg; char error[128]; uint8_t packet[2048]; size_t length = 0;
     REQUIRE("packets/config", parse_core_uri("vless://00000000-0000-0000-0000-000000000001@127.0.0.1:443", &cfg, error, sizeof(error)) == 0);
     vision_wire_vectors(cfg.uuid);
     vision_terminal_reads(cfg.uuid);
+    vision_unconfirmed_tls(cfg.uuid);
+    vision_confirmed_tls(cfg.uuid);
     const uint8_t ipv4[] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,1,187,1,127,0,0,1};
     CHECK("packets/vless-ipv4-golden", vless_build_request(packet, sizeof(packet), &length, &cfg, "127.0.0.1", 443) == 0 && length == sizeof(ipv4) && memcmp(packet, ipv4, length) == 0);
     CHECK("packets/vless-capacity", vless_build_request(packet, sizeof(ipv4)-1, &length, &cfg, "127.0.0.1", 443) != 0 && length == 0);
@@ -151,21 +290,22 @@ int main(void) {
     for (int i = 0; i < 3; i++) { setenv("VLESS_VISION_PAD_PACKETS", pad_values[i], 1); vision_wrap_t wrap; vision_wrap_init(&wrap, cfg.uuid); CHECK("vision/padding-env", wrap.packets_left == expected[i]); }
     unsetenv("VLESS_VISION_PAD_PACKETS");
     vision_wrap_t wrap; vision_wrap_init(&wrap, cfg.uuid); uint8_t *out; size_t out_length;
-    const uint8_t hello[] = {22,3,3,0,4,1,0,0,0}; const uint8_t app[] = {23,3,3,0,1,42};
+    uint8_t hello[59],server[95],app[37]={23,3,3,0,32}; memset(app+5,42,sizeof(app)-5); client_hello_record(hello);
     REQUIRE("vision/hello", vision_wrap_payload(&wrap, hello, sizeof(hello), &out, &out_length) == 0); free(out);
-    REQUIRE("vision/app-one", vision_wrap_payload(&wrap, app, sizeof(app), &out, &out_length) == 0); free(out);
+    size_t server_length=server_hello_record(server,0x1303,0x0304); vision_observe_tls(&wrap,1,server,server_length);
     CHECK("vision/not-direct-too-early", !wrap.direct_sent);
-    REQUIRE("vision/app-two", vision_wrap_payload(&wrap, app, sizeof(app), &out, &out_length) == 0);
+    REQUIRE("vision/app-one", vision_wrap_payload(&wrap, app, sizeof(app), &out, &out_length) == 0);
     CHECK("vision/direct-transition", wrap.direct_sent && !wrap.padding_active && out[0] == 2); free(out);
     CHECK("vision/raw-after-direct", vision_wrap_payload(&wrap, app, sizeof(app), &out, &out_length) == 0 && out_length == sizeof(app) && memcmp(out, app, sizeof(app)) == 0); free(out);
     vision_wrap_init(&wrap,cfg.uuid); vision_unpad_t receive; vision_unpad_init(&receive,cfg.uuid);
     const uint8_t *messages[] = {hello,app,app}; const size_t sizes[] = {sizeof(hello),sizeof(app),sizeof(app)};
     for (int i = 0; i < 3; i++) {
+        if (i == 1) vision_observe_tls(&wrap,1,server,server_length);
         REQUIRE("vision/direct-wrap", vision_wrap_payload(&wrap,messages[i],sizes[i],&out,&out_length) == 0);
         uint8_t *plain; size_t plain_length; int direct = 0;
         REQUIRE("vision/direct-unpad", vision_unpad_feed(&receive,out,out_length,&plain,&plain_length,&direct) == 0);
         CHECK("vision/direct-integrity", plain_length == sizes[i] && memcmp(plain,messages[i],plain_length) == 0);
-        CHECK("vision/downstream-direct-flag", direct == (i == 2)); free(plain); free(out);
+        CHECK("vision/downstream-direct-flag", direct == (i == 1)); free(plain); free(out);
     }
     vision_unpad_free(&receive);
     const size_t lengths[] = {65534, 65535, 65536, 98304, 131071, 131072, 131073};

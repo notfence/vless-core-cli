@@ -15,6 +15,15 @@ def frame(kind, flags, stream, payload):
 def seeds():
     prefix = b"vless://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=none&"
     hello = b"\x03\x03"+bytes(32)+b"\x00\x13\x01\x00\x00\x28\x00\x33\x00\x24\x00\x1d\x00\x20"+bytes(range(32))
+    vision_client=b"\x03\x03"+bytes(32)+b"\x00\x00\x02\x13\x03\x01\x00\x00\x07\x00\x2b\x00\x03\x02\x03\x04"
+    vision_client=b"\x01"+len(vision_client).to_bytes(3,"big")+vision_client
+    vision_client=b"\x16\x03\x03"+len(vision_client).to_bytes(2,"big")+vision_client
+    vision_records=[vision_client,b"\x17\x03\x03\x00\x20"+bytes(32)]
+    for cipher in (0x1301,0x1302,0x1303,0x1304,0x1305,0xc02f):
+        body=b"\x03\x03"+bytes(32)+b"\x00"+cipher.to_bytes(2,"big")+b"\x00\x00\x06\x00\x2b\x00\x02\x03\x04"
+        body=b"\x02"+len(body).to_bytes(3,"big")+body
+        record=b"\x16\x03\x03"+len(body).to_bytes(2,"big")+body
+        vision_records.extend((record,vision_client+record,record+b"\x17\x03\x03\x00\x20"+bytes(32)))
     download={"address":"127.0.0.2","port":8443,"network":"xhttp","security":"tls",
               "tlsSettings":{"serverName":"vless-core.test","alpn":["h2","http/1.1"]},
               "xhttpSettings":{"path":"/vless-core","extra":{"headers":{"Cookie":"vless-core=1"},"noGRPCHeader":True}}}
@@ -72,7 +81,7 @@ def seeds():
         "ws":[b"\x82\x0avless-core",b"\x02\x05vless\x80\x05-core",b"\x89\x00",b"\x88\x00",b"\x82\x7e\x00\x0avless-core",b"\x82\x7f"+bytes(7)+b"\x0avless-core",
               b"\x01\x02\xf0\x9f\x89\x00\x80\x02\x98\x80",b"\xc2\x00",b"\x80\x00",b"\x82\x80"+bytes(4),b"\x88\x03\x03\xe8\xff"],
         "vision":[*[bytes(16)+bytes([command,0,10,0,0])+b"vless-core" for command in (0,1,2)],
-                  b"\x00\x00vless-core",b"\x00\x0avless-coretail",b"\x00\xff",b"\x01\x00",b"short tail"],
+                  b"\x00\x00vless-core",b"\x00\x0avless-coretail",b"\x00\xff",b"\x01\x00",b"short tail",*vision_records],
         "tls":[b"\x02"+len(hello).to_bytes(3,"big")+hello,b"\x02\x00\x00\x26\x03\x03"+bytes(32)+b"\x00\xcc\xa9\x00",
                b"\x16\x03\x03\x00\x0avless-core",b"\x0b\x00\x00\x05\x00\x00\x00\x01\x00",
                b"",b"\x18\x00\x00\x01\x00",b"\x18\x00\x00\x01\x01",b"\x18\x00\x00\x01\x02",
