@@ -42,6 +42,8 @@ def seeds():
         encoded=json.dumps(extra,separators=(",",":"))
         uri_extras.extend((encoded.encode(),prefix+b"security=none&type=xhttp&extra="+quote(encoded,safe="").encode()+b"#vless-core"))
     uri_extras.extend((json.dumps(download,separators=(",",":")).encode(),
+                       b'{"downloadSettings":{"address":"127.0.0.2","port":8080,"network":"xhttp","xhttpSettings":{"host":"vless-core.test","path":"/download","xPaddingBytes":"512-512","extra":{"xPaddingBytes":"128-128","sessionIDPlacement":"header","sessionIDKey":"X-vless-core-session"}}}}',
+                       b'{"downloadSettings":{"address":"127.0.0.2","port":8080,"network":"splithttp","splithttpSettings":{"xPaddingBytes":"512-512","extra":{}}}}',
                        b'{"headers":{"X-Vless-Core":"a","x-vless-core":"b"}}',
                        b'{"sessionKey":"a","sessionIDKey":"b"}',
                        b'{"headers":{"Cookie":"x_data_0=old"},"uplinkDataPlacement":"cookie"}',

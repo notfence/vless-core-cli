@@ -126,8 +126,14 @@ int core_xhttp_download_parse(const core_json_t *root, vless_config_t *config, c
         if (duplicate_fields(xhttp,extra_names,1,error,capacity) != 0) return -1;
         const core_json_t *extra=NULL;
         for (const core_json_t *entry=xhttp->child;entry;entry=entry->next) if (!strcasecmp(entry->key,"extra")) extra=entry;
-        if (extra && core_xhttp_apply_object(config,extra,"extra.downloadSettings.xhttpSettings.extra",error,capacity) != 0) return -1;
-        if (core_xhttp_apply_object(config,xhttp,"extra.downloadSettings.xhttpSettings",error,capacity) != 0) return -1;
+        if (extra) {
+            vless_config_t outer=*config;
+            if (core_xhttp_apply_object(&outer,xhttp,"extra.downloadSettings.xhttpSettings",error,capacity) != 0 ||
+                core_xhttp_apply_object(config,extra,"extra.downloadSettings.xhttpSettings.extra",error,capacity) != 0) return -1;
+            memcpy(config->xhttp_host,outer.xhttp_host,sizeof(config->xhttp_host));
+            memcpy(config->xhttp_path,outer.xhttp_path,sizeof(config->xhttp_path));
+            memcpy(config->xhttp_mode,outer.xhttp_mode,sizeof(config->xhttp_mode));
+        } else if (core_xhttp_apply_object(config,xhttp,"extra.downloadSettings.xhttpSettings",error,capacity) != 0) return -1;
     }
     if (strcmp(config->xhttp_mode,"auto") && config->xhttp_mode[0] && strcmp(config->xhttp_mode,"packet-up") && strcmp(config->xhttp_mode,"stream-up") && strcmp(config->xhttp_mode,"stream-one")) return invalid("xhttpSettings.mode",error,capacity);
     strcpy(config->xhttp_mode,"packet-up");

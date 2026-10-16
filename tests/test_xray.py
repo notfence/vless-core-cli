@@ -393,6 +393,32 @@ class XrayTests(unittest.TestCase):
                         with socks_connect(core.port,target.port): pass
                     self.assertEqual(len(target.connections),0)
 
+    def test_xhttp_download_extra_effective_requests(self):
+        effective={"sessionIDPlacement":"header","sessionIDKey":"X-vless-core-session","seqPlacement":"header",
+                   "xPaddingBytes":"128-128","xPaddingPlacement":"header","xPaddingHeader":"X-vless-core-pad","xPaddingObfsMode":True,
+                   "headers":{"X-vless-core-extra":"selected"},"noGRPCHeader":True}
+        for alias in ("xhttpSettings","splithttpSettings"):
+            for pooled in (False,True):
+                with self.subTest(alias=alias,pooled=pooled), Server() as target, xray_server("xhttp","none",path="/",**effective) as reference:
+                    with CountingProxy(reference.port) as upload, CountingProxy(reference.port,address="127.0.0.2") as download:
+                        settings={"host":"vless-core-down.test","path":"/download","mode":"packet-up",
+                                  "sessionIDPlacement":"query","sessionIDKey":"ignored","xPaddingBytes":"512-512",
+                                  "xPaddingPlacement":"query","xPaddingHeader":"Ignored-Padding","xPaddingObfsMode":False,
+                                  "headers":{"X-vless-core-extra":"ignored"},"extra":effective}
+                        extra={**effective,"downloadSettings":{"address":"127.0.0.2","port":download.port,"network":"xhttp",alias:settings}}
+                        if pooled: extra["xmux"]={"maxConnections":1}
+                        with cli(uri(upload.port,"xhttp","none",path="/upload",mode="packet-up",extra=json.dumps(extra)),
+                                 extra=["--server-ips","127.0.0.1","--download-server-ips","127.0.0.2"]) as core:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,bytes(range(251))*261)
+                            self.assertGreater(len(upload.client_data),0)
+                            requests=b"\r\n".join(bytes(block).lower() for block in download.client_data)
+                            self.assertIn(b"get /download/",requests)
+                            self.assertIn(b"host: vless-core-down.test\r\n",requests)
+                            self.assertIn(b"x-vless-core-extra: selected\r\n",requests)
+                            self.assertIn(b"x-vless-core-session: ",requests)
+                            self.assertIn(b"x-vless-core-pad: "+b"x"*128+b"\r\n",requests)
+                            self.assertNotIn(b"ignored",requests)
+
     def test_xhttp_download_independent_security(self):
         cert,_=certificate()
         shared={"sessionIDPlacement":"header","seqPlacement":"header"}

@@ -20,7 +20,36 @@ static int parent(const char *extra, const char *parameters, vless_config_t *con
     return parse_core_uri(uri,config,error,256);
 }
 
+static void extra_precedence_cases(void) {
+    for (unsigned alias=0;alias<2;alias++) for (unsigned extra=0;extra<3;extra++) {
+        const char *nested[]={"",",\"extra\":{}",",\"extra\":{\"host\":\"ignored.test\",\"path\":\"/ignored\",\"mode\":\"stream-one\",\"headers\":{\"X-vless-core-channel\":\"inner\"},\"noGRPCHeader\":false,\"xPaddingBytes\":\"128-128\",\"sessionIDPlacement\":\"header\",\"sessionIDKey\":\"X-vless-core-session\",\"xmux\":{\"maxConnections\":1}}"};
+        char json[2048],error[256]; vless_config_t config;
+        snprintf(json,sizeof(json),"{\"address\":\"127.0.0.2\",\"port\":8080,\"network\":\"xhttp\",\"%s\":{\"host\":\"outer.test\",\"path\":\"/outer\",\"mode\":\"packet-up\",\"headers\":{\"X-vless-core-channel\":\"outer\"},\"noGRPCHeader\":true,\"xPaddingBytes\":\"512-512\",\"sessionIDPlacement\":\"query\",\"sessionIDKey\":\"outer\",\"xmux\":{\"maxConnections\":3}%s}}",alias ? "splithttpSettings" : "xhttpSettings",nested[extra]);
+        REQUIRE("download/extra-precedence-parsed",parse(json,&config,error) == 0);
+        CHECK("download/outer-bindings-retained",!strcmp(config.xhttp_host,"outer.test") && !strcmp(config.xhttp_path,"/outer") && !strcmp(config.xhttp_mode,"packet-up"));
+        CHECK("download/extra-replaces-padding",config.xhttp_padding_min == (extra == 2 ? 128 : extra ? 100 : 512) &&
+            config.xhttp_padding_max == (extra == 2 ? 128 : extra ? 1000 : 512));
+        CHECK("download/extra-replaces-grpc-flag",config.xhttp_no_grpc_header == !extra);
+        CHECK("download/extra-replaces-headers",extra == 1 ? !config.xhttp_headers[0] : strstr(config.xhttp_headers,extra == 2 ? "inner" : "outer") != NULL);
+        CHECK("download/extra-replaces-session-settings",!strcmp(config.xhttp_session_placement,extra == 2 ? "header" : extra ? "path" : "query"));
+        CHECK("download/extra-replaces-xmux",extra == 1 ? !config.xmux.present : config.xmux.present && config.xmux.max_connections.max == (extra == 2 ? 1 : 3));
+    }
+    char error[256]; vless_config_t config;
+    CHECK("download/absent-outer-bindings-do-not-inherit-extra",parse("{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":{\"extra\":{\"host\":\"ignored.test\",\"path\":\"/ignored\",\"mode\":\"stream-one\"}}}",&config,error) == 0 && !config.xhttp_host[0] && !strcmp(config.xhttp_path,"/"));
+    const char *invalid[]={
+        "{\"extra\":null}","{\"extra\":[]}","{\"extra\":\"invalid\"}","{\"extra\":{},\"path\":false}",
+        "{\"extra\":{},\"xPaddingBytes\":false}","{\"extra\":{},\"headers\":{\"X-vless-core\":false}}",
+        "{\"extra\":{},\"sessionKey\":\"a\",\"sessionIDKey\":\"b\"}","{\"extra\":{\"sessionKey\":\"a\",\"sessionIDKey\":\"b\"}}",
+        "{\"extra\":{\"uplinkDataPlacement\":\"invalid\"}}", "{\"extra\":{\"headers\":{\"Host\":\"injected\"}}}",
+    };
+    for (size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
+        char json[1024]; snprintf(json,sizeof(json),"{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":%s}",invalid[i]);
+        CHECK("download/extra-precedence-retains-validation",parse(json,&config,error) < 0 && error[0]);
+    }
+}
+
 int main(void) {
+    extra_precedence_cases();
     vless_config_t config,download; char error[256];
     CHECK("download/escaped-request-target",parse("{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/vless core?keep=%2F\"}}",&config,error) == 0 && !strcmp(config.xhttp_path,"/vless%20core?keep=%2F"));
     CHECK("download/invalid-escaped-path",parse("{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/bad%00\"}}",&config,error) < 0 && strstr(error,"path"));
