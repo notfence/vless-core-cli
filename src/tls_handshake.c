@@ -743,6 +743,9 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         free(pl);
 
         if (inner_type == 0x16) {
+            if (!dec_len) {
+                free(dec); db_free(&enc_hs); set_err(err,err_cap,"empty TLS handshake fragment"); goto handshake_failure;
+            }
             if (db_append(&enc_hs, dec, dec_len) != 0) {
                 free(dec);
                 db_free(&enc_hs);

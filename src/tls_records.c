@@ -806,7 +806,7 @@ static int tls_session_ticket(const uint8_t *body, size_t length) {
 }
 
 static int tls_post_handshake(tls13_conn_t *c, const uint8_t *data, size_t length) {
-    if (c->tls_auth_state != 4 || tls_buffer_init(&c->tls_post_handshake,TLS_POST_HANDSHAKE_LIMIT,NULL) ||
+    if (!length || c->tls_auth_state != 4 || tls_buffer_init(&c->tls_post_handshake,TLS_POST_HANDSHAKE_LIMIT,NULL) ||
         length > TLS_POST_HANDSHAKE_LIMIT-c->tls_post_handshake.len || db_append(&c->tls_post_handshake,data,length)) return -1;
     while (c->tls_post_handshake.len >= 4) {
         const uint8_t *message=c->tls_post_handshake.data;
@@ -815,7 +815,8 @@ static int tls_post_handshake(tls13_conn_t *c, const uint8_t *data, size_t lengt
         if (c->tls_post_handshake.len < size+4) return 0;
         if (message[0] == 24) {
             unsigned request=message[4];
-            if (request > 1 || tls_update_keys(c,0) || (request && tls_key_update_send(c,0))) return -1;
+            if (request > 1 || c->tls_post_handshake.len != size+4) { errno=EPROTO; return -1; }
+            if (tls_update_keys(c,0) || (request && tls_key_update_send(c,0))) return -1;
         } else if (tls_session_ticket(message+4,size)) return -1;
         db_consume(&c->tls_post_handshake,size+4);
     }
@@ -830,15 +831,18 @@ int tls_application_plain(tls13_conn_t *c, unsigned type, const uint8_t *data, s
         if (type == 21 && length == 2 && data[1] == 0) { c->receive_closed=1; return 1; }
         errno=EPROTO; return -1;
     }
-    if (c->s_app_seq >= TLS_RECORD_REKEY_LIMIT && !c->tls_receive_update_requested && !c->send_closed) {
+    int result;
+    if (type == 22) result=tls_post_handshake(c,data,length);
+    else if (c->tls_post_handshake.len) return -1;
+    else if (type == 23) result=db_append(cache,data,length);
+    else if (type == 21 && length == 2 && data[1] == 0) { c->receive_closed=1; return 1; }
+    else return -1;
+    if (result < 0) return result;
+    if (!c->tls_post_handshake.len && c->s_app_seq >= TLS_RECORD_REKEY_LIMIT && !c->tls_receive_update_requested && !c->send_closed) {
         if (tls_key_update_send(c,1)) return -1;
         c->tls_receive_update_requested=1;
     }
-    if (type == 22) return tls_post_handshake(c,data,length);
-    if (c->tls_post_handshake.len) return -1;
-    if (type == 23) return db_append(cache,data,length);
-    if (type == 21 && length == 2 && data[1] == 0) { c->receive_closed=1; return 1; }
-    return -1;
+    return result;
 }
 
 int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len) {

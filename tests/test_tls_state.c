@@ -175,6 +175,66 @@ static void automatic_update_vectors(void) {
     db_free(&cache); close(pair[0]); close(pair[1]);
 }
 
+static void key_update_record_boundaries(void) {
+    static const uint8_t update[]={24,0,0,1,1};
+    static const uint8_t ticket[]={4,0,0,14,0,0,0,60,0,0,0,0,0,0,1,'x',0,0};
+    for (unsigned pooled=0;pooled<2;pooled++) for (unsigned variant=0;variant<7;variant++) for (unsigned split=0;split<2;split++) {
+        int pair[2]; REQUIRE("tls/boundary-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        tls13_conn_t receiver={.fd=pair[0],.mode=CONN_MODE_TLS,.tls_auth_state=4,.xmux_async=(int)pooled,.s_app_seq=TLS_RECORD_REKEY_LIMIT,.c_app_seq=7};
+        REQUIRE("tls/boundary-cipher",configure_tls_cipher(&receiver,0x1303) == 0);
+        memset(receiver.s_app_traffic,7,32); memset(receiver.c_app_traffic,8,32);
+        REQUIRE("tls/boundary-keys",derive_key_iv_md(receiver.tls_md,receiver.s_app_traffic,32,32,receiver.s_app_key,receiver.s_app_iv) == 0 &&
+            derive_key_iv_md(receiver.tls_md,receiver.c_app_traffic,32,32,receiver.c_app_key,receiver.c_app_iv) == 0);
+        uint8_t secrets[128]; memcpy(secrets,receiver.s_app_traffic,64); memcpy(secrets+64,receiver.c_app_traffic,64);
+        uint8_t keys[88]; memcpy(keys,receiver.s_app_key,32); memcpy(keys+32,receiver.s_app_iv,12);
+        memcpy(keys+44,receiver.c_app_key,32); memcpy(keys+76,receiver.c_app_iv,12);
+        uint8_t record[64]; size_t length=0;
+        if (variant == 1 || variant == 6) { memcpy(record,ticket,sizeof(ticket)); length=sizeof(ticket); }
+        if (variant != 5) { memcpy(record+length,update,sizeof(update)); length+=sizeof(update); }
+        if (variant == 2) { memcpy(record+length,ticket,sizeof(ticket)); length+=sizeof(ticket); }
+        if (variant == 3) { memcpy(record+length,update,sizeof(update)); length+=sizeof(update); }
+        if (variant == 4 || variant == 6) record[length++]=0;
+        dynbuf_t cache={0}; int result=0; size_t prefix=split && length ? (variant < 2 ? length-1 : 4) : 0;
+        if (prefix) {
+            result=tls_application_plain(&receiver,22,record,prefix,&cache);
+            if (variant == 0 || variant == 1) {
+                CHECK("tls/incomplete-update-does-not-change-keys",result == 0 && receiver.s_app_seq == TLS_RECORD_REKEY_LIMIT && receiver.c_app_seq == 7 &&
+                    !memcmp(secrets,receiver.s_app_traffic,64) && !memcmp(secrets+64,receiver.c_app_traffic,64) && !receiver.xmux_wire_output.len && !receiver.tls_receive_update_requested);
+            }
+        }
+        if (!result) result=tls_application_plain(&receiver,22,length ? record+prefix : NULL,length-prefix,&cache);
+        int accepted=variant == 0 || variant == 1;
+        CHECK("tls/key-update-record-boundary",accepted ? result == 0 && !receiver.s_app_seq : result < 0);
+        if (!accepted) {
+            CHECK("tls/invalid-update-preserves-keys-and-sequences",receiver.s_app_seq == TLS_RECORD_REKEY_LIMIT && receiver.c_app_seq == 7 &&
+                !memcmp(secrets,receiver.s_app_traffic,64) && !memcmp(secrets+64,receiver.c_app_traffic,64) &&
+                !memcmp(keys,receiver.s_app_key,32) && !memcmp(keys+32,receiver.s_app_iv,12) &&
+                !memcmp(keys+44,receiver.c_app_key,32) && !memcmp(keys+76,receiver.c_app_iv,12));
+            uint8_t byte;
+            CHECK("tls/invalid-update-has-no-response",!receiver.xmux_wire_output.len && !receiver.tls_receive_update_requested &&
+                recv(pair[1],&byte,1,MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        }
+        db_free(&receiver.tls_post_handshake); db_free(&receiver.xmux_wire_output); db_free(&cache); close(pair[0]); close(pair[1]);
+    }
+    for (unsigned pooled=0;pooled<2;pooled++) for (unsigned empty=0;empty<3;empty++) {
+        int pair[2]; REQUIRE("tls/boundary-wire-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        tls13_conn_t receiver={.fd=pair[0],.mode=CONN_MODE_TLS,.tls_auth_state=4,.xmux_async=(int)pooled},peer={0};
+        REQUIRE("tls/boundary-wire-ciphers",configure_tls_cipher(&receiver,0x1303) == 0 && configure_tls_cipher(&peer,0x1303) == 0);
+        uint8_t payload[32]; size_t length=0;
+        if (!empty) { memcpy(payload,update,sizeof(update)); memcpy(payload+sizeof(update),ticket,sizeof(ticket)); length=sizeof(update)+sizeof(ticket); }
+        uint8_t *record=NULL; size_t record_length=0; unsigned type=empty == 2 ? 23 : 22;
+        REQUIRE("tls/boundary-wire-encrypt",encrypt_record(&peer,peer.s_app_key,peer.s_app_iv,&peer.s_app_seq,(uint8_t)type,payload,length,&record,&record_length) == 0 &&
+            write_exact(pair[1],record,record_length) == 0); free(record);
+        REQUIRE("tls/boundary-wire-following-data",encrypt_record(&peer,peer.s_app_key,peer.s_app_iv,&peer.s_app_seq,23,(const uint8_t *)"vless-core",10,&record,&record_length) == 0 &&
+            write_exact(pair[1],record,record_length) == 0); free(record);
+        uint8_t output[16]; size_t count=0; int result=pooled ? xmux_transport_collect(&receiver) : tls13_read_app(&receiver,output,sizeof(output),&count);
+        CHECK("tls/physical-record-boundaries-enforced",empty == 2 ? result >= 0 && (pooled ? receiver.h2_net_cache.len == 10 : count == 10) : result < 0);
+        if (empty != 2) CHECK("tls/invalid-physical-record-does-not-rotate",receiver.s_app_seq == 1 && !receiver.c_app_seq && !receiver.xmux_wire_output.len);
+        db_free(&receiver.tls_post_handshake); db_free(&receiver.xmux_raw_input); db_free(&receiver.xmux_wire_output);
+        db_free(&receiver.app_cache); db_free(&receiver.h2_net_cache); close(pair[0]); close(pair[1]);
+    }
+}
+
 static void incoming_record_vectors(void) {
     tls13_conn_t connection={0}; REQUIRE("tls/incoming-record-cipher",configure_tls_cipher(&connection,0x1303) == 0);
     static const struct { size_t content,padding; unsigned limit; int accepted; } cases[]={
@@ -267,6 +327,7 @@ int main(int argc, char **argv) {
     record_limit_vectors();
     physical_tls_close_notify();
     automatic_update_vectors();
+    key_update_record_boundaries();
     incoming_record_vectors();
     address_cipher_cache_vectors();
     vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); strcpy(config.alpn,"http/1.1");

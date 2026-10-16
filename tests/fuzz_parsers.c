@@ -289,6 +289,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         fuzz_clear(&legacy);
         (void)append_transcript(&c,data,size);
         (void)tls_post_handshake(&c,data,size);
+        tls13_conn_t fragmented={.fd=-1,.tls_auth_state=4,.xmux_async=1};
+        if (configure_tls_cipher(&fragmented,0x1303)) abort();
+        size_t step=size ? 1+data[size-1]%7 : 1;
+        for (size_t offset=0;offset<size;offset+=step) {
+            size_t count=size-offset < step ? size-offset : step;
+            uint8_t secrets[128]; memcpy(secrets,fragmented.s_app_traffic,64); memcpy(secrets+64,fragmented.c_app_traffic,64);
+            uint64_t incoming=fragmented.s_app_seq,outgoing=fragmented.c_app_seq;
+            errno=0;
+            int result=tls_post_handshake(&fragmented,data+offset,count);
+            if (result < 0) {
+                if (errno == EPROTO && (memcmp(secrets,fragmented.s_app_traffic,64) || memcmp(secrets+64,fragmented.c_app_traffic,64) ||
+                    incoming != fragmented.s_app_seq || outgoing != fragmented.c_app_seq)) abort();
+                break;
+            }
+            db_free(&fragmented.xmux_wire_output);
+        }
+        fuzz_clear(&fragmented);
         int pair[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) abort();
         if (write_exact(pair[1], data, size) != 0 || shutdown(pair[1], SHUT_WR) != 0) abort();

@@ -3,6 +3,7 @@
 #include "tls_fixture.h"
 #include "uri.h"
 #include <openssl/pem.h>
+#include <signal.h>
 
 typedef struct {
     int fd, variant;
@@ -151,6 +152,18 @@ static void *peer_run(void *opaque) {
     if (peer->variant == 6) finished[0]^=1;
     if (peer_message(&flight,20,finished,32)) goto done;
     uint8_t *encrypted=NULL; size_t encrypted_length=0;
+    if (peer->variant == 12 || peer->variant == 13) {
+        size_t prefix=peer->variant == 13 ? 6 : 0;
+        if (prefix) {
+            if (encrypt_record(&server,server.s_hs_key,server.s_hs_iv,&server.s_hs_seq,22,flight.data,prefix,&encrypted,&encrypted_length)) goto done;
+            int sent=write_exact(peer->fd,encrypted,encrypted_length); free(encrypted); encrypted=NULL;
+            if (sent) goto done;
+            db_consume(&flight,prefix);
+        }
+        if (encrypt_record(&server,server.s_hs_key,server.s_hs_iv,&server.s_hs_seq,22,flight.data,0,&encrypted,&encrypted_length)) goto done;
+        int sent=write_exact(peer->fd,encrypted,encrypted_length); free(encrypted); encrypted=NULL;
+        if (sent) goto done;
+    }
     if (encrypt_record(&server,server.s_hs_key,server.s_hs_iv,&server.s_hs_seq,22,flight.data,flight.len,&encrypted,&encrypted_length)) goto done;
     (void)write_exact(peer->fd,encrypted,encrypted_length); free(encrypted);
     if (peer->variant == 7) {
@@ -235,6 +248,7 @@ static void invalid_key_usage_cases(void) {
 }
 
 int main(void) {
+    REQUIRE("auth/ignore-sigpipe",signal(SIGPIPE,SIG_IGN) != SIG_ERR);
     const char *root=getenv("TEST_PRIVATE_ROOT"); REQUIRE("auth/private-root",root != NULL);
     certificate_identity_cases();
     invalid_key_usage_cases();
@@ -257,7 +271,7 @@ int main(void) {
         FILE *file=fopen(ca,"w"); REQUIRE("auth/ca-write",file && PEM_write_X509(file,certificate)); fclose(file);
         setenv("VLESS_CA_BUNDLE",ca,1); setenv("VLESS_XHTTP_PIN_FILE",pins,1);
         const char *modes[]={"strict","insecure","tofu"};
-        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 12);variant++) {
+        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 14);variant++) {
             unlink(pins); int pair[2]; REQUIRE("auth/socketpair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
             peer_t peer={.fd=pair[1],.variant=variant,.key=key,.certificate=der,.certificate_length=(size_t)length}; pthread_t thread;
             REQUIRE("auth/peer-thread",pthread_create(&thread,NULL,peer_run,&peer) == 0);
