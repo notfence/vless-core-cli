@@ -111,22 +111,24 @@ cleanup:
     OPENSSL_cleanse(shared,sizeof(shared)); OPENSSL_cleanse(master,sizeof(master)); OPENSSL_cleanse(block,sizeof(block)); OPENSSL_cleanse(&state,sizeof(state));
     close(peer->fd); return NULL;
 }
-int main(void) {
-    REQUIRE("tls12/ignore-sigpipe",signal(SIGPIPE,SIG_IGN) != SIG_ERR);
-    const char *root=getenv("TEST_PRIVATE_ROOT"); REQUIRE("tls12/private-root",root != NULL);
+static void key_usage_cases(const char *root, unsigned usage) {
     EVP_PKEY *key=EVP_PKEY_Q_keygen(NULL,NULL,"EC","P-256"); X509 *certificate=X509_new();
     REQUIRE("tls12/fixture-certificate",key && certificate);
     X509_set_version(certificate,2); ASN1_INTEGER_set(X509_get_serialNumber(certificate),1);
     X509_gmtime_adj(X509_getm_notBefore(certificate),-60); X509_gmtime_adj(X509_getm_notAfter(certificate),3600);
     X509_NAME *name=X509_get_subject_name(certificate); X509_NAME_add_entry_by_txt(name,"CN",MBSTRING_ASC,(const unsigned char *)"vless-core.test",-1,-1,0);
     X509_set_issuer_name(certificate,name); X509_set_pubkey(certificate,key);
+    if (usage) {
+        X509_EXTENSION *extension=X509V3_EXT_conf_nid(NULL,NULL,NID_key_usage,usage == 1 ? "critical,digitalSignature" : "critical,keyEncipherment");
+        REQUIRE("tls12/key-usage-extension",extension && X509_add_ext(certificate,extension,-1)); X509_EXTENSION_free(extension);
+    }
     REQUIRE("tls12/fixture-sign",X509_sign(certificate,key,EVP_sha256()) > 0);
     unsigned char *der=NULL; int length=i2d_X509(certificate,&der); REQUIRE("tls12/fixture-der",length > 0);
     char ca[PATH_MAX],pins[PATH_MAX]; snprintf(ca,sizeof(ca),"%s/tls12-ca.pem",root); snprintf(pins,sizeof(pins),"%s/tls12-pins",root);
     FILE *file=fopen(ca,"w"); REQUIRE("tls12/ca-file",file && PEM_write_X509(file,certificate)); fclose(file);
     setenv("VLESS_CA_BUNDLE",ca,1); setenv("VLESS_XHTTP_PIN_FILE",pins,1);
     const char *modes[]={"strict","insecure","tofu"};
-    for (unsigned mode=0;mode<3;mode++) for (int ems=0;ems<2;ems++) for (int variant=0;variant<16;variant++) {
+    for (unsigned mode=0;mode<3;mode++) for (int ems=0;ems<2;ems++) for (int variant=0;variant<(usage ? 1 : 16);variant++) {
         unlink(pins); int pair[2]; REQUIRE("tls12/fixture-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
         peer12_t peer={.fd=pair[1],.variant=variant,.ems=ems,.key=key,.certificate=der,.certificate_length=(size_t)length}; pthread_t thread;
         REQUIRE("tls12/fixture-thread",pthread_create(&thread,NULL,peer12_run,&peer) == 0);
@@ -135,7 +137,7 @@ int main(void) {
         setenv("VLESS_TLS_MODE",modes[mode],1);
         tls13_conn_t connection={.fd=pair[0]}; char error[256]={0};
         int result=run_tls_handshake(&config,&connection,TLS_CIPHER_OFFER_CHACHA,error,sizeof(error));
-        int accepted=variant == 0 || variant == 10 || variant == 11;
+        int accepted=usage != 2 && (variant == 0 || variant == 10 || variant == 11);
         if (accepted && result) fprintf(stderr,"TLS 1.2 fixture %s/%d/%d: %s\n",modes[mode],ems,variant,error);
         CHECK("tls12/strict-handshake-state-and-proof",accepted ? !result : result != 0);
         CHECK("tls12/handshake-budget-released",!connection.tls_handshake_bytes && !tls_buffer_bytes);
@@ -146,5 +148,11 @@ int main(void) {
         X509_free(connection.tls_peer_certificate); db_free(&connection.tls_client_hello); db_free(&connection.tls_certificate_message);
         db_free(&connection.transcript); db_free(&connection.tls_post_handshake); EVP_PKEY_free(connection.tls_retry_key); OPENSSL_cleanse(&connection,sizeof(connection));
     }
-    OPENSSL_free(der); X509_free(certificate); EVP_PKEY_free(key); return test_result();
+    OPENSSL_free(der); X509_free(certificate); EVP_PKEY_free(key);
+}
+int main(void) {
+    REQUIRE("tls12/ignore-sigpipe",signal(SIGPIPE,SIG_IGN) != SIG_ERR);
+    const char *root=getenv("TEST_PRIVATE_ROOT"); REQUIRE("tls12/private-root",root != NULL);
+    for (unsigned usage=0;usage<3;usage++) key_usage_cases(root,usage);
+    return test_result();
 }

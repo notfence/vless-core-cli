@@ -172,10 +172,73 @@ done:
     free(hello); db_free(&flight); db_free(&certificate); db_free(&server_hello); db_free(&server.transcript); close(peer->fd); return NULL;
 }
 
+static void certificate_operation_cases(EVP_PKEY *key, X509 *certificate, int usage) {
+    vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); config.fp_mode=FP_FIREFOX;
+    uint8_t private_key[32],public_key[32],random[32],auth[32],*hello=NULL; size_t hello_size=0,sid=0;
+    REQUIRE("usage/client-hello",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&hello_size,&sid,NULL,NULL) == 0);
+    int kind=EVP_PKEY_base_id(key),ed=kind == EVP_PKEY_ED25519,rsa=kind == EVP_PKEY_RSA;
+    tls13_conn_t connection={.tls_peer_certificate=certificate,.tls12_suite=core_tls12_suite(rsa ? 0xcca8 : 0xcca9)};
+    REQUIRE("usage/client-hello-buffer",db_append(&connection.tls_client_hello,hello,hello_size) == 0); free(hello);
+    uint8_t input[68]={0},signature[516]={0}; size_t length=sizeof(signature)-4;
+    signature[0]=ed ? 8 : 4; signature[1]=ed ? 7 : rsa ? 1 : 3;
+    EVP_MD_CTX *sign=EVP_MD_CTX_new();
+    REQUIRE("usage/tls12-signature",sign && EVP_DigestSignInit(sign,NULL,ed ? NULL : EVP_sha256(),NULL,key) == 1 &&
+        EVP_DigestSign(sign,signature+4,&length,input,sizeof(input)) == 1);
+    EVP_MD_CTX_free(sign); signature[2]=(uint8_t)(length>>8); signature[3]=(uint8_t)length;
+    int result=tls12_signature(&connection,input,input+32,input+64,4,signature,length+4);
+    CHECK("usage/tls12-signing-operation",usage == 2 ? result != 0 : result == 0);
+    if (rsa) {
+        dynbuf_t secret={0},exchange={0}; result=tls12_rsa_exchange(&connection,&secret,&exchange);
+        CHECK("usage/tls12-rsa-encryption-operation",usage == 1 ? result != 0 : result == 0);
+        if (usage == 1) CHECK("usage/rsa-refused-before-premaster",secret.len == 0 && exchange.len == 0);
+        if (secret.data) OPENSSL_cleanse(secret.data,secret.cap);
+        db_free(&secret); db_free(&exchange);
+        unsigned char *der=NULL; int size=i2d_X509(certificate,&der); REQUIRE("usage/tls12-rsa-certificate-der",size > 0);
+        size_t list=(size_t)size+3;
+        const uint8_t prefix[]={(uint8_t)(list>>16),(uint8_t)(list>>8),(uint8_t)list,(uint8_t)(size>>16),(uint8_t)(size>>8),(uint8_t)size};
+        dynbuf_t body={0},message={0};
+        REQUIRE("usage/tls12-rsa-certificate-message",!db_append(&body,prefix,sizeof(prefix)) && !db_append(&body,der,(size_t)size) && !peer_message(&message,11,body.data,body.len));
+        for (unsigned policy=0;policy<3;policy++) {
+            tls13_conn_t peer={.tls_verify_policy=(int)policy,.tls12_suite=core_tls12_suite(0x009c)}; char error[256]={0};
+            result=tls12_certificate(&config,&peer,message.data,message.len,error,sizeof(error));
+            CHECK("usage/tls12-rsa-certificate-policy",usage == 1 ? result != 0 : result == 0);
+            tls_handshake_material_clear(&peer);
+        }
+        db_free(&body); db_free(&message); OPENSSL_free(der);
+    }
+    if (ed) {
+        uint8_t auth_key[32]={1},public_key[32],hmac[64]; size_t public_length=sizeof(public_key);
+        REQUIRE("usage/reality-public-key",EVP_PKEY_get_raw_public_key(key,public_key,&public_length) == 1 && public_length == 32);
+        REQUIRE("usage/reality-authenticator",hmac_sha512(auth_key,sizeof(auth_key),public_key,sizeof(public_key),hmac) == 0);
+        const ASN1_BIT_STRING *value=NULL; X509_get0_signature(&value,NULL,certificate);
+        REQUIRE("usage/reality-certificate-signature",value && value->length == sizeof(hmac));
+        memcpy(value->data,hmac,sizeof(hmac));
+        unsigned char *der=NULL; int size=i2d_X509(certificate,&der); REQUIRE("usage/reality-der",size > 0);
+        result=verify_reality_cert(auth_key,der,(size_t)size);
+        CHECK("usage/reality-signing-operation",usage == 2 ? result != 0 : result == 0); OPENSSL_free(der);
+    }
+    db_free(&connection.tls_client_hello);
+}
+
+static void invalid_key_usage_cases(void) {
+    X509 *certificate=X509_new(); REQUIRE("usage/invalid-certificate",certificate);
+    X509_EXTENSION *extension=X509V3_EXT_conf_nid(NULL,NULL,NID_key_usage,"digitalSignature");
+    REQUIRE("usage/duplicate-extension",extension && X509_add_ext(certificate,extension,-1) && X509_add_ext(certificate,extension,-1));
+    CHECK("usage/duplicate-extension-rejected",tls_certificate_key_usage(certificate,1) != 0);
+    X509_EXTENSION_free(extension); X509_free(certificate);
+    certificate=X509_new(); ASN1_OCTET_STRING *data=ASN1_OCTET_STRING_new(); const uint8_t invalid[]={5,0};
+    REQUIRE("usage/invalid-extension-data",certificate && data && ASN1_OCTET_STRING_set(data,invalid,sizeof(invalid)));
+    extension=X509_EXTENSION_create_by_NID(NULL,NID_key_usage,0,data);
+    REQUIRE("usage/invalid-extension",extension && X509_add_ext(certificate,extension,-1));
+    CHECK("usage/invalid-extension-rejected",tls_certificate_key_usage(certificate,1) != 0 && tls_certificate_key_usage(certificate,0) != 0);
+    X509_EXTENSION_free(extension); ASN1_OCTET_STRING_free(data); X509_free(certificate);
+}
+
 int main(void) {
     const char *root=getenv("TEST_PRIVATE_ROOT"); REQUIRE("auth/private-root",root != NULL);
     certificate_identity_cases();
-    for (int kind=0;kind<3;kind++) {
+    invalid_key_usage_cases();
+    for (int kind=0;kind<3;kind++) for (int usage=0;usage<3;usage++) {
         int ed=kind == 1;
         EVP_PKEY *key=kind == 2 ? EVP_PKEY_Q_keygen(NULL,NULL,"RSA",2048) : ed ? EVP_PKEY_Q_keygen(NULL,NULL,"ED25519") : EVP_PKEY_Q_keygen(NULL,NULL,"EC","P-256");
         X509 *certificate=X509_new(); REQUIRE("auth/key-certificate",key && certificate);
@@ -184,13 +247,17 @@ int main(void) {
         X509_NAME *name=X509_get_subject_name(certificate);
         X509_NAME_add_entry_by_txt(name,"CN",MBSTRING_ASC,(const unsigned char *)"vless-core.test",-1,-1,0);
         X509_set_issuer_name(certificate,name); X509_set_pubkey(certificate,key);
+        if (usage) {
+            X509_EXTENSION *extension=X509V3_EXT_conf_nid(NULL,NULL,NID_key_usage,usage == 1 ? "critical,digitalSignature" : "critical,keyEncipherment");
+            REQUIRE("auth/key-usage-extension",extension && X509_add_ext(certificate,extension,-1)); X509_EXTENSION_free(extension);
+        }
         REQUIRE("auth/certificate-sign",X509_sign(certificate,key,ed ? NULL : EVP_sha256()) > 0);
         unsigned char *der=NULL; int length=i2d_X509(certificate,&der); REQUIRE("auth/certificate-der",length > 0);
         char ca[PATH_MAX],pins[PATH_MAX]; snprintf(ca,sizeof(ca),"%s/auth-ca.pem",root); snprintf(pins,sizeof(pins),"%s/auth-pins",root);
         FILE *file=fopen(ca,"w"); REQUIRE("auth/ca-write",file && PEM_write_X509(file,certificate)); fclose(file);
         setenv("VLESS_CA_BUNDLE",ca,1); setenv("VLESS_XHTTP_PIN_FILE",pins,1);
         const char *modes[]={"strict","insecure","tofu"};
-        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<12;variant++) {
+        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 12);variant++) {
             unlink(pins); int pair[2]; REQUIRE("auth/socketpair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
             peer_t peer={.fd=pair[1],.variant=variant,.key=key,.certificate=der,.certificate_length=(size_t)length}; pthread_t thread;
             REQUIRE("auth/peer-thread",pthread_create(&thread,NULL,peer_run,&peer) == 0);
@@ -200,10 +267,10 @@ int main(void) {
             core_set_socket_io_timeout(pair[0],1000);
             int result=run_tls_handshake(&config,&connection,TLS_CIPHER_OFFER_CHACHA,error,sizeof(error));
             CHECK("auth/handshake-memory-released",connection.tls_handshake_bytes == 0);
-            if (!variant && result) fprintf(stderr,"valid handshake %d/%s: %s\n",kind,modes[mode],error);
-            if (variant == 0 || variant == 7) CHECK("auth/valid-signature",result == 0);
+            if (!variant && usage != 2 && result) fprintf(stderr,"valid handshake %d/%s: %s\n",kind,modes[mode],error);
+            if ((variant == 0 || variant == 7) && usage != 2) CHECK("auth/valid-signature",result == 0);
             else CHECK("auth/malformed-handshake-rejected",result != 0);
-            if (variant && variant != 7 && mode == 2) CHECK("auth/failed-handshake-no-tofu-pin",access(pins,F_OK) != 0);
+            if (((variant && variant != 7) || usage == 2) && mode == 2) CHECK("auth/failed-handshake-no-tofu-pin",access(pins,F_OK) != 0);
             shutdown(pair[0],SHUT_RDWR); close(pair[0]); pthread_join(thread,NULL); db_free(&connection.transcript);
             if (variant == 7) {
                 CHECK("auth/requested-empty-client-certificate",peer.empty_certificate);
@@ -212,6 +279,7 @@ int main(void) {
             X509_free(connection.tls_peer_certificate); db_free(&connection.tls_certificate_message);
             db_free(&connection.tls_client_hello); EVP_PKEY_free(connection.tls_retry_key); db_free(&connection.tls_post_handshake);
         }
+        certificate_operation_cases(key,certificate,usage);
         OPENSSL_free(der); X509_free(certificate); EVP_PKEY_free(key);
     }
     CHECK("auth/global-handshake-memory-released",tls_buffer_bytes == 0);

@@ -313,6 +313,7 @@ int tls_identity_parameters(X509_VERIFY_PARAM *parameters, const char *identity)
 int parse_first_cert_der(const uint8_t *message, size_t length, const uint8_t **der, size_t *der_length);
 int tcp_tls_tofu_verify_or_store(const vless_config_t *cfg, const uint8_t *cert_msg, size_t cert_msg_len, char *err, size_t err_cap);
 int verify_reality_cert(const uint8_t auth_key[32], const uint8_t *cert_der, size_t cert_der_len);
+int tls_certificate_key_usage(X509 *certificate, int signing);
 int verify_tls_cert_message(const char *servername, const uint8_t *cert_msg, size_t cert_msg_len, char *err, size_t err_cap);
 void set_err(char *err, size_t cap, const char *msg);
 int db_reserve(dynbuf_t *b, size_t n);

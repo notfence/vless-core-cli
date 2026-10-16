@@ -41,7 +41,7 @@ static int tls_encrypted_extensions(tls13_conn_t *c, const uint8_t *data, size_t
 }
 
 static int verify_server_signature(tls13_conn_t *c, const uint8_t *body, size_t length) {
-    if (!c->tls_peer_certificate || length < 4 || (((size_t)body[2]<<8)|body[3]) != length-4) return -1;
+    if (tls_certificate_key_usage(c->tls_peer_certificate,1) || length < 4 || (((size_t)body[2]<<8)|body[3]) != length-4) return -1;
     unsigned scheme=((unsigned)body[0]<<8)|body[1];
     const EVP_MD *digest=NULL;
     int expected_type=0,curve=0,pss=0;
@@ -121,6 +121,7 @@ static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, 
         const unsigned char *cursor=der;
         c->tls_peer_certificate=d2i_X509(NULL,&cursor,(long)der_length);
         if (!c->tls_peer_certificate || cursor != der+der_length) { set_err(err,err_cap,"invalid TLS leaf certificate"); return -1; }
+        if (tls_certificate_key_usage(c->tls_peer_certificate,1)) { set_err(err,err_cap,"TLS certificate KeyUsage forbids signing"); return -1; }
         if (!strcmp(cfg->security,"reality")) {
             if (verify_reality_cert(c->auth_key,der,der_length)) { set_err(err,err_cap,"REALITY cert verify failed"); return -1; }
         } else if (c->tls_verify_policy == TLS_VERIFY_MODE_STRICT &&
@@ -223,6 +224,9 @@ static int tls12_certificate(const vless_config_t *config,tls13_conn_t *c,const 
     if (parse_first_cert_der(converted.data,converted.len,&der,&der_length)) goto cleanup;
     const unsigned char *cursor=der; c->tls_peer_certificate=d2i_X509(NULL,&cursor,(long)der_length);
     if (!c->tls_peer_certificate || cursor != der+der_length) goto cleanup;
+    if (!c->tls12_suite || tls_certificate_key_usage(c->tls_peer_certificate,c->tls12_suite->exchange != CORE_TLS12_RSA)) {
+        set_err(error,capacity,"TLS certificate KeyUsage forbids key exchange"); goto cleanup;
+    }
     if (c->tls_verify_policy == TLS_VERIFY_MODE_STRICT &&
         verify_tls_cert_message(config->sni[0] ? config->sni : config->server_host,converted.data,converted.len,error,capacity)) goto cleanup;
     c->tls_certificate_message=converted; memset(&converted,0,sizeof(converted)); result=0;
@@ -231,7 +235,7 @@ cleanup:
 }
 static int tls12_signature(tls13_conn_t *c,const uint8_t client_random[32],const uint8_t server_random[32],
                             const uint8_t *parameters,size_t parameters_length,const uint8_t *signature,size_t length) {
-    if (!c->tls_peer_certificate || length < 4 || tls12_word(signature+2) != length-4) return -1;
+    if (tls_certificate_key_usage(c->tls_peer_certificate,1) || length < 4 || tls12_word(signature+2) != length-4) return -1;
     unsigned scheme=tls12_word(signature); size_t offered_size=0;
     const uint8_t *offered=core_tls_hello_extension(c->tls_client_hello.data,c->tls_client_hello.len,13,&offered_size);
     if (!offered || offered_size < 4 || tls12_word(offered) != offered_size-2) return -1;
@@ -331,6 +335,7 @@ cleanup:
     EVP_PKEY_CTX_free(generate); EVP_PKEY_CTX_free(derive); EVP_PKEY_free(local); EVP_PKEY_free(peer); return result;
 }
 static int tls12_rsa_exchange(tls13_conn_t *c,dynbuf_t *premaster,dynbuf_t *client) {
+    if (tls_certificate_key_usage(c->tls_peer_certificate,0)) return -1;
     EVP_PKEY *key=X509_get_pubkey(c->tls_peer_certificate); EVP_PKEY_CTX *context=key ? EVP_PKEY_CTX_new(key,NULL) : NULL; int result=-1;
     if (!key || EVP_PKEY_base_id(key) != EVP_PKEY_RSA || !context || db_reserve(premaster,48)) goto cleanup;
     premaster->len=48;

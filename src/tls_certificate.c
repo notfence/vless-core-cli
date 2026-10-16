@@ -462,10 +462,21 @@ int tcp_tls_tofu_verify_or_store(const vless_config_t *cfg, const uint8_t *cert_
     return tofu_verify_or_store_pin("tls", pin_key, peer_pin, 1, err, err_cap);
 }
 
+int tls_certificate_key_usage(X509 *certificate, int signing) {
+    if (!certificate) return -1;
+    int critical=-1;
+    ASN1_BIT_STRING *usage=X509_get_ext_d2i(certificate,NID_key_usage,&critical,NULL);
+    if (!usage) return critical == -1 ? 0 : -1;
+    int allowed=ASN1_BIT_STRING_get_bit(usage,signing ? 0 : 2);
+    ASN1_BIT_STRING_free(usage);
+    return allowed ? 0 : -1;
+}
+
 int verify_reality_cert(const uint8_t auth_key[32], const uint8_t *cert_der, size_t cert_der_len) {
     const unsigned char *p = cert_der;
     X509 *x = d2i_X509(NULL, &p, (long)cert_der_len);
-    if (x == NULL) {
+    if (x == NULL || p != cert_der+cert_der_len || tls_certificate_key_usage(x,1)) {
+        X509_free(x);
         return -1;
     }
 
