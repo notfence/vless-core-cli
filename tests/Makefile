@@ -64,6 +64,9 @@ $(HOST_BUILD_DIR)/test_tls: $(HOST_BUILD_DIR)/test_tls.o $(filter-out $(HOST_BUI
 $(HOST_BUILD_DIR)/test_tls_handshake: $(HOST_BUILD_DIR)/test_tls_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
+$(HOST_BUILD_DIR)/test_tls12_handshake: $(HOST_BUILD_DIR)/test_tls12_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
+
 $(HOST_BUILD_DIR)/test_tls_state: $(HOST_BUILD_DIR)/test_tls_state.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=malloc
 
@@ -92,6 +95,9 @@ $(HOST_BUILD_DIR)/test_xhttp_payload: $(HOST_BUILD_DIR)/test_xhttp_payload.o $(B
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes
 
 $(HOST_BUILD_DIR)/test_encryption: $(HOST_BUILD_DIR)/test_encryption.o $(filter-out $(HOST_BUILD_DIR)/src/vless_encryption.o $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
+
+$(HOST_BUILD_DIR)/test_tls12: $(HOST_BUILD_DIR)/test_tls12.o $(filter-out $(HOST_BUILD_DIR)/src/tls12.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
 $(HOST_BUILD_DIR)/%: $(HOST_BUILD_DIR)/%.o $(BASE_OBJ) $(NETWORK_GUARD)

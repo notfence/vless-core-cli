@@ -116,11 +116,15 @@ class XrayTests(unittest.TestCase):
                     with socks_connect(core.port,target.port) as tunnel:
                         tunnel.settimeout(5)
                         def upload():
-                            try: tunnel.sendall(payload)
+                            try:
+                                for offset in range(0,len(payload),65536): tunnel.sendall(payload[offset:offset+65536])
                             except OSError as error: failures.append(error)
                         sender=threading.Thread(target=upload); sender.start()
                         try:
-                            self.assertEqual(exact(tunnel,len(payload)),payload[::-1]); self.assertEqual(exact(tunnel,4),b"done")
+                            self.assertEqual(exact(tunnel,len(payload)),payload[::-1])
+                            sender.join(timeout=30)
+                            self.assertFalse(sender.is_alive()); self.assertFalse(failures)
+                            self.assertEqual(exact(tunnel,4),b"done")
                         finally: sender.join(timeout=6)
                         self.assertFalse(sender.is_alive()); self.assertFalse(failures)
 

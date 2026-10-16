@@ -281,7 +281,7 @@ def xray_tls_target(groups=None):
         yield process
 
 @contextlib.contextmanager
-def xray_server(transport, security, mode=None, flow="", decryption="none", tls_certificate=None, reality_target_groups=None, **transport_parameters):
+def xray_server(transport, security, mode=None, flow="", decryption="none", tls_certificate=None, reality_target_groups=None, tls_settings=None, **transport_parameters):
     cert, key = certificate()
     cert = tls_certificate or cert
     with contextlib.ExitStack() as stack:
@@ -294,6 +294,7 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
             stream["grpcSettings"] = {"serviceName":"vless-core", "multiMode":mode == "multi"}
         if security == "tls":
             stream["tlsSettings"] = {"alpn":["h2", "http/1.1"], "certificates":[{"certificateFile":str(cert),"keyFile":str(key)}]}
+            stream["tlsSettings"].update(tls_settings or {})
         elif security == "reality":
             mask = stack.enter_context(xray_tls_target(reality_target_groups))
             stream["realitySettings"] = {"target":f"127.0.0.1:{mask.port}", "serverNames":["vless-core.test"], "privateKey":KEY, "shortIds":["01020304"], "maxTimeDiff":60000}

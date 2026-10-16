@@ -39,6 +39,7 @@ static void fuzz_clear(tls13_conn_t *c) {
     db_free(&c->h2_send_buf);
     db_free(&c->app_cache);
     db_free(&c->ws_net_cache);
+    db_free(&c->tls_stream_input);
     db_free(&c->xhttp_net_cache);
     db_free(&c->xmux_raw_input); db_free(&c->xmux_wire_output); db_free(&c->xmux_plain_output);
 }
@@ -262,6 +263,30 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         (void)tls_certificate_request(data,size);
         (void)tls_session_ticket(data,size);
         (void)tls_encrypted_extensions(&c,data,size);
+        tls13_conn_t legacy={0};
+        if (db_append(&legacy.tls_client_hello,hello,hello_length)) abort();
+        (void)tls12_server_hello(&legacy,data,size);
+        (void)tls12_certificate_request(data,size);
+        legacy.tls12_suite=core_tls12_suite_at(size ? data[0]%27 : 0);
+        uint8_t *opened=NULL; size_t opened_length=0; uint64_t opened_sequence=0;
+        (void)core_tls12_record_open(legacy.tls12_suite,size && (data[0]&1),legacy.s_app_key,legacy.s_app_iv,legacy.tls12_s_mac,&opened_sequence,
+                                   23,data,size,&opened,&opened_length);
+        if (opened) { OPENSSL_cleanse(opened,opened_length); free(opened); }
+        opened=NULL; opened_length=0; opened_sequence=0;
+        uint8_t *legacy_record=NULL; size_t legacy_length=0; uint64_t legacy_sequence=0;
+        int legacy_etm=size && (data[0]&1);
+        size_t legacy_plain_length=size < 16384 ? size : 16384;
+        if (core_tls12_record_seal(legacy.tls12_suite,legacy_etm,legacy.s_app_key,legacy.s_app_iv,legacy.tls12_s_mac,&legacy_sequence,
+                                  23,data,legacy_plain_length,&legacy_record,&legacy_length)) abort();
+        int damaged=size && (data[0]&2);
+        if (damaged) legacy_record[legacy_length-1]^=1;
+        int legacy_result=core_tls12_record_open(legacy.tls12_suite,legacy_etm,legacy.s_app_key,legacy.s_app_iv,legacy.tls12_s_mac,&opened_sequence,
+                                               23,legacy_record+5,legacy_length-5,&opened,&opened_length);
+        if (damaged ? !legacy_result || opened || opened_length || opened_sequence :
+            legacy_result || opened_length != legacy_plain_length || opened_sequence != 1 || memcmp(opened,data,legacy_plain_length)) abort();
+        if (opened) { OPENSSL_cleanse(opened,opened_length); free(opened); }
+        free(legacy_record);
+        fuzz_clear(&legacy);
         (void)append_transcript(&c,data,size);
         (void)tls_post_handshake(&c,data,size);
         int pair[2];

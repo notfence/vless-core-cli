@@ -65,6 +65,18 @@ static void initial_share_vectors(void) {
 }
 
 static void record_limit_vectors(void) {
+    for (int etm=0;etm<2;etm++) {
+        tls13_conn_t legacy={.tls12_suite=core_tls12_suite(0xc013),.tls_receive_record_limit=64,.tls12_etm=etm};
+        uint8_t payload[128]={0},*plain=NULL,inner=0; size_t length=0; uint64_t sequence=0;
+        CHECK("tls12/negotiated-cbc-expansion-rejected",decrypt_record(&legacy,legacy.s_app_key,legacy.s_app_iv,&sequence,23,payload,sizeof(payload),&plain,&length,&inner) < 0 && errno == EMSGSIZE && !sequence && !plain);
+        CHECK("tls12/pool-retained-below-key-threshold",!xmux_transport_retire(&legacy));
+        legacy.c_app_seq=TLS_RECORD_REKEY_LIMIT;
+        CHECK("tls12/pool-retired-before-send-key-limit",xmux_transport_retire(&legacy));
+        legacy.c_app_seq=0; legacy.s_app_seq=TLS_RECORD_REKEY_LIMIT;
+        CHECK("tls12/pool-retired-before-receive-key-limit",xmux_transport_retire(&legacy));
+        legacy.tls12_suite=NULL;
+        CHECK("tls13/pool-uses-key-update-not-rotation",!xmux_transport_retire(&legacy));
+    }
     tls13_conn_t connection={.tls_auth_state=4};
     REQUIRE("tls/record-limit-cipher",configure_tls_cipher(&connection,0x1303) == 0);
     uint8_t *data=calloc(1,16385),*record=NULL; size_t size=0;
@@ -106,6 +118,21 @@ static void record_limit_vectors(void) {
     size_t accounted=tls_buffer_bytes; uint8_t block[1024]={0}; allocation_failure=1;
     CHECK("tls/handshake-resize-reservation-rollback",append_transcript(&connection,block,sizeof(block)) != 0 && tls_buffer_bytes == accounted && connection.transcript.len == 10 && !memcmp(connection.transcript.data,"vless-core",10));
     db_free(&connection.transcript); CHECK("tls/handshake-allocation-cleanup",tls_buffer_bytes == 0);
+}
+static void physical_tls_close_notify(void) {
+    for (int legacy=0;legacy<2;legacy++) {
+        int pair[2]; REQUIRE("tls/physical-close-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        tls13_conn_t *connection=calloc(1,sizeof(*connection)),peer={0};
+        REQUIRE("tls/physical-close-state",connection != NULL);
+        connection->fd=pair[0]; connection->xhttp_upload_fd=-1; connection->tls_auth_state=4; connection->xmux_async=1;
+        if (legacy) { connection->tls12_suite=peer.tls12_suite=core_tls12_suite(0xcca8); connection->tls_md=EVP_sha256(); }
+        else REQUIRE("tls/physical-close-ciphers",!configure_tls_cipher(connection,0x1303) && !configure_tls_cipher(&peer,0x1303));
+        xmux_transport_close(connection);
+        uint8_t type=0,*record=NULL,*plain=NULL,inner=0; size_t record_length=0,plain_length=0; uint64_t sequence=0;
+        int result=read_record_bounded(pair[1],&type,&record,&record_length,legacy);
+        CHECK("tls/physical-close-emits-close-notify",!result && !decrypt_record(&peer,peer.s_app_key,peer.s_app_iv,&sequence,type,record,record_length,&plain,&plain_length,&inner) && inner == 21 && plain_length == 2 && plain[1] == 0);
+        free(plain); free(record); close(pair[1]);
+    }
 }
 
 static void automatic_update_vectors(void) {
@@ -215,14 +242,30 @@ static void address_cipher_cache_vectors(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc == 2) {
+    if (argc == 2 || (argc == 3 && !strcmp(argv[1],"--http"))) {
         vless_config_t config; char error[256]={0}; tls13_conn_t *connection=NULL;
-        REQUIRE("tls/live-config",parse_core_uri(argv[1],&config,error,sizeof(error)) == 0);
+        REQUIRE("tls/live-config",parse_core_uri(argv[argc-1],&config,error,sizeof(error)) == 0);
         int result=tls13_reality_connect(&config,&connection,error,sizeof(error));
         if (result) fprintf(stderr,"handshake: %s\n",error);
-        CHECK("tls/live-retry-handshake",result == 0); tls13_reality_close(connection); return test_result();
+        CHECK("tls/live-retry-handshake",result == 0);
+        if (!result && argc == 3) {
+            const uint8_t request[]="GET / HTTP/1.0\r\n\r\n";
+            CHECK("tls/live-http-send",!tls13_write_app(connection,request,sizeof(request)-1));
+            uint8_t response[16384]; size_t total=0;
+            for (;;) {
+                size_t count=0; int received=tls13_read_app(connection,response+total,sizeof(response)-total,&count);
+                CHECK("tls/live-http-read",received >= 0);
+                if (received < 0 || (!received && !count)) break;
+                if (received > 0) continue;
+                total+=count;
+                REQUIRE("tls/live-http-response-capacity",total < sizeof(response));
+            }
+            CHECK("tls/live-http-response",total > 12 && !memcmp(response,"HTTP/1.0 200 ",13));
+        }
+        tls13_reality_close(connection); return test_result();
     }
     record_limit_vectors();
+    physical_tls_close_notify();
     automatic_update_vectors();
     incoming_record_vectors();
     address_cipher_cache_vectors();

@@ -29,6 +29,7 @@ typedef struct {
     size_t (*pending)(void *);
     uint64_t (*enqueued)(void *);
     uint64_t (*flushed)(void *);
+    int (*retire)(void *);
     int (*request)(void *, const vless_config_t *, const char *, uint64_t, int, const uint8_t *, size_t, uint32_t *, uint32_t, size_t *, size_t *);
     int (*session)(const vless_config_t *, char *, size_t);
 } core_http2_backend_t;

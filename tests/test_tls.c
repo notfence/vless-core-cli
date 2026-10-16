@@ -9,6 +9,7 @@ static int pooled_fixture_pending=-1;
 static uint64_t pacing_clock;
 static uint32_t pacing_random;
 static int pacing_waits,pacing_interrupted,pacing_timeouts[4];
+static int asynchronous_probe,asynchronous_waits;
 uint64_t __real_core_now_ms(void);
 int __real_RAND_bytes(unsigned char *,int);
 int __real_poll(struct pollfd *,nfds_t,int);
@@ -24,6 +25,7 @@ int __wrap_RAND_bytes(unsigned char *data,int length) {
     memcpy(data,&pacing_random,sizeof(pacing_random)); return 1;
 }
 int __wrap_poll(struct pollfd *descriptors,nfds_t count,int timeout) {
+    if (asynchronous_probe) { asynchronous_waits++; pacing_clock+=(unsigned)timeout; return 0; }
     if (!pacing_clock || count) return __real_poll(descriptors,count,timeout);
     if (pacing_waits < 4) pacing_timeouts[pacing_waits]=timeout;
     pacing_waits++;
@@ -45,6 +47,7 @@ static void clear_conn(tls13_conn_t *c) {
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL; EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL;
     db_free(&c->h2_net_cache); db_free(&c->h2_send_buf); db_free(&c->app_cache); db_free(&c->transcript);
     db_free(&c->ws_net_cache); db_free(&c->xhttp_net_cache);
+    db_free(&c->tls_stream_input);
     db_free(&c->xmux_raw_input); db_free(&c->xmux_wire_output); db_free(&c->xmux_plain_output);
     db_free(&c->h2_header_block);
     core_hpack_clear(&c->hpack);
@@ -160,6 +163,17 @@ static void exact_read_drains_buffered_http2(void) {
     uint8_t output[10];
     CHECK("h2/exact-read-does-not-wait-for-already-buffered-data",tls13_read_exact_app(&c,output,sizeof(output)) == 0 && !memcmp(output,"vless-core",10) && core_deadline_remaining() > 0);
     core_deadline_end(); core_deadline_detach(); clear_conn(&c); close(pair[0]); close(pair[1]);
+}
+static void asynchronous_tls_read_preserves_deadline(void) {
+    int pair[2]; REQUIRE("tls/async-read-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    tls13_conn_t connection={.fd=pair[0],.relay_async=1};
+    core_deadline_t deadline; REQUIRE("tls/async-read-deadline-attach",core_deadline_attach(&deadline) == 0);
+    pacing_clock=1000; core_deadline_begin(100); asynchronous_probe=1; asynchronous_waits=0;
+    uint8_t type=0,*payload=NULL; size_t length=0;
+    CHECK("tls/async-read-yields-without-waiting",relay_read_record(&connection,&type,&payload,&length) == 2 && !asynchronous_waits);
+    CHECK("tls/async-read-keeps-connect-budget",core_deadline_remaining() == 100);
+    free(payload); asynchronous_probe=0; core_deadline_end(); core_deadline_detach(); pacing_clock=0;
+    clear_conn(&connection); close(pair[0]); close(pair[1]);
 }
 static void hpack_status_vectors(void) {
     static const struct { uint8_t data[5]; size_t size; int status; } cases[] = {
@@ -355,8 +369,18 @@ static void hpack_response_phases(void) {
     clear_conn(&c);
 }
 static void wait_tls_fixture(tls13_conn_t *c) {
-    if (SSL_pending(c->ssl) > 0) return;
+    if ((c->ssl && SSL_pending(c->ssl) > 0) || (c->xmux_raw_input.len >= 5 &&
+        c->xmux_raw_input.len >= 5+((size_t)c->xmux_raw_input.data[3]<<8)+c->xmux_raw_input.data[4])) return;
     REQUIRE("xhttp/tls-fixture-input",core_wait_socket(c->fd,POLLIN,2000) > 0);
+}
+static int tls_fixture_ack(tls13_conn_t *connection) {
+    core_deadline_scope_t scope; if (core_deadline_scope_begin(&scope,2000)) return -1;
+    int result=xhttp_conn_write_all(connection,"ack",3);
+    while (!result && xmux_transport_pending(connection)) {
+        result=xmux_transport_flush(connection);
+        if (!result && xmux_transport_pending(connection) && core_wait_socket(connection->fd,POLLOUT,-1) <= 0) result=-1;
+    }
+    core_deadline_scope_end(&scope); return result;
 }
 static int xhttp_fixture_try_read(tls13_conn_t *c, uint8_t *data, size_t capacity, size_t *length) {
     *length=0;
@@ -400,16 +424,16 @@ static int live_xhttp_chunks(const char *uri) {
         CHECK("xhttp/tls-incomplete-chunk-yields", xhttp_fixture_try_read(c, data, sizeof(data), &length) == 1 && length == 0);
         CHECK("xhttp/tls-incomplete-chunk-not-pending", xhttp_fixture_try_read(c,data,sizeof(data),&length) == 1 && !length);
         CHECK("xhttp/tls-socket-flags-restored", fcntl(c->fd, F_GETFL, 0) == flags);
-        REQUIRE("xhttp/tls-fixture-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
+        REQUIRE("xhttp/tls-fixture-ack", tls_fixture_ack(c) == 0);
     }
     wait_tls_fixture(c);
     CHECK("xhttp/tls-fragmented-chunk-body", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && length == 1 && data[0] == 'v');
-    REQUIRE("xhttp/tls-body-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
+    REQUIRE("xhttp/tls-body-ack", tls_fixture_ack(c) == 0);
     wait_tls_fixture(c);
     CHECK("xhttp/tls-fragmented-chunk-tail", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && length == 3 && memcmp(data, "pn!", 3) == 0);
     CHECK("xhttp/tls-chunk-ending-yields", xhttp_fixture_try_read(c, data, sizeof(data), &length) == 1 && length == 0);
     CHECK("xhttp/tls-chunk-ending-not-pending", xhttp_fixture_try_read(c,data,sizeof(data),&length) == 1 && !length);
-    REQUIRE("xhttp/tls-end-ack", ssl_write_all(c->ssl, "ack", 3) == 0);
+    REQUIRE("xhttp/tls-end-ack", tls_fixture_ack(c) == 0);
     wait_tls_fixture(c);
     CHECK("xhttp/tls-chunked-eof", xhttp_fixture_read(c, data, sizeof(data), &length) == 0 && !length && !c->xmux_http1_id);
     CHECK("xhttp/tls-final-flags-restored", fcntl(c->fd, F_GETFL, 0) == flags);
@@ -863,6 +887,7 @@ int main(int argc, char **argv) {
     streamed_packet_wire();
     zero_minimum_post_interval();
     exact_read_drains_buffered_http2();
+    asynchronous_tls_read_preserves_deadline();
     tls13_conn_t oversized_h2={.mode=CONN_MODE_GRPC_PLAIN}; core_http2_frame_t invalid_frame;
     const uint8_t oversized_header[]={1,0,0,0,0,0,0,0,1};
     REQUIRE("h2/oversized-frame-header-fixture",db_append(&oversized_h2.h2_net_cache,oversized_header,sizeof(oversized_header)) == 0);

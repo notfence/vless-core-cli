@@ -7,6 +7,8 @@ static int session_failure;
 static uint64_t pacing_clock;
 static uint32_t pacing_random;
 static mux_actor_t *scheduling_actor;
+static int retiring_probe;
+static int scheduling_retire(void *physical) { (void)physical; return retiring_probe; }
 static int scheduling_waits[3],scheduling_polls;
 uint64_t __real_core_now_ms(void);
 int __real_RAND_bytes(unsigned char *,int);
@@ -116,7 +118,9 @@ static void worker_progress_policy(void) {
     core_http2_backend_t backend=finish_backend;
     backend.open=scheduling_open; backend.close=scheduling_close; backend.fd=scheduling_fd;
     backend.collect=scheduling_collect; backend.read_frame=scheduling_frame; backend.flush=scheduling_flush;
-    for (int blocked=0;blocked<2;blocked++) {
+    backend.retire=scheduling_retire;
+    for (int retiring=0;retiring<2;retiring++) for (int blocked=0;blocked<2;blocked++) {
+        retiring_probe=retiring;
         mux_manager_t manager={.backend=&backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
         mux_group_t group={.manager=&manager};
         mux_actor_t actor={.manager=&manager,.group=&group,.peer_frame=16384,.peer_concurrency=UINT32_MAX,
@@ -132,6 +136,7 @@ static void worker_progress_policy(void) {
         memset(&scheduling_wire,0,sizeof(scheduling_wire)); scheduling_polls=0;
         streams=&stream; upload_bytes=sizeof(payload); actor_count=1; scheduling_actor=&actor;
         actor_worker(&actor); scheduling_actor=NULL;
+        CHECK("tls12/pool-rotation-keeps-active-transfer",actor.draining == retiring);
         CHECK("xmux/worker-progress-bounded-passes",scheduling_polls == 3 && !actor_count && upload_bytes == stream.tx.length);
         if (blocked) {
             CHECK("xmux/worker-blocked-upload-still-waits",scheduling_waits[0] == 10 && scheduling_waits[1] == 10 && scheduling_waits[2] == 10 && stream.tx.length == sizeof(payload));
@@ -141,6 +146,7 @@ static void worker_progress_policy(void) {
         }
         core_http2_queue_clear(&stream.tx); close(stream.notify[0]); close(stream.notify[1]); streams=NULL; upload_bytes=0;
     }
+    retiring_probe=0;
 }
 
 static int receive_request(void *physical,const vless_config_t *config,const char *session,uint64_t sequence,int role,const uint8_t *data,size_t length,uint32_t *id,uint32_t limit,size_t *consumed,size_t *body) {

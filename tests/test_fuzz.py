@@ -73,7 +73,8 @@ def seeds():
               b"\x01\x02\xf0\x9f\x89\x00\x80\x02\x98\x80",b"\xc2\x00",b"\x80\x00",b"\x82\x80"+bytes(4),b"\x88\x03\x03\xe8\xff"],
         "vision":[*[bytes(16)+bytes([command,0,10,0,0])+b"vless-core" for command in (0,1,2)],
                   b"\x00\x00vless-core",b"\x00\x0avless-coretail",b"\x00\xff",b"\x01\x00",b"short tail"],
-        "tls":[b"\x02"+len(hello).to_bytes(3,"big")+hello,b"\x16\x03\x03\x00\x0avless-core",b"\x0b\x00\x00\x05\x00\x00\x00\x01\x00"],
+        "tls":[b"\x02"+len(hello).to_bytes(3,"big")+hello,b"\x02\x00\x00\x26\x03\x03"+bytes(32)+b"\x00\xcc\xa9\x00",
+               b"\x16\x03\x03\x00\x0avless-core",b"\x0b\x00\x00\x05\x00\x00\x00\x01\x00"],
         "encryption":[b"\x02vless-core",b"\x03vless-core",b"\x06vless-core",b"\x07vless-core",b"\x0bvless-core",b"\x12vless-core",b"\x16vless-core",bytes(21)],
     }
 
@@ -93,7 +94,7 @@ class FuzzTests(unittest.TestCase):
                 log = BUILD/f"fuzz-{parser}-{time.monotonic_ns()}.log"
                 command = [str(binary),str(corpus),f"-runs={runs}","-seed=13371337","-max_len=4096","-timeout=3",
                            "-rss_limit_mb=1024",f"-artifact_prefix={BUILD}/fuzz-{parser}-"]
-                environment = dict(os.environ,VC_FUZZ_PARSER=parser,ASAN_OPTIONS="detect_leaks=1",UBSAN_OPTIONS="halt_on_error=1")
+                environment = dict(os.environ,VC_FUZZ_PARSER=parser,ASAN_OPTIONS="detect_leaks=1",UBSAN_OPTIONS="halt_on_error=1",DEBUGINFOD_URLS="")
                 with log.open("wb") as output:
                     result = subprocess.run(command,env=environment,stdout=output,stderr=subprocess.STDOUT,timeout=180)
                 self.assertEqual(result.returncode,0,f"{parser}: {log.read_text()[-4000:]}\nlog: {log}")

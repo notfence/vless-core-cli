@@ -881,6 +881,7 @@ static void *actor_worker(void *opaque) {
         pthread_mutex_lock(&mux_lock);
         uint64_t enqueued_before=actor->enqueued,flushed_before=actor->flushed;
         int received_frame=0;
+        if (backend->retire && backend->retire(actor->physical)) actor->draining=1;
         int result=advance_streams(actor);
         int in_use=0;
         for (core_http2_stream_t *stream=streams;stream;stream=stream->next)
