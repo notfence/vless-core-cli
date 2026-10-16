@@ -381,6 +381,34 @@ class CliTests(unittest.TestCase):
             with self.subTest(option=option):
                 result = self.invoke([option]); self.assertEqual(result.returncode,0); self.assertIn(expected,result.stdout+result.stderr)
 
+    def test_xray_version_strict_argv_env_and_precedence(self):
+        invalid=("", "+1.2.3", "1.+2.3", "1.2.+3", "-0.2.3", "1.-0.3", "1.2.-0", " 1.2.3", "1. 2.3", "1.2.3 ",
+                 "1.2", "1..3", "1.2.", "1.2.3.4", "1.2.3junk", "256.0.0", "0.256.0", "0.0.256",
+                 "4294967296.6.27", "26.4294967296.27", "26.6.4294967296", "18446744073709551616.6.27",
+                 "26.6.18446744073709551616", "vless-core-private-version-value")
+        for source in ("argv","env"):
+            for version in invalid:
+                with self.subTest(source=source,version=version):
+                    environment=dict(os.environ,XRAY_VER=version if source == "env" else "26.6.27")
+                    arguments=[str(BUILD/"vless-core-test"),"--uri-fd","0","--listen-port",str(fixtures.port())]
+                    if source == "argv": arguments.extend(["--xray-version",version])
+                    with subprocess.Popen(arguments,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=environment) as process:
+                        stalled=False
+                        try: process.wait(timeout=0.7)
+                        except subprocess.TimeoutExpired: stalled=True; process.kill()
+                        stdout,stderr=process.communicate(timeout=2)
+                        self.assertFalse(stalled,"invalid Xray version reached configuration input")
+                        self.assertNotEqual(process.returncode,0)
+                        self.assertIn("Xray version",stderr)
+                        self.assertNotIn("listening",stdout+stderr)
+                        self.assertNotIn("vless-core-private-version-value",stdout+stderr)
+        for version in ("0.0.0","255.255.255","026.006.027"):
+            with self.subTest(source="env",version=version), cli("socks5://127.0.0.1:1080#vless-core",environment={"XRAY_VER":version}) as core:
+                self.assertIsNone(core.process.poll(),core.log)
+            with self.subTest(source="argv-priority",version=version), cli("socks5://127.0.0.1:1080#vless-core",extra=["--xray-version",version],
+                       environment={"XRAY_VER":"vless-core-private-version-value"}) as core:
+                self.assertIsNone(core.process.poll(),core.log)
+
     def test_invalid_arguments_and_sources(self):
         for args in ([],["--uri","socks5://127.0.0.1","--listen-port","65536"],["--uri-fd","-1","--listen-port","12345"],["--uri","socks5://127.0.0.1","--uri","socks5://127.0.0.2","--listen-port","12345"],["--uri","socks5://127.0.0.1","--listen-port","12345","--route-control-port","1","--route-control-socket","/tmp/vless-core"],["--uri","socks5://127.0.0.1","--listen-port","12345","--route-control-socket","relative"],["--uri","socks5://127.0.0.1","--listen-port","12345","--xray-version","256.0.0"]):
             with self.subTest(args=args):

@@ -61,7 +61,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             offset+=strlen(input+offset)+1;
         }
         core_cli_args_t parsed;
-        (void)core_cli_args_parse(count,arguments,&parsed,error,sizeof(error));
+        int result=core_cli_args_parse(count,arguments,&parsed,error,sizeof(error));
+        if (!result && parsed.xray_version) {
+            uint8_t before[3]; memcpy(before,g_xray_version,sizeof(before));
+            if (tls13_reality_set_xray_version(parsed.xray_version) && memcmp(before,g_xray_version,sizeof(before))) abort();
+        }
         core_cli_args_scrub(count,arguments);
         free(input);
         break;

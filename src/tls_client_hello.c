@@ -7,16 +7,21 @@ static uint8_t g_xray_version[3] = {
 };
 
 int tls13_reality_set_xray_version(const char *value) {
-    unsigned int x = 0, y = 0, z = 0;
-    char trailing = '\0';
-    if (value == NULL ||
-        sscanf(value, "%u.%u.%u%c", &x, &y, &z, &trailing) != 3 ||
-        x > 255 || y > 255 || z > 255) {
-        return -1;
+    if (!value) return -1;
+    uint8_t parsed[3];
+    for (unsigned component=0;component<3;component++) {
+        unsigned number=0;
+        if (*value < '0' || *value > '9') return -1;
+        do {
+            unsigned digit=(unsigned)(*value-'0');
+            if (number > (255U-digit)/10U) return -1;
+            number=number*10U+digit; value++;
+        } while (*value >= '0' && *value <= '9');
+        parsed[component]=(uint8_t)number;
+        if (*value != (component == 2 ? '\0' : '.')) return -1;
+        if (component != 2) value++;
     }
-    g_xray_version[0] = (uint8_t)x;
-    g_xray_version[1] = (uint8_t)y;
-    g_xray_version[2] = (uint8_t)z;
+    memcpy(g_xray_version,parsed,sizeof(parsed));
     return 0;
 }
 

@@ -53,6 +53,28 @@ static void clear_conn(tls13_conn_t *c) {
     core_hpack_clear(&c->hpack);
 }
 
+static void xray_version_cases(void) {
+    static const uint8_t defaults[]={XRAY_DEFAULT_VERSION_X,XRAY_DEFAULT_VERSION_Y,XRAY_DEFAULT_VERSION_Z};
+    CHECK("tls/xray-version-default-unchanged",!memcmp(g_xray_version,defaults,sizeof(defaults)));
+    for (unsigned component=0;component<3;component++) for (unsigned value=0;value<=255;value++) {
+        uint8_t expected[]={26,6,27}; expected[component]=(uint8_t)value; char version[32];
+        snprintf(version,sizeof(version),"%u.%u.%u",expected[0],expected[1],expected[2]);
+        CHECK("tls/xray-version-each-byte-range",tls13_reality_set_xray_version(version) == 0 && !memcmp(g_xray_version,expected,3));
+    }
+    CHECK("tls/xray-version-leading-zero-decimal",tls13_reality_set_xray_version("000.001.002") == 0 && !memcmp(g_xray_version,"\x00\x01\x02",3));
+    const char *invalid[]={NULL,"",".","..","1.2","1..3",".2.3","1.2.","1.2.3.4","1.2.3junk",
+        "+1.2.3","1.+2.3","1.2.+3","-0.2.3","1.-0.3","1.2.-0"," 1.2.3","1. 2.3","1.2.3 ","1.\t2.3",
+        "256.0.0","0.256.0","0.0.256","4294967296.6.27","26.4294967296.27","26.6.4294967296",
+        "18446744073709551616.6.27","26.18446744073709551616.27","26.6.18446744073709551616",
+        "999999999999999999999999999999999999999999999999.0.0"};
+    for (size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
+        uint8_t before[3]; memcpy(before,g_xray_version,3);
+        CHECK("tls/xray-version-malformed-rejected",tls13_reality_set_xray_version(invalid[i]) != 0);
+        CHECK("tls/xray-version-failure-is-atomic",!memcmp(before,g_xray_version,3));
+    }
+    REQUIRE("tls/xray-version-default-restored",tls13_reality_set_xray_version("26.3.27") == 0);
+}
+
 static void pooled_receive_window(void) {
     int pair[2]; REQUIRE("h2/pooled-preface-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
     tls13_conn_t connection={.mode=CONN_MODE_GRPC_PLAIN,.fd=pair[0],.xmux_physical=1,.xmux_async=1};
@@ -948,7 +970,7 @@ int main(int argc, char **argv) {
     CHECK("tls/alpn-default", build_xhttp_tls_alpn(NULL, alpn, sizeof(alpn), &alpn_length) == 0 && alpn_length == 12 && alpn[0] == 2 && memcmp(alpn+1, "h2", 2) == 0);
     CHECK("tls/alpn-h1", build_xhttp_tls_alpn("http/1.1", alpn, sizeof(alpn), &alpn_length) == 0 && alpn_length == 9);
     CHECK("tls/alpn-capacity", build_xhttp_tls_alpn(NULL, alpn, 2, &alpn_length) != 0);
-    CHECK("tls/xray-version", tls13_reality_set_xray_version("26.6.27") == 0 && g_xray_version[1] == 6 && tls13_reality_set_xray_version("256.0.0") != 0 && tls13_reality_set_xray_version("1.2.3x") != 0); tls13_reality_set_xray_version("26.3.27");
+    xray_version_cases();
     cache_tls_aes_fallback(cfg.server_host, 443, cfg.sni);
     CHECK("tls/aes-cache-isolation", tls_aes_fallback_cached(cfg.server_host, 443, cfg.sni) && !tls_aes_fallback_cached(cfg.server_host, 444, cfg.sni) && !tls_aes_fallback_cached(cfg.server_host, 443, "other.test"));
     struct sockaddr_in address = {.sin_family=AF_INET,.sin_port=htons(443),.sin_addr.s_addr=htonl(INADDR_LOOPBACK)}; struct sockaddr_storage found; socklen_t found_size;
