@@ -380,7 +380,7 @@ static mux_actor_t *new_actor(mux_group_t *group, int budget, core_http2_stream_
     else if (!actor->alive_period) actor->alive_period=45;
     if (actor->alive_period < 0) actor->alive_period=0;
     struct sockaddr_storage numeric; socklen_t numeric_length;
-    actor->progress_stage=(core_server_ip_count() && !manager->config.ignore_server_ips) ||
+    actor->progress_stage=core_ip_count(core_config_ip_source(&manager->config)) ||
         core_numeric_address(manager->config.server_host,manager->config.server_port,&numeric,&numeric_length) == 1 ? CORE_TRACE_TCP : CORE_TRACE_DNS;
     core_trace_stage(actor->progress_stage);
     actor->trace_present=core_trace_snapshot(&actor->trace);
@@ -455,9 +455,10 @@ static mux_actor_t *choose_actor(mux_manager_t *manager, int budget, core_http2_
 
 static mux_manager_t *get_manager(const vless_config_t *config, const core_http2_backend_t *backend) {
     uint8_t pins[32]={0};
-    for (size_t i=0;i<core_server_ip_count();i++) {
+    int source=core_config_ip_source(config);
+    for (size_t i=0;i<core_ip_count(source);i++) {
         struct sockaddr_storage address={0}; socklen_t length=0;
-        if (core_server_address_at(i,config->server_port,&address,&length)) continue;
+        if (core_ip_address_at(source,i,config->server_port,&address,&length)) continue;
         uint8_t material[32+sizeof(address)]; memcpy(material,pins,32); memcpy(material+32,&address,length);
         blake3_hash(material,32+length,pins);
     }

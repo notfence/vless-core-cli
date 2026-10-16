@@ -440,6 +440,26 @@ class XrayTests(unittest.TestCase):
                                 self.assertIn(b"x-vless-core-channel: download\r\n",down_data)
                                 self.assertIn(b"get /download/",down_data)
 
+    def test_xhttp_separate_download_ip_pins(self):
+        cert,_=certificate()
+        for security,alpn in (("none",None),("tls","http/1.1"),("tls","h2"),("reality",None)):
+            shared={"sessionIDPlacement":"header","sessionIDKey":"X-vless-core-session","seqPlacement":"header"}
+            with self.subTest(security=security,alpn=alpn), Server() as target, xray_server("xhttp",security,path="/",**shared) as reference, CountingProxy(reference.port) as upload, CountingProxy(reference.port,address="127.0.0.2") as download:
+                settings={"address":"download.invalid","port":download.port,"network":"xhttp","security":security,"xhttpSettings":{"path":"/download",**shared}}
+                if security == "tls": settings["tlsSettings"]={"serverName":"vless-core.test","alpn":[alpn]}
+                if security == "reality": settings["realitySettings"]={"serverName":"vless-core.test","publicKey":PUBLIC_KEY,"shortId":"01020304","fingerprint":"firefox"}
+                extra={"downloadSettings":settings,"xmux":{"maxConnections":1},**shared}
+                params={"mode":"stream-up","path":"/upload","extra":json.dumps(extra)}
+                if alpn: params["alpn"]=alpn
+                with cli(uri(upload.port,"xhttp",security,**params),extra=["--server-ips","127.0.0.1","--download-server-ips","127.0.0.3,127.0.0.2"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                    for index in range(3):
+                        try:
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core separate pinned download"*10000+bytes([index]))
+                        except Exception:
+                            self.fail(core.log)
+                    self.assertGreater(len(upload.client_data),0)
+                    self.assertGreater(len(download.client_data),0)
+
     def test_xhttp_tokenish_padding_and_existing_query_metadata(self):
         for placement in ("header","queryInHeader","query","cookie"):
             extra={"xPaddingObfsMode":True,"xPaddingPlacement":placement,"xPaddingMethod":"tokenish","xPaddingBytes":"200-300","sessionIDPlacement":"query","seqPlacement":"query"}

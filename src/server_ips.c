@@ -5,10 +5,10 @@
 
 #define SERVER_IP_OVERRIDE_MAX 64
 
-static struct sockaddr_storage g_server_ips[SERVER_IP_OVERRIDE_MAX];
-static size_t g_server_ip_count;
+typedef struct { struct sockaddr_storage addresses[SERVER_IP_OVERRIDE_MAX]; size_t count; } server_ip_list_t;
+static server_ip_list_t primary_ips, download_ips;
 
-int core_set_server_ips(const char *value) {
+static int set_ips(server_ip_list_t *list, const char *value) {
     if (value == NULL || value[0] == '\0') return -1;
 
     struct sockaddr_storage parsed[SERVER_IP_OVERRIDE_MAX];
@@ -51,23 +51,32 @@ int core_set_server_ips(const char *value) {
     }
 
     if (parsed_count == 0) return -1;
-    memcpy(g_server_ips, parsed, parsed_count * sizeof(parsed[0]));
-    g_server_ip_count = parsed_count;
+    memcpy(list->addresses, parsed, parsed_count * sizeof(parsed[0]));
+    list->count = parsed_count;
     return 0;
 }
 
-size_t core_server_ip_count(void) {
-    return g_server_ip_count;
+int core_set_server_ips(const char *value) { return set_ips(&primary_ips,value); }
+int core_set_download_server_ips(const char *value) { return set_ips(&download_ips,value); }
+size_t core_server_ip_count(void) { return primary_ips.count; }
+size_t core_ip_count(int source) { return source == CORE_IP_PRIMARY ? primary_ips.count : source == CORE_IP_DOWNLOAD ? download_ips.count : 0; }
+int core_config_ip_source(const vless_config_t *config) {
+    return config->xhttp_download_only && download_ips.count ? CORE_IP_DOWNLOAD : config->ignore_server_ips ? CORE_IP_NONE : CORE_IP_PRIMARY;
 }
 
 const struct in_addr *core_server_ip_at(size_t index) {
-    return index < g_server_ip_count && g_server_ips[index].ss_family == AF_INET ?
-        &((const struct sockaddr_in *)&g_server_ips[index])->sin_addr : NULL;
+    return index < primary_ips.count && primary_ips.addresses[index].ss_family == AF_INET ?
+        &((const struct sockaddr_in *)&primary_ips.addresses[index])->sin_addr : NULL;
 }
 
 int core_server_address_at(size_t index, uint16_t port, struct sockaddr_storage *address, socklen_t *length) {
-    if (index >= g_server_ip_count || !address || !length) return -1;
-    *address = g_server_ips[index];
+    return core_ip_address_at(CORE_IP_PRIMARY,index,port,address,length);
+}
+
+int core_ip_address_at(int source, size_t index, uint16_t port, struct sockaddr_storage *address, socklen_t *length) {
+    const server_ip_list_t *list=source == CORE_IP_PRIMARY ? &primary_ips : source == CORE_IP_DOWNLOAD ? &download_ips : NULL;
+    if (!list || index >= list->count || !address || !length) return -1;
+    *address = list->addresses[index];
     if (address->ss_family == AF_INET) {
         struct sockaddr_in *ipv4 = (struct sockaddr_in *)address;
         ipv4->sin_port = htons(port); *length = sizeof(*ipv4);

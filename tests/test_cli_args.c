@@ -27,6 +27,14 @@ int main(void) {
         CHECK("arguments/leading-zeroes-and-help-alias",core_cli_args_parse(4,arguments,&result,error,sizeof(error)) == 0 && result.action == CORE_CLI_HELP);
     }
     char *version[]={"vless-core","-v"};
+    char *inspection[]={"vless-core","--inspect-config","--uri-fd","0"};
+    CHECK("arguments/offline-inspection",core_cli_args_parse(4,inspection,&result,error,sizeof(error)) == 0 && result.action == CORE_CLI_INSPECT && result.source == CORE_CLI_URI_FD && !result.listen_port);
+    for (unsigned i=0;i<2;i++) {
+        char *conflicting[]={"vless-core","--uri-fd","0","--inspect-config",i ? "--help" : "--inspect-config"};
+        CHECK("arguments/inspection-action-conflicts",core_cli_args_parse(5,conflicting,&result,error,sizeof(error)) < 0);
+    }
+    char *inspection_listener[]={"vless-core","--inspect-config","--uri-fd","0","--listen-port","1080"};
+    CHECK("arguments/inspection-does-not-start-listener",core_cli_args_parse(6,inspection_listener,&result,error,sizeof(error)) < 0);
     CHECK("arguments/version-alias",core_cli_args_parse(2,version,&result,error,sizeof(error)) == 0 && result.action == CORE_CLI_VERSION);
     char *private_value[]={"vless-core","vless-core-private-value"};
     CHECK("arguments/unknown-values-are-not-logged",core_cli_args_parse(2,private_value,&result,error,sizeof(error)) < 0 && !strstr(error,private_value[1]));

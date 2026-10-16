@@ -50,12 +50,15 @@ core_dialer_t *core_dialer_start(const char *host, uint16_t port, int use_server
     dialer->until_ms=core_now_ms()+(unsigned)(core_deadline_active() ? core_deadline_remaining() : timeout_ms);
     dialer->last_error=ECONNREFUSED;
     dialer->attempts[0].fd=dialer->attempts[1].fd=-1;
-    if (preferred && append_address(dialer,preferred,preferred_length) != 0) goto failure;
-    dialer->has_preferred=preferred != NULL;
-    if (use_server_ips && core_server_ip_count()) {
-        for (size_t i=0;i<core_server_ip_count();i++) {
+    if (preferred && !core_ip_count(use_server_ips) && append_address(dialer,preferred,preferred_length) != 0) goto failure;
+    dialer->has_preferred=preferred != NULL && !core_ip_count(use_server_ips);
+    if (core_ip_count(use_server_ips)) {
+        for (size_t i=0;i<core_ip_count(use_server_ips);i++) {
             struct sockaddr_storage address; socklen_t length;
-            if (core_server_address_at(i,port,&address,&length) != 0 || append_address(dialer,(void *)&address,length) != 0) goto failure;
+            if (core_ip_address_at(use_server_ips,i,port,&address,&length) != 0 || append_address(dialer,(void *)&address,length) != 0) goto failure;
+        }
+        if (preferred) for (size_t i=0;i<dialer->count;i++) if (dialer->addresses[i].length == preferred_length && !memcmp(&dialer->addresses[i].address,preferred,preferred_length)) {
+            dialer_address_t first=dialer->addresses[0]; dialer->addresses[0]=dialer->addresses[i]; dialer->addresses[i]=first; dialer->has_preferred=1; break;
         }
         dialer->resolved[0]=dialer->resolved[1]=1;
     } else {

@@ -149,6 +149,18 @@ int main(void) {
     CHECK("dial/delayed-dns-budget", core_dialer_next(dialer,NULL,NULL) < 0 && errno == ETIMEDOUT && core_now_ms()-started < 150 && !connect_count);
     core_dialer_free(dialer); core_deadline_end();
     struct timespec settle={1,0}; nanosleep(&settle,NULL);
+    fixture_mode=0; connect_count=0; stalled_fd=-1;
+    uint16_t pinned_port; int pinned_server=listener(AF_INET,&pinned_port);
+    REQUIRE("dial/separate-primary-pins",core_set_server_ips("127.0.0.2") == 0);
+    REQUIRE("dial/separate-download-pins",core_set_download_server_ips("127.0.0.1") == 0);
+    struct sockaddr_storage wrong; socklen_t wrong_length;
+    REQUIRE("dial/cached-primary-address",core_ip_address_at(CORE_IP_PRIMARY,0,pinned_port,&wrong,&wrong_length) == 0);
+    dialer=core_dialer_start("download.invalid",pinned_port,CORE_IP_DOWNLOAD,1000,(void *)&wrong,wrong_length);
+    REQUIRE("dial/pinned-no-dns-or-outside-cache",dialer && !dialer->queries[0] && !dialer->queries[1] && dialer->count == 1 && !dialer->has_preferred);
+    int pinned=core_dialer_next(dialer,NULL,NULL);
+    CHECK("dial/download-isolated-connect",pinned >= 0 && connect_count == 1);
+    if (pinned >= 0) close(pinned);
+    core_dialer_free(dialer); close(pinned_server);
     core_deadline_detach();
     return test_result();
 }

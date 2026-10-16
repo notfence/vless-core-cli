@@ -5,13 +5,14 @@
 #include <string.h>
 #include <openssl/crypto.h>
 
-enum { URI, URI_FD, CONNECTION_FD, LISTEN, ROUTE_PORT, TIMEOUT, ROUTING, ROUTE_SOCKET, IPS, XRAY_VERSION, HELP, VERSION, PATCH };
+enum { URI, URI_FD, CONNECTION_FD, LISTEN, ROUTE_PORT, TIMEOUT, ROUTING, ROUTE_SOCKET, IPS, DOWNLOAD_IPS, XRAY_VERSION, HELP, VERSION, PATCH, INSPECT };
 typedef struct { const char *name; unsigned id, value, minimum, maximum; } option_t;
 static const option_t options[]={
     {"--uri",URI,1,0,0},{"--uri-fd",URI_FD,1,0,INT_MAX},{"--connection-fd",CONNECTION_FD,1,0,INT_MAX},
     {"--listen-port",LISTEN,1,1,65535},{"--route-control-port",ROUTE_PORT,1,0,65535},
     {"--connect-timeout-ms",TIMEOUT,1,1,300000},{"--routing",ROUTING,1,0,0},
     {"--route-control-socket",ROUTE_SOCKET,1,0,0},{"--server-ips",IPS,1,0,0},{"--xray-version",XRAY_VERSION,1,0,0},
+    {"--download-server-ips",DOWNLOAD_IPS,1,0,0},{"--inspect-config",INSPECT,0,0,0},
     {"--help",HELP,0,0,0},{"-h",HELP,0,0,0},{"--version",VERSION,0,0,0},{"-v",VERSION,0,0,0},
     {"--openssl-patch-status",PATCH,0,0,0}
 };
@@ -46,7 +47,10 @@ int core_cli_args_parse(int count, char *const *arguments, core_cli_args_t *resu
         const option_t *option=lookup(arguments[i]);
         if (!option) return error(message,capacity,"unknown startup argument",NULL);
         if (!option->value) {
-            if (!result->action) result->action=option->id == HELP ? CORE_CLI_HELP : option->id == VERSION ? CORE_CLI_VERSION : CORE_CLI_PATCH_STATUS;
+            if (option->id == INSPECT && (seen&(1U<<INSPECT))) return error(message,capacity,"duplicate startup parameter",option->name);
+            if ((option->id == INSPECT && result->action) || result->action == CORE_CLI_INSPECT) return error(message,capacity,"conflicting startup actions",option->name);
+            if (!result->action) result->action=option->id == HELP ? CORE_CLI_HELP : option->id == VERSION ? CORE_CLI_VERSION : option->id == INSPECT ? CORE_CLI_INSPECT : CORE_CLI_PATCH_STATUS;
+            seen|=1U<<option->id;
             continue;
         }
         if (seen&(1U<<option->id)) return error(message,capacity,"duplicate startup parameter",option->name);
@@ -69,8 +73,13 @@ int core_cli_args_parse(int count, char *const *arguments, core_cli_args_t *resu
                 if (result->source == CORE_CLI_CONNECTION_FD) return error(message,capacity,"conflicting server IP sources",option->name);
                 result->server_ips=value; break;
             case XRAY_VERSION: result->xray_version=value; break;
+            case DOWNLOAD_IPS: result->download_server_ips=value; break;
         }
         seen|=1U<<option->id;
+    }
+    if (result->action == CORE_CLI_INSPECT) {
+        if (result->source != CORE_CLI_URI_FD || (seen&~((1U<<URI_FD)|(1U<<INSPECT)))) return error(message,capacity,"inspection requires only --uri-fd","--inspect-config");
+        return 0;
     }
     if (!result->action && !result->source) return error(message,capacity,"missing URI source","--uri/--uri-fd/--connection-fd");
     if (!result->action && !result->listen_port) return error(message,capacity,"missing startup parameter","--listen-port");

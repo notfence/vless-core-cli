@@ -162,7 +162,7 @@ struct tls13_conn {
     unsigned h2_response_count;
     int64_t h2_receive_window;
     int fd;
-    int ignore_server_ips;
+    int ignore_server_ips, ip_source;
     conn_mode_t mode;
     int xhttp_upload_fd;
     pthread_t xhttp_upload_reader;

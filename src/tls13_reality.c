@@ -2436,7 +2436,7 @@ static int xhttp_http1_packet_request(tls13_conn_t *connection, const char *path
 
 static int xhttp_post_packet_plain(tls13_conn_t *c, const uint8_t *buf, size_t *length, char *err, size_t err_cap) {
     if (xhttp_wait_post(c,err,err_cap) != 0) return -1;
-    int fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
+    int fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
     if (fd < 0) {
         set_err(err, err_cap, "tcp connect failed");
         return -1;
@@ -2490,7 +2490,7 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length
             set_err(err, err_cap, "failed to build TOFU pin key");
             return -1;
         }
-        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd, &c->tls_use_aes_fallback, err,
+        if (open_tls_socket(c->ip_source, c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd, &c->tls_use_aes_fallback, err,
                             err_cap) != 0) {
             return -1;
         }
@@ -2504,7 +2504,7 @@ static int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length
         c->xhttp_tls_insecure = 1;
     } else {
         int verify_peer = c->xhttp_tls_insecure ? 0 : tls_verify_peer(mode);
-        if (open_tls_socket(!c->ignore_server_ips, c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &ctx, &ssl, &fd,
+        if (open_tls_socket(c->ip_source, c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &ctx, &ssl, &fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
         }
@@ -2894,7 +2894,7 @@ static int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *
     struct sockaddr_storage cached_address;
     socklen_t cached_length = 0;
     int cached = get_cached_tls_endpoint(cfg, sni, &cached_address, &cached_length);
-    core_dialer_t *dialer = core_dialer_start(cfg->server_host, cfg->server_port, !cfg->ignore_server_ips, CORE_CONNECT_TIMEOUT_MS,
+    core_dialer_t *dialer = core_dialer_start(cfg->server_host, cfg->server_port, core_config_ip_source(cfg), CORE_CONNECT_TIMEOUT_MS,
         cached ? (const struct sockaddr *)&cached_address : NULL, cached_length);
     if (!dialer) { set_connect_err(err, err_cap, "tcp resolve failed"); return -1; }
     char last_err[256] = {0};
@@ -3022,7 +3022,7 @@ static int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, siz
             set_err(err,err_cap,"WebSocket server selected incompatible ALPN"); return -1;
         }
     } else {
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;
@@ -3095,7 +3095,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
 
     if (strcmp(cfg->security, "none") == 0) {
         c->mode = CONN_MODE_XHTTP_PLAIN;
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;
@@ -3110,7 +3110,7 @@ static int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, 
             return -1;
         }
         if (strcmp(c->xhttp_transport_mode, "stream-up") == 0) {
-            c->xhttp_upload_fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
+            c->xhttp_upload_fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
             if (c->xhttp_upload_fd < 0) {
                 set_err(err, err_cap, "xhttp upload tcp connect failed");
                 return -1;
@@ -3197,7 +3197,7 @@ static int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, s
 
     if (strcmp(cfg->security, "none") == 0) {
         c->mode = CONN_MODE_GRPC_PLAIN;
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port, !c->ignore_server_ips);
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;
@@ -3230,6 +3230,7 @@ static int tls13_connect_budgeted(const vless_config_t *cfg, tls13_conn_t **out,
     }
     c->fd = -1;
     c->ignore_server_ips=cfg->ignore_server_ips;
+    c->ip_source=core_config_ip_source(cfg);
     c->xhttp_upload_fd = -1;
     c->mode = CONN_MODE_REALITY;
     c->input_memory=input_memory; c->output_memory=output_memory;
@@ -3286,7 +3287,7 @@ static int tls13_connect_budgeted(const vless_config_t *cfg, tls13_conn_t **out,
 
     if (strcmp(cfg->security, "none") == 0) {
         c->mode = CONN_MODE_PLAIN;
-        c->fd = tcp_connect_host(cfg->server_host, cfg->server_port, !cfg->ignore_server_ips);
+        c->fd = tcp_connect_host(cfg->server_host, cfg->server_port, core_config_ip_source(cfg));
         if (c->fd < 0) {
             tls13_reality_close(c);
             set_err(err, err_cap, "tcp connect failed");

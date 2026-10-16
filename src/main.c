@@ -22,6 +22,7 @@
 #include "socks5_upstream.h"
 #include "routing.h"
 #include "server_ips.h"
+#include "config_inspect.h"
 #include "socket_util.h"
 #include "tls13_reality.h"
 #include "types.h"
@@ -1210,6 +1211,8 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --uri <uri>              VLESS URI or SOCKS5 upstream URI\n");
     fprintf(stderr, "  --uri-fd <fd>            Read the URI from a file descriptor\n");
     fprintf(stderr, "  --connection-fd <fd>     Read URI and pre-resolved server IPs from a file descriptor\n");
+    fprintf(stderr, "  --inspect-config        Validate --uri-fd and print server endpoints without connecting\n");
+    fprintf(stderr, "  --download-server-ips <list> Pre-resolved download-channel addresses\n");
     fprintf(stderr, "  --listen-port <port>     Local SOCKS5 listen port (127.0.0.1)\n");
     fprintf(stderr, "  --connect-timeout-ms <n> Connection budget, 1-300000 ms (default 30000)\n");
     fprintf(stderr, "  --routing <rules>        Optional Proxy, Direct and Block rules\n");
@@ -1326,7 +1329,7 @@ int main(int argc, char **argv) {
     if (core_cli_args_parse(argc,argv,&arguments,argument_error,sizeof(argument_error))) {
         vc_log_error("startup","%s",argument_error); goto startup_failure;
     }
-    if (arguments.action) {
+    if (arguments.action && arguments.action != CORE_CLI_INSPECT) {
         core_cli_args_scrub(argc,argv);
         if (arguments.action == CORE_CLI_HELP) usage(prog);
         else if (arguments.action == CORE_CLI_VERSION) printf("vless-core %s\n",VLESS_CORE_VERSION);
@@ -1388,6 +1391,19 @@ int main(int argc, char **argv) {
         goto startup_failure;
     }
     OPENSSL_cleanse(uri_storage,sizeof(uri_storage));
+    if (arguments.action == CORE_CLI_INSPECT) {
+        char output[1024];
+        if (core_config_inspect(&cfg,output,sizeof(output),err,sizeof(err))) {
+            vc_log_error("startup","configuration inspection failed: %s",err); goto startup_failure;
+        }
+        OPENSSL_cleanse(&cfg,sizeof(cfg));
+        int result=fputs(output,stdout) < 0 || fflush(stdout) != 0;
+        OPENSSL_cleanse(output,sizeof(output));
+        return result;
+    }
+    if (arguments.download_server_ips && (!cfg.xhttp_download_settings[0] || strlen(arguments.download_server_ips) > SERVER_IP_LIST_MAX_LENGTH || core_set_download_server_ips(arguments.download_server_ips))) {
+        vc_log_error("startup","invalid --download-server-ips or missing downloadSettings"); goto startup_failure;
+    }
     if (server_ips != NULL) {
         if (core_set_server_ips(server_ips) != 0) {
             vc_log_error("startup", "invalid pre-resolved server IP list");

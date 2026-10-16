@@ -11,6 +11,21 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_inspection_is_private_and_offline(self):
+        configurations=(("socks5://user:private-vless-core@no-dns.invalid:1080#vless-core", "PRIMARY\tno-dns.invalid\t1080\n"),
+            (uri(443,"xhttp","none",downloadSettings=json.dumps({"address":"download.invalid","port":8443,"network":"xhttp"})), "PRIMARY\t127.0.0.1\t443\nDOWNLOAD\tdownload.invalid\t8443\n"))
+        for config,endpoints in configurations:
+            with self.subTest(config=config.split("?",1)[0].split("@")[-1]):
+                result=subprocess.run([str(BUILD/"vless-core-test"),"--inspect-config","--uri-fd","0"],input=config,text=True,capture_output=True,timeout=3)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout,"CONFIG\t1\n"+endpoints+"END\n")
+                self.assertNotIn("private-vless-core",result.stdout+result.stderr)
+                self.assertNotIn("listening",result.stdout+result.stderr)
+        result=subprocess.run([str(BUILD/"vless-core-test"),"--inspect-config","--uri-fd","0"],input="vless-core-invalid-secret",text=True,capture_output=True,timeout=3)
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(result.stdout,"")
+        self.assertNotIn("vless-core-invalid-secret",result.stderr)
+
     def test_tls_failures_are_not_tcp_refusals(self):
         def alert(connection):
             connection.recv(65536)
