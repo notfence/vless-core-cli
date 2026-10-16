@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "check.h"
-#include "../src/tls13_reality.c"
+#include "tls_fixture.h"
 #include "uri.h"
 #include <openssl/pem.h>
 

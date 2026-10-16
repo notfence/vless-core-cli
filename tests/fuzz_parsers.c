@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-#include "../src/tls13_reality.c"
+#include "tls_fixture.h"
 #include "uri.h"
 #include "json.h"
 #include "utils.h"

@@ -1,4 +1,5 @@
 import base64
+import errno
 import concurrent.futures
 import hashlib
 import json
@@ -1362,7 +1363,13 @@ class XrayTests(unittest.TestCase):
     def test_tls_failure_advances_to_next_pinned_address(self):
         cert,_=certificate()
         def broken(connection):
-            connection.recv(4096); connection.sendall(b"not a TLS server"); connection.shutdown(socket.SHUT_WR)
+            header=exact(connection,5)
+            self.assertEqual(header[0],22)
+            exact(connection,int.from_bytes(header[3:5],"big"))
+            connection.sendall(b"not a TLS server")
+            try: connection.shutdown(socket.SHUT_WR)
+            except OSError as error:
+                if error.errno != errno.ENOTCONN: raise
         for transport,pooled in (("ws",False),("xhttp",False),("xhttp",True),("grpc",True)):
             parameters={"extra":json.dumps({"xmux":{"maxConnections":1}})} if pooled and transport == "xhttp" else {}
             with self.subTest(transport=transport,pooled=pooled), Server() as target, xray_server(transport,"tls") as reference, Server(broken) as bad, CountingProxy(reference.port,address="127.0.0.2",listen_port=bad.port) as good:

@@ -7,7 +7,9 @@ TEST_XRAY_BIN ?= $(abspath $(ROOT)/../tools/xray-v26.6.27-linux-64/xray)
 FUZZ_CC ?= clang
 FUZZ_RUNS ?= 10000
 FUZZ_FLAGS := -O1 -g -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE -I$(ROOT)/include -I$(TEST_OPENSSL_PREFIX)/include -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
-FUZZ_SRC = $(filter-out $(ROOT)/src/tls13_reality.c,$(BASE_SRC))
+TLS_INTERNAL_SRC := $(addprefix $(ROOT)/src/,tls_client_hello.c tls_certificate.c tls_records.c tls_handshake.c)
+TLS_INTERNAL_OBJ = $(patsubst $(ROOT)/src/%.c,$(HOST_BUILD_DIR)/src/%.o,$(TLS_INTERNAL_SRC))
+FUZZ_SRC = $(filter-out $(ROOT)/src/tls13_reality.c $(TLS_INTERNAL_SRC),$(BASE_SRC))
 FUZZ_OBJ = $(patsubst $(ROOT)/src/%.c,$(HOST_BUILD_DIR)/fuzz-src/%.o,$(FUZZ_SRC))
 FUZZ_BIN := $(HOST_BUILD_DIR)/fuzz-parsers
 ENCRYPTION_FUZZ_BIN := $(HOST_BUILD_DIR)/fuzz-encryption
@@ -58,16 +60,16 @@ $(HOST_BUILD_DIR)/%.o: $(ROOT)/tests/%.c $(ROOT)/tests/check.h | requirements
 $(HOST_BUILD_DIR)/test_main: $(HOST_BUILD_DIR)/test_main.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=calloc,--wrap=pthread_create,--wrap=accept
 
-$(HOST_BUILD_DIR)/test_tls: $(HOST_BUILD_DIR)/test_tls.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+$(HOST_BUILD_DIR)/test_tls: $(HOST_BUILD_DIR)/test_tls.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=write,--wrap=rename,--wrap=fsync,--wrap=core_http2_pending,--wrap=core_now_ms,--wrap=clock_gettime,--wrap=poll,--wrap=RAND_bytes
 
-$(HOST_BUILD_DIR)/test_tls_handshake: $(HOST_BUILD_DIR)/test_tls_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+$(HOST_BUILD_DIR)/test_tls_handshake: $(HOST_BUILD_DIR)/test_tls_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
-$(HOST_BUILD_DIR)/test_tls12_handshake: $(HOST_BUILD_DIR)/test_tls12_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+$(HOST_BUILD_DIR)/test_tls12_handshake: $(HOST_BUILD_DIR)/test_tls12_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
-$(HOST_BUILD_DIR)/test_tls_state: $(HOST_BUILD_DIR)/test_tls_state.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+$(HOST_BUILD_DIR)/test_tls_state: $(HOST_BUILD_DIR)/test_tls_state.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=malloc
 
 $(HOST_BUILD_DIR)/test_socket: $(HOST_BUILD_DIR)/test_socket.o $(HOST_BUILD_DIR)/src/connection_trace.o $(HOST_BUILD_DIR)/src/core_log.o $(HOST_BUILD_DIR)/src/deadline.o $(HOST_BUILD_DIR)/src/resolver.o
@@ -94,7 +96,7 @@ $(HOST_BUILD_DIR)/test_socks5: $(HOST_BUILD_DIR)/test_socks5.o $(BASE_OBJ) $(NET
 $(HOST_BUILD_DIR)/test_xhttp_payload: $(HOST_BUILD_DIR)/test_xhttp_payload.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes
 
-$(HOST_BUILD_DIR)/test_encryption: $(HOST_BUILD_DIR)/test_encryption.o $(filter-out $(HOST_BUILD_DIR)/src/vless_encryption.o $(HOST_BUILD_DIR)/src/tls13_reality.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+$(HOST_BUILD_DIR)/test_encryption: $(HOST_BUILD_DIR)/test_encryption.o $(filter-out $(HOST_BUILD_DIR)/src/vless_encryption.o $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
 $(HOST_BUILD_DIR)/test_tls12: $(HOST_BUILD_DIR)/test_tls12.o $(filter-out $(HOST_BUILD_DIR)/src/tls12.o,$(BASE_OBJ)) $(NETWORK_GUARD)
