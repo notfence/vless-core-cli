@@ -69,7 +69,7 @@ ssize_t core_recv(int fd, void *buffer, size_t length, int flags) {
         int bounded = core_deadline_active();
         if (bounded && core_deadline_remaining() == 0) return -1;
         ssize_t result = recv(fd, buffer, length, flags | (bounded ? MSG_DONTWAIT : 0));
-        if (result >= 0 || (errno != EINTR && (!bounded || (errno != EAGAIN && errno != EWOULDBLOCK)))) return result;
+        if (result >= 0 || (errno != EINTR && (!bounded || (flags & MSG_DONTWAIT) || (errno != EAGAIN && errno != EWOULDBLOCK)))) return result;
         if (errno == EINTR) continue;
         int ready = core_wait_socket(fd, POLLIN, -1);
         if (ready <= 0) { if (ready == 0) errno = ETIMEDOUT; return -1; }
@@ -81,7 +81,7 @@ ssize_t core_send(int fd, const void *buffer, size_t length, int flags) {
         int bounded = core_deadline_active();
         if (bounded && core_deadline_remaining() == 0) return -1;
         ssize_t result = send(fd, buffer, length, flags | (bounded ? MSG_DONTWAIT : 0));
-        if (result >= 0 || (errno != EINTR && (!bounded || (errno != EAGAIN && errno != EWOULDBLOCK)))) return result;
+        if (result >= 0 || (errno != EINTR && (!bounded || (flags & MSG_DONTWAIT) || (errno != EAGAIN && errno != EWOULDBLOCK)))) return result;
         if (errno == EINTR) continue;
         int ready = core_wait_socket(fd, POLLOUT, -1);
         if (ready <= 0) { if (ready == 0) errno = ETIMEDOUT; return -1; }

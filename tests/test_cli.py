@@ -1,3 +1,4 @@
+import contextlib
 import os
 import json
 import socket
@@ -110,6 +111,38 @@ class CliTests(unittest.TestCase):
         with Server(handler) as target, cli(uri(target.port,"tcp","none"),["--connect-timeout-ms","200"]) as core:
             with socks_connect(core.port,80) as tunnel:
                 time.sleep(0.45); tunnel.sendall(b"A"); self.assertEqual(exact(tunnel,1),b"A")
+
+    def test_initial_upload_backpressure_does_not_hide_vless_response(self):
+        release=threading.Event(); completed=threading.Event(); errors=[]
+        payload=b"vless-core duplex before response\x00"*(256*1024)
+        def handler(connection):
+            exact(connection,26)
+            time.sleep(0.25); connection.sendall(b"\x00\x00READY")
+            if not release.wait(3): return
+            request=bytearray()
+            while True:
+                block=connection.recv(65536)
+                if not block: break
+                request.extend(block)
+            self.assertEqual(bytes(request),payload)
+            connection.sendall(b"DONE"); completed.set()
+        with Server(handler) as target, cli(uri(target.port),["--connect-timeout-ms","1000"]) as core:
+            with socks_connect(core.port,80) as tunnel:
+                tunnel.settimeout(5)
+                def upload():
+                    try: tunnel.sendall(payload); tunnel.shutdown(socket.SHUT_WR)
+                    except OSError as error: errors.append(error)
+                sender=threading.Thread(target=upload,daemon=True); sender.start()
+                try:
+                    self.assertEqual(exact(tunnel,5),b"READY")
+                    release.set(); self.assertEqual(exact(tunnel,4),b"DONE")
+                    self.assertEqual(tunnel.recv(1),b"")
+                    self.assertTrue(completed.wait(1))
+                finally:
+                    release.set()
+                    with contextlib.suppress(OSError): tunnel.shutdown(socket.SHUT_RDWR)
+                    sender.join(5)
+                self.assertFalse(sender.is_alive()); self.assertFalse(errors,errors)
 
     def test_complete_vless_header_disables_connection_budget_without_payload(self):
         def handler(connection):

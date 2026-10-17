@@ -3,19 +3,23 @@
 #include <arpa/inet.h>
 static int mode, interrupted;
 static volatile unsigned notify_send_interrupts,notify_recv_interrupts;
+static unsigned send_again,recv_again,poll_calls;
 ssize_t __real_send(int,const void *,size_t,int);
 ssize_t __real_recv(int,void *,size_t,int);
 ssize_t __real___recv_chk(int,void *,size_t,size_t,int);
 ssize_t __wrap_send(int fd,const void *data,size_t length,int flags) {
     if (notify_send_interrupts) { notify_send_interrupts--; errno=EINTR; return -1; }
+    if (send_again) { send_again--; errno=EAGAIN; return -1; }
     return __real_send(fd,data,length,flags);
 }
 ssize_t __wrap_recv(int fd,void *data,size_t length,int flags) {
     if (notify_recv_interrupts) { notify_recv_interrupts--; errno=EINTR; return -1; }
+    if (recv_again) { recv_again--; errno=EAGAIN; return -1; }
     return __real_recv(fd,data,length,flags);
 }
 ssize_t __wrap___recv_chk(int fd,void *data,size_t length,size_t capacity,int flags) {
     if (notify_recv_interrupts) { notify_recv_interrupts--; errno=EINTR; return -1; }
+    if (recv_again) { recv_again--; errno=EAGAIN; return -1; }
     return __real___recv_chk(fd,data,length,capacity,flags);
 }
 int __real_connect(int fd, const struct sockaddr *address, socklen_t length);
@@ -23,6 +27,7 @@ int __real_poll(struct pollfd *fds, nfds_t count, int timeout);
 int __real_getsockopt(int fd, int level, int option, void *value, socklen_t *length);
 int __wrap_connect(int fd, const struct sockaddr *address, socklen_t length) { if (mode) { errno = mode == 4 ? EINTR : EINPROGRESS; return -1; } return __real_connect(fd,address,length); }
 int __wrap_poll(struct pollfd *fds, nfds_t count, int timeout) {
+    poll_calls++;
     if (mode == 1) return 0;
     if (mode == 3 && !interrupted++) { errno = EINTR; return -1; }
     if (mode) { for (nfds_t i=0;i<count;i++) fds[i].revents=fds[i].events; return 1; }
@@ -33,6 +38,21 @@ int __wrap_getsockopt(int fd, int level, int option, void *value, socklen_t *len
     return __real_getsockopt(fd,level,option,value,length);
 }
 int main(void) {
+    int duplex[2]; REQUIRE("socket/duplex-pair",!socketpair(AF_UNIX,SOCK_STREAM,0,duplex));
+    core_deadline_t duplex_deadline; REQUIRE("socket/duplex-deadline",!core_deadline_attach(&duplex_deadline)); core_deadline_begin(1000);
+    mode=1; send_again=1; notify_send_interrupts=2; unsigned before=poll_calls;
+    CHECK("socket/nonblocking-send-preserves-eagain",core_send(duplex[0],"v",1,MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    CHECK("socket/nonblocking-send-never-waits",poll_calls == before && !notify_send_interrupts);
+    recv_again=1; notify_recv_interrupts=2; before=poll_calls; char received=0;
+    CHECK("socket/nonblocking-recv-preserves-eagain",core_recv(duplex[1],&received,1,MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    CHECK("socket/nonblocking-recv-never-waits",poll_calls == before && !notify_recv_interrupts);
+    mode=0; send_again=1; before=poll_calls;
+    CHECK("socket/blocking-send-keeps-deadline-wait",core_send(duplex[0],"v",1,0) == 1 && poll_calls == before+1);
+    recv_again=1; before=poll_calls;
+    CHECK("socket/blocking-recv-keeps-deadline-wait",core_recv(duplex[1],&received,1,0) == 1 && received == 'v' && poll_calls == before+1);
+    mode=1;
+    CHECK("socket/blocking-empty-recv-times-out",core_recv(duplex[1],&received,1,0) == -1 && errno == ETIMEDOUT);
+    mode=0; core_deadline_end(); core_deadline_detach(); close(duplex[0]); close(duplex[1]);
     int notifications[2]; REQUIRE("socket/notification-pair",!socketpair(AF_UNIX,SOCK_STREAM,0,notifications));
     for (unsigned i=0;i<2;i++) REQUIRE("socket/notification-nonblocking",!fcntl(notifications[i],F_SETFL,O_NONBLOCK));
     core_deadline_t deadline; REQUIRE("socket/notification-deadline",!core_deadline_attach(&deadline)); core_deadline_begin(1);
