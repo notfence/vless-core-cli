@@ -61,7 +61,7 @@ $(HOST_BUILD_DIR)/test_main: $(HOST_BUILD_DIR)/test_main.o $(BASE_OBJ) $(NETWORK
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=calloc,--wrap=malloc,--wrap=pthread_create,--wrap=accept
 
 $(HOST_BUILD_DIR)/test_relay_memory: $(HOST_BUILD_DIR)/test_relay_memory.o $(BASE_OBJ) $(NETWORK_GUARD)
-	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=realloc,--wrap=socketpair
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=realloc,--wrap=socketpair,--wrap=send,--wrap=recv
 
 $(HOST_BUILD_DIR)/test_tls: $(HOST_BUILD_DIR)/test_tls.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=write,--wrap=rename,--wrap=fsync,--wrap=core_http2_pending,--wrap=core_now_ms,--wrap=clock_gettime,--wrap=poll,--wrap=RAND_bytes

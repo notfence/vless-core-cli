@@ -1,4 +1,5 @@
 #include "relay_memory.h"
+#include "deadline.h"
 #include "vision.h"
 #include "check.h"
 #include <errno.h>
@@ -8,9 +9,21 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static int fail_allocation,fail_notification;
+static int fail_allocation,fail_notification,interrupt_send,interrupt_receive;
+static uint64_t notification_now;
+static uint64_t notification_clock(void) { return notification_now; }
 void *__real_realloc(void *,size_t);
 int __real_socketpair(int,int,int,int[2]);
+ssize_t __real_send(int,const void *,size_t,int);
+ssize_t __real_recv(int,void *,size_t,int);
+ssize_t __wrap_send(int fd,const void *data,size_t length,int flags) {
+    if (interrupt_send) { interrupt_send=0; errno=EINTR; return -1; }
+    return __real_send(fd,data,length,flags);
+}
+ssize_t __wrap_recv(int fd,void *data,size_t length,int flags) {
+    if (interrupt_receive) { interrupt_receive=0; errno=EINTR; return -1; }
+    return __real_recv(fd,data,length,flags);
+}
 void *__wrap_realloc(void *pointer,size_t size) {
     if (fail_allocation) { fail_allocation=0; errno=ENOMEM; return NULL; }
     return __real_realloc(pointer,size);
@@ -153,6 +166,46 @@ static void *wait_for_release(void *opaque) {
     return (void *)(intptr_t)(poll(&fd,1,1000) == 1 && core_relay_memory_ack(memory) == 3);
 }
 
+static void deadline_independent_notifications(void) {
+    core_relay_memory_t memory[4]={0}; core_buffer_budget_t pressure={0};
+    core_deadline_t deadline;
+    REQUIRE("relay-memory/deadline-attach",core_deadline_attach(&deadline) == 0);
+    deadline.now_ms=notification_clock; notification_now=100;
+    for (size_t i=0;i<4;i++) {
+        REQUIRE("relay-memory/deadline-minimum",core_relay_memory_init(memory+i,65536) == 1);
+        REQUIRE("relay-memory/deadline-watch",core_relay_memory_watch(memory+i,3) == 0);
+    }
+    REQUIRE("relay-memory/deadline-pressure",core_buffer_budget_init(&pressure,CORE_BUFFER_RELAY,core_buffer_available(CORE_BUFFER_RELAY)) == 0);
+    core_deadline_begin(10); notification_now=110;
+    errno=EACCES; interrupt_send=1;
+    REQUIRE("relay-memory/expired-worker-releases-budget",core_buffer_budget_clear(&pressure) == 0);
+    CHECK("relay-memory/notification-preserves-errno",errno == EACCES);
+    CHECK("relay-memory/notification-does-not-extend-deadline",deadline.until_ms == 110 && core_deadline_remaining() == 0);
+    for (size_t i=0;i<4;i++) {
+        struct pollfd fd={.fd=core_relay_memory_fd(memory+i),.events=POLLIN};
+        CHECK("relay-memory/expired-release-wakes-all-neighbors",poll(&fd,1,0) == 1 && (fd.revents&POLLIN));
+    }
+    core_deadline_end(); core_relay_memory_released();
+    core_deadline_begin(10); notification_now=120; interrupt_receive=1;
+    for (size_t i=0;i<4;i++) {
+        struct pollfd fd={.fd=core_relay_memory_fd(memory+i),.events=POLLIN};
+        CHECK("relay-memory/expired-ack-retains-directions",core_relay_memory_ack(memory+i) == 3);
+        CHECK("relay-memory/expired-ack-drains-notification",poll(&fd,1,0) == 0);
+    }
+    core_deadline_end();
+    REQUIRE("relay-memory/full-channel-watch",core_relay_memory_watch(memory,3) == 0);
+    uint8_t byte=1;
+    while (__real_send(memory[0].notify[1],&byte,1,MSG_DONTWAIT) == 1) {}
+    REQUIRE("relay-memory/channel-filled",errno == EAGAIN || errno == EWOULDBLOCK);
+    core_relay_memory_released();
+    CHECK("relay-memory/full-channel-coalesces",memory[0].notified == 1);
+    CHECK("relay-memory/full-channel-ack",core_relay_memory_ack(memory) == 3);
+    struct pollfd fd={.fd=memory[0].notify[0],.events=POLLIN};
+    CHECK("relay-memory/full-channel-drained",poll(&fd,1,0) == 0);
+    for (size_t i=0;i<4;i++) core_relay_memory_clear(memory+i);
+    core_deadline_detach(); empty_budget();
+}
+
 static void parallel_recovery(void) {
     core_relay_memory_t memory[16]={0}; pthread_t threads[16]; core_buffer_budget_t pressure={0};
     for (size_t i=0;i<16;i++) {
@@ -170,7 +223,28 @@ static void parallel_recovery(void) {
     empty_budget();
 }
 
+static void *release_while_closing(void *unused) {
+    (void)unused;
+    for (unsigned i=0;i<4096;i++) core_relay_memory_released();
+    return NULL;
+}
+
+static void concurrent_close(void) {
+    pthread_t thread;
+    REQUIRE("relay-memory/concurrent-release-thread",pthread_create(&thread,NULL,release_while_closing,NULL) == 0);
+    for (unsigned i=0;i<1024;i++) {
+        core_relay_memory_t memory={0};
+        REQUIRE("relay-memory/concurrent-close-init",core_relay_memory_init(&memory,65536) == 1);
+        REQUIRE("relay-memory/concurrent-close-watch",core_relay_memory_watch(&memory,3) == 0);
+        int fd=memory.notify[0];
+        core_relay_memory_clear(&memory);
+        CHECK("relay-memory/concurrent-close-descriptor-released",fcntl(fd,F_GETFD) == -1 && errno == EBADF);
+    }
+    REQUIRE("relay-memory/concurrent-release-join",pthread_join(thread,NULL) == 0);
+    empty_budget();
+}
+
 int main(void) {
-    minimum_and_growth(); limits_and_notifications(); transformation_capacity(); allocated_saturation(); parallel_recovery();
+    minimum_and_growth(); limits_and_notifications(); transformation_capacity(); allocated_saturation(); parallel_recovery(); deadline_independent_notifications(); concurrent_close();
     return test_result();
 }

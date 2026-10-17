@@ -101,12 +101,17 @@ void core_relay_memory_unwatch(core_relay_memory_t *memory,unsigned mask) {
 }
 
 unsigned core_relay_memory_ack(core_relay_memory_t *memory) {
+    int saved=errno;
     pthread_mutex_lock(&relay_wait_lock);
     unsigned waiting=memory->waiting;
     memory->waiting=0; memory->notified=0;
     uint8_t bytes[64];
-    if (memory->registered) while (core_recv(memory->notify[0],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {}
-    pthread_mutex_unlock(&relay_wait_lock); return waiting;
+    if (memory->registered) {
+        ssize_t received;
+        do { received=recv(memory->notify[0],bytes,sizeof(bytes),MSG_DONTWAIT); }
+        while (received > 0 || (received < 0 && errno == EINTR));
+    }
+    pthread_mutex_unlock(&relay_wait_lock); errno=saved; return waiting;
 }
 
 int core_relay_memory_fd(const core_relay_memory_t *memory) {
@@ -119,7 +124,13 @@ void core_relay_memory_released(void) {
     for (core_relay_memory_t *memory=relay_waiters;memory;memory=memory->next) {
         if (!memory->waiting || memory->notified) continue;
         uint8_t byte=1;
-        if (core_send(memory->notify[1],&byte,1,MSG_DONTWAIT) == 1) memory->notified=1;
+        int flags=MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+        flags|=MSG_NOSIGNAL;
+#endif
+        ssize_t sent;
+        do { sent=send(memory->notify[1],&byte,1,flags); } while (sent < 0 && errno == EINTR);
+        if (sent == 1 || (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) memory->notified=1;
     }
     pthread_mutex_unlock(&relay_wait_lock);
     errno=saved;
