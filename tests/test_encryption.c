@@ -8,6 +8,13 @@ static unsigned observing,allocation_calls,allocation_failure,cipher_calls,ciphe
 static unsigned peer_mode,peer_ready,peer_cut,peer_building,peer_empty_padding,peer_corrupt;
 static EVP_PKEY *peer_key;
 static int prepare_peer_reply(void);
+static void *watched_write,*watched_record;
+static unsigned write_cleanses,record_cleanses;
+static void observe_cleanse(void *data,size_t length) {
+    if (data == watched_write && length) write_cleanses++;
+    if (data == watched_record && length) record_cleanses++;
+    OPENSSL_cleanse(data,length);
+}
 static void *observe_allocation(size_t size, int zero) {
     if (observing && ++allocation_calls == allocation_failure) { fault_triggered=1; errno=ENOMEM; return NULL; }
     void *pointer=zero ? calloc(1,size) : malloc(size);
@@ -49,7 +56,9 @@ static int observe_random(unsigned char *output, int size) {
 #define free observe_free
 #define EVP_CIPHER_CTX_new observe_cipher_new
 #define RAND_bytes observe_random
+#define OPENSSL_cleanse observe_cleanse
 #include "../src/vless_encryption.c"
+#undef OPENSSL_cleanse
 #undef RAND_bytes
 #undef EVP_CIPHER_CTX_new
 #undef free
@@ -216,8 +225,39 @@ int tls13_read_exact_or_eof(tls13_conn_t *c, uint8_t *data, size_t length) {
     if (tls13_read_app(c,data,length,&got)) return -1;
     return got == length ? 0 : !got ? 1 : -1;
 }
+static void record_reuse_checks(void) {
+    observing=1; allocation_failure=cipher_failure=random_failure=0;
+    vless_encryption_conn_t *writer=observe_calloc(1,sizeof(*writer)),*reader=observe_calloc(1,sizeof(*reader));
+    REQUIRE("encryption/reuse-connections",writer && reader);
+    uint8_t key[64]={0},input[8192],output[8192]; memset(input,0x3c,sizeof(input));
+    aead_init(&writer->outgoing,(const uint8_t *)"vless-core",10,key,sizeof(key)); reader->incoming=writer->outgoing;
+    for (unsigned iteration=0;iteration<65;iteration++) {
+        unsigned before_allocations=allocation_calls,before_contexts=cipher_calls;
+        watched_write=writer->write_buffer; watched_record=reader->record_data; write_cleanses=record_cleanses=0;
+        transport_length=transport_position=0;
+        REQUIRE("encryption/reuse-write",!vless_encryption_write(writer,input,sizeof(input)));
+        REQUIRE("encryption/reuse-read",!vless_encryption_read_exact(reader,output,sizeof(output)));
+        CHECK("encryption/reuse-data",!memcmp(input,output,sizeof(input)));
+        if (iteration) CHECK("encryption/reuse-no-record-allocation",allocation_calls == before_allocations && cipher_calls == before_contexts);
+        if (iteration) CHECK("encryption/reuse-cleanses-working-data-once",write_cleanses == 1 && record_cleanses == 1);
+        CHECK("encryption/reuse-distinct-direction-contexts",writer->record_encrypt && reader->record_decrypt && writer->record_encrypt != reader->record_decrypt);
+        size_t used,reserved; core_buffer_snapshot(CORE_BUFFER_RELAY,&used,&reserved);
+        CHECK("encryption/reuse-capacity-accounted",used == writer->write_capacity+reader->record_capacity+reader->input_capacity && !reserved);
+        unsigned dirty=0; for (size_t i=0;i<writer->write_capacity;i++) dirty|=writer->write_buffer[i];
+        for (size_t i=0;i<reader->record_capacity;i++) dirty|=reader->record_data[i];
+        CHECK("encryption/reuse-temporaries-cleared",!dirty);
+    }
+    watched_write=watched_record=NULL;
+    vless_encryption_close(reader); vless_encryption_close(writer);
+    size_t used,reserved; core_buffer_snapshot(CORE_BUFFER_RELAY,&used,&reserved);
+    CHECK("encryption/reuse-close-releases-capacity",!used && !reserved);
+    for (unsigned i=0;i<128;i++) CHECK("encryption/reuse-no-retained-secrets",!observed_allocations[i].pointer);
+    observing=0;
+}
+
 int main(void) {
     cleanup_checks();
+    record_reuse_checks();
     vless_encryption_conn_t raw_switch={0}; uint8_t tail[16]; size_t tail_length=0;
     raw_switch.input=(uint8_t *)"buffered"; raw_switch.input_len=8;
     memcpy(transport_data,"wire",4); transport_length=4; transport_position=0;

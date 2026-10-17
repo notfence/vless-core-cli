@@ -109,6 +109,8 @@ int tls_buffer_init(dynbuf_t *buffer, size_t limit, size_t *owner) {
 }
 
 void tls_handshake_material_clear(tls13_conn_t *connection) {
+    if (connection->record_encrypt) EVP_CIPHER_CTX_reset(connection->record_encrypt);
+    if (connection->record_decrypt) EVP_CIPHER_CTX_reset(connection->record_decrypt);
     OPENSSL_cleanse(connection->auth_key,sizeof(connection->auth_key));
     OPENSSL_cleanse(connection->hs_secret,sizeof(connection->hs_secret));
     OPENSSL_cleanse(connection->c_hs_traffic,sizeof(connection->c_hs_traffic));
@@ -333,7 +335,7 @@ static int derive_key_iv_md(const EVP_MD *md, const uint8_t *traffic_secret, siz
     return 0;
 }
 
-int read_record_bounded(int fd, uint8_t *rtype, uint8_t **payload, size_t *payload_len, int tls12_encrypted) {
+static int read_record_header(int fd,uint8_t *rtype,size_t *payload_len,int tls12_encrypted) {
     uint8_t hdr[5];
     size_t off = 0;
     while (off < sizeof(hdr)) {
@@ -350,6 +352,12 @@ int read_record_bounded(int fd, uint8_t *rtype, uint8_t **payload, size_t *paylo
     size_t len = ((size_t)hdr[3] << 8) | hdr[4];
     if (hdr[1] != 3 || (hdr[2] != 3 && !(hdr[0] == 22 && hdr[2] == 1)) ||
         len > (tls12_encrypted ? 18432U : hdr[0] == 23 ? 16640U : 16384U)) { errno=EMSGSIZE; return -1; }
+    *rtype=hdr[0]; *payload_len=len; return 0;
+}
+
+int read_record_bounded(int fd, uint8_t *rtype, uint8_t **payload, size_t *payload_len, int tls12_encrypted) {
+    size_t len=0; int result=read_record_header(fd,rtype,&len,tls12_encrypted);
+    if (result) return result;
     uint8_t *buf = (uint8_t *)malloc(len ? len : 1);
     if (buf == NULL) {
         return -1;
@@ -359,7 +367,6 @@ int read_record_bounded(int fd, uint8_t *rtype, uint8_t **payload, size_t *paylo
         return -1;
     }
 
-    *rtype = hdr[0];
     *payload = buf;
     *payload_len = len;
     return 0;
@@ -587,168 +594,169 @@ static const EVP_CIPHER *record_cipher_for_conn(const tls13_conn_t *c) {
     return NULL;
 }
 
-int encrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t inner_type, const uint8_t *plain,
-                          size_t plain_len, uint8_t **out, size_t *out_len) {
-    if (c->tls12_suite) {
-        if (c->tls_send_record_limit && plain_len > c->tls_send_record_limit) { errno=EMSGSIZE; return -1; }
-        return core_tls12_record_seal(c->tls12_suite,c->tls12_etm,key,iv,c->tls12_c_mac,seq,inner_type,plain,plain_len,out,out_len);
-    }
-    *out=NULL; *out_len=0;
-    if (plain_len > 16384 || *seq >= TLS_RECORD_HARD_LIMIT ||
-        (c->tls_send_record_limit && plain_len+1 > c->tls_send_record_limit) ||
-        (inner_type != 21 && inner_type != 22 && inner_type != 23)) { errno=EMSGSIZE; return -1; }
-    size_t inner_len = plain_len + 1;
-    uint8_t *inner = (uint8_t *)malloc(inner_len);
-    if (inner == NULL) {
-        return -1;
-    }
-    memcpy(inner, plain, plain_len);
-    inner[plain_len] = inner_type;
-
-    size_t c_len = inner_len + 16;
-    uint8_t *record = (uint8_t *)malloc(5 + c_len);
-    if (record == NULL) {
-        free(inner);
-        return -1;
-    }
-
-    record[0] = 0x17;
-    record[1] = 0x03;
-    record[2] = 0x03;
-    record[3] = (uint8_t)(c_len >> 8);
-    record[4] = (uint8_t)(c_len & 0xFF);
-
-    uint8_t nonce[12];
-    xor_seq_nonce(nonce, iv, *seq);
-
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (ctx == NULL) {
-        free(inner);
-        free(record);
-        return -1;
-    }
-    const EVP_CIPHER *cipher = record_cipher_for_conn(c);
-    if (cipher == NULL) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(inner);
-        free(record);
-        return -1;
-    }
-
-    int len1 = 0;
-    int ok = EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL) == 1 &&
-             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) == 1 &&
-             EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
-             EVP_EncryptUpdate(ctx, NULL, &len1, record, 5) == 1 &&
-             EVP_EncryptUpdate(ctx, record + 5, &len1, inner, (int)inner_len) == 1;
-
-    int len2 = 0;
-    if (ok) {
-        ok = EVP_EncryptFinal_ex(ctx, record + 5 + len1, &len2) == 1;
-    }
-    if (ok) {
-        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, record + 5 + inner_len) == 1;
-    }
-
-    EVP_CIPHER_CTX_free(ctx);
-    OPENSSL_cleanse(inner,inner_len); free(inner);
-
-    if (!ok) {
-        free(record);
-        return -1;
-    }
-
-    *seq += 1;
-    *out = record;
-    *out_len = 5 + c_len;
-    return 0;
+static EVP_CIPHER_CTX *tls_record_context(tls13_conn_t *c,int sending) {
+    if (!c->crypto_reuse) return EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX **context=sending ? &c->record_encrypt : &c->record_decrypt;
+    if (!*context) *context=EVP_CIPHER_CTX_new();
+    if (!*context) errno=ENOMEM;
+    return *context;
 }
 
-int decrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t rtype, const uint8_t *payload,
-                          size_t payload_len, uint8_t **plain, size_t *plain_len, uint8_t *inner_type) {
+static int encrypt_record_into(const tls13_conn_t *c,EVP_CIPHER_CTX *context,const uint8_t *key,const uint8_t iv[12],uint64_t *seq,
+                               uint8_t inner_type,const uint8_t *plain,size_t plain_len,uint8_t *record,size_t capacity,size_t *out_len) {
+    *out_len=0;
+    if (c->tls12_suite) {
+        if (c->tls_send_record_limit && plain_len > c->tls_send_record_limit) { errno=EMSGSIZE; return -1; }
+        return core_tls12_record_seal_into(c->tls12_suite,c->tls12_etm,context,key,iv,c->tls12_c_mac,seq,inner_type,plain,plain_len,record,capacity,out_len);
+    }
+    if (plain_len > 16384 || *seq >= TLS_RECORD_HARD_LIMIT ||
+        (c->tls_send_record_limit && plain_len+1 > c->tls_send_record_limit) ||
+        (inner_type != 21 && inner_type != 22 && inner_type != 23)) { if (context) EVP_CIPHER_CTX_reset(context); errno=EMSGSIZE; return -1; }
+    size_t inner_len=plain_len+1,c_len=inner_len+16;
+    const EVP_CIPHER *cipher=record_cipher_for_conn(c);
+    if (!context || !cipher || !record || capacity < 5+c_len) { if (context) EVP_CIPHER_CTX_reset(context); errno=ENOBUFS; return -1; }
+    if (EVP_CIPHER_CTX_cipher(context) && EVP_CIPHER_CTX_nid(context) != EVP_CIPHER_nid(cipher)) EVP_CIPHER_CTX_reset(context);
+    const EVP_CIPHER *initial=EVP_CIPHER_CTX_cipher(context) ? NULL : cipher;
+    record[0]=23; record[1]=3; record[2]=3; record[3]=(uint8_t)(c_len>>8); record[4]=(uint8_t)c_len;
+    memmove(record+5,plain,plain_len); record[5+plain_len]=inner_type;
+    uint8_t nonce[12]; xor_seq_nonce(nonce,iv,*seq); int n=0,final=0;
+    int ok=EVP_EncryptInit_ex(context,initial,NULL,NULL,NULL) == 1 &&
+        EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_SET_IVLEN,12,NULL) == 1 &&
+        EVP_EncryptInit_ex(context,NULL,NULL,key,nonce) == 1 &&
+        EVP_EncryptUpdate(context,NULL,&n,record,5) == 1 &&
+        EVP_EncryptUpdate(context,record+5,&n,record+5,(int)inner_len) == 1 &&
+        EVP_EncryptFinal_ex(context,record+5+n,&final) == 1 && (size_t)(n+final) == inner_len &&
+        EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_GET_TAG,16,record+5+inner_len) == 1;
+    OPENSSL_cleanse(nonce,sizeof(nonce));
+    if (!ok) { OPENSSL_cleanse(record,5+c_len); EVP_CIPHER_CTX_reset(context); errno=EPROTO; return -1; }
+    (*seq)++; *out_len=5+c_len; return 0;
+}
+
+static int decrypt_record_into(const tls13_conn_t *c,EVP_CIPHER_CTX *context,const uint8_t *key,const uint8_t iv[12],uint64_t *seq,
+                               uint8_t rtype,const uint8_t *payload,size_t payload_len,uint8_t *plain,size_t capacity,size_t *plain_len,uint8_t *inner_type) {
+    *plain_len=0; *inner_type=0;
     if (c->tls12_suite) {
         if (c->tls_receive_record_limit && c->tls_receive_record_limit < 16384 && c->tls12_suite->cipher == CORE_TLS12_CBC) {
             size_t mac=(size_t)EVP_MD_get_size(core_tls12_digest(c->tls12_suite->mac_hash));
             size_t bound=16+((c->tls_receive_record_limit+(c->tls12_etm ? 0 : mac)+16)/16)*16+(c->tls12_etm ? mac : 0);
-            if (payload_len > bound) { *plain=NULL; *plain_len=0; errno=EMSGSIZE; return -1; }
+            if (payload_len > bound) { errno=EMSGSIZE; return -1; }
         }
-        int result=core_tls12_record_open(c->tls12_suite,c->tls12_etm,key,iv,c->tls12_s_mac,seq,rtype,payload,payload_len,plain,plain_len);
+        int result=core_tls12_record_open_into(c->tls12_suite,c->tls12_etm,context,key,iv,c->tls12_s_mac,seq,rtype,payload,payload_len,plain,capacity,plain_len);
         if (!result && c->tls_receive_record_limit && *plain_len > c->tls_receive_record_limit) {
-            OPENSSL_cleanse(*plain,*plain_len); free(*plain); *plain=NULL; *plain_len=0; errno=EMSGSIZE; return -1;
+            OPENSSL_cleanse(plain,*plain_len); *plain_len=0; EVP_CIPHER_CTX_reset(context); errno=EMSGSIZE; return -1;
         }
-        *inner_type=rtype; return result;
+        if (!result) *inner_type=rtype;
+        return result;
     }
-    if (rtype != 0x17 || payload_len < 17 || payload_len > 16640 || *seq >= TLS_RECORD_HARD_LIMIT ||
-        (c->tls_receive_record_limit && payload_len-16 > c->tls_receive_record_limit)) {
-        return -1;
+    if (rtype != 23 || payload_len < 17 || payload_len > 16640 || *seq >= TLS_RECORD_HARD_LIMIT ||
+        (c->tls_receive_record_limit && payload_len-16 > c->tls_receive_record_limit)) { if (context) EVP_CIPHER_CTX_reset(context); errno=EMSGSIZE; return -1; }
+    size_t ct_len=payload_len-16;
+    const EVP_CIPHER *cipher=record_cipher_for_conn(c);
+    if (!context || !cipher || !plain || capacity < ct_len) { if (context) EVP_CIPHER_CTX_reset(context); errno=ENOBUFS; return -1; }
+    if (EVP_CIPHER_CTX_cipher(context) && EVP_CIPHER_CTX_nid(context) != EVP_CIPHER_nid(cipher)) EVP_CIPHER_CTX_reset(context);
+    const EVP_CIPHER *initial=EVP_CIPHER_CTX_cipher(context) ? NULL : cipher;
+    uint8_t header[]={rtype,3,3,(uint8_t)(payload_len>>8),(uint8_t)payload_len},nonce[12];
+    xor_seq_nonce(nonce,iv,*seq); int n=0,final=0;
+    int ok=EVP_DecryptInit_ex(context,initial,NULL,NULL,NULL) == 1 &&
+        EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_SET_IVLEN,12,NULL) == 1 &&
+        EVP_DecryptInit_ex(context,NULL,NULL,key,nonce) == 1 &&
+        EVP_DecryptUpdate(context,NULL,&n,header,sizeof(header)) == 1 &&
+        EVP_DecryptUpdate(context,plain,&n,payload,(int)ct_len) == 1 &&
+        EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_SET_TAG,16,(void *)(payload+ct_len)) == 1 &&
+        EVP_DecryptFinal_ex(context,plain+n,&final) == 1 && (size_t)(n+final) == ct_len;
+    OPENSSL_cleanse(nonce,sizeof(nonce));
+    size_t end=ct_len;
+    if (ok) while (end && !plain[end-1]) end--;
+    if (!ok || !end || end-1 > 16384 || (plain[end-1] != 21 && plain[end-1] != 22 && plain[end-1] != 23)) {
+        OPENSSL_cleanse(plain,ct_len); EVP_CIPHER_CTX_reset(context); errno=EPROTO; return -1;
     }
+    *inner_type=plain[end-1]; *plain_len=end-1;
+    OPENSSL_cleanse(plain+end-1,ct_len-end+1);
+    (*seq)++; return 0;
+}
 
-    uint8_t hdr[5] = {rtype, 0x03, 0x03, (uint8_t)(payload_len >> 8), (uint8_t)(payload_len & 0xFF)};
+int encrypt_record(tls13_conn_t *c,const uint8_t *key,const uint8_t iv[12],uint64_t *seq,uint8_t inner_type,
+                   const uint8_t *plain,size_t plain_len,uint8_t **out,size_t *out_len) {
+    *out=NULL; *out_len=0;
+    if (plain_len > 16384) { errno=EMSGSIZE; return -1; }
+    size_t capacity=c->tls12_suite ? core_tls12_record_bound(c->tls12_suite,c->tls12_etm,plain_len) : plain_len+22;
+    if (!capacity) return -1;
+    uint8_t *record=malloc(capacity); EVP_CIPHER_CTX *context=tls_record_context(c,1);
+    int result=record && context ? encrypt_record_into(c,context,key,iv,seq,inner_type,plain,plain_len,record,capacity,out_len) : -1;
+    if (!c->crypto_reuse) EVP_CIPHER_CTX_free(context);
+    if (result) { if (record) { OPENSSL_cleanse(record,capacity); free(record); } if (!record || !context) errno=ENOMEM; }
+    else *out=record;
+    return result;
+}
 
-    size_t ct_len = payload_len - 16;
-    const uint8_t *ct = payload;
-    const uint8_t *tag = payload + ct_len;
+int decrypt_record(tls13_conn_t *c,const uint8_t *key,const uint8_t iv[12],uint64_t *seq,uint8_t rtype,
+                   const uint8_t *payload,size_t payload_len,uint8_t **plain,size_t *plain_len,uint8_t *inner_type) {
+    *plain=NULL; *plain_len=0; *inner_type=0;
+    if (payload_len > 18432) { errno=EMSGSIZE; return -1; }
+    size_t capacity=payload_len ? payload_len : 1;
+    uint8_t *data=malloc(capacity); EVP_CIPHER_CTX *context=tls_record_context(c,0);
+    int result=data && context ? decrypt_record_into(c,context,key,iv,seq,rtype,payload,payload_len,data,capacity,plain_len,inner_type) : -1;
+    if (!c->crypto_reuse) EVP_CIPHER_CTX_free(context);
+    if (result) { if (data) { OPENSSL_cleanse(data,capacity); free(data); } if (!data || !context) errno=ENOMEM; }
+    else *plain=data;
+    return result;
+}
 
-    uint8_t nonce[12];
-    xor_seq_nonce(nonce, iv, *seq);
-
-    uint8_t *buf = (uint8_t *)malloc(ct_len);
-    if (buf == NULL) {
-        return -1;
+static int tls_record_buffer(tls13_conn_t *c,dynbuf_t *buffer,size_t needed,int writing) {
+    if (buffer->data && (needed > buffer->cap || (buffer == &c->record_plain && buffer->len))) OPENSSL_cleanse(buffer->data,buffer->cap);
+    if (buffer->tls_budget && c->tls_auth_state == 4) db_free(buffer);
+    buffer->len=0;
+    if (!buffer->memory && !buffer->tls_budget) {
+        if (c->tls_auth_state != 4 && c->tls_md) {
+            if (tls_buffer_init(buffer,18944,&c->tls_handshake_bytes)) return -1;
+        } else {
+            if (core_buffer_budget_init(&c->record_memory,CORE_BUFFER_RELAY,0)) return -1;
+            buffer->memory=writing ? c->output_memory : c->input_memory;
+            if (!buffer->memory) buffer->memory=&c->record_memory;
+            buffer->limit=18944;
+        }
     }
+    size_t previous=buffer->cap;
+    int result=db_reserve(buffer,needed ? needed : 1);
+    if (!result && buffer->cap != previous) OPENSSL_cleanse(buffer->data,buffer->cap);
+    return result;
+}
 
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (ctx == NULL) {
-        free(buf);
-        return -1;
+int tls_record_seal_owned(tls13_conn_t *c,uint8_t type,const uint8_t *plain,size_t length,uint8_t **output,size_t *output_length) {
+    *output=NULL; *output_length=0;
+    if (length > 16384) { errno=EMSGSIZE; return -1; }
+    size_t needed=c->tls12_suite ? core_tls12_record_bound(c->tls12_suite,c->tls12_etm,length) : length+22;
+    if (!needed || tls_record_buffer(c,&c->record_output,needed,1)) return -1;
+    EVP_CIPHER_CTX *context=tls_record_context(c,1);
+    if (!context) { OPENSSL_cleanse(c->record_output.data,c->record_output.cap); return -1; }
+    int result=encrypt_record_into(c,context,c->c_app_key,c->c_app_iv,&c->c_app_seq,type,plain,length,c->record_output.data,c->record_output.cap,output_length);
+    if (!c->crypto_reuse) EVP_CIPHER_CTX_free(context);
+    if (!result) { c->record_output.len=*output_length; *output=c->record_output.data; }
+    else OPENSSL_cleanse(c->record_output.data,c->record_output.cap);
+    return result;
+}
+
+int tls_record_open_owned(tls13_conn_t *c,uint8_t type,const uint8_t *payload,size_t length,uint8_t **plain,size_t *plain_length,uint8_t *inner) {
+    *plain=NULL; *plain_length=0; *inner=0;
+    if (length > 18432 || tls_record_buffer(c,&c->record_plain,length,0)) return -1;
+    EVP_CIPHER_CTX *context=tls_record_context(c,0);
+    if (!context) { OPENSSL_cleanse(c->record_plain.data,c->record_plain.cap); return -1; }
+    int result=decrypt_record_into(c,context,c->s_app_key,c->s_app_iv,&c->s_app_seq,type,payload,length,c->record_plain.data,c->record_plain.cap,plain_length,inner);
+    if (!c->crypto_reuse) EVP_CIPHER_CTX_free(context);
+    if (!result) { c->record_plain.len=*plain_length; *plain=c->record_plain.data; }
+    else OPENSSL_cleanse(c->record_plain.data,c->record_plain.cap);
+    return result;
+}
+
+void tls_record_work_clear(tls13_conn_t *c) {
+    EVP_CIPHER_CTX_free(c->record_encrypt); EVP_CIPHER_CTX_free(c->record_decrypt);
+    c->record_encrypt=c->record_decrypt=NULL;
+    dynbuf_t *buffers[]={&c->record_output,&c->record_plain,&c->record_wire};
+    for (size_t i=0;i<sizeof(buffers)/sizeof(*buffers);i++) {
+        if (buffers[i]->data) OPENSSL_cleanse(buffers[i]->data,buffers[i]->cap);
+        db_free(buffers[i]);
     }
-    const EVP_CIPHER *cipher = record_cipher_for_conn(c);
-    if (cipher == NULL) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(buf);
-        return -1;
-    }
-
-    int len1 = 0;
-    int ok = EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL) == 1 &&
-             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) == 1 &&
-             EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
-             EVP_DecryptUpdate(ctx, NULL, &len1, hdr, 5) == 1 && EVP_DecryptUpdate(ctx, buf, &len1, ct, (int)ct_len) == 1 &&
-             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, (void *)tag) == 1;
-
-    int len2 = 0;
-    if (ok) {
-        ok = EVP_DecryptFinal_ex(ctx, buf + len1, &len2) == 1;
-    }
-
-    EVP_CIPHER_CTX_free(ctx);
-    if (!ok) {
-        free(buf);
-        return -1;
-    }
-
-    size_t pt_len = ct_len;
-    size_t i = pt_len;
-    while (i > 0 && buf[i - 1] == 0x00) {
-        i--;
-    }
-    if (i == 0) {
-        free(buf);
-        return -1;
-    }
-
-    uint8_t ctype = buf[i - 1];
-    size_t content_len = i - 1;
-
-    if (content_len > 16384 || (ctype != 21 && ctype != 22 && ctype != 23)) { OPENSSL_cleanse(buf,ct_len); free(buf); return -1; }
-
-    OPENSSL_cleanse(buf+content_len,ct_len-content_len);
-
-    *seq += 1;
-    *plain = buf;
-    *plain_len = content_len;
-    *inner_type = ctype;
-    return 0;
+    if (!c->record_memory.allocated) core_buffer_budget_clear(&c->record_memory);
 }
 
 int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len) {
@@ -764,6 +772,8 @@ static int tls_update_keys(tls13_conn_t *c, int sending) {
     if (hkdf_expand_label_md(c->tls_md,secret,c->tls_hash_len,"traffic upd",NULL,0,next,c->tls_hash_len) ||
         derive_key_iv_md(c->tls_md,next,c->tls_hash_len,c->tls_key_len,key,iv)) { OPENSSL_cleanse(next,sizeof(next)); return -1; }
     memcpy(secret,next,c->tls_hash_len); OPENSSL_cleanse(next,sizeof(next));
+    EVP_CIPHER_CTX *context=sending ? c->record_encrypt : c->record_decrypt;
+    if (context) EVP_CIPHER_CTX_reset(context);
     if (sending) c->c_app_seq=0; else { c->s_app_seq=0; c->tls_receive_update_requested=0; }
     return 0;
 }
@@ -771,11 +781,13 @@ static int tls_update_keys(tls13_conn_t *c, int sending) {
 static int tls_key_update_send(tls13_conn_t *c, unsigned request) {
     if (c->send_closed) return -1;
     const uint8_t message[]={24,0,0,1,(uint8_t)request}; uint8_t *record=NULL; size_t length=0;
-    if (encrypt_record(c,c->c_app_key,c->c_app_iv,&c->c_app_seq,22,message,sizeof(message),&record,&length)) return -1;
+    int encrypted=c->crypto_reuse ? tls_record_seal_owned(c,22,message,sizeof(message),&record,&length) :
+        encrypt_record(c,c->c_app_key,c->c_app_iv,&c->c_app_seq,22,message,sizeof(message),&record,&length);
+    if (encrypted) return -1;
     int result;
     if (c->xmux_async) result=length > 256U*1024U-c->xmux_wire_output.len ? -1 : db_append(&c->xmux_wire_output,record,length);
     else result=relay_write_wire(c,record,length);
-    free(record);
+    if (!c->crypto_reuse) free(record);
     return result ? -1 : tls_update_keys(c,1);
 }
 
@@ -866,15 +878,17 @@ int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len) {
 
         uint8_t *rec = NULL;
         size_t rec_len = 0;
-        if (encrypt_record(c, c->c_app_key, c->c_app_iv, &c->c_app_seq, 0x17, buf + off, chunk, &rec, &rec_len) != 0) {
+        int encrypted=c->crypto_reuse ? tls_record_seal_owned(c,23,buf+off,chunk,&rec,&rec_len) :
+            encrypt_record(c,c->c_app_key,c->c_app_iv,&c->c_app_seq,23,buf+off,chunk,&rec,&rec_len);
+        if (encrypted != 0) {
             return -1;
         }
         if (relay_write_wire(c, rec, rec_len) != 0) {
-            free(rec);
+            if (!c->crypto_reuse) free(rec);
             return -1;
         }
         c->c_app_record_bytes += rec_len;
-        free(rec);
+        if (!c->crypto_reuse) free(rec);
         off += chunk;
     }
     return 0;
@@ -888,7 +902,10 @@ static int relay_read_record(tls13_conn_t *c, uint8_t *type, uint8_t **payload, 
             if ((record_type != 23 && !(c->tls12_suite && (record_type == 21 || record_type == 22))) || c->xmux_raw_input.data[1] != 3 ||
                 c->xmux_raw_input.data[2] != 3 || size > (c->tls12_suite ? 18432U : 16640U)) return -1;
             if (c->xmux_raw_input.len >= size+5) {
-                *payload=malloc(size ? size : 1); if (!*payload) return -1;
+                if (c->crypto_reuse) {
+                    if (tls_record_buffer(c,&c->record_wire,size,0)) return -1;
+                    *payload=c->record_wire.data;
+                } else { *payload=malloc(size ? size : 1); if (!*payload) return -1; }
                 *type=c->xmux_raw_input.data[0]; *length=size;
                 memcpy(*payload,c->xmux_raw_input.data+5,size); db_consume(&c->xmux_raw_input,size+5); return 0;
             }
@@ -907,7 +924,16 @@ int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
         uint8_t rtype = 0;
         uint8_t *pl = NULL;
         size_t pl_len = 0;
-        int record_result = c->relay_async ? relay_read_record(c,&rtype,&pl,&pl_len) : read_record_bounded(c->fd, &rtype, &pl, &pl_len,c->tls12_suite != NULL);
+        int record_result;
+        if (c->relay_async) record_result=relay_read_record(c,&rtype,&pl,&pl_len);
+        else if (!c->crypto_reuse) record_result=read_record_bounded(c->fd,&rtype,&pl,&pl_len,c->tls12_suite != NULL);
+        else {
+            record_result=read_record_header(c->fd,&rtype,&pl_len,c->tls12_suite != NULL);
+            if (!record_result) {
+                if (tls_record_buffer(c,&c->record_wire,pl_len,0)) record_result=-1;
+                else { pl=c->record_wire.data; record_result=read_exact(c->fd,pl,pl_len); }
+            }
+        }
         if (record_result == 2) return 1;
         if (record_result > 0) {
             if (c->tls_post_handshake.len) { vc_log_error("tls","truncated post-handshake message"); return -1; }
@@ -921,20 +947,24 @@ int fill_reality_plain_cache(tls13_conn_t *c, dynbuf_t *cache) {
 
         if (rtype != 0x17 && !(c->tls12_suite && (rtype == 21 || rtype == 22))) {
             vc_log_warning("tls", "non-app record type=0x%02x in app phase", rtype);
-            free(pl);
+            if (!c->crypto_reuse) free(pl);
             return -1;
         }
 
         uint8_t *dec = NULL;
         size_t dec_len = 0;
         uint8_t inner = 0;
-        if (decrypt_record(c, c->s_app_key, c->s_app_iv, &c->s_app_seq, rtype, pl, pl_len, &dec, &dec_len, &inner) != 0) {
+        int decoded=c->crypto_reuse ? tls_record_open_owned(c,rtype,pl,pl_len,&dec,&dec_len,&inner) :
+            decrypt_record(c,c->s_app_key,c->s_app_iv,&c->s_app_seq,rtype,pl,pl_len,&dec,&dec_len,&inner);
+        if (decoded != 0) {
             vc_log_error("tls", "decrypt_record failed in app phase");
-            free(pl);
+            if (!c->crypto_reuse) free(pl);
             return -1;
         }
-        free(pl);
-        int result=tls_application_plain(c,inner,dec,dec_len,cache); free(dec);
+        if (!c->crypto_reuse) free(pl);
+        int result=tls_application_plain(c,inner,dec,dec_len,cache);
+        if (c->crypto_reuse) { OPENSSL_cleanse(c->record_plain.data,c->record_plain.cap); c->record_plain.len=0; }
+        else { OPENSSL_cleanse(dec,dec_len); free(dec); }
         if (result < 0) return -1;
         if (result > 0 || cache->len) return 0;
     }
@@ -947,7 +977,8 @@ int fill_reality_app_cache(tls13_conn_t *c) {
 int manual_stream_read(tls13_conn_t *c,uint8_t *data,size_t capacity,size_t *length) {
     *length=0;
     if (!capacity) return 0;
-    c->tls_stream_input.limit=16384; c->tls_stream_input.memory=c->input_memory;
+    c->tls_stream_input.limit=16384;
+    c->tls_stream_input.memory=c->input_memory ? c->input_memory : c->crypto_reuse ? &c->record_memory : NULL;
     if (!c->tls_stream_input.len) { int result=fill_reality_plain_cache(c,&c->tls_stream_input); if (result) return result; }
     size_t take=c->tls_stream_input.len < capacity ? c->tls_stream_input.len : capacity;
     if (take) memcpy(data,c->tls_stream_input.data,take);

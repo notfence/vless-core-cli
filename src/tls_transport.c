@@ -636,6 +636,7 @@ static const char *tls_cipher_suite_name(uint16_t suite) {
 }
 
 static void reset_manual_tls_handshake(tls13_conn_t *c) {
+    tls_record_work_clear(c);
     c->tls12_suite=NULL; c->tls12_etm=c->tls12_ems=c->tls12_ticket=c->tls12_status=0;
     OPENSSL_cleanse(c->tls12_c_mac,sizeof(c->tls12_c_mac)); OPENSSL_cleanse(c->tls12_s_mac,sizeof(c->tls12_s_mac));
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL;
@@ -870,14 +871,16 @@ static int xmux_transport_flush(void *opaque) {
         size_t length=connection->xmux_plain_output.len < limit ? connection->xmux_plain_output.len : limit;
         uint8_t *record=NULL; size_t record_length=0;
         size_t temporary=2*(length+(connection->tls12_suite ? 384U : 22U));
-        if (connection->output_memory && core_buffer_hold(connection->output_memory,temporary)) return -1;
-        if (encrypt_record(connection,connection->c_app_key,connection->c_app_iv,&connection->c_app_seq,0x17,
-                           connection->xmux_plain_output.data,length,&record,&record_length) != 0) {
-            if (connection->output_memory) core_buffer_drop(connection->output_memory,temporary);
+        if (!connection->crypto_reuse && connection->output_memory && core_buffer_hold(connection->output_memory,temporary)) return -1;
+        int encrypted=connection->crypto_reuse ? tls_record_seal_owned(connection,23,connection->xmux_plain_output.data,length,&record,&record_length) :
+            encrypt_record(connection,connection->c_app_key,connection->c_app_iv,&connection->c_app_seq,23,connection->xmux_plain_output.data,length,&record,&record_length);
+        if (encrypted != 0) {
+            if (!connection->crypto_reuse && connection->output_memory) core_buffer_drop(connection->output_memory,temporary);
             return -1;
         }
-        int result=db_append(&connection->xmux_wire_output,record,record_length); free(record);
-        if (connection->output_memory) core_buffer_drop(connection->output_memory,temporary);
+        int result=db_append(&connection->xmux_wire_output,record,record_length);
+        if (!connection->crypto_reuse) free(record);
+        if (!connection->crypto_reuse && connection->output_memory) core_buffer_drop(connection->output_memory,temporary);
         if (result != 0) return -1;
         connection->xmux_wire_plain_length=length;
         db_consume(&connection->xmux_plain_output,length);
@@ -946,14 +949,16 @@ static int xmux_transport_collect(void *opaque) {
             if (record[0] == 0x17 || connection->tls12_suite) {
                 uint8_t *plain=NULL,inner=0; size_t plain_length=0;
                 size_t temporary=2U*(connection->tls12_suite ? 18432U : 16640U);
-                if (connection->input_memory && core_buffer_hold(connection->input_memory,temporary)) return -1;
-                if (decrypt_record(connection,connection->s_app_key,connection->s_app_iv,&connection->s_app_seq,record[0],record+5,length,
-                                   &plain,&plain_length,&inner) != 0) {
-                    if (connection->input_memory) core_buffer_drop(connection->input_memory,temporary);
+                if (!connection->crypto_reuse && connection->input_memory && core_buffer_hold(connection->input_memory,temporary)) return -1;
+                int decoded=connection->crypto_reuse ? tls_record_open_owned(connection,record[0],record+5,length,&plain,&plain_length,&inner) :
+                    decrypt_record(connection,connection->s_app_key,connection->s_app_iv,&connection->s_app_seq,record[0],record+5,length,&plain,&plain_length,&inner);
+                if (decoded != 0) {
+                    if (!connection->crypto_reuse && connection->input_memory) core_buffer_drop(connection->input_memory,temporary);
                     return -1;
                 }
                 int result=tls_application_plain(connection,inner,plain,plain_length,&connection->h2_net_cache);
-                OPENSSL_cleanse(plain,plain_length); free(plain); if (connection->input_memory) core_buffer_drop(connection->input_memory,temporary);
+                if (connection->crypto_reuse) { OPENSSL_cleanse(connection->record_plain.data,connection->record_plain.cap); connection->record_plain.len=0; }
+                else { OPENSSL_cleanse(plain,plain_length); free(plain); if (connection->input_memory) core_buffer_drop(connection->input_memory,temporary); }
                 if (result < 0 || (result > 0 && tls13_uses_h2(connection))) return -1;
                 if (result > 0) { connection->xmux_http1_eof=1; db_consume(&connection->xmux_raw_input,length+5); return CORE_HTTP2_INPUT_PROGRESS; }
             }

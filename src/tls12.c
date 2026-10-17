@@ -146,27 +146,38 @@ static const EVP_CIPHER *record_cipher(const core_tls12_suite_t *suite) {
     if (suite->cipher == CORE_TLS12_GCM) return suite->key_length == 16 ? EVP_aes_128_gcm() : EVP_aes_256_gcm();
     return suite->key_length == 16 ? EVP_aes_128_cbc() : EVP_aes_256_cbc();
 }
-int core_tls12_record_seal(const core_tls12_suite_t *suite,int etm,const uint8_t *key,const uint8_t *iv,const uint8_t *mac_key,
-                           uint64_t *sequence,unsigned type,const uint8_t *plain,size_t length,uint8_t **output,size_t *output_length) {
-    *output=NULL; *output_length=0;
-    if (!suite || length > 16384 || *sequence >= (UINT64_C(1)<<24) || (type != 21 && type != 22 && type != 23)) { errno=EMSGSIZE; return -1; }
+size_t core_tls12_record_bound(const core_tls12_suite_t *suite,int etm,size_t length) {
+    if (!suite || length > 16384) { errno=EMSGSIZE; return 0; }
+    const EVP_MD *digest=core_tls12_digest(suite->mac_hash);
+    size_t mac=digest ? (size_t)EVP_MD_get_size(digest) : 0;
+    size_t explicit=suite->cipher == CORE_TLS12_GCM ? 8 : suite->cipher == CORE_TLS12_CBC ? 16 : 0;
+    size_t encrypted=length+(suite->cipher == CORE_TLS12_CBC && !etm ? mac : 0);
+    if (suite->cipher == CORE_TLS12_CBC) encrypted=((encrypted+1+15)/16)*16;
+    return 5+explicit+encrypted+(suite->cipher == CORE_TLS12_CBC ? etm ? mac : 0 : 16);
+}
+
+int core_tls12_record_seal_into(const core_tls12_suite_t *suite,int etm,EVP_CIPHER_CTX *context,const uint8_t *key,const uint8_t *iv,const uint8_t *mac_key,
+                           uint64_t *sequence,unsigned type,const uint8_t *plain,size_t length,uint8_t *output,size_t capacity,size_t *output_length) {
+    *output_length=0;
+    if (!suite || length > 16384 || *sequence >= (UINT64_C(1)<<24) || (type != 21 && type != 22 && type != 23)) { if (context) EVP_CIPHER_CTX_reset(context); errno=EMSGSIZE; return -1; }
     const EVP_MD *digest=core_tls12_digest(suite->mac_hash); size_t mac_length=digest ? (size_t)EVP_MD_get_size(digest) : 0;
     size_t explicit_length=suite->cipher == CORE_TLS12_GCM ? 8 : suite->cipher == CORE_TLS12_CBC ? 16 : 0;
     size_t encrypted_length=length+(suite->cipher == CORE_TLS12_CBC && !etm ? mac_length : 0);
     if (suite->cipher == CORE_TLS12_CBC) encrypted_length=((encrypted_length+1+15)/16)*16;
     size_t payload_length=explicit_length+encrypted_length+(suite->cipher == CORE_TLS12_CBC ? etm ? mac_length : 0 : 16);
-    uint8_t *record=malloc(5+payload_length),*padded=NULL,nonce[16]={0},header[13],authentication[64]={0}; EVP_CIPHER_CTX *context=NULL;
+    if (!output || capacity < 5+payload_length || !context) { if (context) EVP_CIPHER_CTX_reset(context); errno=ENOBUFS; return -1; }
+    uint8_t *record=output,*padded=record+21,nonce[16]={0},header[13],authentication[64]={0};
+    const EVP_CIPHER *cipher=record_cipher(suite);
+    if (EVP_CIPHER_CTX_cipher(context) && EVP_CIPHER_CTX_nid(context) != EVP_CIPHER_nid(cipher)) EVP_CIPHER_CTX_reset(context);
+    const EVP_CIPHER *initial=EVP_CIPHER_CTX_cipher(context) ? NULL : cipher;
     int result=-1,n=0,final=0,cause=EPROTO;
-    if (!record) { cause=ENOMEM; goto cleanup; }
     record[0]=(uint8_t)type; record[1]=3; record[2]=3; record[3]=(uint8_t)(payload_length>>8); record[4]=(uint8_t)payload_length;
-    context=EVP_CIPHER_CTX_new(); if (!context) { cause=ENOMEM; goto cleanup; }
     if (suite->cipher == CORE_TLS12_CBC) {
-        padded=malloc(encrypted_length); if (!padded) { cause=ENOMEM; goto cleanup; }
         if (RAND_bytes(nonce,16) != 1) goto cleanup;
         memcpy(record+5,nonce,16); memcpy(padded,plain,length); size_t used=length;
         if (!etm) { if (record_mac(digest,mac_key,*sequence,type,plain,length,authentication)) goto cleanup; memcpy(padded+used,authentication,mac_length); used+=mac_length; }
         memset(padded+used,(int)(encrypted_length-used-1),encrypted_length-used);
-        if (EVP_EncryptInit_ex(context,record_cipher(suite),NULL,key,nonce) != 1 || EVP_CIPHER_CTX_set_padding(context,0) != 1 ||
+        if (EVP_EncryptInit_ex(context,initial,NULL,key,nonce) != 1 || EVP_CIPHER_CTX_set_padding(context,0) != 1 ||
             EVP_EncryptUpdate(context,record+21,&n,padded,(int)encrypted_length) != 1 || EVP_EncryptFinal_ex(context,record+21+n,&final) != 1 || (size_t)(n+final) != encrypted_length) goto cleanup;
         if (etm) { if (record_mac(digest,mac_key,*sequence,type,record+5,explicit_length+encrypted_length,authentication)) goto cleanup; memcpy(record+5+explicit_length+encrypted_length,authentication,mac_length); }
     } else {
@@ -174,20 +185,20 @@ int core_tls12_record_seal(const core_tls12_suite_t *suite,int etm,const uint8_t
         if (suite->cipher == CORE_TLS12_GCM) { memcpy(nonce,iv,4); memcpy(nonce+4,header,8); memcpy(record+5,header,8); }
         else { memcpy(nonce,iv,12); for (size_t i=0;i<8;i++) nonce[4+i]^=header[i]; }
         uint8_t *ciphertext=record+5+explicit_length;
-        if (EVP_EncryptInit_ex(context,record_cipher(suite),NULL,NULL,NULL) != 1 || EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_SET_IVLEN,12,NULL) != 1 ||
+        if (EVP_EncryptInit_ex(context,initial,NULL,NULL,NULL) != 1 || EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_SET_IVLEN,12,NULL) != 1 ||
             EVP_EncryptInit_ex(context,NULL,NULL,key,nonce) != 1 || EVP_EncryptUpdate(context,NULL,&n,header,sizeof(header)) != 1 ||
             EVP_EncryptUpdate(context,ciphertext,&n,plain,(int)length) != 1 || EVP_EncryptFinal_ex(context,ciphertext+n,&final) != 1 ||
             (size_t)(n+final) != length || EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_GET_TAG,16,ciphertext+length) != 1) goto cleanup;
     }
-    (*sequence)++; *output=record; *output_length=5+payload_length; record=NULL; result=0;
+    (*sequence)++; *output_length=5+payload_length; result=0;
 cleanup:
-    EVP_CIPHER_CTX_free(context); clear_free(record,5+payload_length); clear_free(padded,encrypted_length);
+    if (result) { OPENSSL_cleanse(record,5+payload_length); EVP_CIPHER_CTX_reset(context); }
     OPENSSL_cleanse(nonce,sizeof(nonce)); OPENSSL_cleanse(authentication,sizeof(authentication)); if (result) errno=cause; return result;
 }
-int core_tls12_record_open(const core_tls12_suite_t *suite,int etm,const uint8_t *key,const uint8_t *iv,const uint8_t *mac_key,
-                           uint64_t *sequence,unsigned type,const uint8_t *payload,size_t length,uint8_t **output,size_t *output_length) {
-    *output=NULL; *output_length=0;
-    if (!suite || length > 18432 || *sequence >= (UINT64_C(1)<<24) || (type != 21 && type != 22 && type != 23)) { errno=EMSGSIZE; return -1; }
+int core_tls12_record_open_into(const core_tls12_suite_t *suite,int etm,EVP_CIPHER_CTX *context,const uint8_t *key,const uint8_t *iv,const uint8_t *mac_key,
+                           uint64_t *sequence,unsigned type,const uint8_t *payload,size_t length,uint8_t *output,size_t capacity,size_t *output_length) {
+    *output_length=0;
+    if (!suite || length > 18432 || *sequence >= (UINT64_C(1)<<24) || (type != 21 && type != 22 && type != 23)) { if (context) EVP_CIPHER_CTX_reset(context); errno=EMSGSIZE; return -1; }
     const EVP_MD *digest=core_tls12_digest(suite->mac_hash); size_t mac_length=digest ? (size_t)EVP_MD_get_size(digest) : 0;
     size_t explicit_length=suite->cipher == CORE_TLS12_GCM ? 8 : suite->cipher == CORE_TLS12_CBC ? 16 : 0;
     size_t tag_length=suite->cipher == CORE_TLS12_CBC ? etm ? mac_length : 0 : 16;
@@ -195,14 +206,16 @@ int core_tls12_record_open(const core_tls12_suite_t *suite,int etm,const uint8_t
     size_t encrypted_length=length-explicit_length-tag_length;
     if (suite->cipher == CORE_TLS12_CBC && encrypted_length%16) goto invalid;
     if (suite->cipher != CORE_TLS12_CBC && encrypted_length > 16384) goto invalid;
-    uint8_t authentication[64]={0},received_mac[64]={0},nonce[16]={0},header[13],*plain=NULL; EVP_CIPHER_CTX *context=NULL;
+    if (!output || capacity < encrypted_length || !context) { if (context) EVP_CIPHER_CTX_reset(context); errno=ENOBUFS; return -1; }
+    uint8_t authentication[64]={0},received_mac[64]={0},nonce[16]={0},header[13],*plain=output;
+    const EVP_CIPHER *cipher=record_cipher(suite);
+    if (EVP_CIPHER_CTX_cipher(context) && EVP_CIPHER_CTX_nid(context) != EVP_CIPHER_nid(cipher)) EVP_CIPHER_CTX_reset(context);
+    const EVP_CIPHER *initial=EVP_CIPHER_CTX_cipher(context) ? NULL : cipher;
     int result=-1,n=0,final=0,cause=EPROTO; size_t content_length=0;
     if (suite->cipher == CORE_TLS12_CBC && etm && (record_mac(digest,mac_key,*sequence,type,payload,length-mac_length,authentication) ||
         CRYPTO_memcmp(authentication,payload+length-mac_length,mac_length))) goto cleanup;
-    plain=malloc(encrypted_length ? encrypted_length : 1); context=EVP_CIPHER_CTX_new();
-    if (!plain || !context) { cause=ENOMEM; goto cleanup; }
     if (suite->cipher == CORE_TLS12_CBC) {
-        if (EVP_DecryptInit_ex(context,record_cipher(suite),NULL,key,payload) != 1 || EVP_CIPHER_CTX_set_padding(context,0) != 1 ||
+        if (EVP_DecryptInit_ex(context,initial,NULL,key,payload) != 1 || EVP_CIPHER_CTX_set_padding(context,0) != 1 ||
             EVP_DecryptUpdate(context,plain,&n,payload+16,(int)encrypted_length) != 1 || EVP_DecryptFinal_ex(context,plain+n,&final) != 1 || (size_t)(n+final) != encrypted_length) goto cleanup;
         unsigned valid=cbc_padding(plain,encrypted_length,etm ? 0 : mac_length,&content_length);
         if (!etm) {
@@ -215,7 +228,7 @@ int core_tls12_record_open(const core_tls12_suite_t *suite,int etm,const uint8_t
         record_header(header,*sequence,type,encrypted_length);
         if (suite->cipher == CORE_TLS12_GCM) { memcpy(nonce,iv,4); memcpy(nonce+4,payload,8); }
         else { memcpy(nonce,iv,12); for (size_t i=0;i<8;i++) nonce[4+i]^=header[i]; }
-        if (EVP_DecryptInit_ex(context,record_cipher(suite),NULL,NULL,NULL) != 1 || EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_SET_IVLEN,12,NULL) != 1 ||
+        if (EVP_DecryptInit_ex(context,initial,NULL,NULL,NULL) != 1 || EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_SET_IVLEN,12,NULL) != 1 ||
             EVP_DecryptInit_ex(context,NULL,NULL,key,nonce) != 1 || EVP_DecryptUpdate(context,NULL,&n,header,sizeof(header)) != 1 ||
             EVP_DecryptUpdate(context,plain,&n,payload+explicit_length,(int)encrypted_length) != 1 ||
             EVP_CIPHER_CTX_ctrl(context,EVP_CTRL_AEAD_SET_TAG,16,(void *)(payload+length-16)) != 1 ||
@@ -223,12 +236,37 @@ int core_tls12_record_open(const core_tls12_suite_t *suite,int etm,const uint8_t
         content_length=encrypted_length;
     }
     OPENSSL_cleanse(plain+content_length,encrypted_length-content_length);
-    (*sequence)++; *output=plain; *output_length=content_length; plain=NULL; result=0;
+    (*sequence)++; *output_length=content_length; result=0;
 cleanup:
-    EVP_CIPHER_CTX_free(context); clear_free(plain,encrypted_length ? encrypted_length : 1);
+    if (result) { OPENSSL_cleanse(plain,encrypted_length); EVP_CIPHER_CTX_reset(context); }
     OPENSSL_cleanse(authentication,sizeof(authentication)); OPENSSL_cleanse(received_mac,sizeof(received_mac)); OPENSSL_cleanse(nonce,sizeof(nonce));
     if (result) errno=cause;
     return result;
 invalid:
+    if (context) EVP_CIPHER_CTX_reset(context);
     errno=EPROTO; return -1;
+}
+
+int core_tls12_record_seal(const core_tls12_suite_t *suite,int etm,const uint8_t *key,const uint8_t *iv,const uint8_t *mac_key,
+                           uint64_t *sequence,unsigned type,const uint8_t *plain,size_t length,uint8_t **output,size_t *output_length) {
+    *output=NULL; *output_length=0;
+    size_t capacity=core_tls12_record_bound(suite,etm,length); if (!capacity) return -1;
+    uint8_t *record=malloc(capacity); EVP_CIPHER_CTX *context=EVP_CIPHER_CTX_new();
+    int result=record && context ? core_tls12_record_seal_into(suite,etm,context,key,iv,mac_key,sequence,type,plain,length,record,capacity,output_length) : -1;
+    EVP_CIPHER_CTX_free(context);
+    if (result) { clear_free(record,capacity); if (!record || !context) errno=ENOMEM; }
+    else *output=record;
+    return result;
+}
+int core_tls12_record_open(const core_tls12_suite_t *suite,int etm,const uint8_t *key,const uint8_t *iv,const uint8_t *mac_key,
+                           uint64_t *sequence,unsigned type,const uint8_t *payload,size_t length,uint8_t **output,size_t *output_length) {
+    *output=NULL; *output_length=0;
+    if (length > 18432) { errno=EMSGSIZE; return -1; }
+    size_t capacity=length ? length : 1;
+    uint8_t *plain=malloc(capacity); EVP_CIPHER_CTX *context=EVP_CIPHER_CTX_new();
+    int result=plain && context ? core_tls12_record_open_into(suite,etm,context,key,iv,mac_key,sequence,type,payload,length,plain,capacity,output_length) : -1;
+    EVP_CIPHER_CTX_free(context);
+    if (result) { clear_free(plain,capacity); if (!plain || !context) errno=ENOMEM; }
+    else *output=plain;
+    return result;
 }

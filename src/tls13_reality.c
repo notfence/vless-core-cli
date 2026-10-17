@@ -241,6 +241,9 @@ int tls13_connect_budgeted(const vless_config_t *cfg, tls13_conn_t **out, char *
     c->ip_source=core_config_ip_source(cfg);
     c->xhttp_upload_fd = -1;
     c->mode = CONN_MODE_REALITY;
+    c->crypto_reuse=1; c->record_memory.direction=CORE_BUFFER_RELAY;
+    c->app_cache.memory=c->tls_stream_input.memory=c->ws_net_cache.memory=&c->record_memory;
+    c->xmux_raw_input.memory=c->xmux_wire_output.memory=&c->record_memory;
     c->input_memory=input_memory; c->output_memory=output_memory;
     c->hpack.memory=input_memory;
     if (cfg->xhttp_physical_only || cfg->grpc_physical_only) {
@@ -342,7 +345,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     }
     int saved=errno;
     core_grpc_clear(&c->grpc_decoder); db_free(&c->grpc_net_cache);
-    if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); OPENSSL_cleanse(c,sizeof(*c)); free(c); errno=saved; return; }
+    if (c->xmux_stream) { core_xmux_close(c->xmux_stream); db_free(&c->app_cache); tls_record_work_clear(c); OPENSSL_cleanse(c,sizeof(*c)); free(c); errno=saved; return; }
     h2_response_clear(c);
     if (!c->send_closed && c->mode == CONN_MODE_XHTTP_PLAIN && strcmp(c->xhttp_transport_mode, "packet-up") != 0) {
         int upload_fd = strcmp(c->xhttp_transport_mode, "stream-one") == 0 ? c->fd : c->xhttp_upload_fd;
@@ -388,6 +391,7 @@ void tls13_reality_close(tls13_conn_t *c) {
     db_free(&c->transcript);
     db_free(&c->app_cache);
     db_free(&c->xmux_raw_input); db_free(&c->xmux_plain_output); db_free(&c->xmux_wire_output);
+    tls_record_work_clear(c);
     OPENSSL_cleanse(c,sizeof(*c));
     free(c);
     errno=saved;
@@ -607,9 +611,10 @@ int tls13_finish_write(tls13_conn_t *c, int raw) {
         }
     } else if (c->mode == CONN_MODE_TLS || c->mode == CONN_MODE_REALITY) {
         const uint8_t alert[]={1,0}; uint8_t *record=NULL; size_t length=0;
-        result=encrypt_record(c,c->c_app_key,c->c_app_iv,&c->c_app_seq,21,alert,sizeof(alert),&record,&length);
+        result=c->crypto_reuse ? tls_record_seal_owned(c,21,alert,sizeof(alert),&record,&length) :
+            encrypt_record(c,c->c_app_key,c->c_app_iv,&c->c_app_seq,21,alert,sizeof(alert),&record,&length);
         if (!result) result=relay_write_wire(c,record,length);
-        free(record);
+        if (!c->crypto_reuse) free(record);
     }
     if (!result) {
         c->send_closed=1;

@@ -84,6 +84,9 @@ $(HOST_BUILD_DIR)/test_tls12_handshake: $(HOST_BUILD_DIR)/test_tls12_handshake.o
 $(HOST_BUILD_DIR)/test_tls_state: $(HOST_BUILD_DIR)/test_tls_state.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=malloc
 
+$(HOST_BUILD_DIR)/test_record_crypto: $(HOST_BUILD_DIR)/test_record_crypto.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes,--wrap=EVP_CIPHER_CTX_new,--wrap=realloc,--wrap=OPENSSL_cleanse
+
 $(HOST_BUILD_DIR)/test_socket: $(HOST_BUILD_DIR)/test_socket.o $(HOST_BUILD_DIR)/src/connection_trace.o $(HOST_BUILD_DIR)/src/core_log.o $(HOST_BUILD_DIR)/src/deadline.o $(HOST_BUILD_DIR)/src/resolver.o
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) -Wl,--wrap=connect,--wrap=poll,--wrap=getsockopt,--wrap=send,--wrap=recv,--wrap=__recv_chk
 

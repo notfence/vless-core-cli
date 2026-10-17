@@ -42,6 +42,7 @@ static void fuzz_clear(tls13_conn_t *c) {
     db_free(&c->tls_stream_input);
     db_free(&c->xhttp_net_cache);
     db_free(&c->xmux_raw_input); db_free(&c->xmux_wire_output); db_free(&c->xmux_plain_output);
+    tls_record_work_clear(c);
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -290,7 +291,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             (void)core_tls_hello_retry(hello,hello_length,&server,&retry,&retry_length,&key);
             free(retry); EVP_PKEY_free(key);
         }
-        configure_tls_cipher(&c,0x1303); c.tls_auth_state=4;
+        configure_tls_cipher(&c,0x1303); c.tls_auth_state=4; c.crypto_reuse=size && (data[0]&4);
         (void)tls_certificate_request(data,size);
         (void)tls_session_ticket(data,size);
         (void)tls_encrypted_extensions(&c,data,size);
@@ -320,7 +321,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         fuzz_clear(&legacy);
         (void)append_transcript(&c,data,size);
         (void)tls_post_handshake(&c,data,size);
-        tls13_conn_t fragmented={.fd=-1,.tls_auth_state=4,.xmux_async=1};
+        tls13_conn_t fragmented={.fd=-1,.tls_auth_state=4,.xmux_async=1,.crypto_reuse=size && (data[0]&8)};
         if (configure_tls_cipher(&fragmented,0x1303)) abort();
         size_t step=size ? 1+data[size-1]%7 : 1;
         for (size_t offset=0;offset<size;offset+=step) {

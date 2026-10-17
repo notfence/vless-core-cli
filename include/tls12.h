@@ -15,6 +15,9 @@ typedef struct {
 const core_tls12_suite_t *core_tls12_suite(unsigned);
 const core_tls12_suite_t *core_tls12_suite_at(size_t);
 const EVP_MD *core_tls12_digest(unsigned);
+size_t core_tls12_record_bound(const core_tls12_suite_t *,int,size_t);
+int core_tls12_record_seal_into(const core_tls12_suite_t *,int,EVP_CIPHER_CTX *,const uint8_t *,const uint8_t *,const uint8_t *,uint64_t *,unsigned,const uint8_t *,size_t,uint8_t *,size_t,size_t *);
+int core_tls12_record_open_into(const core_tls12_suite_t *,int,EVP_CIPHER_CTX *,const uint8_t *,const uint8_t *,const uint8_t *,uint64_t *,unsigned,const uint8_t *,size_t,uint8_t *,size_t,size_t *);
 int core_tls12_prf(const EVP_MD *,const uint8_t *,size_t,const char *,const uint8_t *,size_t,uint8_t *,size_t);
 int core_tls12_record_seal(const core_tls12_suite_t *,int,const uint8_t *,const uint8_t *,const uint8_t *,uint64_t *,
                           unsigned,const uint8_t *,size_t,uint8_t **,size_t *);

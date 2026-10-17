@@ -15,6 +15,7 @@
 #include "socket_util.h"
 #include "deadline.h"
 #include "server_ips.h"
+#include "buffer_budget.h"
 
 typedef struct {
     uint8_t key[32];
@@ -29,6 +30,10 @@ struct vless_encryption_conn {
     vless_aead_t incoming;
     EVP_CIPHER_CTX *outgoing_header_ctr;
     EVP_CIPHER_CTX *incoming_header_ctr;
+    EVP_CIPHER_CTX *record_encrypt,*record_decrypt;
+    core_buffer_budget_t working_memory;
+    uint8_t *write_buffer;
+    size_t write_capacity,record_capacity;
     uint8_t outgoing_raw_header[5];
     size_t outgoing_raw_header_len;
     size_t outgoing_raw_skip;
@@ -181,7 +186,7 @@ static void aead_init(vless_aead_t *aead, const uint8_t *context,
     blake3_derive_key(context, context_len, key, key_len, aead->key);
 }
 
-static int aead_seal(vless_aead_t *aead, const uint8_t *nonce_override,
+static int aead_seal_context(vless_aead_t *aead, EVP_CIPHER_CTX *ctx, const uint8_t *nonce_override,
                      const uint8_t *plain, size_t plain_len,
                      const uint8_t *aad, size_t aad_len,
                      uint8_t *out, size_t *out_len) {
@@ -194,14 +199,15 @@ static int aead_seal(vless_aead_t *aead, const uint8_t *nonce_override,
         memcpy(nonce, aead->nonce, sizeof(nonce));
     }
 
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (ctx == NULL) {
         OPENSSL_cleanse(nonce,sizeof(nonce));
         return -1;
     }
     int n = 0;
     int total = 0;
-    int ok = EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) == 1 &&
+    const EVP_CIPHER *cipher=EVP_chacha20_poly1305();
+    if (EVP_CIPHER_CTX_cipher(ctx) && EVP_CIPHER_CTX_nid(ctx) != EVP_CIPHER_nid(cipher)) EVP_CIPHER_CTX_reset(ctx);
+    int ok = EVP_EncryptInit_ex(ctx, EVP_CIPHER_CTX_cipher(ctx) ? NULL : cipher, NULL, NULL, NULL) == 1 &&
              EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, sizeof(nonce), NULL) == 1 &&
              EVP_EncryptInit_ex(ctx, NULL, NULL, aead->key, nonce) == 1;
     if (ok && aad_len > 0) {
@@ -220,7 +226,7 @@ static int aead_seal(vless_aead_t *aead, const uint8_t *nonce_override,
                                  out + total) == 1;
         total += 16;
     }
-    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) EVP_CIPHER_CTX_reset(ctx);
     OPENSSL_cleanse(nonce,sizeof(nonce));
     if (!ok) {
         OPENSSL_cleanse(out,plain_len+16);
@@ -230,7 +236,7 @@ static int aead_seal(vless_aead_t *aead, const uint8_t *nonce_override,
     return 0;
 }
 
-static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
+static int aead_open_context(vless_aead_t *aead, EVP_CIPHER_CTX *ctx, const uint8_t *nonce_override,
                      const uint8_t *ciphertext, size_t ciphertext_len,
                      const uint8_t *aad, size_t aad_len,
                      uint8_t *out, size_t *out_len) {
@@ -247,7 +253,6 @@ static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
     }
 
     size_t data_len = ciphertext_len - 16;
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     if (ctx == NULL) {
         OPENSSL_cleanse(nonce,sizeof(nonce));
         OPENSSL_cleanse(out,data_len);
@@ -255,7 +260,9 @@ static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
     }
     int n = 0;
     int total = 0;
-    int ok = EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) == 1 &&
+    const EVP_CIPHER *cipher=EVP_chacha20_poly1305();
+    if (EVP_CIPHER_CTX_cipher(ctx) && EVP_CIPHER_CTX_nid(ctx) != EVP_CIPHER_nid(cipher)) EVP_CIPHER_CTX_reset(ctx);
+    int ok = EVP_DecryptInit_ex(ctx, EVP_CIPHER_CTX_cipher(ctx) ? NULL : cipher, NULL, NULL, NULL) == 1 &&
              EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, sizeof(nonce), NULL) == 1 &&
              EVP_DecryptInit_ex(ctx, NULL, NULL, aead->key, nonce) == 1;
     if (ok && aad_len > 0) {
@@ -273,7 +280,7 @@ static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
         ok = EVP_DecryptFinal_ex(ctx, out + total, &n) == 1;
         total += n;
     }
-    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) EVP_CIPHER_CTX_reset(ctx);
     OPENSSL_cleanse(nonce,sizeof(nonce));
     if (!ok) {
         OPENSSL_cleanse(out,data_len);
@@ -281,6 +288,18 @@ static int aead_open(vless_aead_t *aead, const uint8_t *nonce_override,
     }
     *out_len = (size_t)total;
     return 0;
+}
+static int aead_seal(vless_aead_t *aead,const uint8_t *nonce,const uint8_t *plain,size_t length,
+                     const uint8_t *aad,size_t aad_length,uint8_t *output,size_t *output_length) {
+    EVP_CIPHER_CTX *context=EVP_CIPHER_CTX_new();
+    int result=aead_seal_context(aead,context,nonce,plain,length,aad,aad_length,output,output_length);
+    EVP_CIPHER_CTX_free(context); return result;
+}
+static int aead_open(vless_aead_t *aead,const uint8_t *nonce,const uint8_t *data,size_t length,
+                     const uint8_t *aad,size_t aad_length,uint8_t *output,size_t *output_length) {
+    EVP_CIPHER_CTX *context=EVP_CIPHER_CTX_new();
+    int result=aead_open_context(aead,context,nonce,data,length,aad,aad_length,output,output_length);
+    EVP_CIPHER_CTX_free(context); return result;
 }
 
 static int x25519_generate(EVP_PKEY **out_key, uint8_t public_key[32]) {
@@ -626,16 +645,44 @@ cleanup: {
     errno=saved; return result;
 }
 }
+static EVP_CIPHER_CTX *record_context(vless_encryption_conn_t *connection,int writing) {
+    EVP_CIPHER_CTX **context=writing ? &connection->record_encrypt : &connection->record_decrypt;
+    if (!*context) *context=EVP_CIPHER_CTX_new();
+    if (!*context) errno=ENOMEM;
+    return *context;
+}
+static void working_free(vless_encryption_conn_t *connection,uint8_t *buffer,size_t capacity) {
+    if (!buffer) return;
+    clear_free(buffer,capacity); core_buffer_drop(&connection->working_memory,capacity);
+}
+static int working_reserve(vless_encryption_conn_t *connection,uint8_t **buffer,size_t *capacity,size_t needed,size_t limit) {
+    if (*buffer && (needed > *capacity || buffer == &connection->input)) OPENSSL_cleanse(*buffer,*capacity);
+    if (needed <= *capacity) return 0;
+    if (needed > limit) { errno=EMSGSIZE; return -1; }
+    if (core_buffer_budget_init(&connection->working_memory,CORE_BUFFER_RELAY,0)) return -1;
+    size_t size=*capacity ? *capacity : 1024;
+    while (size < needed) size=size > limit/2 ? limit : size*2;
+    if (core_buffer_hold(&connection->working_memory,size)) return -1;
+    uint8_t *replacement=malloc(size);
+    if (!replacement) { core_buffer_drop(&connection->working_memory,size); return -1; }
+    OPENSSL_cleanse(replacement,size);
+    working_free(connection,*buffer,*capacity);
+    *buffer=replacement; *capacity=size; return 0;
+}
+
 void vless_encryption_close(vless_encryption_conn_t *conn) {
     if (conn == NULL) {
         return;
     }
     int saved=errno;
-    clear_free(conn->input,conn->input_capacity);
-    clear_free(conn->record_data,conn->record_length);
+    working_free(conn,conn->input,conn->input_capacity);
+    working_free(conn,conn->record_data,conn->record_capacity);
+    working_free(conn,conn->write_buffer,conn->write_capacity);
+    core_buffer_budget_clear(&conn->working_memory);
     clear_free(conn->prewrite,conn->prewrite_capacity);
     EVP_CIPHER_CTX_free(conn->outgoing_header_ctr);
     EVP_CIPHER_CTX_free(conn->incoming_header_ctr);
+    EVP_CIPHER_CTX_free(conn->record_encrypt); EVP_CIPHER_CTX_free(conn->record_decrypt);
     OPENSSL_cleanse(conn->united_key, sizeof(conn->united_key));
     OPENSSL_cleanse(&conn->outgoing, sizeof(conn->outgoing));
     OPENSSL_cleanse(&conn->incoming, sizeof(conn->incoming));
@@ -653,11 +700,10 @@ int vless_encryption_write(vless_encryption_conn_t *conn,
             chunk = 8192;
         }
         size_t record_len = 5 + chunk + 16;
+        if (conn->prewrite_length > SIZE_MAX-record_len) { errno=EOVERFLOW; return -1; }
         size_t packet_capacity=conn->prewrite_length+record_len;
-        uint8_t *packet = (uint8_t *)malloc(packet_capacity);
-        if (packet == NULL) {
-            return -1;
-        }
+        if (working_reserve(conn,&conn->write_buffer,&conn->write_capacity,packet_capacity,CORE_BUFFER_TOTAL_LIMIT)) return -1;
+        uint8_t *packet=conn->write_buffer;
         if (conn->prewrite_length) memcpy(packet,conn->prewrite,conn->prewrite_length);
         uint8_t *record=packet+conn->prewrite_length;
         size_t encrypted_len = chunk + 16;
@@ -667,7 +713,7 @@ int vless_encryption_write(vless_encryption_conn_t *conn,
         record[3] = (uint8_t)(encrypted_len >> 8);
         record[4] = (uint8_t)encrypted_len;
         size_t written = 0;
-        int ok = aead_seal(&conn->outgoing, NULL, buf + off, chunk,
+        int ok = aead_seal_context(&conn->outgoing, record_context(conn,1), NULL, buf + off, chunk,
                            record, 5, record + 5, &written) == 0 &&
                  written == encrypted_len;
         if (ok && conn->outgoing_header_ctr != NULL) {
@@ -676,7 +722,7 @@ int vless_encryption_write(vless_encryption_conn_t *conn,
         if (ok) {
             ok = tls13_write_app(conn->transport,packet,conn->prewrite_length+record_len) == 0;
         }
-        clear_free(packet,packet_capacity); clear_free(conn->prewrite,conn->prewrite_capacity);
+        OPENSSL_cleanse(packet,conn->write_capacity); clear_free(conn->prewrite,conn->prewrite_capacity);
         conn->prewrite=NULL; conn->prewrite_length=conn->prewrite_capacity=0;
         if (!ok) {
             cache_invalidate(conn);
@@ -695,10 +741,8 @@ int vless_encryption_write_raw(vless_encryption_conn_t *conn,
     if (conn->outgoing_header_ctr == NULL) {
         return tls13_write_app(conn->transport, buf, len);
     }
-    uint8_t *encoded = (uint8_t *)malloc(len);
-    if (encoded == NULL) {
-        return -1;
-    }
+    if (working_reserve(conn,&conn->write_buffer,&conn->write_capacity,len,CORE_BUFFER_TOTAL_LIMIT)) return -1;
+    uint8_t *encoded=conn->write_buffer;
     memcpy(encoded, buf, len);
     int rc = xor_raw_headers(
         conn->outgoing_header_ctr, encoded, len,
@@ -707,7 +751,7 @@ int vless_encryption_write_raw(vless_encryption_conn_t *conn,
     if (rc == 0) {
         rc = tls13_write_app(conn->transport, encoded, len);
     }
-    clear_free(encoded,len);
+    OPENSSL_cleanse(encoded,conn->write_capacity);
     return rc;
 }
 
@@ -727,7 +771,7 @@ static int read_record(vless_encryption_conn_t *conn) {
         OPENSSL_cleanse(conn->incoming_random,sizeof(conn->incoming_random));
         return 2;
     }
-    if (!conn->record_data) {
+    if (conn->record_header_length < sizeof(conn->record_header)) {
         size_t received=0;
         int result=tls13_read_app(conn->transport,conn->record_header+conn->record_header_length,sizeof(conn->record_header)-conn->record_header_length,&received);
         if (result > 0) return 2;
@@ -741,8 +785,8 @@ static int read_record(vless_encryption_conn_t *conn) {
         if (conn->incoming_header_ctr && aes_ctr_xor(conn->incoming_header_ctr,conn->record_header,sizeof(conn->record_header))) { cache_invalidate(conn); return -1; }
         conn->record_length=((size_t)conn->record_header[3]<<8)|conn->record_header[4];
         if (conn->record_header[0] != 23 || conn->record_header[1] != 3 || conn->record_header[2] != 3 || conn->record_length < 17 || conn->record_length > 16640) { cache_invalidate(conn); return -1; }
-        conn->record_data=malloc(conn->record_length);
-        if (!conn->record_data) { cache_invalidate(conn); return -1; }
+        if (working_reserve(conn,&conn->record_data,&conn->record_capacity,conn->record_length,16640) ||
+            working_reserve(conn,&conn->input,&conn->input_capacity,conn->record_length-16,16640)) { cache_invalidate(conn); return -1; }
         return 2;
     }
     size_t received=0;
@@ -751,22 +795,17 @@ static int read_record(vless_encryption_conn_t *conn) {
     if (result < 0 || !received) { cache_invalidate(conn); return -1; }
     conn->record_received+=received;
     if (conn->record_received < conn->record_length) return 2;
-    size_t plain_capacity=conn->record_length-16;
-    uint8_t *plain=malloc(plain_capacity);
-    if (!plain) { cache_invalidate(conn); return -1; }
+    uint8_t *plain=conn->input;
     size_t plain_len = 0;
-    int rc = aead_open(&conn->incoming, NULL, conn->record_data, conn->record_length,
+    int rc = aead_open_context(&conn->incoming, record_context(conn,0), NULL, conn->record_data, conn->record_length,
                        conn->record_header, sizeof(conn->record_header), plain, &plain_len);
-    clear_free(conn->record_data,conn->record_length); conn->record_data=NULL;
+    OPENSSL_cleanse(conn->record_data,conn->record_capacity);
     conn->record_header_length=conn->record_length=conn->record_received=0;
     if (rc != 0) {
         cache_invalidate(conn);
-        clear_free(plain,plain_capacity);
+        OPENSSL_cleanse(plain,conn->input_capacity);
         return -1;
     }
-    clear_free(conn->input,conn->input_capacity);
-    conn->input = plain;
-    conn->input_capacity=plain_capacity;
     conn->input_len = plain_len;
     conn->input_off = 0;
     conn->cache_generation=0;

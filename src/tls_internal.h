@@ -147,6 +147,10 @@ struct tls13_conn {
     struct tls13_conn *xmux_owner;
     int xmux_physical, xmux_async;
     core_buffer_budget_t *input_memory, *output_memory;
+    core_buffer_budget_t record_memory;
+    EVP_CIPHER_CTX *record_encrypt,*record_decrypt;
+    dynbuf_t record_output,record_plain,record_wire;
+    int crypto_reuse;
     int relay_async,relay_raw_finish;
     dynbuf_t xmux_raw_input, xmux_plain_output, xmux_wire_output;
     size_t xmux_ssl_write_length;
@@ -341,11 +345,14 @@ int transcript_hash(const tls13_conn_t *c, uint8_t *out);
 int calc_finished_verify(const tls13_conn_t *c, const uint8_t *traffic_secret, const uint8_t *transcript_hash_val, uint8_t *out);
 int derive_handshake_keys(tls13_conn_t *c, const uint8_t *shared, size_t shared_len);
 int derive_app_keys(tls13_conn_t *c);
-int encrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t inner_type, const uint8_t *plain,
+int encrypt_record(tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t inner_type, const uint8_t *plain,
                           size_t plain_len, uint8_t **out, size_t *out_len);
-int decrypt_record(const tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t rtype, const uint8_t *payload,
+int decrypt_record(tls13_conn_t *c, const uint8_t *key, const uint8_t iv[12], uint64_t *seq, uint8_t rtype, const uint8_t *payload,
                           size_t payload_len, uint8_t **plain, size_t *plain_len, uint8_t *inner_type);
 int append_transcript(tls13_conn_t *c, const uint8_t *msg, size_t msg_len);
+int tls_record_seal_owned(tls13_conn_t *,uint8_t,const uint8_t *,size_t,uint8_t **,size_t *);
+int tls_record_open_owned(tls13_conn_t *,uint8_t,const uint8_t *,size_t,uint8_t **,size_t *,uint8_t *);
+void tls_record_work_clear(tls13_conn_t *);
 int tls_prepare_app_record(tls13_conn_t *c);
 int tls_application_plain(tls13_conn_t *c, unsigned type, const uint8_t *data, size_t length, dynbuf_t *cache);
 int reality_write_app_records(tls13_conn_t *c, const uint8_t *buf, size_t len);
