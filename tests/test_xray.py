@@ -34,6 +34,51 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_blocked_log_receiver_keeps_http2_streams_alive(self):
+        cert,_=certificate()
+        with Server() as target,xray_server("xhttp","tls","stream-one") as reference:
+            output_read,output_write=os.pipe()
+            input_read,input_write=os.pipe()
+            os.set_blocking(output_write,False)
+            try:
+                while True: os.write(output_write,b"x"*1024)
+            except BlockingIOError:
+                pass
+            os.set_blocking(output_write,True)
+            listen=port()
+            config=uri(reference.port,"xhttp","tls",mode="stream-one",extra=json.dumps({"xmux":{"maxConnections":1}}))
+            process=None
+            try:
+                process=subprocess.Popen([str(BUILD/"vless-core-test"),"--listen-port",str(listen),"--uri-fd",str(input_read)],
+                    stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=output_write,pass_fds=(input_read,),
+                    env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)))
+                os.write(input_write,config.encode()); os.close(input_write); input_write=-1
+                os.close(input_read); input_read=-1
+                os.close(output_write); output_write=-1
+                until=time.monotonic()+2
+                while True:
+                    self.assertIsNone(process.poll())
+                    try:
+                        with socket.create_connection(("127.0.0.1",listen),timeout=0.1): break
+                    except OSError:
+                        self.assertLess(time.monotonic(),until,"listener did not become available")
+                        time.sleep(0.01)
+                with socks_connect(listen,target.port) as tunnel: exchange(tunnel,b"vless-core blocked logs first stream")
+                with socks_connect(listen,port()) as failed:
+                    failed.sendall(b"vless-core rejected target")
+                    self.assertEqual(failed.recv(1),b"")
+                def transfer(index):
+                    with socks_connect(listen,target.port) as tunnel: exchange(tunnel,bytes(range(251))*128+bytes([index]))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers: list(workers.map(transfer,range(4)))
+                self.assertIsNone(process.poll())
+            finally:
+                if process is not None:
+                    process.terminate()
+                    try: process.wait(timeout=2)
+                    except subprocess.TimeoutExpired: process.kill(); process.wait()
+                for descriptor in (output_read,output_write,input_read,input_write):
+                    if descriptor >= 0: os.close(descriptor)
+
     def test_ws_xhttp_escaped_paths_interoperate(self):
         cert,_=certificate()
         server_path="/vless core/тест"
@@ -79,7 +124,7 @@ class XrayTests(unittest.TestCase):
         with Server(handler) as server, cli(uri(server.port,"xhttp","none",mode="stream-up")) as core:
             with self.assertRaises((AssertionError,EOFError,ConnectionError)):
                 with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core")
-            self.assertIn("upload response failed",core.log)
+            self.assertIn("upload response failed",core.wait_log("upload response failed"))
 
     def test_http1_post_response_is_fully_validated(self):
         responses=[
@@ -1111,7 +1156,7 @@ class XrayTests(unittest.TestCase):
                                     pass
                         if status != 200:
                             expected = "invalid h2 header block" if status is None else f"non-200: {status}"
-                            self.assertIn(expected,core.log)
+                            self.assertIn(expected,core.wait_log(expected))
                         self.assertIsNone(core.process.poll(),core.log)
 
     def test_xhttp_h2_header_only_response(self):
@@ -1375,7 +1420,7 @@ class XrayTests(unittest.TestCase):
             with self.assertRaises((AssertionError,EOFError,ConnectionError)):
                 with socks_connect(core.port,target.port) as tunnel:
                     exchange(tunnel,b"vless-core")
-            self.assertIn("expired",core.log.lower())
+            self.assertIn("expired",core.wait_log("expired",ignore_case=True).lower())
 
     def test_reality_bad_key(self):
         with Server() as target, xray_server("tcp","reality") as reference:

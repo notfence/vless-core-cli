@@ -16,6 +16,8 @@ void vc_log_warning(const char *component, const char *format, ...)
     VC_LOG_PRINTF(2, 3);
 void vc_log_error(const char *component, const char *format, ...)
     VC_LOG_PRINTF(2, 3);
+void vc_log_probe(int success,const char *text);
+int vc_log_flush(void);
 
 #undef VC_LOG_PRINTF
 

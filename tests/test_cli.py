@@ -37,7 +37,7 @@ class CliTests(unittest.TestCase):
                     tunnel.sendall(b"\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x50")
                     self.assertEqual(exact(tunnel,10)[1],1)
                 self.wait_for_probe(core,"transport")
-                self.assertRegex(core.log,r"upstream connect failed: .* id=1 stage=transport category=tls system=\d+")
+                self.assertRegex(core.wait_log(r"upstream connect failed: .* id=1 stage=transport category=tls system=\d+",regex=True),r"upstream connect failed: .* id=1 stage=transport category=tls system=\d+")
 
     def test_vless_response_failure_reasons_and_identity(self):
         cases=((b"","no response received"),(b"\x00","truncated header"),(b"\x00\x03x","truncated addons"))
@@ -47,7 +47,7 @@ class CliTests(unittest.TestCase):
             with self.subTest(reason=reason), Server(handler) as upstream, cli(uri(upstream.port)) as core:
                 with socks_connect(core.port,80) as tunnel: self.assertEqual(tunnel.recv(1),b"")
                 self.wait_for_probe(core,"protocol")
-                self.assertIn(f"VLESS response read failed: {reason} id=1 stage=protocol category=eof system=0",core.log)
+                self.assertIn(f"VLESS response read failed: {reason} id=1 stage=protocol category=eof system=0",core.wait_log(f"VLESS response read failed: {reason} id=1 stage=protocol category=eof system=0"))
 
     def test_transport_reset_is_not_a_clean_truncated_response(self):
         def handler(connection):
@@ -56,7 +56,7 @@ class CliTests(unittest.TestCase):
         with Server(handler) as upstream, cli(uri(upstream.port)) as core:
             with socks_connect(core.port,80) as tunnel: self.assertEqual(tunnel.recv(1),b"")
             self.wait_for_probe(core,"transport")
-            self.assertRegex(core.log,r"VLESS response read failed: transport failure before the complete header id=1 stage=transport category=system system=\d+")
+            self.assertRegex(core.wait_log(r"VLESS response read failed: transport failure before the complete header id=1 stage=transport category=system system=\d+",regex=True),r"VLESS response read failed: transport failure before the complete header id=1 stage=transport category=system system=\d+")
             self.assertNotIn("truncated header",core.log)
 
     def test_absolute_incoming_socks_budget(self):
@@ -101,7 +101,7 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(tunnel.recv(1),b"")
                     self.assertLess(time.monotonic()-started,0.6)
                 self.wait_for_probe(core,"protocol")
-                self.assertIn("VLESS response deadline expired",core.log)
+                self.assertIn("VLESS response deadline expired",core.wait_log("VLESS response deadline expired"))
 
     def test_vless_initial_local_idle_pauses_remaining_budget(self):
         def handler(connection):
@@ -175,8 +175,8 @@ class CliTests(unittest.TestCase):
 
     def test_unknown_uri_fields_are_reported_without_values(self):
         with cli(uri(1,"tcp","none",unknown="vless-core-private-value",host="vless-core-unused-host")) as core:
-            self.assertIn("unknown field query.unknown",core.log)
-            self.assertIn("field query.host",core.log)
+            self.assertIn("unknown field query.unknown",core.wait_log("unknown field query.unknown"))
+            self.assertIn("field query.host",core.wait_log("field query.host"))
             self.assertNotIn("vless-core-private-value",core.log)
             self.assertNotIn("vless-core-unused-host",core.log)
 
@@ -184,9 +184,9 @@ class CliTests(unittest.TestCase):
         extra={"noSSEHeader":True,"scMaxBufferedPosts":30,"scStreamUpServerSecs":"20-80","serverMaxHeaderBytes":16384,"unknown":{"private":"vless-core-secret-value"}}
         with cli(uri(1,"xhttp","none",extra=json.dumps(extra))) as core:
             for name in ("noSSEHeader","scMaxBufferedPosts","scStreamUpServerSecs","serverMaxHeaderBytes"):
-                self.assertIn(f"server-only field extra.{name}",core.log)
+                self.assertIn(f"server-only field extra.{name}",core.wait_log(f"server-only field extra.{name}"))
                 self.assertNotIn(f"unknown field extra.{name}",core.log)
-            self.assertIn("unknown field extra.unknown",core.log)
+            self.assertIn("unknown field extra.unknown",core.wait_log("unknown field extra.unknown"))
             self.assertNotIn("vless-core-secret-value",core.log)
 
     def test_absolute_socks_handshake_budget(self):
@@ -296,7 +296,7 @@ class CliTests(unittest.TestCase):
         deadline = time.monotonic()+2
         while f"success=0 stage={stage} " not in core.log and time.monotonic() < deadline:
             time.sleep(0.01)
-        self.assertIn(f"success=0 stage={stage} ",core.log)
+        self.assertIn(f"success=0 stage={stage} ",core.wait_log(f"success=0 stage={stage} "))
         self.assertIsNone(core.process.poll(),core.log)
 
     def test_connection_failure_stage_reports(self):
@@ -470,7 +470,7 @@ class CliTests(unittest.TestCase):
             try:
                 os.write(write,data); os.close(write); write = -1
                 with cli(None,[option,str(read)],pass_fds=(read,)) as process:
-                    self.assertIn("listening on",process.log)
+                    self.assertIn("listening on",process.wait_log("listening on"))
                     self.assertNotIn(data.split(b"\n")[0].decode(),process.log)
             finally:
                 os.close(read)
@@ -500,7 +500,7 @@ class CliTests(unittest.TestCase):
             with cli("socks5://127.0.0.1:1",["--routing","1;block;0;direct,domain,vless-core.test"]) as process:
                 with socks_connect(process.port,target.port) as connection:
                     exchange(connection,b"GET / HTTP/1.1\r\nHost: vless-core.test\r\n\r\n")
-                self.assertIn("sniffed",process.log)
+                self.assertIn("sniffed",process.wait_log("sniffed"))
 
     def test_local_listener_and_client_recovery(self):
         with cli("socks5://127.0.0.1:1") as process:
@@ -516,7 +516,7 @@ class CliTests(unittest.TestCase):
                 with cli(f"socks5://{host}:9") as process:
                     with self.assertRaises(AssertionError):
                         socks_connect(process.port,8080)
-                    self.assertIn(expected,process.log)
+                    self.assertIn(expected,process.wait_log(expected))
 
     def test_vless_response_failures(self):
         for response in (b"\x01\x00",b"\x00\x04a"):
@@ -527,7 +527,7 @@ class CliTests(unittest.TestCase):
                 with socks_connect(core.port,8080) as tunnel:
                     with self.assertRaises((EOFError,ConnectionError)):
                         exchange(tunnel,b"vless-core")
-                self.assertIn("VLESS response read failed",core.log)
+                self.assertIn("VLESS response read failed",core.wait_log("VLESS response read failed"))
 
     def test_tls_connection_refused(self):
         with socket.socket() as reserved:
@@ -539,9 +539,9 @@ class CliTests(unittest.TestCase):
                         tunnel.sendall(b"\x05\x01\x00"); self.assertEqual(exact(tunnel,2),b"\x05\x00")
                         tunnel.sendall(b"\x05\x01\x00\x01\x7f\x00\x00\x01\x1f\x90")
                         self.assertEqual(exact(tunnel,10)[1],5)
-                    self.assertIn("tcp connect failed",core.log)
+                    self.assertIn("tcp connect failed",core.wait_log("tcp connect failed"))
                     self.wait_for_probe(core,"tcp")
-                    self.assertRegex(core.log,r"upstream connect failed: .* id=1 stage=tcp category=system system=\d+")
+                    self.assertRegex(core.wait_log(r"upstream connect failed: .* id=1 stage=tcp category=system system=\d+",regex=True),r"upstream connect failed: .* id=1 stage=tcp category=system system=\d+")
                     self.assertIsNone(core.process.poll(),core.log)
 
     def test_ipv6_direct_and_vless_server(self):

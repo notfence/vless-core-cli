@@ -60,7 +60,7 @@ class WebSocketTests(unittest.TestCase):
             with self.subTest(response=name), Server(handler) as server, cli(uri(server.port,"ws","none")) as core:
                 with self.assertRaises((AssertionError,EOFError,ConnectionError)):
                     with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core")
-                self.assertIn("invalid WebSocket upgrade response",core.log)
+                self.assertIn("invalid WebSocket upgrade response",core.wait_log("invalid WebSocket upgrade response"))
 
     def test_upgrade_token_lists_and_subprotocol_agreement(self):
         for early in (0,16384):

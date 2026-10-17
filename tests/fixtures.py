@@ -3,6 +3,7 @@ import contextlib
 import json
 import selectors
 import os
+import re
 from pathlib import Path
 import socket
 import ssl
@@ -75,6 +76,16 @@ class Process:
     @property
     def log(self):
         return self.path.read_text(errors="replace")
+
+    def wait_log(self,text,timeout=2,regex=False,ignore_case=False):
+        until=time.monotonic()+timeout
+        while True:
+            value=self.log
+            matched=re.search(text,value,re.IGNORECASE if ignore_case else 0) if regex else text.lower() in value.lower() if ignore_case else text in value
+            if matched: return value
+            if self.process.poll() is not None or time.monotonic() >= until:
+                raise AssertionError(f"expected log message was not received: {text}\n{value}")
+            time.sleep(0.001)
 
     def close(self):
         stopped = False

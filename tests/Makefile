@@ -60,6 +60,9 @@ $(HOST_BUILD_DIR)/%.o: $(ROOT)/tests/%.c $(ROOT)/tests/check.h | requirements
 $(HOST_BUILD_DIR)/test_main: $(HOST_BUILD_DIR)/test_main.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=calloc,--wrap=malloc,--wrap=pthread_create,--wrap=accept
 
+$(HOST_BUILD_DIR)/test_log: $(HOST_BUILD_DIR)/test_log.o $(filter-out $(HOST_BUILD_DIR)/src/core_log.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=pthread_create,--wrap=write
+
 $(HOST_BUILD_DIR)/test_relay_memory: $(HOST_BUILD_DIR)/test_relay_memory.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=realloc,--wrap=socketpair,--wrap=send,--wrap=recv
 

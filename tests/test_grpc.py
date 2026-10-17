@@ -207,7 +207,7 @@ class GrpcTests(unittest.TestCase):
                     with self.assertRaises(TimeoutError): holding.recv(1)
                     with socks_connect(core.port,80) as rejected:
                         rejected.sendall(b"vless-core budget rejection"); self.assertEqual(rejected.recv(1),b"")
-                    self.assertIn("gRPC message buffering budget exhausted",core.log)
+                    self.assertIn("gRPC message buffering budget exhausted",core.wait_log("gRPC message buffering budget exhausted"))
                 self.assertTrue(peer.finished.wait(1))
                 exchange(sibling,b"vless-core recovered sibling")
                 with socks_connect(core.port,80) as recovered: exchange(recovered,b"vless-core recovered budget")
@@ -251,7 +251,7 @@ class GrpcTests(unittest.TestCase):
                 for name,_,_,_ in cases:
                     with self.subTest(case=name), socks_connect(core.port,80) as rejected:
                         rejected.sendall(name.encode()); self.assertEqual(rejected.recv(1),b"")
-                        if name != "only-success": self.assertIn("gRPC",core.log)
+                        if name != "only-success": self.assertIn("gRPC",core.wait_log("gRPC"))
                     exchange(sibling,b"vless-core unchanged sibling")
             self.assertEqual(len(peer.connections),1)
 
@@ -270,7 +270,7 @@ class GrpcTests(unittest.TestCase):
                         self.assertEqual(exact(tunnel,len(reply)),reply); self.assertEqual(tunnel.recv(1),b"")
                     exchange(sibling,b"vless-core retained sibling")
             self.assertEqual(len(peer.connections),1)
-            self.assertIn("grpc-status=2",core.log)
+            self.assertIn("grpc-status=2",core.wait_log("grpc-status=2"))
 
     def test_malformed_http_response_keeps_sibling_and_hpack_table(self):
         with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none")) as core:
@@ -298,7 +298,7 @@ class GrpcTests(unittest.TestCase):
             with self.subTest(settings=settings), GrpcPeer(settings=settings) as peer, cli(uri(peer.port,"grpc","none")) as core:
                 with self.assertRaises((AssertionError,EOFError,ConnectionError)):
                     with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core")
-                self.assertIn("invalid h2 frame sequence",core.log)
+                self.assertIn("invalid h2 frame sequence",core.wait_log("invalid h2 frame sequence"))
 
     def test_client_fin_drains_reply_and_keeps_sibling(self):
         with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none")) as core:
@@ -324,7 +324,7 @@ class GrpcTests(unittest.TestCase):
         with GrpcPeer() as peer, cli(uri(peer.port,"grpc","none",downloadSettings=json.dumps(settings))) as core:
             with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core ignored XHTTP settings")
             self.assertEqual(len(peer.connections),1)
-            self.assertIn("query.downloadsettings is not applied",core.log)
+            self.assertIn("query.downloadsettings is not applied",core.wait_log("query.downloadsettings is not applied"))
     def test_pool_capacity_wait_deadline_and_recovery(self):
         with GrpcPeer(maximum=1) as peer, cli(uri(peer.port,"grpc","none"),extra=["--connect-timeout-ms","300"]) as core:
             clients=[]
@@ -378,7 +378,7 @@ class GrpcTests(unittest.TestCase):
                     if acknowledge: exchange(tunnel,b"vless-core after ACK")
                     else:
                         tunnel.settimeout(3); self.assertEqual(tunnel.recv(1),b"")
-                        self.assertIn("keepalive acknowledgement deadline expired",core.log)
+                        self.assertIn("keepalive acknowledgement deadline expired",core.wait_log("keepalive acknowledgement deadline expired"))
 
     def test_idle_keepalive_requires_permission(self):
         for permitted in (False,True):

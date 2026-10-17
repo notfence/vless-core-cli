@@ -189,8 +189,7 @@ void core_trace_complete(int success) {
         else if (trace->failed_stage == CORE_TRACE_NONE) trace->failed_stage = trace->stage;
         char text[384];
         if (core_trace_format(trace, text, sizeof(text)) >= 0) {
-            if (success) vc_log_info("probe", "%s", text);
-            else vc_log_warning("probe", "%s", text);
+            vc_log_probe(success,text);
         }
     }
     errno = saved_errno;

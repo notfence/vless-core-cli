@@ -62,7 +62,7 @@ class SocksTests(unittest.TestCase):
     def test_ignored_uri_fields_warn_without_values(self):
         with Upstream() as upstream, cli(f"socks5://127.0.0.1:{upstream.port}?security=none&type=xhttp&extra=secret-private-parameter&fp=not-applied&allowInsecure=true") as core:
             with socks_connect(core.port,8080) as tunnel: exchange(tunnel,b"vless-core unchanged SOCKS transport")
-            for field in ("transport","extra","fp","allowinsecure"): self.assertIn(f"query.{field} is not applied to SOCKS5",core.log)
+            for field in ("transport","extra","fp","allowinsecure"): self.assertIn(f"query.{field} is not applied to SOCKS5",core.wait_log(f"query.{field} is not applied to SOCKS5"))
             self.assertNotIn("secret-private-parameter",core.log)
             self.assertNotIn("not-applied",core.log)
 
@@ -108,7 +108,7 @@ class SocksTests(unittest.TestCase):
         with cli(f"socks5://{credentials}127.0.0.1:{upstream.port}") as core:
             with self.assertRaises(AssertionError):
                 socks_connect(core.port,8080)
-            self.assertIn(expected,core.log)
+            self.assertIn(expected,core.wait_log(expected))
             self.assertIsNone(core.process.poll(),core.log)
             if credentials:
                 self.assertNotIn(credentials,core.log)
@@ -210,7 +210,7 @@ class SocksTests(unittest.TestCase):
             with cli(f"socks5://vless-core:wrong@127.0.0.1:{upstream.port}") as core:
                 with self.assertRaises(AssertionError):
                     socks_connect(core.port,8080)
-                self.assertIn("auth failed",core.log.lower())
+                self.assertIn("auth failed",core.wait_log("auth failed",ignore_case=True).lower())
 
     def test_upstream_bind_address_formats(self):
         for reply_type in (1,3,4):
