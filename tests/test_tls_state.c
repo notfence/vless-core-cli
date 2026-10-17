@@ -301,6 +301,30 @@ static void address_cipher_cache_vectors(void) {
     memset(g_tls_aes_fallback_cache,0,sizeof(g_tls_aes_fallback_cache)); g_tls_aes_fallback_count=0;
 }
 
+static void buffered_http_progress(void) {
+    int pair[2]; REQUIRE("h1/buffered-progress-pair",!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+    REQUIRE("h1/buffered-progress-nonblocking",!fcntl(pair[0],F_SETFL,O_NONBLOCK));
+    tls13_conn_t sender={0},receiver={.fd=pair[0],.mode=CONN_MODE_XHTTP_TLS,.xmux_async=1,.tls_auth_state=4,.xmux_http1_id=1};
+    REQUIRE("h1/buffered-progress-ciphers",!configure_tls_cipher(&sender,0x1303) && !configure_tls_cipher(&receiver,0x1303));
+    const uint8_t response[]="HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nvless-core";
+    for (unsigned fragment=0;fragment<2;fragment++) {
+        size_t offset=fragment ? 7 : 0,length=fragment ? sizeof(response)-1-7 : 7,size=0; uint8_t *record=NULL;
+        REQUIRE("h1/buffered-progress-record",!encrypt_record(&sender,sender.c_app_key,sender.c_app_iv,&sender.c_app_seq,23,response+offset,length,&record,&size));
+        REQUIRE("h1/buffered-progress-cache",!db_append(&receiver.xmux_raw_input,record,size)); free(record);
+    }
+    CHECK("h1/buffered-progress-without-socket-readiness",core_wait_socket(pair[0],POLLIN,0) == 0);
+    CHECK("h1/buffered-progress-is-runnable",xmux_transport_collect(&receiver) == CORE_HTTP2_INPUT_PROGRESS);
+    core_http2_frame_t frame;
+    CHECK("h1/partial-http-header-has-no-event",xmux_transport_read_frame(&receiver,&frame,65535) == 1 && receiver.xmux_raw_input.len > 5 && receiver.h2_net_cache.len == 7);
+    CHECK("h1/buffered-next-record-is-runnable",xmux_transport_collect(&receiver) == CORE_HTTP2_INPUT_PROGRESS);
+    REQUIRE("h1/buffered-header-event",!xmux_transport_read_frame(&receiver,&frame,65535) && frame.event == 1 && frame.status == 200);
+    CHECK("h1/blocked-payload-is-not-runnable",xmux_transport_read_frame(&receiver,&frame,0) == CORE_HTTP2_INPUT_BLOCKED && receiver.h2_net_cache.len == 10);
+    REQUIRE("h1/buffered-payload-event",!xmux_transport_read_frame(&receiver,&frame,65535) && frame.event == 2 && frame.length == 10 && !memcmp(frame.data,"vless-core",10)); xmux_transport_release_frame(&receiver,&frame);
+    REQUIRE("h1/buffered-end-event",!xmux_transport_read_frame(&receiver,&frame,65535) && frame.event == 3);
+    CHECK("h1/no-buffered-progress-no-active-loop",xmux_transport_collect(&receiver) == 0);
+    db_free(&receiver.h2_net_cache); db_free(&receiver.xmux_raw_input); close(pair[0]); close(pair[1]);
+}
+
 static void alps_vectors(void) {
     const uint8_t frame[]={0,0,30,4,0,0,0,0,0,0,1,0,0,0,0,0,3,0,0,0,2,0,4,0,0,4,0,0,5,0,0,128,0,0,6,0,1,0,0};
     core_http2_settings_t settings={0};
@@ -407,6 +431,7 @@ int main(int argc, char **argv) {
     }
     record_limit_vectors();
     alps_vectors();
+    buffered_http_progress();
     physical_tls_close_notify();
     automatic_update_vectors();
     key_update_record_boundaries();

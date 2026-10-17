@@ -917,7 +917,7 @@ static void pooled_input_backpressure(void) {
     uint8_t frame[16384]={0}; frame[1]=0x3f; frame[2]=0xf7; frame[8]=1;
     REQUIRE("h2/backpressure-initial-frame",db_append(&connection.h2_net_cache,frame,sizeof(frame)) == 0);
     core_http2_frame_t incoming;
-    CHECK("h2/backpressure-parser-paused",xmux_transport_read_frame(&connection,&incoming,0) == 1);
+    CHECK("h2/backpressure-parser-paused",xmux_transport_read_frame(&connection,&incoming,0) == CORE_HTTP2_INPUT_BLOCKED);
     uint8_t *record=NULL; size_t length=0; uint64_t sequence=0;
     REQUIRE("h2/backpressure-extra-record",encrypt_record(&connection,connection.s_app_key,connection.s_app_iv,&sequence,23,frame,sizeof(frame),&record,&length) == 0);
     REQUIRE("h2/backpressure-peer-write",write_exact(pair[1],record,length) == 0); free(record);

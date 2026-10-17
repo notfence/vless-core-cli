@@ -1,5 +1,6 @@
 #include "buffer_budget.h"
 #include "relay_memory.h"
+#include "socket_util.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -7,6 +8,32 @@
 
 static pthread_mutex_t buffer_lock=PTHREAD_MUTEX_INITIALIZER;
 static size_t charged[CORE_BUFFER_DIRECTIONS], allocated[CORE_BUFFER_DIRECTIONS];
+static pthread_mutex_t wait_lock=PTHREAD_MUTEX_INITIALIZER;
+static core_buffer_waiter_t *waiters;
+
+void core_buffer_watch(core_buffer_waiter_t *waiter,int fd,unsigned directions) {
+    pthread_mutex_lock(&wait_lock);
+    waiter->fd=fd; waiter->directions=directions;
+    if (!waiter->registered) { waiter->registered=1; waiter->next=waiters; waiters=waiter; }
+    pthread_mutex_unlock(&wait_lock);
+}
+
+void core_buffer_unwatch(core_buffer_waiter_t *waiter) {
+    pthread_mutex_lock(&wait_lock);
+    core_buffer_waiter_t **cursor=&waiters;
+    while (*cursor && *cursor != waiter) cursor=&(*cursor)->next;
+    if (*cursor) *cursor=waiter->next;
+    waiter->next=NULL; waiter->registered=0; waiter->directions=0;
+    pthread_mutex_unlock(&wait_lock);
+}
+
+static void notify_released(unsigned direction) {
+    if (direction == CORE_BUFFER_RELAY) { core_relay_memory_released(); return; }
+    pthread_mutex_lock(&wait_lock);
+    for (core_buffer_waiter_t *waiter=waiters;waiter;waiter=waiter->next)
+        if (waiter->directions&(1U<<direction)) core_notify_socket(waiter->fd);
+    pthread_mutex_unlock(&wait_lock);
+}
 
 static int claim(core_buffer_budget_t *budget, size_t size) {
     if (!budget || budget->direction >= CORE_BUFFER_DIRECTIONS) { errno=EINVAL; return -1; }
@@ -27,7 +54,7 @@ static void release(core_buffer_budget_t *budget, size_t size) {
     size_t released=budget->charged-remaining;
     charged[budget->direction]-=budget->charged-remaining; budget->charged=remaining;
     pthread_mutex_unlock(&buffer_lock);
-    if (released && budget->direction == CORE_BUFFER_RELAY) core_relay_memory_released();
+    if (released) notify_released(budget->direction);
 }
 
 int core_buffer_budget_init(core_buffer_budget_t *budget, unsigned direction, size_t minimum) {
@@ -42,7 +69,7 @@ int core_buffer_budget_init(core_buffer_budget_t *budget, unsigned direction, si
     if (required < budget->charged) charged[direction]-=budget->charged-required;
     budget->direction=direction; budget->minimum=minimum; budget->charged=required;
     pthread_mutex_unlock(&buffer_lock);
-    if (released && direction == CORE_BUFFER_RELAY) core_relay_memory_released();
+    if (released) notify_released(direction);
     return 0;
 }
 
@@ -91,7 +118,9 @@ int core_buffer_transfer(core_buffer_budget_t *from, core_buffer_budget_t *to, s
     }
     charged[from->direction]-=current; charged[from->direction]+=future;
     from->allocated-=size; to->allocated+=size; from->charged=source; to->charged=destination;
-    pthread_mutex_unlock(&buffer_lock); return 0;
+    pthread_mutex_unlock(&buffer_lock);
+    if (future < current) notify_released(from->direction);
+    return 0;
 }
 
 void core_buffer_snapshot(unsigned direction, size_t *bytes, size_t *reserved) {

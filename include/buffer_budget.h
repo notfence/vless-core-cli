@@ -11,6 +11,13 @@ typedef struct {
     size_t minimum, allocated, charged;
     unsigned direction;
 } core_buffer_budget_t;
+typedef struct core_buffer_waiter {
+    struct core_buffer_waiter *next;
+    int fd,registered;
+    unsigned directions;
+} core_buffer_waiter_t;
+void core_buffer_watch(core_buffer_waiter_t *,int,unsigned);
+void core_buffer_unwatch(core_buffer_waiter_t *);
 int core_buffer_budget_init(core_buffer_budget_t *, unsigned, size_t);
 int core_buffer_budget_clear(core_buffer_budget_t *);
 int core_buffer_hold(core_buffer_budget_t *, size_t);

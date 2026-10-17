@@ -4,10 +4,66 @@
 #include "hpack.h"
 #include "xhttp_payload.h"
 #include "check.h"
+#include "socket_util.h"
+#include "deadline.h"
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <string.h>
+#include <unistd.h>
+
+static void *watcher_release(void *unused) {
+    (void)unused; core_buffer_budget_t memory={0};
+    for (unsigned i=0;i<1000;i++) {
+        if (core_buffer_budget_init(&memory,CORE_BUFFER_UPLOAD,1) || core_buffer_budget_clear(&memory)) return (void *)1;
+    }
+    return NULL;
+}
+
+static void notification_policy(void) {
+    core_buffer_waiter_t first={0},second={0}; int channels[2][2];
+    for (unsigned i=0;i<2;i++) {
+        REQUIRE("buffers/wake-pair",!socketpair(AF_UNIX,SOCK_STREAM,0,channels[i]));
+        for (unsigned j=0;j<2;j++) REQUIRE("buffers/wake-nonblocking",!fcntl(channels[i][j],F_SETFL,O_NONBLOCK));
+    }
+    core_buffer_watch(&first,channels[0][1],1U<<CORE_BUFFER_UPLOAD);
+    core_buffer_watch(&second,channels[1][1],1U<<CORE_BUFFER_DOWNLOAD);
+    core_buffer_budget_t memory={0};
+    REQUIRE("buffers/wake-reserve",!core_buffer_budget_init(&memory,CORE_BUFFER_UPLOAD,32));
+    core_deadline_t deadline; REQUIRE("buffers/wake-deadline",!core_deadline_attach(&deadline)); core_deadline_begin(1);
+    struct pollfd idle={.fd=-1}; (void)core_poll(&idle,1,4);
+    REQUIRE("buffers/wake-release-after-expiry",!core_buffer_budget_clear(&memory));
+    uint8_t byte;
+    CHECK("buffers/wake-ignores-releasing-deadline",recv(channels[0][0],&byte,1,0) == 1);
+    CHECK("buffers/wake-direction-isolated",recv(channels[1][0],&byte,1,0) < 0 && errno == EAGAIN);
+    core_deadline_end(); core_deadline_detach();
+    uint8_t fill[4096]={0}; while (send(channels[0][1],fill,sizeof(fill),0) > 0) {}
+    REQUIRE("buffers/full-wake-reserve",!core_buffer_budget_init(&memory,CORE_BUFFER_UPLOAD,32));
+    REQUIRE("buffers/full-wake-release",!core_buffer_budget_clear(&memory));
+    core_drain_socket(channels[0][0]);
+    REQUIRE("buffers/full-wake-recovery-reserve",!core_buffer_budget_init(&memory,CORE_BUFFER_UPLOAD,32));
+    REQUIRE("buffers/full-wake-recovery-release",!core_buffer_budget_clear(&memory));
+    CHECK("buffers/full-wake-recovers",recv(channels[0][0],&byte,1,0) == 1);
+    core_buffer_unwatch(&first); core_buffer_watch(&first,channels[0][1],1U<<CORE_BUFFER_DOWNLOAD);
+    REQUIRE("buffers/multiple-wake-reserve",!core_buffer_budget_init(&memory,CORE_BUFFER_DOWNLOAD,32));
+    REQUIRE("buffers/multiple-wake-release",!core_buffer_budget_clear(&memory));
+    CHECK("buffers/all-relevant-waiters-woken",recv(channels[0][0],&byte,1,0) == 1 && recv(channels[1][0],&byte,1,0) == 1);
+    core_buffer_unwatch(&first); core_buffer_unwatch(&second);
+    for (unsigned i=0;i<2;i++) for (unsigned j=0;j<2;j++) close(channels[i][j]);
+    pthread_t releasing; REQUIRE("buffers/wake-close-worker",!pthread_create(&releasing,NULL,watcher_release,NULL));
+    for (unsigned i=0;i<100;i++) {
+        int pair[2]; REQUIRE("buffers/wake-close-pair",!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+        REQUIRE("buffers/wake-close-nonblocking",!fcntl(pair[1],F_SETFL,O_NONBLOCK));
+        core_buffer_watch(&first,pair[1],1U<<CORE_BUFFER_UPLOAD); core_buffer_unwatch(&first); close(pair[0]); close(pair[1]);
+    }
+    void *result=NULL; pthread_join(releasing,&result);
+    CHECK("buffers/wake-close-no-stale-registration",!result && !first.registered && !second.registered);
+    size_t used,reserved; core_buffer_snapshot(CORE_BUFFER_UPLOAD,&used,&reserved);
+    CHECK("buffers/wake-close-budget-drained",!used && !reserved);
+}
 
 int main(void) {
+    notification_policy();
     core_buffer_budget_t account={0},other={0}; size_t bytes,reserved;
     REQUIRE("buffers/reserve-without-allocation",core_buffer_budget_init(&account,CORE_BUFFER_DOWNLOAD,CORE_BUFFER_TOTAL_LIMIT) == 0);
     core_buffer_snapshot(CORE_BUFFER_DOWNLOAD,&bytes,&reserved);

@@ -181,6 +181,23 @@ int core_numeric_address(const char *host, uint16_t port, struct sockaddr_storag
     *address=numeric; return 1;
 }
 
+int core_notify_socket(int fd) {
+    int saved=errno,flags=MSG_DONTWAIT; uint8_t byte=1; ssize_t sent;
+#ifdef MSG_NOSIGNAL
+    flags|=MSG_NOSIGNAL;
+#endif
+    do { sent=send(fd,&byte,1,flags); } while (sent < 0 && errno == EINTR);
+    int result=sent == 1 || (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    errno=saved; return result;
+}
+
+void core_drain_socket(int fd) {
+    int saved=errno; uint8_t bytes[128]; ssize_t received;
+    do { received=recv(fd,bytes,sizeof(bytes),MSG_DONTWAIT); }
+    while (received > 0 || (received < 0 && errno == EINTR));
+    errno=saved;
+}
+
 int core_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **addresses) {
     core_trace_stage(CORE_TRACE_DNS);
     core_resolver_query_t *query = core_resolver_start(host, service, hints);

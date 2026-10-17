@@ -2,6 +2,22 @@
 #include "check.h"
 #include <arpa/inet.h>
 static int mode, interrupted;
+static volatile unsigned notify_send_interrupts,notify_recv_interrupts;
+ssize_t __real_send(int,const void *,size_t,int);
+ssize_t __real_recv(int,void *,size_t,int);
+ssize_t __real___recv_chk(int,void *,size_t,size_t,int);
+ssize_t __wrap_send(int fd,const void *data,size_t length,int flags) {
+    if (notify_send_interrupts) { notify_send_interrupts--; errno=EINTR; return -1; }
+    return __real_send(fd,data,length,flags);
+}
+ssize_t __wrap_recv(int fd,void *data,size_t length,int flags) {
+    if (notify_recv_interrupts) { notify_recv_interrupts--; errno=EINTR; return -1; }
+    return __real_recv(fd,data,length,flags);
+}
+ssize_t __wrap___recv_chk(int fd,void *data,size_t length,size_t capacity,int flags) {
+    if (notify_recv_interrupts) { notify_recv_interrupts--; errno=EINTR; return -1; }
+    return __real___recv_chk(fd,data,length,capacity,flags);
+}
 int __real_connect(int fd, const struct sockaddr *address, socklen_t length);
 int __real_poll(struct pollfd *fds, nfds_t count, int timeout);
 int __real_getsockopt(int fd, int level, int option, void *value, socklen_t *length);
@@ -17,6 +33,20 @@ int __wrap_getsockopt(int fd, int level, int option, void *value, socklen_t *len
     return __real_getsockopt(fd,level,option,value,length);
 }
 int main(void) {
+    int notifications[2]; REQUIRE("socket/notification-pair",!socketpair(AF_UNIX,SOCK_STREAM,0,notifications));
+    for (unsigned i=0;i<2;i++) REQUIRE("socket/notification-nonblocking",!fcntl(notifications[i],F_SETFL,O_NONBLOCK));
+    core_deadline_t deadline; REQUIRE("socket/notification-deadline",!core_deadline_attach(&deadline)); core_deadline_begin(1);
+    (void)core_poll(NULL,0,4); errno=ENOTTY; notify_send_interrupts=2;
+    CHECK("socket/notification-retries-eintr-without-deadline",core_notify_socket(notifications[1]) && !notify_send_interrupts && errno == ENOTTY);
+    notify_recv_interrupts=2; errno=ENOTTY; core_drain_socket(notifications[0]);
+    int drain_error=errno;
+    CHECK("socket/notification-drain-retries",!notify_recv_interrupts);
+    CHECK("socket/notification-drain-preserves-error",drain_error == ENOTTY);
+    uint8_t scratch[4096]={0}; while (send(notifications[1],scratch,sizeof(scratch),MSG_DONTWAIT) > 0) {}
+    CHECK("socket/notification-coalesces-full-channel",core_notify_socket(notifications[1]));
+    core_drain_socket(notifications[0]); core_deadline_end(); core_deadline_detach();
+    close(notifications[0]); errno=ENOTTY;
+    CHECK("socket/notification-closed-receiver-is-safe",!core_notify_socket(notifications[1]) && errno == ENOTTY); close(notifications[1]);
     struct sockaddr_storage numeric; socklen_t numeric_length=0;
     REQUIRE("socket/numeric-ipv4",core_numeric_address("127.0.0.1",443,&numeric,&numeric_length) == 1);
     CHECK("socket/numeric-ipv4-port-and-size",numeric.ss_family == AF_INET && numeric_length == sizeof(struct sockaddr_in) && ntohs(((struct sockaddr_in *)&numeric)->sin_port) == 443);

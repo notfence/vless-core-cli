@@ -96,6 +96,7 @@ struct mux_actor {
     uint32_t peer_window, peer_frame, peer_concurrency, peer_header_limit;
     size_t net_accounted;
     core_buffer_budget_t input_memory, output_memory;
+    core_buffer_waiter_t memory_waiter;
     uint64_t enqueued, flushed;
     uint64_t idle_pending_ms;
     char error[160];
@@ -199,13 +200,16 @@ static int notification_pair(int pair[2]) {
 }
 
 static void wake_actor(mux_actor_t *actor) {
-    if (actor && !actor->stopped) { uint8_t byte=1; (void)send(actor->wake[1],&byte,1,MSG_DONTWAIT); }
+    if (actor && !actor->stopped) core_notify_socket(actor->wake[1]);
+}
+
+static void wake_channels(mux_manager_t *manager,mux_actor_t *source) {
+    for (mux_actor_t *actor=manager->actors;actor;actor=actor->next) if (actor != source) wake_actor(actor);
 }
 
 static void signal_stream(core_http2_stream_t *stream) {
     if (!stream->closed && !stream->notified) {
-        uint8_t byte=1;
-        if (send(stream->notify[1],&byte,1,MSG_DONTWAIT) == 1) stream->notified=1;
+        if (core_notify_socket(stream->notify[1])) stream->notified=1;
     }
 }
 
@@ -816,7 +820,7 @@ static int advance_streams(mux_actor_t *actor) {
                 if (move_waiting_streams(actor) != 0) return -1;
             }
             if (!(request->ended && request->send_ended) && !request->reset && send_frame(actor,3,0,request->id,(const uint8_t[]){0,0,0,8},4) != 0) return -1;
-            *cursor=request->next; free(request); signal_stream(stream); release_stream(stream);
+            *cursor=request->next; free(request); signal_stream(stream); release_stream(stream); wake_channels(actor->manager,actor);
         } else cursor=&request->next;
     }
     return 0;
@@ -850,6 +854,34 @@ static int stop_idle_actor(mux_actor_t *actor, int in_use, uint64_t now) {
     actor->draining=1; return 1;
 }
 
+static int actor_wait_timeout(mux_actor_t *actor,int progressed,uint64_t now) {
+    if (progressed) return 0;
+    uint64_t due=UINT64_MAX;
+    if (actor->ping_deadline_ms) due=actor->ping_deadline_ms;
+    else if (actor->alive_period && (!grpc_manager(actor->manager) || actor->manager->config.grpc_permit_without_stream || request_active(actor))) {
+        uint64_t period=(uint64_t)actor->alive_period*1000;
+        due=actor->last_input_ms > UINT64_MAX-period ? UINT64_MAX : actor->last_input_ms+period;
+    }
+    if (actor->idle_pending_ms) {
+        uint64_t period=grpc_manager(actor->manager) ? 60000 : XMUX_CANCEL_DRAIN_MS;
+        uint64_t idle=actor->idle_pending_ms > UINT64_MAX-period ? UINT64_MAX : actor->idle_pending_ms+period;
+        if (idle < due) due=idle;
+    }
+    for (mux_request_t *request=actor->requests;request;request=request->next) {
+        if (request->role != 4 || request->send_ended || request->ended) continue;
+        uint64_t packet=request->packet_until_ms;
+        if (!request->stream->tx.length && request->packet_idle_ms && request->packet_idle_ms < packet) packet=request->packet_idle_ms;
+        if (packet < due) due=packet;
+    }
+    for (core_http2_stream_t *stream=streams;stream;stream=stream->next) {
+        if (stream->failed || stream->closed) continue;
+        if (stream->download == actor && !stream->down_id && stream->until_ms < due) due=stream->until_ms;
+        if (stream->upload == actor && stream->ready == 1 && stream->tx.length && stream->next_post_ms > now && stream->next_post_ms < due) due=stream->next_post_ms;
+    }
+    if (due == UINT64_MAX) return -1;
+    return due <= now ? 0 : due-now > INT_MAX ? INT_MAX : (int)(due-now);
+}
+
 static void *actor_worker(void *opaque) {
     mux_actor_t *actor=opaque; const core_http2_backend_t *backend=actor->manager->backend;
     core_deadline_t deadline; int http2=0;
@@ -873,6 +905,7 @@ static void *actor_worker(void *opaque) {
         }
         core_trace_detach(); core_deadline_end();
     }
+    core_buffer_watch(&actor->memory_waiter,actor->wake[1],(1U<<CORE_BUFFER_UPLOAD)|(1U<<CORE_BUFFER_DOWNLOAD));
     pthread_mutex_lock(&mux_lock); actor->opening=0;
     if (actor->error[0]) actor->failed=1;
     actor->http2=http2;
@@ -887,6 +920,11 @@ static void *actor_worker(void *opaque) {
         }
     }
     if (!http2) { actor->peer_concurrency=1; actor->alive_period=0; }
+    for (core_http2_stream_t *stream=streams;stream;stream=stream->next) if (!stream->closed && (stream->download == actor || stream->upload == actor)) {
+        if (stream->download != actor) wake_actor(stream->download);
+        if (stream->upload != actor) wake_actor(stream->upload);
+        signal_stream(stream);
+    }
     actor->last_input_ms=core_now_ms(); pthread_mutex_unlock(&mux_lock);
     while (!actor_failed(actor)) {
         pthread_mutex_lock(&mux_lock);
@@ -929,27 +967,14 @@ static void *actor_worker(void *opaque) {
         pthread_mutex_lock(&mux_lock);
         if (maintain_ping(actor,now) != 0) actor->failed=1;
         size_t pending=actor->net_accounted;
-        int progressed=received_frame || actor->enqueued != enqueued_before || actor->flushed != flushed_before;
-        int wait=progressed ? 0 : 10;
-        if (wait) for (mux_request_t *request=actor->requests;request;request=request->next) {
-            if (request->role != 4 || request->send_ended || request->ended) continue;
-            uint64_t due=request->packet_until_ms;
-            if (!request->stream->tx.length && request->packet_idle_ms && request->packet_idle_ms < due) due=request->packet_idle_ms;
-            if (due > now && due-now < (unsigned)wait) wait=(int)(due-now);
-        }
+        int progressed=collected == CORE_HTTP2_INPUT_PROGRESS || received_frame || actor->enqueued != enqueued_before || actor->flushed != flushed_before;
+        int wait=actor_wait_timeout(actor,progressed,now);
         pthread_mutex_unlock(&mux_lock);
         short events=backend->events ? backend->events(actor->physical) : (short)(POLLIN|(pending ? POLLOUT : 0));
+        if (result == CORE_HTTP2_INPUT_BLOCKED) events&=(short)~POLLIN;
         struct pollfd descriptors[2]={{.fd=actor->wake[0],.events=POLLIN},{.fd=backend->fd(actor->physical),.events=events}};
-        if (grpc_manager(actor->manager) && !in_use && !actor->requests && !pending) {
-            uint64_t due=actor->idle_pending_ms+60000;
-            if (actor->alive_period && actor->manager->config.grpc_permit_without_stream) {
-                uint64_t ping=actor->ping_deadline_ms ? actor->ping_deadline_ms : actor->last_input_ms+(uint64_t)actor->alive_period*1000;
-                if (ping < due) due=ping;
-            }
-            wait=due > now ? (int)(due-now) : 0;
-        }
         if (core_poll(descriptors,2,wait) < 0) { mark_failed(actor,CORE_FAILURE_SYSTEM,errno); break; }
-        if (descriptors[0].revents) { uint8_t bytes[128]; while (recv(actor->wake[0],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {} }
+        if (descriptors[0].revents) core_drain_socket(actor->wake[0]);
     }
     pthread_mutex_lock(&mux_lock);
     if (actor->failed) vc_log_warning("xhttp","%s",actor->error[0] ? actor->error : "XHTTP channel state failed");
@@ -959,6 +984,7 @@ static void *actor_worker(void *opaque) {
     mux_request_t *request=actor->requests; actor->requests=NULL;
     while (request) { mux_request_t *next=request->next; release_stream(request->stream); free(request); request=next; }
     pthread_mutex_unlock(&mux_lock);
+    core_buffer_unwatch(&actor->memory_waiter);
     if (actor->physical) backend->close(actor->physical);
     actor->physical=NULL; core_hpack_clear(&actor->hpack); core_http2_queue_clear(&actor->header_block);
     core_buffer_budget_clear(&actor->input_memory); core_buffer_budget_clear(&actor->output_memory); core_deadline_detach();
@@ -968,6 +994,7 @@ static void *actor_worker(void *opaque) {
     actor->stopped=1; close(actor->wake[0]); close(actor->wake[1]); actor_count--;
     pthread_cond_broadcast(&workers_stopped);
     wake_admission();
+    wake_channels(actor->manager,actor);
     collect_stopped_actors();
     pthread_mutex_unlock(&mux_lock); return NULL;
 }
@@ -1059,7 +1086,7 @@ core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core
             pthread_mutex_lock(&mux_lock); core_trace_error_set(core_connection_error(actor ? actor->progress_stage : CORE_TRACE_TRANSPORT,CORE_FAILURE_DEADLINE,ETIMEDOUT)); pthread_mutex_unlock(&mux_lock);
             errno=ETIMEDOUT; break;
         }
-        uint8_t byte; (void)recv(stream->notify[0],&byte,1,MSG_DONTWAIT);
+        core_drain_socket(stream->notify[0]);
         pthread_mutex_lock(&mux_lock); stream->notified=0; pthread_mutex_unlock(&mux_lock);
     }
     int saved=errno; core_http2_close(stream); errno=saved; return NULL;
@@ -1081,7 +1108,7 @@ int core_http2_start_relay(core_http2_stream_t *stream) {
 
 void core_http2_drain_notifications(core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
-    uint8_t bytes[128]; while (recv(stream->notify[0],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {}
+    core_drain_socket(stream->notify[0]);
     stream->notified=0;
     pthread_mutex_unlock(&mux_lock);
 }
@@ -1178,7 +1205,7 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
         if (!pending) break;
         if (wait_for_output(stream) <= 0) { core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,errno ? errno : ETIMEDOUT)); return -1; }
         pthread_mutex_lock(&mux_lock);
-        uint8_t bytes[128]; while (recv(stream->notify[0],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {}
+        core_drain_socket(stream->notify[0]);
         stream->notified=0; pthread_mutex_unlock(&mux_lock);
     }
     return 0;
@@ -1187,7 +1214,7 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
 int core_http2_read(core_http2_stream_t *stream, uint8_t *data, size_t capacity, size_t *length) {
     if (!capacity) { *length=0; return 0; }
     pthread_mutex_lock(&mux_lock); *length=0;
-    uint8_t byte; while (recv(stream->notify[0],&byte,1,MSG_DONTWAIT) > 0) {}
+    core_drain_socket(stream->notify[0]);
     stream->notified=0;
     size_t take=stream->rx.length < capacity ? stream->rx.length : capacity;
     if (take) {

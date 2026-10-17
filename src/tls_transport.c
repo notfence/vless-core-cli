@@ -818,7 +818,8 @@ static int xmux_transport_retire(void *opaque) {
 
 static short xmux_transport_events(void *opaque) {
     tls13_conn_t *connection=opaque;
-    short input=tls13_uses_h2(connection) || (!connection->xmux_http1_eof && connection->h2_net_cache.len < 65536) ? POLLIN : 0;
+    size_t limit=connection->tls_md && !connection->ssl ? 49152 : 65536;
+    short input=tls13_uses_h2(connection) || (!connection->xmux_http1_eof && connection->h2_net_cache.len < limit) ? POLLIN : 0;
     return (short)(input|((xmux_transport_pending(connection) && !connection->xmux_write_wants_read) || connection->xmux_read_wants_write ? POLLOUT : 0));
 }
 
@@ -899,7 +900,7 @@ static int xmux_transport_collect(void *opaque) {
         if (h2_cached_frame_ready(connection)) return 1;
         uint8_t input[8192];
         ssize_t received=core_recv(connection->fd,input,sizeof(input),MSG_DONTWAIT);
-        if (received > 0) return db_append(&connection->h2_net_cache,input,(size_t)received);
+        if (received > 0) return db_append(&connection->h2_net_cache,input,(size_t)received) ? -1 : CORE_HTTP2_INPUT_PROGRESS;
         return received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
     }
     if (!tls13_uses_h2(connection) && !connection->tls_md) {
@@ -925,12 +926,16 @@ static int xmux_transport_collect(void *opaque) {
             size=(int)core_recv(connection->fd,data,capacity,MSG_DONTWAIT);
             if (size < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
         }
-        if (size > 0) return db_append(&connection->h2_net_cache,data,(size_t)size);
-        connection->xmux_http1_eof=1; return 0;
+        if (size > 0) return db_append(&connection->h2_net_cache,data,(size_t)size) ? -1 : CORE_HTTP2_INPUT_PROGRESS;
+        connection->xmux_http1_eof=1; return CORE_HTTP2_INPUT_PROGRESS;
     }
-    if (connection->ssl) return h2_collect_tls_available(connection,&connection->xmux_read_wants_write);
+    if (connection->ssl) {
+        int result=h2_collect_tls_available(connection,&connection->xmux_read_wants_write);
+        return result > 0 ? CORE_HTTP2_INPUT_PROGRESS : result;
+    }
     if (!tls13_uses_h2(connection) && (connection->h2_net_cache.len >= 49152 || connection->xmux_http1_eof)) return 0;
     uint8_t input[16384];
+    int progressed=0;
     for (unsigned reads=0;reads<64;reads++) {
         while (connection->xmux_raw_input.len >= 5) {
             const uint8_t *record=connection->xmux_raw_input.data;
@@ -950,17 +955,18 @@ static int xmux_transport_collect(void *opaque) {
                 int result=tls_application_plain(connection,inner,plain,plain_length,&connection->h2_net_cache);
                 OPENSSL_cleanse(plain,plain_length); free(plain); if (connection->input_memory) core_buffer_drop(connection->input_memory,temporary);
                 if (result < 0 || (result > 0 && tls13_uses_h2(connection))) return -1;
-                if (result > 0) { connection->xmux_http1_eof=1; db_consume(&connection->xmux_raw_input,length+5); return 0; }
+                if (result > 0) { connection->xmux_http1_eof=1; db_consume(&connection->xmux_raw_input,length+5); return CORE_HTTP2_INPUT_PROGRESS; }
             }
             db_consume(&connection->xmux_raw_input,length+5);
-            if (tls13_uses_h2(connection) ? h2_cached_frame_ready(connection) : connection->h2_net_cache.len != 0) return 1;
+            progressed=1;
+            if (tls13_uses_h2(connection) ? h2_cached_frame_ready(connection) : connection->h2_net_cache.len != 0) return CORE_HTTP2_INPUT_PROGRESS;
         }
         ssize_t length=core_recv(connection->fd,input,sizeof(input),MSG_DONTWAIT);
-        if (length > 0) { if (db_append(&connection->xmux_raw_input,input,(size_t)length) != 0) return -1; }
-        else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        if (length > 0) { if (db_append(&connection->xmux_raw_input,input,(size_t)length) != 0) return -1; progressed=1; }
+        else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return progressed ? CORE_HTTP2_INPUT_PROGRESS : 0;
         else return -1;
     }
-    return 0;
+    return progressed ? CORE_HTTP2_INPUT_PROGRESS : 0;
 }
 
 static int xmux_transport_read_frame(void *opaque, core_xmux_frame_t *frame, size_t capacity) {
@@ -987,14 +993,18 @@ static int xmux_transport_read_frame(void *opaque, core_xmux_frame_t *frame, siz
             }
             if (event.kind == 3) connection->xmux_http1_id=0;
         }
-        db_consume(&connection->h2_net_cache,event.consumed); return result;
+        db_consume(&connection->h2_net_cache,event.consumed);
+        if (result == 1 && !capacity && connection->h2_net_cache.len &&
+            (connection->xmux_http1_response.state == 1 || connection->xmux_http1_response.state == 3) && connection->xmux_http1_response.remaining)
+            return CORE_HTTP2_INPUT_BLOCKED;
+        return result;
     }
     if (connection->h2_net_cache.len >= 9 && (connection->h2_net_cache.data[0] ||
         (((unsigned)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2]) > 16384)) return -1;
     if (!h2_cached_frame_ready(connection)) return 1;
     if (!connection->h2_net_cache.data[3]) {
         size_t length=((size_t)connection->h2_net_cache.data[0]<<16)|((size_t)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2];
-        if (length > capacity) return 1;
+        if (length > capacity) return CORE_HTTP2_INPUT_BLOCKED;
     }
     size_t length=((size_t)connection->h2_net_cache.data[0]<<16)|((size_t)connection->h2_net_cache.data[1]<<8)|connection->h2_net_cache.data[2];
     if (connection->input_memory && core_buffer_hold(connection->input_memory,length)) return -1;

@@ -11,6 +11,7 @@ static int retiring_probe;
 static int scheduling_retire(void *physical) { (void)physical; return retiring_probe; }
 static int scheduling_waits[3],scheduling_polls;
 static int scheduling_alps;
+static int scheduling_read_progress,scheduling_collections;
 uint64_t __real_core_now_ms(void);
 int __real_RAND_bytes(unsigned char *,int);
 int __real_core_poll(struct pollfd *,nfds_t,int);
@@ -18,6 +19,7 @@ int __wrap_core_poll(struct pollfd *descriptors,nfds_t count,int timeout) {
     if (!scheduling_actor) return __real_core_poll(descriptors,count,timeout);
     if (scheduling_alps) CHECK("alps/actor-applies-authenticated-settings",scheduling_actor->validation.settings_received && scheduling_actor->validation.settings_pending == 1 && scheduling_actor->peer_window == 1024 && scheduling_actor->peer_frame == 32768 && scheduling_actor->peer_concurrency == 2 && scheduling_actor->peer_header_limit == 65536);
     for (nfds_t i=0;i<count;i++) descriptors[i].revents=0;
+    if (scheduling_read_progress == 2) CHECK("h2/blocked-consumer-does-not-poll-readable-socket",count == 2 && !(descriptors[1].events&POLLIN));
     scheduling_waits[scheduling_polls++]=timeout;
     if (scheduling_polls == 3) scheduling_actor->failed=1;
     return 0;
@@ -69,9 +71,9 @@ static int scheduling_open(const vless_config_t *config,void **physical,int *htt
 }
 static void scheduling_close(void *physical) { (void)physical; }
 static int scheduling_fd(void *physical) { (void)physical; return -1; }
-static int scheduling_collect(void *physical) { (void)physical; return 0; }
+static int scheduling_collect(void *physical) { (void)physical; return scheduling_read_progress == 2 ? CORE_HTTP2_INPUT_READY : scheduling_read_progress && scheduling_collections++ < 2 ? CORE_HTTP2_INPUT_PROGRESS : 0; }
 static int scheduling_frame(void *physical,core_http2_frame_t *frame,size_t capacity) {
-    (void)physical; (void)frame; (void)capacity; return 1;
+    (void)physical; (void)frame; (void)capacity; return scheduling_read_progress == 2 ? CORE_HTTP2_INPUT_BLOCKED : 1;
 }
 static int scheduling_flush(void *physical) {
     wire_t *wire=physical; wire->flushed=wire->enqueued; wire->pending=0; return 0;
@@ -128,7 +130,8 @@ static void worker_progress_policy(void) {
     backend.collect=scheduling_collect; backend.read_frame=scheduling_frame; backend.flush=scheduling_flush;
     backend.retire=scheduling_retire;
     backend.initial_settings=scheduling_settings;
-    for (int retiring=0;retiring<2;retiring++) for (int blocked=0;blocked<2;blocked++) {
+    for (int reading=0;reading<3;reading++) for (int retiring=0;retiring<2;retiring++) for (int blocked=0;blocked<2;blocked++) {
+        scheduling_read_progress=reading; scheduling_collections=0;
         retiring_probe=retiring;
         scheduling_alps=blocked;
         mux_manager_t manager={.backend=&backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
@@ -149,20 +152,56 @@ static void worker_progress_policy(void) {
         CHECK("tls12/pool-rotation-keeps-active-transfer",actor.draining == retiring);
         CHECK("xmux/worker-progress-bounded-passes",scheduling_polls == 3 && !actor_count && upload_bytes == stream.tx.length);
         if (blocked) {
-            CHECK("xmux/worker-blocked-upload-still-waits",scheduling_waits[0] == 10 && scheduling_waits[1] == 10 && scheduling_waits[2] == 10 && stream.tx.length == sizeof(payload));
+            CHECK("xmux/worker-blocked-upload-still-waits",scheduling_waits[0] == (reading == 1 ? 0 : -1) && scheduling_waits[1] == (reading == 1 ? 0 : -1) && scheduling_waits[2] == -1 && stream.tx.length == sizeof(payload));
         } else {
             CHECK("xmux/worker-ready-upload-no-poll-delay",scheduling_waits[0] == 0 && scheduling_waits[1] == 0);
-            CHECK("xmux/worker-idle-does-not-spin",scheduling_waits[2] == 10 && !stream.tx.length);
+            CHECK("xmux/worker-idle-does-not-spin",scheduling_waits[2] == -1 && !stream.tx.length);
         }
         core_http2_queue_clear(&stream.tx); close(stream.notify[0]); close(stream.notify[1]); streams=NULL; upload_bytes=0;
     }
     retiring_probe=0;
     scheduling_alps=0;
+    scheduling_read_progress=0;
 }
 
 static int receive_request(void *physical,const vless_config_t *config,const char *session,uint64_t sequence,int role,const uint8_t *data,size_t length,uint32_t *id,uint32_t limit,size_t *consumed,size_t *body) {
     int result=pacing_request(physical,config,session,sequence,role,data,length,id,limit,consumed,body);
     wire_t *wire=physical; *id=wire->request_id+=2; return result;
+}
+
+static void worker_timer_policy(void) {
+    mux_manager_t manager={0}; manager.config.transport_mode=TRANSPORT_XHTTP;
+    mux_actor_t actor={.manager=&manager,.last_input_ms=1000};
+    CHECK("h2/idle-worker-event-only",actor_wait_timeout(&actor,0,2000) == -1);
+    CHECK("h2/runnable-worker-immediate",actor_wait_timeout(&actor,1,2000) == 0);
+    actor.alive_period=10;
+    CHECK("h2/keepalive-next-real-deadline",actor_wait_timeout(&actor,0,2000) == 9000);
+    actor.ping_deadline_ms=2500;
+    CHECK("h2/keepalive-ack-next-deadline",actor_wait_timeout(&actor,0,2000) == 500);
+    CHECK("h2/keepalive-ack-expired",actor_wait_timeout(&actor,0,2500) == 0);
+    actor.alive_period=0; actor.ping_deadline_ms=0; actor.idle_pending_ms=1000;
+    CHECK("h2/cancel-drain-timer",actor_wait_timeout(&actor,0,2000) == 1000);
+    manager.config.transport_mode=TRANSPORT_GRPC;
+    CHECK("h2/grpc-idle-timer",actor_wait_timeout(&actor,0,2000) == 59000);
+    actor.idle_pending_ms=0; actor.alive_period=1;
+    CHECK("h2/grpc-no-idle-ping",actor_wait_timeout(&actor,0,2000) == -1);
+    manager.config.grpc_permit_without_stream=1;
+    CHECK("h2/grpc-permitted-idle-ping",actor_wait_timeout(&actor,0,1500) == 500);
+    manager.config.transport_mode=TRANSPORT_XHTTP; actor.alive_period=0;
+    core_http2_stream_t stream={.upload=&actor,.ready=1,.down_id=1,.next_post_ms=2017};
+    mux_request_t request={.stream=&stream,.role=4,.packet_until_ms=2100,.packet_idle_ms=2008}; actor.requests=&request;
+    CHECK("h2/packet-idle-timer",actor_wait_timeout(&actor,0,2000) == 8);
+    stream.tx.length=1; streams=&stream;
+    CHECK("h2/post-interval-timer",actor_wait_timeout(&actor,0,2000) == 17);
+    stream.next_post_ms=0;
+    CHECK("h2/packet-max-age-timer",actor_wait_timeout(&actor,0,2000) == 100);
+    request.send_ended=1;
+    CHECK("h2/ended-packet-no-repeated-timer",actor_wait_timeout(&actor,0,2000) == -1);
+    stream.download=&actor; stream.down_id=0; stream.until_ms=2500;
+    CHECK("h2/unstarted-stream-own-deadline",actor_wait_timeout(&actor,0,2000) == 500);
+    stream.until_ms=UINT64_MAX-1;
+    CHECK("h2/timer-overflow-clamped",actor_wait_timeout(&actor,0,2000) == INT_MAX);
+    streams=NULL;
 }
 
 static void receive_capacity_policy(void) {
@@ -565,6 +604,7 @@ int main(void) {
     memory_admission_policy();
     drained_queue_memory();
     worker_progress_policy();
+    worker_timer_policy();
     receive_capacity_policy();
     flush_notification_policy();
     receive_credit_batching();
