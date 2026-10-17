@@ -72,6 +72,9 @@ $(HOST_BUILD_DIR)/test_transport_wire: $(HOST_BUILD_DIR)/test_transport_wire.o $
 $(HOST_BUILD_DIR)/test_tls_handshake: $(HOST_BUILD_DIR)/test_tls_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
+$(HOST_BUILD_DIR)/test_tofu_deadline: $(HOST_BUILD_DIR)/test_tofu_deadline.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=core_now_ms,--wrap=poll,--wrap=flock,--wrap=fsync
+
 $(HOST_BUILD_DIR)/test_tls12_handshake: $(HOST_BUILD_DIR)/test_tls12_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 

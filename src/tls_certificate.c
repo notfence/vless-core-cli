@@ -56,6 +56,21 @@ int xhttp_make_pin_key(const char *host, uint16_t port, char *out, size_t out_ca
 
 #define TLS_PIN_FILE_MAX_SIZE (1024U * 1024U)
 
+static int tofu_deadline_check(char *err,size_t capacity) {
+    if (!core_deadline_active() || core_deadline_remaining()) return 0;
+    set_err(err,capacity,"TOFU pin deadline expired"); errno=ETIMEDOUT; return -1;
+}
+
+static int tofu_lock(int fd,char *err,size_t capacity) {
+    for (;;) {
+        if (tofu_deadline_check(err,capacity)) return -1;
+        if (flock(fd,LOCK_EX|LOCK_NB) == 0) return tofu_deadline_check(err,capacity);
+        if (errno == EINTR) continue;
+        if (errno != EWOULDBLOCK && errno != EAGAIN) { set_err(err,capacity,"failed to lock TOFU pin file"); return -1; }
+        if (core_poll(NULL,0,10) < 0) { set_err(err,capacity,"failed to wait for TOFU pin lock"); return -1; }
+    }
+}
+
 static int tls_pin_file_path(char out[PATH_MAX], char *err, size_t err_cap) {
     const char *override = getenv("VLESS_XHTTP_PIN_FILE");
     if (override != NULL && override[0] != '\0') {
@@ -205,6 +220,7 @@ static int write_fd_all(int fd, const void *data, size_t length) {
 
 static int atomic_add_pin(const char *path, const char *parent, int source_fd, const char *key, const char *pin_hex, char *err,
                           size_t err_cap) {
+    if (tofu_deadline_check(err,err_cap)) return -1;
     struct stat st;
     if (fstat(source_fd, &st) != 0 || st.st_size < 0 || (uint64_t)st.st_size > TLS_PIN_FILE_MAX_SIZE) {
         set_err(err, err_cap, "TOFU pin file is too large");
@@ -248,6 +264,7 @@ static int atomic_add_pin(const char *path, const char *parent, int source_fd, c
         goto done;
     }
     temp_fd = -1;
+    if (tofu_deadline_check(err,err_cap)) goto done;
     if (rename(temp_path, path) != 0) goto done;
 
     int parent_fd = open(parent, O_RDONLY | O_NOFOLLOW);
@@ -257,16 +274,20 @@ static int atomic_add_pin(const char *path, const char *parent, int source_fd, c
     }
     result = 0;
 
-done:
+done: {
+    int saved=errno;
     if (temp_fd >= 0) close(temp_fd);
     if (result != 0) {
         unlink(temp_path);
-        set_err(err, err_cap, "failed to persist TOFU pin");
+        if (saved != ETIMEDOUT) set_err(err, err_cap, "failed to persist TOFU pin");
+    }
+    errno=saved;
     }
     return result;
 }
 
-static int secure_tofu_verify_or_store(const char *key, const char *pin_hex, int *stored, char *err, size_t err_cap) {
+static int secure_tofu_verify_or_store_impl(const char *key, const char *pin_hex, int *stored, char *err, size_t err_cap) {
+    if (tofu_deadline_check(err,err_cap)) return -1;
     char path[PATH_MAX];
     char parent[PATH_MAX];
     if (tls_pin_file_path(path, err, err_cap) != 0 || ensure_private_pin_parent(path, parent, err, err_cap) != 0) return -1;
@@ -279,9 +300,10 @@ static int secure_tofu_verify_or_store(const char *key, const char *pin_hex, int
     }
     int lock_fd = open_private_pin_file(lock_path, O_RDWR | O_CREAT, err, err_cap);
     if (lock_fd < 0) return -1;
-    if (flock(lock_fd, LOCK_EX) != 0) {
+    if (tofu_lock(lock_fd,err,err_cap) != 0) {
+        int saved=errno;
         close(lock_fd);
-        set_err(err, err_cap, "failed to lock TOFU pin file");
+        errno=saved;
         return -1;
     }
 
@@ -298,7 +320,9 @@ static int secure_tofu_verify_or_store(const char *key, const char *pin_hex, int
         }
         char existing[65];
         int found = find_pin_in_fd(pin_fd, key, existing);
-        if (found == 0) {
+        if (tofu_deadline_check(err,err_cap)) {
+            result=-1;
+        } else if (found == 0) {
             if (strcmp(existing, pin_hex) == 0) {
                 *stored = 0;
                 result = 0;
@@ -311,12 +335,26 @@ static int secure_tofu_verify_or_store(const char *key, const char *pin_hex, int
         } else if (found < 0) {
             set_err(err, err_cap, "failed to read TOFU pin file");
         }
-        close(pin_fd);
+        int saved=errno;
+        close(pin_fd); errno=saved;
     }
 
+    int saved=errno;
     (void)flock(lock_fd, LOCK_UN);
     close(lock_fd);
+    errno=saved;
     return result;
+}
+
+static int secure_tofu_verify_or_store(const char *key,const char *pin_hex,int *stored,char *err,size_t capacity) {
+    core_deadline_scope_t scope;
+    int scoped=!core_deadline_active();
+    if (scoped && core_deadline_scope_begin(&scope,CORE_TLS_HANDSHAKE_TIMEOUT_MS)) {
+        set_err(err,capacity,"failed to prepare TOFU pin deadline"); errno=ENOMEM; return -1;
+    }
+    int result=secure_tofu_verify_or_store_impl(key,pin_hex,stored,err,capacity),saved=errno;
+    if (scoped) core_deadline_scope_end(&scope);
+    errno=saved; return result;
 }
 
 static int sha256_hex(const uint8_t *data, size_t len, char out_hex[65]) {
