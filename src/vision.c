@@ -19,25 +19,11 @@
 #define VISION_LONG_PAD_BASE 900
 #define VISION_SHORT_PAD_RANDOM 256
 
-static int append_bytes(uint8_t **buf, size_t *len, size_t *cap, const uint8_t *src, size_t n) {
-    if (n == 0) {
-        return 0;
-    }
-    if (*len + n > *cap) {
-        size_t new_cap = (*cap == 0) ? 512 : *cap;
-        while (new_cap < *len + n) {
-            new_cap *= 2;
-        }
-        uint8_t *tmp = (uint8_t *)realloc(*buf, new_cap);
-        if (tmp == NULL) {
-            return -1;
-        }
-        *buf = tmp;
-        *cap = new_cap;
-    }
-    memcpy(*buf + *len, src, n);
-    *len += n;
-    return 0;
+static int append_stash(vision_unpad_t *ctx,const uint8_t *data,size_t length) {
+    core_relay_buffer_t stash={.data=ctx->stash,.length=ctx->stash_len,.capacity=ctx->stash_cap,.memory=ctx->memory};
+    int result=core_relay_buffer_append(&stash,data,length);
+    ctx->stash=stash.data; ctx->stash_len=stash.length; ctx->stash_cap=stash.capacity;
+    return result;
 }
 
 static int read_pad_packets_env(void) {
@@ -239,8 +225,7 @@ void vision_observe_tls(vision_wrap_t *ctx, int server, const uint8_t *data, siz
     }
 }
 
-static int vision_build_block(vision_wrap_t *ctx, uint8_t command, const uint8_t *content, size_t content_len, int long_padding, uint8_t **out,
-                              size_t *out_len) {
+static int vision_build_block(vision_wrap_t *ctx, uint8_t command, const uint8_t *content, size_t content_len, int long_padding, core_relay_buffer_t *out) {
     if (content_len > 0xFFFF) {
         return -1;
     }
@@ -250,10 +235,8 @@ static int vision_build_block(vision_wrap_t *ctx, uint8_t command, const uint8_t
     size_t prefix = ctx->uuid_sent ? 0 : 16;
     size_t total = prefix + 1 + 2 + 2 + content_len + (size_t)padding16;
 
-    uint8_t *buf = (uint8_t *)malloc(total);
-    if (buf == NULL) {
-        return -1;
-    }
+    if (core_relay_buffer_reserve(out,total) != 1) return -1;
+    uint8_t *buf=out->data;
 
     size_t off = 0;
     if (!ctx->uuid_sent) {
@@ -280,8 +263,7 @@ static int vision_build_block(vision_wrap_t *ctx, uint8_t command, const uint8_t
         off += padding16;
     }
 
-    *out = buf;
-    *out_len = off;
+    out->length=off;
     return 0;
 }
 
@@ -294,34 +276,30 @@ void vision_wrap_init(vision_wrap_t *ctx, const uint8_t uuid[16]) {
     ctx->bootstrap_sent = 0;
 }
 
-int vision_wrap_bootstrap(vision_wrap_t *ctx, uint8_t **out, size_t *out_len) {
-    *out = NULL;
-    *out_len = 0;
+int vision_wrap_bootstrap_buffer(vision_wrap_t *ctx,core_relay_buffer_t *out) {
+    core_relay_buffer_clear(out);
 
     if (!ctx->padding_active || ctx->bootstrap_sent) {
         return 0;
     }
     ctx->bootstrap_sent = 1;
-    return vision_build_block(ctx, CMD_CONTINUE, NULL, 0, 1, out, out_len);
+    return vision_build_block(ctx, CMD_CONTINUE, NULL, 0, 1, out);
 }
 
-static int vision_wrap_chunk(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len) {
-    *out = NULL;
-    *out_len = 0;
+int vision_wrap_bootstrap(vision_wrap_t *ctx,uint8_t **out,size_t *out_len) {
+    core_relay_buffer_t buffer={0}; int result=vision_wrap_bootstrap_buffer(ctx,&buffer);
+    if (result) core_relay_buffer_clear(&buffer);
+    *out=buffer.data; *out_len=buffer.length; return result;
+}
+
+static int vision_wrap_chunk(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, core_relay_buffer_t *out) {
 
     if (in_len == 0) {
         return 0;
     }
 
     if (!ctx->padding_active) {
-        uint8_t *cpy = (uint8_t *)malloc(in_len);
-        if (cpy == NULL) {
-            return -1;
-        }
-        memcpy(cpy, in, in_len);
-        *out = cpy;
-        *out_len = in_len;
-        return 0;
+        return core_relay_buffer_append(out,in,in_len);
     }
 
     size_t payload_len = in_len;
@@ -336,7 +314,7 @@ static int vision_wrap_chunk(vision_wrap_t *ctx, const uint8_t *in, size_t in_le
         command=ctx->tls13_confirmed ? CMD_DIRECT : CMD_END;
 
     int long_padding = (payload_len < VISION_LONG_PAD_THRESHOLD) ? 1 : 0;
-    if (vision_build_block(ctx, command, in, payload_len, long_padding, out, out_len) != 0) {
+    if (vision_build_block(ctx, command, in, payload_len, long_padding, out) != 0) {
         return -1;
     }
 
@@ -350,30 +328,40 @@ static int vision_wrap_chunk(vision_wrap_t *ctx, const uint8_t *in, size_t in_le
     return 0;
 }
 
-int vision_wrap_payload(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len) {
+int vision_wrap_payload_buffer(vision_wrap_t *ctx, const uint8_t *in, size_t in_len, core_relay_buffer_t *out) {
+    core_relay_buffer_clear(out);
     if (in_len <= 0xFFFF || !ctx->padding_active) {
-        return vision_wrap_chunk(ctx, in, in_len, out, out_len);
+        return vision_wrap_chunk(ctx, in, in_len, out);
     }
-    *out = NULL;
-    *out_len = 0;
-    size_t capacity = 0;
     for (size_t offset = 0; offset < in_len;) {
         size_t length = in_len - offset;
         if (ctx->padding_active && length > 0xFFFF) length = 0xFFFF;
-        uint8_t *chunk = NULL;
-        size_t chunk_length = 0;
-        if (vision_wrap_chunk(ctx, in + offset, length, &chunk, &chunk_length) != 0 ||
-            append_bytes(out, out_len, &capacity, chunk, chunk_length) != 0) {
-            free(chunk);
-            free(*out);
-            *out = NULL;
-            *out_len = 0;
+        core_relay_buffer_t chunk={.memory=out->memory};
+        if (vision_wrap_chunk(ctx, in + offset, length, &chunk) != 0 ||
+            core_relay_buffer_append(out,chunk.data,chunk.length) != 0) {
+            core_relay_buffer_clear(&chunk); core_relay_buffer_clear(out);
             return -1;
         }
-        free(chunk);
+        core_relay_buffer_clear(&chunk);
         offset += length;
     }
     return 0;
+}
+
+int vision_wrap_payload(vision_wrap_t *ctx,const uint8_t *in,size_t in_len,uint8_t **out,size_t *out_len) {
+    core_relay_buffer_t buffer={0}; int result=vision_wrap_payload_buffer(ctx,in,in_len,&buffer);
+    if (result) core_relay_buffer_clear(&buffer);
+    *out=buffer.data; *out_len=buffer.length; return result;
+}
+
+size_t vision_wrap_buffer_bound(size_t length) {
+    if (length <= 65535) return core_relay_capacity(length+21+(length < 900 ? 1399-length : 255));
+    size_t parts=length/65535+(length%65535 != 0),tail=(length-1)%65535+1;
+    if (parts > (SIZE_MAX-16-1399)/260 || length > SIZE_MAX-16-1399-parts*260) return SIZE_MAX;
+    size_t total=length+16+parts*5+(parts-1)*255+(tail < 900 ? 1399-tail : 255);
+    size_t capacity=core_relay_capacity(total),chunk=core_relay_capacity(65535+21+255);
+    if (capacity > SIZE_MAX-capacity/2 || capacity+capacity/2 > SIZE_MAX-chunk) return SIZE_MAX;
+    return capacity+capacity/2+chunk;
 }
 
 void vision_unpad_init(vision_unpad_t *ctx, const uint8_t uuid[16]) {
@@ -389,29 +377,44 @@ int vision_unpad_complete(const vision_unpad_t *ctx) {
         (ctx->remaining_command == -1 || (ctx->remaining_command == 5 && ctx->completed_block));
 }
 
+int vision_unpad_is_raw(const vision_unpad_t *ctx) {
+    return vision_unpad_complete(ctx) && (ctx->current_command == CMD_END || ctx->current_command == CMD_DIRECT);
+}
+
+size_t vision_unpad_buffer_bound(const vision_unpad_t *ctx,size_t length) {
+    if (length > SIZE_MAX-ctx->stash_len) return SIZE_MAX;
+    size_t capacity=core_relay_capacity(length+ctx->stash_len);
+    if (capacity > SIZE_MAX-capacity/2 || capacity+capacity/2 > SIZE_MAX-capacity) return SIZE_MAX;
+    size_t processing=capacity+capacity+capacity/2;
+    if (ctx->stash_cap > capacity) {
+        if (ctx->stash_cap > SIZE_MAX-capacity-capacity/2) return SIZE_MAX;
+        processing=ctx->stash_cap+capacity+capacity/2;
+    } else if (ctx->stash_cap > capacity/2) {
+        size_t growing=ctx->stash_cap+capacity;
+        if (growing > processing) processing=growing;
+    }
+    return processing;
+}
+
 void vision_unpad_free(vision_unpad_t *ctx) {
     if (ctx->stash != NULL) {
-        free(ctx->stash);
+        if (ctx->memory) core_buffer_free(ctx->memory,ctx->stash,ctx->stash_cap);
+        else free(ctx->stash);
         ctx->stash = NULL;
     }
     ctx->stash_len = 0;
     ctx->stash_cap = 0;
 }
 
-int vision_unpad_feed(vision_unpad_t *ctx, const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len, int *switch_to_direct) {
-    *out = NULL;
-    *out_len = 0;
+int vision_unpad_feed_buffer(vision_unpad_t *ctx, const uint8_t *in, size_t in_len, core_relay_buffer_t *out, int *switch_to_direct) {
+    core_relay_buffer_clear(out);
     if (switch_to_direct != NULL) {
         *switch_to_direct = 0;
     }
 
-    if (in_len > 0 && append_bytes(&ctx->stash, &ctx->stash_len, &ctx->stash_cap, in, in_len) != 0) {
+    if (in_len > 0 && append_stash(ctx,in,in_len) != 0) {
         return -1;
     }
-
-    uint8_t *plain = NULL;
-    size_t plain_len = 0;
-    size_t plain_cap = 0;
 
     size_t i = 0;
     while (i < ctx->stash_len) {
@@ -422,8 +425,8 @@ int vision_unpad_feed(vision_unpad_t *ctx, const uint8_t *in, size_t in_len, uin
                 break;
             }
             if (padding_ended || remain < 16 || memcmp(ctx->stash + i, ctx->uuid, 16) != 0) {
-                if (append_bytes(&plain, &plain_len, &plain_cap, ctx->stash + i, remain) != 0) {
-                    free(plain);
+                if (core_relay_buffer_append(out,ctx->stash+i,remain) != 0) {
+                    core_relay_buffer_clear(out);
                     return -1;
                 }
                 i = ctx->stash_len;
@@ -469,8 +472,8 @@ int vision_unpad_feed(vision_unpad_t *ctx, const uint8_t *in, size_t in_len, uin
             if (take > (size_t)ctx->remaining_content) {
                 take = (size_t)ctx->remaining_content;
             }
-            if (append_bytes(&plain, &plain_len, &plain_cap, ctx->stash + i, take) != 0) {
-                free(plain);
+            if (core_relay_buffer_append(out,ctx->stash+i,take) != 0) {
+                core_relay_buffer_clear(out);
                 return -1;
             }
             i += take;
@@ -502,8 +505,8 @@ int vision_unpad_feed(vision_unpad_t *ctx, const uint8_t *in, size_t in_len, uin
                 ctx->remaining_padding = -1;
                 if (i < ctx->stash_len) {
                     size_t remain = ctx->stash_len - i;
-                    if (append_bytes(&plain, &plain_len, &plain_cap, ctx->stash + i, remain) != 0) {
-                        free(plain);
+                    if (core_relay_buffer_append(out,ctx->stash+i,remain) != 0) {
+                        core_relay_buffer_clear(out);
                         return -1;
                     }
                     i = ctx->stash_len;
@@ -520,7 +523,12 @@ done:
         ctx->stash_len = left;
     }
 
-    *out = plain;
-    *out_len = plain_len;
+    if (ctx->memory && !ctx->stash_len) vision_unpad_free(ctx);
     return 0;
+}
+
+int vision_unpad_feed(vision_unpad_t *ctx,const uint8_t *in,size_t in_len,uint8_t **out,size_t *out_len,int *direct) {
+    core_relay_buffer_t buffer={0}; int result=vision_unpad_feed_buffer(ctx,in,in_len,&buffer,direct);
+    if (result) core_relay_buffer_clear(&buffer);
+    *out=buffer.data; *out_len=buffer.length; return result;
 }

@@ -230,19 +230,34 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (whole.tls_disabled != fragmented.tls_disabled || whole.client_hello_seen != fragmented.client_hello_seen ||
                 whole.server_hello_seen != fragmented.server_hello_seen || whole.tls13_confirmed != fragmented.tls13_confirmed) abort();
         }
-        vision_unpad_t unpad;
+        vision_unpad_t unpad,accounted;
         vision_unpad_init(&unpad, uuid);
+        vision_unpad_init(&accounted,uuid);
+        core_relay_memory_t memory={0};
+        if (core_relay_memory_init(&memory,8192) != 1) abort();
+        accounted.memory=&memory.temporary;
         for (size_t off = 0; off < size; off += step) {
             uint8_t *plain = NULL;
             size_t length = 0, count = size - off < step ? size - off : step;
             int direct = 0;
             int result = vision_unpad_feed(&unpad, data + off, count, &plain, &length, &direct);
+            int accounted_direct=0;
+            if (core_relay_memory_credit(&memory,vision_unpad_buffer_bound(&accounted,count)) != 1) abort();
+            int accounted_result=vision_unpad_feed_buffer(&accounted,data+off,count,&memory.plain,&accounted_direct);
+            if (result != accounted_result || direct != accounted_direct || length != memory.plain.length ||
+                (length && memcmp(plain,memory.plain.data,length))) abort();
+            size_t bytes,reserved; core_buffer_snapshot(CORE_BUFFER_RELAY,&bytes,&reserved);
+            if (memory.temporary.allocated > memory.temporary.minimum || bytes+reserved > CORE_BUFFER_TOTAL_LIMIT) abort();
+            core_relay_buffer_clear(&memory.plain);
             free(plain);
             if (result != 0) break;
             (void)vision_unpad_complete(&unpad);
         }
         (void)vision_unpad_complete(&unpad);
         vision_unpad_free(&unpad);
+        vision_unpad_free(&accounted); core_relay_memory_clear(&memory);
+        size_t bytes,reserved; core_buffer_snapshot(CORE_BUFFER_RELAY,&bytes,&reserved);
+        if (bytes || reserved) abort();
         vless_response_t response={0}; size_t offset=0;
         while (offset < size) {
             size_t chunk=size-offset < step ? size-offset : step, consumed=0;

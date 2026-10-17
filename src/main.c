@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 #include <openssl/crypto.h>
@@ -30,6 +31,7 @@
 #include "vision.h"
 #include "vless.h"
 #include "vless_encryption.h"
+#include "relay_memory.h"
 
 #define VLESS_CORE_VERSION "1.1.5"
 #define MAX_CLIENT_CONNECTIONS 256
@@ -545,7 +547,62 @@ static void response_failure(const vless_response_t *response, int transport_err
     }
 }
 
-static void *client_worker_run(void *arg) {
+static int relay_prepare_memory(core_relay_memory_t *memory,tls13_conn_t *tls,int client,int temporary) {
+    for (;;) {
+        int result=core_relay_memory_init(memory,tls13_write_batch_size(tls));
+        if (result == 1) result=core_relay_memory_credit(memory,temporary ? 32768 : 0);
+        if (result == 1) { core_relay_memory_unwatch(memory,3); return 0; }
+        if (result < 0 || core_relay_memory_watch(memory,3)) return -1;
+        result=core_relay_memory_init(memory,tls13_write_batch_size(tls));
+        if (result == 1) result=core_relay_memory_credit(memory,temporary ? 32768 : 0);
+        if (result == 1) { core_relay_memory_unwatch(memory,3); return 0; }
+        if (result < 0) return -1;
+        struct pollfd fds[]={{.fd=core_relay_memory_fd(memory),.events=POLLIN},{.fd=client}};
+        int ready=core_poll(fds,2,core_deadline_remaining());
+        if (ready <= 0) { if (!ready) errno=ETIMEDOUT; return -1; }
+        if (fds[1].revents&(POLLHUP|POLLERR|POLLNVAL)) { errno=ECONNRESET; return -1; }
+        if (fds[0].revents&POLLIN) core_relay_memory_ack(memory);
+    }
+}
+
+static int relay_input_room(core_relay_memory_t *memory,size_t requested,int transform,size_t *capacity) {
+    for (size_t size=requested;size;size/=2) {
+        int result=core_relay_buffer_reserve(&memory->input,size);
+        if (result < 0) return -1;
+        if (result == 1) {
+            size_t credit=transform ? vision_wrap_buffer_bound(size) : 0;
+            if (transform) {
+                if (credit > SIZE_MAX-memory->temporary.allocated) { errno=EOVERFLOW; return -1; }
+                credit+=memory->temporary.allocated;
+            }
+            result=core_relay_memory_credit(memory,credit);
+            if (result == 1) { *capacity=size; return 1; }
+            if (result < 0) return -1;
+        }
+        if (core_relay_buffer_trim(&memory->input) != 1) return -1;
+    }
+    return 0;
+}
+
+static int relay_output_room(core_relay_memory_t *memory,const vision_unpad_t *vision,size_t requested,size_t *capacity) {
+    size_t extra=vision ? vision->stash_len : 0;
+    if (extra >= memory->output.limit-memory->output.length) return 0;
+    size_t available=memory->output.limit-memory->output.length-extra;
+    if (requested > available) requested=available;
+    for (size_t size=requested;size;size/=2) {
+        int result=core_relay_buffer_reserve(&memory->output,memory->output.length+size+extra);
+        if (result < 0) return -1;
+        if (result == 1) {
+            result=core_relay_memory_credit(memory,vision ? vision_unpad_buffer_bound(vision,size) : 0);
+            if (result == 1) { *capacity=size; return 1; }
+            if (result < 0) return -1;
+        }
+        if (core_relay_buffer_trim(&memory->output) != 1) return -1;
+    }
+    return 0;
+}
+
+static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
     client_ctx_t *ctx = (client_ctx_t *)arg;
     int cfd = ctx->client_fd;
     vless_config_t cfg = ctx->cfg;
@@ -769,6 +826,11 @@ static void *client_worker_run(void *arg) {
     }
 
     int use_vision = (strcmp(cfg.flow, "xtls-rprx-vision") == 0);
+    if (relay_prepare_memory(memory,tls,cfd,use_vision || cfg.transport_mode == TRANSPORT_WS)) {
+        connection_log_failure("relay buffer preparation failed","resources unavailable",connection_failure(errno));
+        if (!socks_success_sent) socks5_send_failure(cfd,1);
+        upstream_close(tls,encryption); close(cfd); return NULL;
+    }
     int allow_raw_vision =
         (cfg.transport_mode == TRANSPORT_VISION && encryption == NULL);
     vision_wrap_t vwrap;
@@ -776,6 +838,7 @@ static void *client_worker_run(void *arg) {
     if (use_vision) {
         vision_wrap_init(&vwrap, cfg.uuid);
         vision_unpad_init(&vunpad, cfg.uuid);
+        vunpad.memory=&memory->temporary;
     }
 
     if (use_vision) {
@@ -816,7 +879,7 @@ static void *client_worker_run(void *arg) {
         }
 
         if (first_payload_len > 0) {
-            if (vision_wrap_payload(&vwrap, first_payload, (size_t)first_payload_len, &vision_first, &vision_first_len) != 0) {
+            if (vision_wrap_payload_buffer(&vwrap, first_payload, (size_t)first_payload_len, &memory->wrapped) != 0) {
                 vc_log_error("connection", "first Vision payload wrap failed for %s:%u",
                              target_host, (unsigned)target_port);
                 vision_unpad_free(&vunpad);
@@ -824,7 +887,7 @@ static void *client_worker_run(void *arg) {
                 close(cfd);
                 return NULL;
             }
-        } else if (vision_wrap_bootstrap(&vwrap, &vision_first, &vision_first_len) != 0) {
+        } else if (vision_wrap_bootstrap_buffer(&vwrap, &memory->wrapped) != 0) {
             vc_log_error("connection", "Vision bootstrap build failed for %s:%u",
                          target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
@@ -833,10 +896,10 @@ static void *client_worker_run(void *arg) {
             return NULL;
         }
 
+        vision_first=memory->wrapped.data; vision_first_len=memory->wrapped.length;
         first_packet_len = vless_req_len + vision_first_len;
-        first_packet = (uint8_t *)malloc(first_packet_len);
-        if (first_packet == NULL) {
-            free(vision_first);
+        if (core_relay_buffer_reserve(&memory->packet,first_packet_len) != 1) {
+            core_relay_buffer_clear(&memory->wrapped);
             vc_log_error("connection", "VLESS/Vision request alloc failed for %s:%u",
                          target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
@@ -844,16 +907,17 @@ static void *client_worker_run(void *arg) {
             close(cfd);
             return NULL;
         }
+        first_packet=memory->packet.data;
 
         memcpy(first_packet, vless_req, vless_req_len);
         if (vision_first_len > 0) {
             memcpy(first_packet + vless_req_len, vision_first, vision_first_len);
         }
-        free(vision_first);
+        core_relay_buffer_clear(&memory->wrapped);
 
         if (upstream_write(tls, encryption, first_packet,
                            first_packet_len) != 0) {
-            free(first_packet);
+            core_relay_buffer_clear(&memory->packet);
             vc_log_error("connection", "VLESS/Vision request send failed for %s:%u",
                          target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
@@ -861,7 +925,7 @@ static void *client_worker_run(void *arg) {
             close(cfd);
             return NULL;
         }
-        free(first_packet);
+        core_relay_buffer_clear(&memory->packet);
 
     } else if (cfg.transport_mode == TRANSPORT_WS) {
         uint8_t vless_req[2048];
@@ -896,14 +960,14 @@ static void *client_worker_run(void *arg) {
         }
 
         first_packet_len = vless_req_len + ((first_payload_len > 0) ? (size_t)first_payload_len : 0);
-        first_packet = (uint8_t *)malloc(first_packet_len);
-        if (first_packet == NULL) {
+        if (core_relay_buffer_reserve(&memory->packet,first_packet_len) != 1) {
             vc_log_error("connection", "VLESS/WS request alloc failed for %s:%u",
                          target_host, (unsigned)target_port);
             upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
+        first_packet=memory->packet.data;
 
         memcpy(first_packet, vless_req, vless_req_len);
         if (first_payload_len > 0) {
@@ -912,14 +976,14 @@ static void *client_worker_run(void *arg) {
 
         if (upstream_write(tls, encryption, first_packet,
                            first_packet_len) != 0) {
-            free(first_packet);
+            core_relay_buffer_clear(&memory->packet);
             vc_log_error("connection", "VLESS/WS request send failed for %s:%u",
                          target_host, (unsigned)target_port);
             upstream_close(tls, encryption);
             close(cfd);
             return NULL;
         }
-        free(first_packet);
+        core_relay_buffer_clear(&memory->packet);
     } else {
         if (vless_send_request(tls, encryption, &cfg, target_host,
                                target_port) != 0) {
@@ -954,17 +1018,12 @@ static void *client_worker_run(void *arg) {
 
     int tfd = tls13_get_fd(tls);
     vc_log_debug("connection", "upstream fd=%d target=%s:%u", tfd, target_host, (unsigned)target_port);
-    size_t cbuf_cap = tls13_write_batch_size(tls);
-    if (cbuf_cap < 8192) {
-        cbuf_cap = 8192;
-    }
-    uint8_t *cbuf = (uint8_t *)malloc(cbuf_cap),*output=malloc(256U*1024U);
-    if (cbuf == NULL || output == NULL || tls13_start_relay(tls)) {
+    (void)core_relay_memory_credit(memory,0);
+    if (tls13_start_relay(tls)) {
         if (use_vision) {
             vision_unpad_free(&vunpad);
         }
         upstream_close(tls, encryption);
-        free(cbuf); free(output);
         close(cfd);
         return NULL;
     }
@@ -978,10 +1037,15 @@ static void *client_worker_run(void *arg) {
     int upstream_encryption_direct = 0;
     int downstream_encryption_direct = 0;
     int client_eof=0,upstream_eof=0,upstream_failed=0;
-    int client_send_closed=0; size_t output_length=0;
+    int client_send_closed=0,client_hup=0; size_t output_length=0;
     vless_response_t response={0};
 
     while (1) {
+        (void)core_relay_memory_credit(memory,0);
+        if (core_relay_buffer_trim(&memory->input) != 1) break;
+        memory->output.length=output_length;
+        if (core_relay_buffer_trim(&memory->output) != 1) break;
+        uint8_t *output=memory->output.data;
         if (!got_vless_response && core_deadline_active() && !core_deadline_remaining()) break;
         if (!upstream_failed && (tls13_flush(tls) || tls13_tick(tls))) {
             if (!got_vless_response) response_failure(&response,1,errno);
@@ -989,7 +1053,10 @@ static void *client_worker_run(void *arg) {
         }
         if (output_length) {
             ssize_t sent=core_send(cfd,output,output_length,MSG_DONTWAIT);
-            if (sent > 0) { output_length-=(size_t)sent; memmove(output,output+sent,output_length); }
+            if (sent > 0) {
+                output_length-=(size_t)sent; memmove(output,output+sent,output_length);
+                memory->output.length=output_length; core_relay_memory_unwatch(memory,CORE_RELAY_OUTPUT_WAIT);
+            }
             else if (!sent || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
         }
         if (upstream_eof && !output_length && !client_send_closed) {
@@ -1000,8 +1067,10 @@ static void *client_worker_run(void *arg) {
         if (finishing < 0) { upstream_failed=client_eof=upstream_eof=1; finishing=0; }
         if (client_eof && upstream_eof && !finishing && !output_length) break;
         int client_ready = 0;
-        int client_writable = !client_eof && tls13_write_capacity(tls) >= 128U*1024U;
-        int receive_capacity=output_length <= 256U*1024U-sizeof(tbuf);
+        size_t receive_read_capacity=0;
+        int client_writable = !client_eof && !(memory->waiting&CORE_RELAY_INPUT_WAIT) && tls13_write_capacity(tls) >= 128U*1024U;
+        size_t extra=use_vision && !vision_unpad_is_raw(&vunpad) ? vunpad.stash_len : 0;
+        int receive_capacity=output_length+extra < memory->output.limit && !(memory->waiting&CORE_RELAY_OUTPUT_WAIT);
         int upstream_ready = !upstream_eof && receive_capacity &&
                              (downstream_direct ? tls13_has_pending_raw(tls) : tls13_has_pending_input(tls) || vless_encryption_has_pending_input(encryption));
         if (upstream_ready) {
@@ -1011,20 +1080,42 @@ static void *client_worker_run(void *arg) {
             }
             client_ready = s > 0;
         } else {
-            struct pollfd fds[2] = {{.fd=client_writable || output_length ? cfd : -1,.events=(short)((client_writable ? POLLIN : 0)|(output_length ? POLLOUT : 0))},
-                {.fd=!upstream_eof || finishing || tls13_needs_write(tls) ? tfd : -1,.events=(short)(((!upstream_eof && receive_capacity) || finishing ? POLLIN : 0) | (tls13_needs_write(tls) ? POLLOUT : 0))}};
-            int s = core_poll(fds, 2, tls13_idle_timeout(tls));
+            struct pollfd fds[3] = {{.fd=client_writable || output_length || (!client_eof && !client_hup) ? cfd : -1,.events=(short)((client_writable ? POLLIN : 0)|(output_length ? POLLOUT : 0))},
+                {.fd=(!upstream_eof && receive_capacity) || finishing || tls13_needs_write(tls) ? tfd : -1,.events=(short)(((!upstream_eof && receive_capacity) || finishing ? POLLIN : 0) | (tls13_needs_write(tls) ? POLLOUT : 0))},
+                {.fd=core_relay_memory_fd(memory),.events=POLLIN}};
+            int s = core_poll(fds, 3, tls13_idle_timeout(tls));
             if (s < 0 || (!upstream_failed && tls13_tick(tls))) {
                 break;
             }
             if (s == 0) continue;
+            if (fds[2].revents&(POLLIN|POLLHUP|POLLERR)) { core_relay_memory_ack(memory); continue; }
+            if (fds[0].revents&(POLLHUP|POLLERR|POLLNVAL)) {
+                uint8_t byte; ssize_t pending=core_recv(cfd,&byte,1,MSG_PEEK|MSG_DONTWAIT);
+                if (pending < 0 && errno != EAGAIN && errno != EWOULDBLOCK) break;
+                if (!pending) {
+                    client_eof=1; core_relay_memory_unwatch(memory,CORE_RELAY_INPUT_WAIT);
+                    if (tls13_finish_write(tls,upstream_direct)) break;
+                } else client_hup=1;
+            }
             client_ready = (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0;
             upstream_ready = receive_capacity && (fds[1].revents & (POLLIN | POLLHUP | POLLERR | (tls13_uses_async_io(tls) ? POLLOUT : 0))) != 0;
         }
 
-        if (client_ready && tls13_reserve_write(tls, 128U*1024U)) {
+        if (client_ready && !client_eof && tls13_reserve_write(tls, 128U*1024U)) {
+            int available=0; size_t requested=tls13_write_batch_size(tls),read_capacity=0;
+            if (requested > CORE_RELAY_MINIMUM && !ioctl(cfd,FIONREAD,&available) && available < (int)CORE_RELAY_MINIMUM) requested=CORE_RELAY_MINIMUM;
+            int transform=use_vision && vwrap.padding_active && !upstream_direct;
+            int room=relay_input_room(memory,requested,transform,&read_capacity);
+            if (!room) {
+                if (core_relay_memory_watch(memory,CORE_RELAY_INPUT_WAIT)) break;
+                room=relay_input_room(memory,requested,transform,&read_capacity);
+            }
+            if (room < 0) break;
+            if (!room) { tls13_release_write(tls); goto receive_upstream; }
+            core_relay_memory_unwatch(memory,CORE_RELAY_INPUT_WAIT);
+            uint8_t *cbuf=memory->input.data;
             if (waiting_initial_payload) { core_deadline_resume(); waiting_initial_payload=0; }
-            ssize_t n = recv_coalesced(cfd, cbuf, cbuf_cap, cbuf_cap > 8192 ? 2000 : 0);
+            ssize_t n = recv_coalesced(cfd, cbuf, read_capacity, read_capacity > 8192 ? 2000 : 0);
             if (n <= 0) {
                 tls13_release_write(tls);
                 if (n < 0) break;
@@ -1036,13 +1127,11 @@ static void *client_worker_run(void *arg) {
                 if (tls13_write_raw(tls, cbuf, (size_t)n) != 0) {
                     break;
                 }
-            } else if (use_vision) {
-                uint8_t *wrapped = NULL;
-                size_t wrapped_len = 0;
-                if (vision_wrap_payload(&vwrap, cbuf, (size_t)n, &wrapped, &wrapped_len) != 0) {
+            } else if (transform) {
+                if (vision_wrap_payload_buffer(&vwrap, cbuf, (size_t)n, &memory->wrapped) != 0) {
                     break;
                 }
-
+                uint8_t *wrapped=memory->wrapped.data; size_t wrapped_len=memory->wrapped.length;
                 if (wrapped_len > 0) {
                     int write_rc = upstream_encryption_direct
                                        ? vless_encryption_write_raw(
@@ -1050,11 +1139,11 @@ static void *client_worker_run(void *arg) {
                                        : upstream_write(tls, encryption,
                                                         wrapped, wrapped_len);
                     if (write_rc != 0) {
-                        free(wrapped);
+                        core_relay_buffer_clear(&memory->wrapped);
                         break;
                     }
                 }
-                free(wrapped);
+                core_relay_buffer_clear(&memory->wrapped);
                 if (vwrap.direct_sent) {
                     if (encryption != NULL) {
                         upstream_encryption_direct = 1;
@@ -1063,14 +1152,29 @@ static void *client_worker_run(void *arg) {
                     }
                 }
             } else {
-                if (upstream_write(tls, encryption, cbuf, (size_t)n) != 0) {
+                int written=upstream_encryption_direct ? vless_encryption_write_raw(encryption,cbuf,(size_t)n) : upstream_write(tls,encryption,cbuf,(size_t)n);
+                if (written != 0) {
                     break;
                 }
             }
             tls13_release_write(tls);
         }
 
+receive_upstream:
+        (void)core_relay_memory_credit(memory,0);
+        if (core_relay_buffer_trim(&memory->input) != 1) break;
         if (upstream_ready) {
+            const vision_unpad_t *transformation=use_vision && !vision_unpad_is_raw(&vunpad) && !(allow_raw_vision && tls13_reality_is_raw_direct(tls)) ? &vunpad : NULL;
+            memory->output.length=output_length;
+            int room=relay_output_room(memory,transformation,sizeof(tbuf),&receive_read_capacity);
+            if (!room) {
+                if (core_relay_memory_watch(memory,CORE_RELAY_OUTPUT_WAIT)) break;
+                room=relay_output_room(memory,transformation,sizeof(tbuf),&receive_read_capacity);
+            }
+            if (room < 0) break;
+            if (!room) continue;
+            core_relay_memory_unwatch(memory,CORE_RELAY_OUTPUT_WAIT);
+            output=memory->output.data;
             int drained = tls13_drain_h2_input(tls);
             if (drained < 0) {
                 if (!got_vless_response) response_failure(&response,1,errno);
@@ -1084,7 +1188,7 @@ static void *client_worker_run(void *arg) {
 
         if (upstream_ready) {
             if (downstream_direct) {
-                size_t got=0; int result=tls13_read_raw(tls,tbuf,sizeof(tbuf),&got);
+                size_t got=0; int result=tls13_read_raw(tls,tbuf,receive_read_capacity,&got);
                 if (result < 0) { upstream_failed=client_eof=upstream_eof=1; continue; }
                 if (result > 0) continue;
                 if (!got) {
@@ -1099,9 +1203,9 @@ static void *client_worker_run(void *arg) {
             size_t got = 0;
             int read_rc = downstream_encryption_direct
                               ? vless_encryption_read_raw(
-                                    encryption, tbuf, sizeof(tbuf), &got)
+                                    encryption, tbuf, receive_read_capacity, &got)
                               : upstream_read(tls, encryption, tbuf,
-                                              sizeof(tbuf), &got);
+                                              receive_read_capacity, &got);
             if (read_rc < 0) {
                 if (!got_vless_response) response_failure(&response,1,errno);
                 upstream_failed=client_eof=upstream_eof=1; continue;
@@ -1146,18 +1250,22 @@ static void *client_worker_run(void *arg) {
                     continue;
                 }
 
-                uint8_t *plain = NULL;
-                size_t plain_len = 0;
                 int switch_to_direct = 0;
-                if (vision_unpad_feed(&vunpad, tbuf, got, &plain, &plain_len, &switch_to_direct) != 0) {
+                if (vision_unpad_is_raw(&vunpad)) {
+                    vision_observe_tls(&vwrap,1,tbuf,got);
+                    if (!received_reply) { received_reply = 1; core_trace_complete(1); }
+                    memcpy(output+output_length,tbuf,got); output_length+=got;
+                    continue;
+                }
+                if (vision_unpad_feed_buffer(&vunpad, tbuf, got, &memory->plain, &switch_to_direct) != 0) {
                     break;
                 }
-
+                uint8_t *plain=memory->plain.data; size_t plain_len=memory->plain.length;
                 if (plain_len > 0 && !received_reply) { received_reply = 1; core_trace_complete(1); }
-                if (plain_len > 256U*1024U-output_length) { free(plain); break; }
+                if (plain_len > memory->output.capacity-output_length) break;
                 vision_observe_tls(&vwrap,1,plain,plain_len);
                 if (plain_len) { memcpy(output+output_length,plain,plain_len); output_length+=plain_len; }
-                free(plain);
+                core_relay_buffer_clear(&memory->plain);
 
                 if (switch_to_direct) {
                     if (encryption != NULL) {
@@ -1181,8 +1289,6 @@ static void *client_worker_run(void *arg) {
     if (use_vision) {
         vision_unpad_free(&vunpad);
     }
-    free(cbuf);
-    free(output);
     upstream_close(tls, encryption);
     close(cfd);
     return NULL;
@@ -1197,7 +1303,9 @@ static void *client_worker(void *arg) {
         return NULL;
     }
     int attached = core_trace_attach(&trace) == 0;
-    void *result = client_worker_run(arg);
+    core_relay_memory_t memory={0};
+    void *result = client_worker_run(arg,&memory);
+    core_relay_memory_clear(&memory);
     if (attached) {
         core_trace_complete(0);
         core_trace_detach();

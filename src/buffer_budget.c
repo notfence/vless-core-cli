@@ -1,4 +1,5 @@
 #include "buffer_budget.h"
+#include "relay_memory.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -23,8 +24,10 @@ static void release(core_buffer_budget_t *budget, size_t size) {
     pthread_mutex_lock(&buffer_lock);
     budget->allocated-=size; allocated[budget->direction]-=size;
     size_t remaining=budget->allocated > budget->minimum ? budget->allocated : budget->minimum;
+    size_t released=budget->charged-remaining;
     charged[budget->direction]-=budget->charged-remaining; budget->charged=remaining;
     pthread_mutex_unlock(&buffer_lock);
+    if (released && budget->direction == CORE_BUFFER_RELAY) core_relay_memory_released();
 }
 
 int core_buffer_budget_init(core_buffer_budget_t *budget, unsigned direction, size_t minimum) {
@@ -32,12 +35,15 @@ int core_buffer_budget_init(core_buffer_budget_t *budget, unsigned direction, si
         ((budget->charged || budget->allocated) && budget->direction != direction)) { errno=EINVAL; return -1; }
     pthread_mutex_lock(&buffer_lock);
     size_t required=minimum > budget->allocated ? minimum : budget->allocated;
+    size_t released=required < budget->charged ? budget->charged-required : 0;
     size_t increase=required > budget->charged ? required-budget->charged : 0;
     if (increase > CORE_BUFFER_TOTAL_LIMIT-charged[direction]) { pthread_mutex_unlock(&buffer_lock); errno=ENOBUFS; return -1; }
     charged[direction]+=increase;
     if (required < budget->charged) charged[direction]-=budget->charged-required;
     budget->direction=direction; budget->minimum=minimum; budget->charged=required;
-    pthread_mutex_unlock(&buffer_lock); return 0;
+    pthread_mutex_unlock(&buffer_lock);
+    if (released && direction == CORE_BUFFER_RELAY) core_relay_memory_released();
+    return 0;
 }
 
 int core_buffer_budget_clear(core_buffer_budget_t *budget) {

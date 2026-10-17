@@ -3,9 +3,17 @@
 #define main vc_program_main
 #include "../src/main.c"
 #undef main
+#include "../src/tls_internal.h"
 #include <fcntl.h>
 #include <signal.h>
 static int allocation_failure, thread_failure, accept_fixture = -1, accept_transient_error;
+static int reject_large_relay;
+static unsigned large_relay_allocations;
+void *__real_malloc(size_t size);
+void *__wrap_malloc(size_t size) {
+    if (reject_large_relay && size == 256U*1024U) { large_relay_allocations++; errno=ENOMEM; return NULL; }
+    return __real_malloc(size);
+}
 void *__real_calloc(size_t count, size_t size);
 int __real_accept(int fd, struct sockaddr *address, socklen_t *length);
 int __real_pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
@@ -33,6 +41,76 @@ static void test_start_failure(int allocation, int transient) {
     CHECK(allocation ? "clients/allocation-failure-release" : "clients/thread-failure-release", vc_program_main(5, args) != 0 && g_active_client_count == 0);
     CHECK("clients/failure-closes-socket", fcntl(pair[0], F_GETFD) == -1 && errno == EBADF); close(pair[0]); close(pair[1]);
 }
+
+static void *relay_fixture_peer(void *opaque) {
+    int listener=*(int *)opaque,fd=accept(listener,NULL,NULL);
+    if (fd >= 0) {
+        core_set_socket_io_timeout(fd,1000);
+        uint8_t request[26],data[10],response[]={0,0};
+        if (!read_exact(fd,request,sizeof(request)) && !write_all(fd,response,sizeof(response)) &&
+            !read_exact(fd,data,sizeof(data))) (void)write_all(fd,data,sizeof(data));
+        close(fd);
+    }
+    return NULL;
+}
+
+static void relay_minimum_allocation(void) {
+    int listener=socket(AF_INET,SOCK_STREAM,0); struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+    REQUIRE("relay/minimum-listener",listener >= 0 && bind(listener,(void *)&address,sizeof(address)) == 0 && listen(listener,1) == 0);
+    socklen_t size=sizeof(address); REQUIRE("relay/minimum-port",getsockname(listener,(void *)&address,&size) == 0);
+    int pair[2]; REQUIRE("relay/minimum-client-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    core_set_socket_io_timeout(pair[1],1500);
+    client_ctx_t *ctx=calloc(1,sizeof(*ctx)); REQUIRE("relay/minimum-client-context",ctx != NULL);
+    ctx->client_fd=pair[0]; char uri[256],error[256];
+    snprintf(uri,sizeof(uri),"vless://00000000-0000-0000-0000-000000000001@127.0.0.1:%u?type=tcp&security=none",ntohs(address.sin_port));
+    REQUIRE("relay/minimum-config",parse_core_uri(uri,&ctx->cfg,error,sizeof(error)) == 0 && routing_config_parse("1;proxy;0",&g_routing,error,sizeof(error)) == 0);
+    pthread_t server,worker; reject_large_relay=1; large_relay_allocations=0;
+    REQUIRE("relay/minimum-peer",pthread_create(&server,NULL,relay_fixture_peer,&listener) == 0);
+    REQUIRE("relay/minimum-worker-slot",acquire_client_slot());
+    REQUIRE("relay/minimum-worker",pthread_create(&worker,NULL,client_worker,ctx) == 0);
+    uint8_t greeting[]={5,1,0},method[2],connect[]={5,1,0,1,127,0,0,1,1,187},reply[10],data[10];
+    REQUIRE("relay/minimum-socks-method",write_all(pair[1],greeting,sizeof(greeting)) == 0 && !read_exact(pair[1],method,sizeof(method)) && !memcmp(method,"\x05\x00",2));
+    REQUIRE("relay/minimum-socks-connect",write_all(pair[1],connect,sizeof(connect)) == 0 && !read_exact(pair[1],reply,sizeof(reply)) && reply[1] == 0);
+    int exchanged=write_all(pair[1],(const uint8_t *)"vless-core",10) == 0 && !read_exact(pair[1],data,sizeof(data)) && !memcmp(data,"vless-core",10);
+    shutdown(pair[1],SHUT_RDWR); close(pair[1]); pthread_join(worker,NULL); pthread_join(server,NULL); close(listener);
+    reject_large_relay=0;
+    CHECK("relay/minimum-buffer-keeps-connection-working",exchanged);
+    CHECK("relay/no-eager-256k-allocation",large_relay_allocations == 0);
+    CHECK("relay/minimum-worker-released",g_active_client_count == 0);
+    routing_config_init(&g_routing);
+}
+
+static void relay_memory_pressure(void) {
+    core_relay_memory_t memory={0}; core_buffer_budget_t pressure={0}; size_t capacity=0;
+    REQUIRE("relay/pressure-memory",core_relay_memory_init(&memory,128U*1024U) == 1);
+    REQUIRE("relay/pressure-reserve",core_buffer_budget_init(&pressure,CORE_BUFFER_RELAY,core_buffer_available(CORE_BUFFER_RELAY)) == 0);
+    CHECK("relay/plain-input-uses-existing-floor",relay_input_room(&memory,128U*1024U,0,&capacity) == 1 && capacity == 8192);
+    CHECK("relay/vision-input-pauses-without-reading",relay_input_room(&memory,128U*1024U,1,&capacity) == 0);
+    REQUIRE("relay/pressure-watch-input",core_relay_memory_watch(&memory,CORE_RELAY_INPUT_WAIT) == 0);
+    CHECK("relay/opposite-direction-can-progress",relay_output_room(&memory,NULL,8192,&capacity) == 1 && capacity == 8192);
+    memory.output.length=8192;
+    CHECK("relay/full-output-pauses-without-reading",relay_output_room(&memory,NULL,8192,&capacity) == 0 && memory.output.capacity == 8192);
+    REQUIRE("relay/pressure-watch-output",core_relay_memory_watch(&memory,CORE_RELAY_OUTPUT_WAIT) == 0);
+    core_relay_buffer_consume(&memory.output,8192);
+    core_relay_memory_unwatch(&memory,CORE_RELAY_OUTPUT_WAIT);
+    CHECK("relay/consumption-unblocks-without-free",memory.waiting == CORE_RELAY_INPUT_WAIT && relay_output_room(&memory,NULL,8192,&capacity) == 1);
+    REQUIRE("relay/pressure-release",core_buffer_budget_clear(&pressure) == 0);
+    CHECK("relay/input-recovers-large-batch",relay_input_room(&memory,128U*1024U,1,&capacity) == 1 && capacity == 128U*1024U);
+    core_relay_memory_clear(&memory);
+    size_t bytes,reserved; core_buffer_snapshot(CORE_BUFFER_RELAY,&bytes,&reserved);
+    CHECK("relay/pressure-cancel-releases-everything",!bytes && !reserved);
+    REQUIRE("relay/retained-fragment-memory",core_relay_memory_init(&memory,8192) == 1);
+    void *retained=core_buffer_alloc(&memory.temporary,512);
+    REQUIRE("relay/retained-fragment-allocation",retained != NULL);
+    REQUIRE("relay/retained-fragment-pressure",core_buffer_budget_init(&pressure,CORE_BUFFER_RELAY,core_buffer_available(CORE_BUFFER_RELAY)-vision_wrap_buffer_bound(8192)) == 0);
+    REQUIRE("relay/retained-fragment-read-reservation",relay_input_room(&memory,8192,1,&capacity) == 1);
+    REQUIRE("relay/competing-client-takes-unreserved-capacity",core_buffer_budget_init(&pressure,CORE_BUFFER_RELAY,pressure.minimum+core_buffer_available(CORE_BUFFER_RELAY)) == 0);
+    vision_wrap_t wrap; uint8_t uuid[16]={0},data[8192]={0}; vision_wrap_init(&wrap,uuid);
+    CHECK("relay/transform-credit-includes-retained-fragment",vision_wrap_payload_buffer(&wrap,data,sizeof(data),&memory.wrapped) == 0);
+    core_buffer_free(&memory.temporary,retained,512);
+    core_relay_memory_clear(&memory); REQUIRE("relay/retained-fragment-pressure-release",core_buffer_budget_clear(&pressure) == 0);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     char private_uri[]="socks5://user:vless-core-private-value@127.0.0.1:1080#vless-core";
@@ -45,6 +123,8 @@ int main(void) {
     int pair[2]; REQUIRE("clients/worker-pair", socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     close(pair[1]); client_ctx_t *ctx = calloc(1, sizeof(*ctx)); ctx->client_fd = pair[0]; acquire_client_slot();
     client_worker(ctx); CHECK("clients/handshake-error-release", g_active_client_count == 0 && fcntl(pair[0], F_GETFD) == -1);
+    relay_minimum_allocation();
+    relay_memory_pressure();
     test_start_failure(1, 0); test_start_failure(0, 0);
     test_start_failure(1, EMFILE); test_start_failure(1, ENFILE);
     test_start_failure(1, ENOBUFS); test_start_failure(1, ENOMEM);

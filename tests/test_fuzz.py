@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -117,7 +118,9 @@ class FuzzTests(unittest.TestCase):
                 with log.open("wb") as output:
                     result = subprocess.run(command,env=environment,stdout=output,stderr=subprocess.STDOUT,timeout=180)
                 self.assertEqual(result.returncode,0,f"{parser}: {log.read_text()[-4000:]}\nlog: {log}")
-                self.assertIn(f"Done {runs} runs",log.read_text())
+                completed=re.findall(r"^Done ([0-9]+) runs in [0-9]+ second\(s\)$",log.read_text(),re.MULTILINE)
+                self.assertEqual(len(completed),1,"missing or ambiguous fuzz completion")
+                self.assertGreaterEqual(int(completed[0]),runs,"fuzzer stopped before the requested number of runs")
 
 if __name__ == "__main__":
     BUILD.mkdir(parents=True,exist_ok=True)
