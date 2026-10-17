@@ -131,12 +131,18 @@ static int p256_generate_public(uint8_t pub[65], EVP_PKEY **retained) {
 #endif
 }
 
-static uint16_t random_grease_value(void) {
+static int random_grease_values(uint16_t values[4]) {
     static const uint16_t vals[] = {0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
                                     0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa};
-    uint8_t b = 0;
-    RAND_bytes(&b, 1);
-    return vals[b % (sizeof(vals) / sizeof(vals[0]))];
+    uint8_t bytes[4],available[16];
+    if (RAND_bytes(bytes,sizeof(bytes)) != 1) { errno=EIO; return -1; }
+    values[0]=vals[bytes[0]%16];
+    for (unsigned i=0;i<16;i++) available[i]=(uint8_t)i;
+    for (unsigned i=1;i<4;i++) {
+        unsigned count=17-i,index=bytes[i]%count;
+        values[i]=vals[available[index]]; available[index]=available[count-1];
+    }
+    return 0;
 }
 
 static int add_ext(dynbuf_t *b, uint16_t etype, const uint8_t *edata, size_t elen) {
@@ -473,7 +479,7 @@ static int shuffle_indices(size_t *idx, size_t n) {
     }
     for (size_t i = n; i > 1; i--) {
         uint8_t r = 0;
-        RAND_bytes(&r, 1);
+        if (RAND_bytes(&r, 1) != 1) { errno=EIO; return -1; }
         size_t j = r % i;
         size_t tmp = idx[i - 1];
         idx[i - 1] = idx[j];
@@ -482,7 +488,7 @@ static int shuffle_indices(size_t *idx, size_t n) {
     return 0;
 }
 
-int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_offer_t cipher_offer, uint8_t client_priv[32],
+static int build_client_hello_impl(const vless_config_t *cfg, int use_reality, tls_cipher_offer_t cipher_offer, uint8_t client_priv[32],
                               uint8_t client_pub[32], uint8_t client_random[32], uint8_t auth_key[32], uint8_t **out, size_t *out_len,
                               size_t *sid_pos, const uint8_t *hybrid_pub, EVP_PKEY **retained) {
     dynbuf_t hs = {0};
@@ -523,16 +529,10 @@ int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_of
         return -1;
     }
 
-    uint16_t grease = random_grease_value();
-    uint16_t boring_grease_cipher = random_grease_value();
-    uint16_t boring_grease_group = random_grease_value();
-    while (boring_grease_group == boring_grease_cipher) {
-        boring_grease_group = random_grease_value();
-    }
-    uint16_t boring_grease_vers = random_grease_value();
-    while (boring_grease_vers == boring_grease_cipher || boring_grease_vers == boring_grease_group) {
-        boring_grease_vers = random_grease_value();
-    }
+    uint16_t grease_values[4];
+    if (random_grease_values(grease_values) != 0) { db_free(&hs); return -1; }
+    uint16_t grease=grease_values[0],boring_grease_cipher=grease_values[1];
+    uint16_t boring_grease_group=grease_values[2],boring_grease_vers=grease_values[3];
     uint16_t boring_grease_ext1 = boring_grease_cipher;
     uint16_t boring_grease_ext2 = boring_grease_vers;
     uint8_t suites[128];
@@ -626,7 +626,7 @@ int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_of
     } else {
         enum { EX_SNI, EX_GROUPS, EX_SIGS, EX_ALPN, EX_VERS, EX_PSK, EX_KEYSHARE, EX_ECPF, EX_COUNT };
         size_t order[EX_COUNT];
-        shuffle_indices(order, EX_COUNT);
+        if (shuffle_indices(order, EX_COUNT) != 0) { db_free(&exts); db_free(&hs); return -1; }
         for (size_t i = 0; i < EX_COUNT; i++) {
             switch (order[i]) {
                 case EX_SNI:
@@ -803,4 +803,20 @@ int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_of
     *out = hs.data;
     *out_len = hs.len;
     return 0;
+}
+
+int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_offer_t cipher_offer, uint8_t client_priv[32],
+                      uint8_t client_pub[32], uint8_t client_random[32], uint8_t auth_key[32], uint8_t **out, size_t *out_len,
+                      size_t *sid_pos, const uint8_t *hybrid_pub, EVP_PKEY **retained) {
+    *out=NULL; *out_len=0; *sid_pos=0;
+    if (retained) *retained=NULL;
+    int result=build_client_hello_impl(cfg,use_reality,cipher_offer,client_priv,client_pub,client_random,auth_key,out,out_len,sid_pos,hybrid_pub,retained);
+    if (result) {
+        int saved=errno;
+        OPENSSL_cleanse(client_priv,32); OPENSSL_cleanse(client_pub,32);
+        OPENSSL_cleanse(client_random,32); OPENSSL_cleanse(auth_key,32);
+        if (retained) { EVP_PKEY_free(*retained); *retained=NULL; }
+        *sid_pos=0; errno=saved ? saved : EIO;
+    }
+    return result;
 }

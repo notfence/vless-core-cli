@@ -10,6 +10,7 @@ static uint64_t pacing_clock;
 static uint32_t pacing_random;
 static int pacing_waits,pacing_interrupted,pacing_timeouts[4];
 static int asynchronous_probe,asynchronous_waits;
+static int hello_random_probe,hello_random_calls,hello_random_failure,hello_random_constant;
 uint64_t __real_core_now_ms(void);
 int __real_RAND_bytes(unsigned char *,int);
 int __real_poll(struct pollfd *,nfds_t,int);
@@ -20,9 +21,54 @@ int __wrap_clock_gettime(clockid_t id,struct timespec *now) {
     now->tv_sec=(time_t)(pacing_clock/1000); now->tv_nsec=(long)(pacing_clock%1000)*1000000; return 0;
 }
 int __wrap_RAND_bytes(unsigned char *data,int length) {
+    if (hello_random_probe) {
+        hello_random_calls++;
+        if (hello_random_failure && hello_random_calls >= hello_random_failure) return 0;
+        if (hello_random_constant) { memset(data,0,(size_t)length); return 1; }
+    }
     if (!pacing_clock) return __real_RAND_bytes(data,length);
     if (length != (int)sizeof(pacing_random)) return 0;
     memcpy(data,&pacing_random,sizeof(pacing_random)); return 1;
+}
+
+static int cleared_bytes(const uint8_t *data,size_t length) {
+    uint8_t combined=0;
+    for (size_t i=0;i<length;i++) combined|=data[i];
+    return combined == 0;
+}
+
+static void client_hello_random_failures(void) {
+    vless_config_t config={.server_port=443}; strcpy(config.server_host,"vless-core.test"); strcpy(config.sni,"vless-core.test");
+    for (int fp=0;fp<6;fp++) {
+        config.fp_mode=fp;
+        uint8_t private[32],public[32],random[32],auth[32],*hello=NULL; size_t length=0,sid=0; EVP_PKEY *retained=NULL;
+        hello_random_probe=1; hello_random_failure=0; hello_random_calls=0;
+        REQUIRE("tls/random-baseline-profile",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private,public,random,auth,&hello,&length,&sid,NULL,&retained) == 0);
+        int calls=hello_random_calls; free(hello); EVP_PKEY_free(retained);
+        for (int failure=1;failure<=calls;failure++) {
+            pid_t child=fork(); REQUIRE("tls/random-failure-child",child >= 0);
+            if (!child) {
+                alarm(1); hello_random_failure=failure; hello_random_calls=0; hello=NULL; length=0; sid=0; retained=NULL;
+                memset(private,0xcc,sizeof(private)); memset(auth,0xcc,sizeof(auth));
+                int result=build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private,public,random,auth,&hello,&length,&sid,NULL,&retained);
+                int valid=result < 0 && !hello && !length && !retained && cleared_bytes(private,sizeof(private)) && cleared_bytes(auth,sizeof(auth));
+                free(hello); EVP_PKEY_free(retained); _exit(valid ? 0 : 1);
+            }
+            int status=0; REQUIRE("tls/random-failure-wait",waitpid(child,&status,0) == child);
+            CHECK("tls/random-failure-rejects-and-clears",WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+        pid_t child=fork(); REQUIRE("tls/random-constant-child",child >= 0);
+        if (!child) {
+            alarm(1); hello_random_failure=0; hello_random_constant=1; hello_random_calls=0; hello=NULL; retained=NULL;
+            int result=build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private,public,random,auth,&hello,&length,&sid,NULL,&retained);
+            free(hello); EVP_PKEY_free(retained); _exit(!result && hello_random_calls < 64 ? 0 : 1);
+        }
+        int status=0; REQUIRE("tls/random-constant-wait",waitpid(child,&status,0) == child);
+        CHECK("tls/random-constant-terminates",WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        hello_random_failure=0; hello_random_calls=0; hello=NULL; retained=NULL;
+        REQUIRE("tls/random-recovery-after-failure",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private,public,random,auth,&hello,&length,&sid,NULL,&retained) == 0);
+        free(hello); EVP_PKEY_free(retained); hello_random_probe=0;
+    }
 }
 int __wrap_poll(struct pollfd *descriptors,nfds_t count,int timeout) {
     if (asynchronous_probe) { asynchronous_waits++; pacing_clock+=(unsigned)timeout; return 0; }
@@ -971,6 +1017,7 @@ int main(int argc, char **argv) {
     CHECK("tls/alpn-h1", build_xhttp_tls_alpn("http/1.1", alpn, sizeof(alpn), &alpn_length) == 0 && alpn_length == 9);
     CHECK("tls/alpn-capacity", build_xhttp_tls_alpn(NULL, alpn, 2, &alpn_length) != 0);
     xray_version_cases();
+    client_hello_random_failures();
     cache_tls_aes_fallback(cfg.server_host, 443, cfg.sni);
     CHECK("tls/aes-cache-isolation", tls_aes_fallback_cached(cfg.server_host, 443, cfg.sni) && !tls_aes_fallback_cached(cfg.server_host, 444, cfg.sni) && !tls_aes_fallback_cached(cfg.server_host, 443, "other.test"));
     struct sockaddr_in address = {.sin_family=AF_INET,.sin_port=htons(443),.sin_addr.s_addr=htonl(INADDR_LOOPBACK)}; struct sockaddr_storage found; socklen_t found_size;
