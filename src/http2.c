@@ -5,6 +5,44 @@ static uint32_t value32(const uint8_t *data) {
     return ((uint32_t)data[0]<<24)|((uint32_t)data[1]<<16)|((uint32_t)data[2]<<8)|data[3];
 }
 
+int core_http2_alps_parse(const uint8_t *data,size_t length,core_http2_settings_t *output) {
+    if ((!data && length) || !output || length > 65535) return -1;
+    core_http2_settings_t settings={.table_size=4096,.concurrency=UINT32_MAX,.initial_window=65535,.max_frame=16384,.header_limit=8192};
+    for (size_t offset=0;offset < length;) {
+        if (length-offset < 9) return -1;
+        size_t size=((size_t)data[offset]<<16)|((size_t)data[offset+1]<<8)|data[offset+2];
+        unsigned type=data[offset+3],flags=data[offset+4]; uint32_t stream=value32(data+offset+5)&0x7fffffffU;
+        offset+=9;
+        if (size > 16384 || size > length-offset) return -1;
+        const uint8_t *body=data+offset;
+        if (type <= 9 && type != 4) return -1;
+        if (type == 4) {
+            core_http2_validation_t state={.settings_received=1};
+            if ((flags&1) || core_http2_validate_frame(&state,4,(uint8_t)flags,stream,body,size)) return -1;
+            settings.received=1;
+            for (size_t position=0;position<size;position+=6) {
+                unsigned id=((unsigned)body[position]<<8)|body[position+1]; uint32_t value=value32(body+position+2);
+                if (id == 1) settings.table_size=value;
+                else if (id == 3) settings.concurrency=value;
+                else if (id == 4) settings.initial_window=value;
+                else if (id == 5) settings.max_frame=value;
+                else if (id == 6) settings.header_limit=value;
+            }
+        } else if (type == 0x89) {
+            if (stream || flags) return -1;
+            size_t position=0;
+            while (position < size) for (unsigned field=0;field<2;field++) {
+                if (size-position < 2) return -1;
+                size_t count=((size_t)body[position]<<8)|body[position+1]; position+=2;
+                if (count > size-position) return -1;
+                position+=count;
+            }
+        }
+        offset+=size;
+    }
+    *output=settings; return 0;
+}
+
 int core_http2_validate_frame(core_http2_validation_t *state, uint8_t type, uint8_t flags, uint32_t stream, const uint8_t *data, size_t length) {
     if (!state || (!data && length) || length > 16384 || stream > 0x7fffffffU) return -1;
     if (!state->settings_received && (type != 4 || (flags&1) || stream)) return -1;

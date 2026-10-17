@@ -134,6 +134,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
     }
     case 2: {
+        core_http2_settings_t settings;
+        (void)core_http2_alps_parse(data,size,&settings);
         if (db_append(&c.h2_net_cache, data, size) != 0) abort();
         while (c.h2_net_cache.len > 0) {
             uint8_t type, flags, *payload = NULL;

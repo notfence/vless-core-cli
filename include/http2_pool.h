@@ -2,6 +2,7 @@
 #define CORE_HTTP2_POOL_H
 #include "types.h"
 #include "buffer_budget.h"
+#include "http2.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -32,6 +33,7 @@ typedef struct {
     int (*retire)(void *);
     int (*request)(void *, const vless_config_t *, const char *, uint64_t, int, const uint8_t *, size_t, uint32_t *, uint32_t, size_t *, size_t *);
     int (*session)(const vless_config_t *, char *, size_t);
+    int (*initial_settings)(void *,core_http2_settings_t *,core_http2_validation_t *);
 } core_http2_backend_t;
 
 core_http2_stream_t *core_http2_connect(const vless_config_t *, const core_http2_backend_t *, char *, size_t);

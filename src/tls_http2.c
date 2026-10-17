@@ -609,6 +609,7 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
         set_err(err, err_cap, "failed to send h2 settings");
         return -1;
     }
+    c->h2_validation.settings_pending=1;
     return 0;
 }
 
@@ -1023,6 +1024,14 @@ static int xhttp_h2_begin(tls13_conn_t *c, char *err, size_t err_cap) {
     c->h2_peer_concurrency=UINT32_MAX;
     c->h2_peer_conn_window = H2_DEFAULT_WINDOW;
     c->h2_peer_stream_window = H2_DEFAULT_WINDOW;
+    if (c->tls_alps_received && c->tls_alps_settings.received && c->tls_auth_state == 4) {
+        c->h2_validation.settings_received=1;
+        c->h2_peer_initial_window=c->tls_alps_settings.initial_window;
+        c->h2_peer_stream_window=c->h2_peer_initial_window;
+        c->h2_peer_max_frame_size=c->tls_alps_settings.max_frame;
+        c->h2_peer_header_list_size=c->tls_alps_settings.header_limit;
+        c->h2_peer_concurrency=c->tls_alps_settings.concurrency;
+    }
     c->h2_upload_stream_id = 0;
     c->h2_upload_stream_window = 0;
     c->h2_recv_conn_pending = 0;

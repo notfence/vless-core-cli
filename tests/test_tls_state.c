@@ -301,6 +301,87 @@ static void address_cipher_cache_vectors(void) {
     memset(g_tls_aes_fallback_cache,0,sizeof(g_tls_aes_fallback_cache)); g_tls_aes_fallback_count=0;
 }
 
+static void alps_vectors(void) {
+    const uint8_t frame[]={0,0,30,4,0,0,0,0,0,0,1,0,0,0,0,0,3,0,0,0,2,0,4,0,0,4,0,0,5,0,0,128,0,0,6,0,1,0,0};
+    core_http2_settings_t settings={0};
+    REQUIRE("alps/http2-settings",core_http2_alps_parse(frame,sizeof(frame),&settings) == 0);
+    CHECK("alps/settings-values",settings.received && !settings.table_size && settings.concurrency == 2 && settings.initial_window == 1024 && settings.max_frame == 32768 && settings.header_limit == 65536);
+    const uint8_t unknown[]={0,0,1,0xff,7,0,0,0,0,1},hints[]={0,0,6,0x89,0,0,0,0,0,0,1,'x',0,1,'y'};
+    CHECK("alps/extension-frames",core_http2_alps_parse(unknown,sizeof(unknown),&settings) == 0 && !settings.received && core_http2_alps_parse(hints,sizeof(hints),&settings) == 0);
+    uint8_t invalid[sizeof(frame)];
+    for (unsigned type=0;type<10;type++) if (type != 4) {
+        memcpy(invalid,frame,sizeof(frame)); invalid[3]=(uint8_t)type;
+        CHECK("alps/forbidden-frames",core_http2_alps_parse(invalid,sizeof(invalid),&settings) < 0);
+    }
+    for (size_t cut=1;cut<sizeof(frame);cut++) CHECK("alps/truncated-frame",core_http2_alps_parse(frame,cut,&settings) < 0);
+    memcpy(invalid,frame,sizeof(frame)); invalid[4]=1;
+    CHECK("alps/settings-ack-forbidden",core_http2_alps_parse(invalid,sizeof(invalid),&settings) < 0);
+    invalid[4]=0; invalid[8]=1;
+    CHECK("alps/settings-stream-forbidden",core_http2_alps_parse(invalid,sizeof(invalid),&settings) < 0);
+    invalid[8]=0; invalid[23]=128;
+    CHECK("alps/settings-window-overflow",core_http2_alps_parse(invalid,sizeof(invalid),&settings) < 0);
+    uint8_t bad_hints[sizeof(hints)]; memcpy(bad_hints,hints,sizeof(hints)); bad_hints[10]=9;
+    CHECK("alps/malformed-accept-ch",core_http2_alps_parse(bad_hints,sizeof(bad_hints),&settings) < 0);
+    REQUIRE("alps/settings-restored",core_http2_alps_parse(frame,sizeof(frame),&settings) == 0);
+    vless_config_t config; core_config_defaults(&config); strcpy(config.sni,"vless-core.test"); config.fp_mode=FP_QQ;
+    for (unsigned h2=0;h2<2;h2++) {
+        strcpy(config.alpn,h2 ? "h2,http/1.1" : "http/1.1");
+        uint8_t private[32],public[32],random[32],auth[32],*hello=NULL; size_t size=0,sid=0;
+        REQUIRE("alps/profile-clienthello",!build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private,public,random,auth,&hello,&size,&sid,NULL,NULL));
+        size_t extension_length=0; const uint8_t *extension=core_tls_hello_extension(hello,size,0x4469,&extension_length);
+        CHECK("alps/advertisement-follows-alpn",h2 ? extension && extension_length == 5 : !extension);
+        tls13_conn_t negotiated={0}; negotiated.tls_client_hello.data=hello; negotiated.tls_client_hello.len=size;
+        strcpy(negotiated.tls_offered_alpn,config.alpn);
+        const uint8_t valid[]={0,13,0x44,0x69,0,0,0,16,0,5,0,3,2,'h','2'};
+        CHECK("alps/selection-must-be-offered",(tls_encrypted_extensions(&negotiated,valid,sizeof(valid)) == 0) == h2);
+        negotiated.tls_selected_alpn[0]=0; negotiated.tls_alps_received=0;
+        const uint8_t absent[]={0,4,0x44,0x69,0,0};
+        CHECK("alps/selection-requires-alpn",tls_encrypted_extensions(&negotiated,absent,sizeof(absent)) < 0 && !negotiated.tls_alps_received);
+        const uint8_t duplicate[]={0,17,0x44,0x69,0,0,0,16,0,5,0,3,2,'h','2',0x44,0x69,0,0};
+        CHECK("alps/duplicate-extension",tls_encrypted_extensions(&negotiated,duplicate,sizeof(duplicate)) < 0 && !negotiated.tls_alps_received);
+        const uint8_t wrong_alpn[]={0,19,0x44,0x69,0,0,0,16,0,11,0,9,8,'h','t','t','p','/','1','.','1'};
+        CHECK("alps/http1-selection-forbidden",tls_encrypted_extensions(&negotiated,wrong_alpn,sizeof(wrong_alpn)) < 0 && !negotiated.tls_alps_received);
+        negotiated.tls12_suite=core_tls12_suite(0xc02f);
+        CHECK("alps/tls12-selection-forbidden",tls_encrypted_extensions(&negotiated,valid,sizeof(valid)) < 0 && !negotiated.tls_alps_received);
+        free(hello);
+    }
+    for (unsigned pooled=0;pooled<2;pooled++) {
+        int pair[2]; REQUIRE("alps/preface-pair",!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+        tls13_conn_t *connection=calloc(1,sizeof(*connection)); REQUIRE("alps/preface-connection",connection != NULL);
+        connection->fd=pair[0]; connection->xhttp_upload_fd=-1; connection->mode=CONN_MODE_GRPC_PLAIN;
+        connection->xmux_physical=connection->xmux_async=(int)pooled;
+        connection->tls_alps_received=1; connection->tls_auth_state=4; connection->tls_alps_settings=settings;
+        char error[128]; REQUIRE("alps/initial-settings-applied",!xhttp_h2_begin(connection,error,sizeof(error)));
+        CHECK("alps/initial-window-before-request",connection->h2_peer_initial_window == 1024 && connection->h2_peer_stream_window == 1024 && connection->h2_peer_max_frame_size == 32768 && connection->h2_peer_concurrency == 2);
+        core_http2_settings_t snapshot; core_http2_validation_t validation;
+        REQUIRE("alps/physical-settings-snapshot",xmux_backend.initial_settings(connection,&snapshot,&validation) == 1);
+        CHECK("alps/server-settings-already-acknowledged",validation.settings_received && validation.settings_pending == 1);
+        CHECK("alps/client-wire-settings-ack",core_http2_validate_frame(&validation,4,1,0,NULL,0) == 0 && validation.settings_pending == 0);
+        const uint8_t status[]={0x88};
+        CHECK("alps/response-without-wire-server-settings",core_http2_validate_frame(&validation,1,4,1,status,sizeof(status)) == 0);
+        CHECK("alps/later-wire-settings",core_http2_validate_frame(&validation,4,0,0,frame+9,sizeof(frame)-9) == 0);
+        connection->tls_auth_state=3;
+        CHECK("alps/settings-not-exposed-before-auth",xmux_backend.initial_settings(connection,&snapshot,&validation) == 0);
+        tls13_reality_close(connection); close(pair[1]);
+    }
+    int pair[2]; REQUIRE("alps/fragmented-flight-pair",!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+    tls13_conn_t sender={.fd=pair[0],.tls_alps_received=1,.tls_client_certificate_requested=1,.tls_send_record_limit=64},peer={0};
+    REQUIRE("alps/fragmented-flight-cipher",!configure_tls_cipher(&sender,0x1302) && !configure_tls_cipher(&peer,0x1302));
+    REQUIRE("alps/fragmented-flight-transcript",!db_append(&sender.transcript,"vless-core server Finished",26));
+    char error[128]; REQUIRE("alps/fragmented-client-flight",!tls_send_client_finished(&sender,error,sizeof(error)));
+    uint8_t type,*record=NULL,*plain=NULL,inner=0,combined[86]; size_t size=0,length=0,total=0,records=0;
+    REQUIRE("alps/fragmented-flight-ccs",!read_record(pair[1],&type,&record,&size) && type == 20 && size == 1); free(record);
+    while (records<2) {
+        REQUIRE("alps/fragmented-flight-record",!read_record(pair[1],&type,&record,&size));
+        REQUIRE("alps/fragmented-flight-decrypt",!decrypt_record(&peer,peer.c_hs_key,peer.c_hs_iv,&peer.c_hs_seq,type,record,size,&plain,&length,&inner)); free(record);
+        CHECK("alps/fragmented-flight-record-size",inner == 22 && length <= 63 && total+length <= sizeof(combined));
+        memcpy(combined+total,plain,length); total+=length; free(plain); records++;
+    }
+    const uint8_t prefix[]={8,0,0,6,0,4,0x44,0x69,0,0,11,0,0,4,0,0,0,0,20,0,0,48};
+    CHECK("alps/fragmented-flight-order-and-last-boundary",total == 70 && sender.c_hs_seq == 2 && !memcmp(combined,prefix,sizeof(prefix)));
+    tls_handshake_material_clear(&sender); close(pair[0]); close(pair[1]);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 || (argc == 3 && !strcmp(argv[1],"--http"))) {
         vless_config_t config; char error[256]={0}; tls13_conn_t *connection=NULL;
@@ -325,6 +406,7 @@ int main(int argc, char **argv) {
         tls13_reality_close(connection); return test_result();
     }
     record_limit_vectors();
+    alps_vectors();
     physical_tls_close_notify();
     automatic_update_vectors();
     key_update_record_boundaries();

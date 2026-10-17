@@ -641,6 +641,7 @@ static void reset_manual_tls_handshake(tls13_conn_t *c) {
     X509_free(c->tls_peer_certificate); c->tls_peer_certificate=NULL;
     db_free(&c->tls_certificate_message); c->tls_auth_state=0;
     c->tls_client_certificate_requested=0;
+    c->tls_alps_received=0; memset(&c->tls_alps_settings,0,sizeof(c->tls_alps_settings));
     c->tls_receive_record_limit=c->tls_send_record_limit=0; c->tls_receive_update_requested=0;
     db_free(&c->tls_post_handshake); c->tls_selected_alpn[0]=0;
     db_free(&c->tls_client_hello); EVP_PKEY_free(c->tls_retry_key); c->tls_retry_key=NULL; c->tls_retry_seen=0; c->tls_retry_group=0; c->tls_exchange_group=0;
@@ -1066,9 +1067,16 @@ static int xmux_transport_session(const vless_config_t *config, char *session, s
     memcpy(session,connection.xhttp_session_id,strlen(connection.xhttp_session_id)+1); return 0;
 }
 
+static int xmux_transport_initial_settings(void *opaque,core_http2_settings_t *settings,core_http2_validation_t *validation) {
+    tls13_conn_t *connection=opaque;
+    if (!connection->tls_alps_received || connection->tls_auth_state != 4) return 0;
+    *settings=connection->tls_alps_settings; *validation=connection->h2_validation; return 1;
+}
+
 const core_xmux_backend_t xmux_backend={
     .open=xmux_transport_open,.close=xmux_transport_close,.fd=xmux_transport_fd,.events=xmux_transport_events,.collect=xmux_transport_collect,
     .open_budgeted=xmux_transport_open_budgeted,.release_frame=xmux_transport_release_frame,
     .read_frame=xmux_transport_read_frame,.send_frame=xmux_transport_send_frame,.flush=xmux_transport_flush,
     .pending=xmux_transport_pending,.enqueued=xmux_transport_enqueued,.flushed=xmux_transport_flushed,.retire=xmux_transport_retire,.request=xmux_transport_request,.session=xmux_transport_session,
+    .initial_settings=xmux_transport_initial_settings,
 };

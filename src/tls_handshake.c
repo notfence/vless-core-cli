@@ -3,6 +3,7 @@
 static int tls_encrypted_extensions(tls13_conn_t *c, const uint8_t *data, size_t length) {
     if (length < 2 || (((size_t)data[0]<<8)|data[1]) != length-2) return -1;
     unsigned seen[32]; size_t count=0;
+    int alps=0; core_http2_settings_t settings={0};
     for (size_t offset=2;offset < length;) {
         if (length-offset < 4 || count == 32) return -1;
         unsigned type=((unsigned)data[offset]<<8)|data[offset+1]; size_t size=((size_t)data[offset+2]<<8)|data[offset+3]; offset+=4;
@@ -34,8 +35,14 @@ static int tls_encrypted_extensions(tls13_conn_t *c, const uint8_t *data, size_t
             memcpy(c->tls_selected_alpn,data+offset+3,size-3); c->tls_selected_alpn[size-3]=0;
             if (strlen(c->tls_selected_alpn) != size-3 || !alpn_csv_has_token(c->tls_offered_alpn,c->tls_selected_alpn)) return -1;
         }
+        if (type == 0x4469) {
+            if (c->tls12_suite || offered_size != 5 || memcmp(offered,"\x00\x03\x02h2",5) || core_http2_alps_parse(data+offset,size,&settings)) return -1;
+            alps=1;
+        }
         offset+=size;
     }
+    if (alps && strcmp(c->tls_selected_alpn,"h2")) return -1;
+    c->tls_alps_received=alps; c->tls_alps_settings=settings;
     return c->tls_h2_required && strcmp(c->tls_selected_alpn,"h2") &&
         !(c->tls_is_reality && !c->tls_selected_alpn[0]) ? -1 : 0;
 }
@@ -509,6 +516,61 @@ cleanup: {
 }
 }
 
+static int tls_send_client_finished(tls13_conn_t *c,char *err,size_t err_cap) {
+    static const uint8_t empty_certificate[]={11,0,0,4,0,0,0,0};
+    static const uint8_t client_extensions[]={8,0,0,6,0,4,0x44,0x69,0,0};
+    if (c->tls_alps_received && append_transcript(c,client_extensions,sizeof(client_extensions))) return -1;
+    if (c->tls_client_certificate_requested && append_transcript(c,empty_certificate,sizeof(empty_certificate))) return -1;
+    uint8_t thash[64],client_verify[64];
+    if (transcript_hash(c,thash) || calc_finished_verify(c,c->c_hs_traffic,thash,client_verify)) {
+        set_err(err,err_cap,"failed to create client Finished"); return -1;
+    }
+
+    uint8_t flight[86]; size_t prefix=0;
+    if (c->tls_alps_received) { memcpy(flight,client_extensions,sizeof(client_extensions)); prefix=sizeof(client_extensions); }
+    if (c->tls_client_certificate_requested) { memcpy(flight+prefix,empty_certificate,sizeof(empty_certificate)); prefix+=sizeof(empty_certificate); }
+    uint8_t *fin_msg=flight+prefix;
+    size_t fin_msg_len = 4 + c->tls_hash_len;
+    fin_msg[0] = 0x14;
+    fin_msg[1] = 0x00;
+    fin_msg[2] = 0x00;
+    fin_msg[3] = (uint8_t)c->tls_hash_len;
+    memcpy(fin_msg + 4, client_verify, c->tls_hash_len);
+
+    /*
+     * uTLS/Go middlebox-compat TLS 1.3 sends ChangeCipherSpec after the server
+     * handshake flight and immediately before the encrypted Client Finished.
+     * It is not included in the handshake transcript.
+     */
+    uint8_t ccs_rec[6] = {0x14, 0x03, 0x03, 0x00, 0x01, 0x01};
+    dynbuf_t final_flight={0};
+    if (tls_buffer_init(&final_flight,1024,&c->tls_handshake_bytes) || db_append(&final_flight,ccs_rec,sizeof(ccs_rec))) {
+        db_free(&final_flight); set_err(err,err_cap,"failed to allocate client Finished flight"); return -1;
+    }
+    size_t limit=c->tls_send_record_limit ? c->tls_send_record_limit-1 : 16384;
+    if (limit > 16384) limit=16384;
+    for (size_t offset=0;offset < prefix+fin_msg_len;) {
+        size_t count=prefix+fin_msg_len-offset; if (count > limit) count=limit;
+        uint8_t *record=NULL; size_t size=0;
+        if (!count || encrypt_record(c,c->c_hs_key,c->c_hs_iv,&c->c_hs_seq,22,flight+offset,count,&record,&size)) {
+            db_free(&final_flight); set_err(err,err_cap,"failed to encrypt client Finished"); return -1;
+        }
+        int result=db_append(&final_flight,record,size); free(record);
+        if (result) { db_free(&final_flight); set_err(err,err_cap,"failed to allocate client Finished flight"); return -1; }
+        offset+=count;
+    }
+    int sent=write_exact(c->fd,final_flight.data,final_flight.len); db_free(&final_flight);
+    OPENSSL_cleanse(flight,sizeof(flight));
+    if (sent) { set_err(err,err_cap,"failed to send client Finished"); return -1; }
+
+    if (append_transcript(c, (const uint8_t[]){20,0,0,(uint8_t)c->tls_hash_len},4) != 0 ||
+        append_transcript(c,client_verify,c->tls_hash_len) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
 static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, EVP_PKEY *hybrid_key, const uint8_t *hybrid_pub, char *err, size_t err_cap) {
     uint8_t client_priv[32]={0},shared[96]={0};
     int use_reality = (strcmp(cfg->security, "reality") == 0);
@@ -520,6 +582,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         (cfg->fp_mode == FP_RANDOM || cfg->fp_mode == FP_RANDOMIZED ? "http/1.1,h2" : "h2,http/1.1"));
     c->tls_h2_required=cfg->transport_mode == TRANSPORT_GRPC || (cfg->transport_mode == TRANSPORT_XHTTP && use_reality);
     c->tls_is_reality=use_reality;
+    c->tls_alps_received=0; memset(&c->tls_alps_settings,0,sizeof(c->tls_alps_settings));
     c->tls_receive_record_limit=c->tls_send_record_limit=0; c->tls_receive_update_requested=0;
     if (tls_buffer_init(&c->tls_client_hello,65536,&c->tls_handshake_bytes) ||
         tls_buffer_init(&c->tls_certificate_message,TLS_HANDSHAKE_LIMIT,&c->tls_handshake_bytes)) {
@@ -782,56 +845,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
         goto handshake_failure;
     }
 
-    static const uint8_t empty_certificate[]={11,0,0,4,0,0,0,0};
-    if (c->tls_client_certificate_requested && append_transcript(c,empty_certificate,sizeof(empty_certificate))) goto handshake_failure;
-    uint8_t thash[64],client_verify[64];
-    if (transcript_hash(c,thash) || calc_finished_verify(c,c->c_hs_traffic,thash,client_verify)) {
-        set_err(err,err_cap,"failed to create client Finished"); goto handshake_failure;
-    }
-
-    uint8_t flight[76],*fin_msg=flight+(c->tls_client_certificate_requested ? sizeof(empty_certificate) : 0);
-    if (c->tls_client_certificate_requested) memcpy(flight,empty_certificate,sizeof(empty_certificate));
-    size_t fin_msg_len = 4 + c->tls_hash_len;
-    fin_msg[0] = 0x14;
-    fin_msg[1] = 0x00;
-    fin_msg[2] = 0x00;
-    fin_msg[3] = (uint8_t)c->tls_hash_len;
-    memcpy(fin_msg + 4, client_verify, c->tls_hash_len);
-
-    uint8_t *enc_fin = NULL;
-    size_t enc_fin_len = 0;
-    if (encrypt_record(c, c->c_hs_key, c->c_hs_iv, &c->c_hs_seq, 0x16, flight, (size_t)(fin_msg-flight)+fin_msg_len, &enc_fin, &enc_fin_len) != 0) {
-        set_err(err, err_cap, "failed to encrypt client Finished");
-        goto handshake_failure;
-    }
-
-    /*
-     * uTLS/Go middlebox-compat TLS 1.3 sends ChangeCipherSpec after the server
-     * handshake flight and immediately before the encrypted Client Finished.
-     * It is not included in the handshake transcript.
-     */
-    uint8_t ccs_rec[6] = {0x14, 0x03, 0x03, 0x00, 0x01, 0x01};
-    uint8_t *client_last_flight = (uint8_t *)malloc(sizeof(ccs_rec) + enc_fin_len);
-    if (client_last_flight == NULL) {
-        free(enc_fin);
-        set_err(err, err_cap, "failed to allocate client Finished flight");
-        goto handshake_failure;
-    }
-    memcpy(client_last_flight, ccs_rec, sizeof(ccs_rec));
-    memcpy(client_last_flight + sizeof(ccs_rec), enc_fin, enc_fin_len);
-    if (write_exact(c->fd, client_last_flight, sizeof(ccs_rec) + enc_fin_len) != 0) {
-        free(client_last_flight);
-        free(enc_fin);
-        set_err(err, err_cap, "failed to send client Finished");
-        goto handshake_failure;
-    }
-    free(client_last_flight);
-    free(enc_fin);
-
-    if (append_transcript(c, fin_msg, fin_msg_len) != 0) {
-        goto handshake_failure;
-    }
-
+    if (tls_send_client_finished(c,err,err_cap)) goto handshake_failure;
 handshake_complete:
     OPENSSL_cleanse(client_priv,sizeof(client_priv)); OPENSSL_cleanse(shared,sizeof(shared));
     tls_handshake_material_clear(c);

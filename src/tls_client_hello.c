@@ -454,7 +454,8 @@ static int ext_ech_grease_firefox(dynbuf_t *exts) {
     return add_ext(exts, 0xfe0d, data, off);
 }
 
-static int ext_application_settings_h2(dynbuf_t *exts) {
+static int ext_application_settings_h2(dynbuf_t *exts,const char *alpn) {
+    if (alpn && *alpn && !alpn_csv_has_token(alpn,"h2")) return 0;
     /* ALPS (0x4469): protocol_name_list with single entry "h2". */
     uint8_t data[] = {0x00, 0x03, 0x02, 'h', '2'};
     return add_ext(exts, 0x4469, data, sizeof(data));
@@ -578,7 +579,7 @@ static int build_client_hello_impl(const vless_config_t *cfg, int use_reality, t
             ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
             ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0, hybrid_pub) != 0 ||
             ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, boring_grease_vers) != 0 ||
-            ext_application_settings_h2(&exts) != 0 ||
+            ext_application_settings_h2(&exts,cfg->alpn) != 0 ||
             ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
             db_free(&exts);
             db_free(&hs);

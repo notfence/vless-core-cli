@@ -188,6 +188,8 @@ struct tls13_conn {
     dynbuf_t tls_stream_input;
     char tls_offered_alpn[128], tls_selected_alpn[128];
     int tls_h2_required, tls_is_reality;
+    int tls_alps_received;
+    core_http2_settings_t tls_alps_settings;
     dynbuf_t tls_client_hello;
     EVP_PKEY *tls_retry_key;
     unsigned tls_retry_group,tls_exchange_group;

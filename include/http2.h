@@ -6,6 +6,11 @@
 
 typedef struct { uint32_t continuation; unsigned settings_received, settings_pending; } core_http2_validation_t;
 typedef struct {
+    uint32_t table_size,concurrency,initial_window,max_frame,header_limit;
+    unsigned received;
+} core_http2_settings_t;
+int core_http2_alps_parse(const uint8_t *,size_t,core_http2_settings_t *);
+typedef struct {
     uint64_t content_length, received;
     unsigned headers, ended, has_content_length, no_body;
 } core_http2_response_t;

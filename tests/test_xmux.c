@@ -10,11 +10,13 @@ static mux_actor_t *scheduling_actor;
 static int retiring_probe;
 static int scheduling_retire(void *physical) { (void)physical; return retiring_probe; }
 static int scheduling_waits[3],scheduling_polls;
+static int scheduling_alps;
 uint64_t __real_core_now_ms(void);
 int __real_RAND_bytes(unsigned char *,int);
 int __real_core_poll(struct pollfd *,nfds_t,int);
 int __wrap_core_poll(struct pollfd *descriptors,nfds_t count,int timeout) {
     if (!scheduling_actor) return __real_core_poll(descriptors,count,timeout);
+    if (scheduling_alps) CHECK("alps/actor-applies-authenticated-settings",scheduling_actor->validation.settings_received && scheduling_actor->validation.settings_pending == 1 && scheduling_actor->peer_window == 1024 && scheduling_actor->peer_frame == 32768 && scheduling_actor->peer_concurrency == 2 && scheduling_actor->peer_header_limit == 65536);
     for (nfds_t i=0;i<count;i++) descriptors[i].revents=0;
     scheduling_waits[scheduling_polls++]=timeout;
     if (scheduling_polls == 3) scheduling_actor->failed=1;
@@ -74,6 +76,12 @@ static int scheduling_frame(void *physical,core_http2_frame_t *frame,size_t capa
 static int scheduling_flush(void *physical) {
     wire_t *wire=physical; wire->flushed=wire->enqueued; wire->pending=0; return 0;
 }
+static int scheduling_settings(void *physical,core_http2_settings_t *settings,core_http2_validation_t *validation) {
+    (void)physical;
+    if (!scheduling_alps) return 0;
+    *settings=(core_http2_settings_t){.received=1,.initial_window=1024,.max_frame=32768,.concurrency=2,.header_limit=65536};
+    *validation=(core_http2_validation_t){.settings_received=1,.settings_pending=1}; return 1;
+}
 
 static pthread_mutex_t close_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t close_ready=PTHREAD_COND_INITIALIZER;
@@ -119,8 +127,10 @@ static void worker_progress_policy(void) {
     backend.open=scheduling_open; backend.close=scheduling_close; backend.fd=scheduling_fd;
     backend.collect=scheduling_collect; backend.read_frame=scheduling_frame; backend.flush=scheduling_flush;
     backend.retire=scheduling_retire;
+    backend.initial_settings=scheduling_settings;
     for (int retiring=0;retiring<2;retiring++) for (int blocked=0;blocked<2;blocked++) {
         retiring_probe=retiring;
+        scheduling_alps=blocked;
         mux_manager_t manager={.backend=&backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
         mux_group_t group={.manager=&manager};
         mux_actor_t actor={.manager=&manager,.group=&group,.peer_frame=16384,.peer_concurrency=UINT32_MAX,
@@ -147,6 +157,7 @@ static void worker_progress_policy(void) {
         core_http2_queue_clear(&stream.tx); close(stream.notify[0]); close(stream.notify[1]); streams=NULL; upload_bytes=0;
     }
     retiring_probe=0;
+    scheduling_alps=0;
 }
 
 static int receive_request(void *physical,const vless_config_t *config,const char *session,uint64_t sequence,int role,const uint8_t *data,size_t length,uint32_t *id,uint32_t limit,size_t *consumed,size_t *body) {

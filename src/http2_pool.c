@@ -876,6 +876,16 @@ static void *actor_worker(void *opaque) {
     pthread_mutex_lock(&mux_lock); actor->opening=0;
     if (actor->error[0]) actor->failed=1;
     actor->http2=http2;
+    if (http2 && actor->physical && backend->initial_settings) {
+        core_http2_settings_t settings={0}; core_http2_validation_t validation={0};
+        if (backend->initial_settings(actor->physical,&settings,&validation)) {
+            actor->validation=validation;
+            if (settings.received) {
+                actor->peer_window=settings.initial_window; actor->peer_frame=settings.max_frame;
+                actor->peer_concurrency=settings.concurrency; actor->peer_header_limit=settings.header_limit;
+            }
+        }
+    }
     if (!http2) { actor->peer_concurrency=1; actor->alive_period=0; }
     actor->last_input_ms=core_now_ms(); pthread_mutex_unlock(&mux_lock);
     while (!actor_failed(actor)) {

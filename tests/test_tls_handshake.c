@@ -11,6 +11,7 @@ typedef struct {
     uint8_t *certificate;
     size_t certificate_length;
     int empty_certificate, client_finished;
+    int alps,client_alps;
 } peer_t;
 
 static int peer_message(dynbuf_t *buffer, uint8_t type, const uint8_t *body, size_t length) {
@@ -106,7 +107,8 @@ static void *peer_run(void *opaque) {
     uint8_t record_header[]={22,3,3,(uint8_t)(server_hello.len>>8),(uint8_t)server_hello.len};
     if (write_exact(peer->fd,record_header,5) || write_exact(peer->fd,server_hello.data,server_hello.len) || derive_handshake_keys(&server,shared,32)) goto done;
     const uint8_t empty_extensions[]={0,0};
-    if (peer_message(&flight,8,empty_extensions,2)) goto done;
+    const uint8_t alps_extensions[]={0,13,0x44,0x69,0,0,0,16,0,5,0,3,2,'h','2'};
+    if (peer_message(&flight,8,peer->alps ? alps_extensions : empty_extensions,peer->alps ? sizeof(alps_extensions) : 2)) goto done;
     const uint8_t request[]={0,0,8,0,13,0,4,0,2,8,7};
     if (peer->variant == 7 || peer->variant == 8) {
         if (peer_message(&flight,13,request,sizeof(request))) goto done;
@@ -166,16 +168,27 @@ static void *peer_run(void *opaque) {
     }
     if (encrypt_record(&server,server.s_hs_key,server.s_hs_iv,&server.s_hs_seq,22,flight.data,flight.len,&encrypted,&encrypted_length)) goto done;
     (void)write_exact(peer->fd,encrypted,encrypted_length); free(encrypted);
-    if (peer->variant == 7) {
+    if (peer->variant == 7 || peer->alps) {
         uint8_t *record=NULL,*plain=NULL,inner=0; size_t record_size=0,plain_size=0;
         if (peer_message(&server.transcript,20,finished,32) || read_record(peer->fd,&type,&record,&record_size)) goto done;
         if (type == 20) { free(record); record=NULL; if (read_record(peer->fd,&type,&record,&record_size)) goto done; }
         int result=decrypt_record(&server,server.c_hs_key,server.c_hs_iv,&server.c_hs_seq,type,record,record_size,&plain,&plain_size,&inner);
         free(record);
-        if (!result && inner == 22 && plain_size == 44 && !memcmp(plain,"\x0b\x00\x00\x04\x00\x00\x00\x00",8)) {
-            peer->empty_certificate=1;
-            if (!db_append(&server.transcript,plain,8) && !transcript_hash(&server,transcript) && !calc_finished_verify(&server,server.c_hs_traffic,transcript,finished))
-                peer->client_finished=!memcmp(plain+8,"\x14\x00\x00\x20",4) && !CRYPTO_memcmp(plain+12,finished,32);
+        if (!result && inner == 22) for (size_t offset=0;offset+4 <= plain_size;) {
+            size_t length=4+((size_t)plain[offset+1]<<16)+((size_t)plain[offset+2]<<8)+plain[offset+3];
+            if (length > plain_size-offset) break;
+            if (plain[offset] == 8) {
+                const uint8_t expected[]={8,0,0,6,0,4,0x44,0x69,0,0};
+                peer->client_alps=offset == 0 && length == sizeof(expected) && !memcmp(plain+offset,expected,sizeof(expected));
+            } else if (plain[offset] == 11) {
+                const uint8_t expected[]={11,0,0,4,0,0,0,0};
+                peer->empty_certificate=length == sizeof(expected) && !memcmp(plain+offset,expected,sizeof(expected));
+            } else if (plain[offset] == 20 && length == 36) {
+                if (!transcript_hash(&server,transcript) && !calc_finished_verify(&server,server.c_hs_traffic,transcript,finished))
+                    peer->client_finished=!CRYPTO_memcmp(plain+offset+4,finished,32);
+            }
+            if (db_append(&server.transcript,plain+offset,length)) break;
+            offset+=length;
         }
         free(plain);
     }
@@ -271,9 +284,9 @@ int main(void) {
         FILE *file=fopen(ca,"w"); REQUIRE("auth/ca-write",file && PEM_write_X509(file,certificate)); fclose(file);
         setenv("VLESS_CA_BUNDLE",ca,1); setenv("VLESS_XHTTP_PIN_FILE",pins,1);
         const char *modes[]={"strict","insecure","tofu"};
-        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 14);variant++) {
+        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 14);variant++) for (int alps=0;alps<2;alps++) {
             unlink(pins); int pair[2]; REQUIRE("auth/socketpair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
-            peer_t peer={.fd=pair[1],.variant=variant,.key=key,.certificate=der,.certificate_length=(size_t)length}; pthread_t thread;
+            peer_t peer={.fd=pair[1],.variant=variant,.key=key,.certificate=der,.certificate_length=(size_t)length,.alps=alps}; pthread_t thread;
             REQUIRE("auth/peer-thread",pthread_create(&thread,NULL,peer_run,&peer) == 0);
             vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); config.server_port=443; config.fp_mode=FP_QQ;
             setenv("VLESS_TLS_MODE",modes[mode],1);
@@ -286,6 +299,7 @@ int main(void) {
             else CHECK("auth/malformed-handshake-rejected",result != 0);
             if (((variant && variant != 7) || usage == 2) && mode == 2) CHECK("auth/failed-handshake-no-tofu-pin",access(pins,F_OK) != 0);
             shutdown(pair[0],SHUT_RDWR); close(pair[0]); pthread_join(thread,NULL); db_free(&connection.transcript);
+            if (alps) CHECK("alps/authenticated-client-settings-and-finished",((variant == 0 || variant == 7) && usage != 2) ? peer.client_alps && peer.client_finished : !peer.client_alps);
             if (variant == 7) {
                 CHECK("auth/requested-empty-client-certificate",peer.empty_certificate);
                 CHECK("auth/requested-client-finished-transcript",peer.client_finished);

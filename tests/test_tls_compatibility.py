@@ -127,10 +127,12 @@ class TlsCompatibilityTests(unittest.TestCase):
                         self.assertTrue(wire.client_data)
                         actual=hello_layout(bytes(wire.client_data[0]))
                         self.assertEqual(actual[0],expected[0],core.log)
+                        expected_extensions=tuple(value for value in expected[1] if not (transport == "ws" and value == 0x4469))
+                        if fingerprint == "qq": self.assertEqual(0x4469 in actual[1],transport != "ws",core.log)
                         if fingerprint in ("random","randomized"):
-                            self.assertCountEqual(actual[1],expected[1],core.log)
+                            self.assertCountEqual(actual[1],expected_extensions,core.log)
                         else:
-                            self.assertEqual(actual[1],expected[1],core.log)
+                            self.assertEqual(actual[1],expected_extensions,core.log)
 
     def test_tls12_xray_transports(self):
         cert,_=certificate()
