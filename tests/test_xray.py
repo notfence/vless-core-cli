@@ -702,19 +702,24 @@ class XrayTests(unittest.TestCase):
                                 with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,bytes(range(256))*17)
 
     def test_xhttp_custom_session_identifiers(self):
-        extra={"sessionIDTable":"Base62","sessionIDLength":"16-32","sessionIDPlacement":"header","sessionIDKey":"X-vless-core-session"}
-        for pooled in (False,True):
-            options={**extra,**({"xmux":{"maxConnections":1}} if pooled else {})}
-            with self.subTest(pooled=pooled), Server() as target, xray_server("xhttp","none",**extra) as reference, CountingProxy(reference.port) as proxy:
-                with cli(uri(proxy.port,"xhttp","none",mode="packet-up",extra=json.dumps(options))) as core:
-                    with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core session identifiers"*1000)
-                    identifiers=[]
-                    for captured in proxy.client_data:
-                        identifiers.extend(line.split(b": ",1)[1] for line in bytes(captured).split(b"\r\n") if line.startswith(b"X-vless-core-session: "))
-                    self.assertGreaterEqual(len(identifiers),2)
-                    self.assertEqual(len(set(identifiers)),1)
-                    self.assertTrue(16 <= len(identifiers[0]) <= 32)
-                    self.assertTrue(all(chr(byte).isalnum() and byte < 128 for byte in identifiers[0]))
+        for table,length in (("Base62","16-32"),("AAAB",31)):
+            extra={"sessionIDTable":table,"sessionIDLength":length,"sessionIDPlacement":"header","sessionIDKey":"X-vless-core-session"}
+            for pooled in (False,True):
+                options={**extra,**({"xmux":{"maxConnections":1}} if pooled else {})}
+                with self.subTest(table=table,pooled=pooled), Server() as target, xray_server("xhttp","none",**extra) as reference, CountingProxy(reference.port) as proxy:
+                    with cli(uri(proxy.port,"xhttp","none",mode="packet-up",extra=json.dumps(options))) as core:
+                        with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core session identifiers"*1000)
+                        identifiers=[]
+                        for captured in proxy.client_data:
+                            identifiers.extend(line.split(b": ",1)[1] for line in bytes(captured).split(b"\r\n") if line.startswith(b"X-vless-core-session: "))
+                        self.assertGreaterEqual(len(identifiers),2)
+                        self.assertEqual(len(set(identifiers)),1)
+                        if table == "Base62":
+                            self.assertTrue(16 <= len(identifiers[0]) <= 32)
+                            self.assertTrue(all(chr(byte).isalnum() and byte < 128 for byte in identifiers[0]))
+                        else:
+                            self.assertEqual(len(identifiers[0]),31)
+                            self.assertLessEqual(set(identifiers[0]),set(b"AB"))
 
     def test_xhttp_session_metadata_url_encoding(self):
         for placement in ("path","query"):

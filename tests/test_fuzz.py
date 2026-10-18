@@ -38,6 +38,7 @@ def seeds():
                    "xmux":{"maxConnections":"1-3","maxConcurrency":"0","cMaxReuseTimes":"3-5",
                            "hMaxRequestTimes":"10-20","hMaxReusableSecs":"1-3","hKeepAlivePeriod":-1}})
     extras.append({"noSSEHeader":False,"scMaxBufferedPosts":30,"scStreamUpServerSecs":"20-80","serverMaxHeaderBytes":8192})
+    extras.extend(({"sessionIDTable":"AAAAAAAA","sessionIDLength":16}, {"sessionIDTable":"AAAB","sessionIDLength":"1-31"}))
     uri_extras=[]
     for extra in extras:
         encoded=json.dumps(extra,separators=(",",":"))

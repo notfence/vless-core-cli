@@ -12,7 +12,33 @@ static vless_config_t config;
 static char error[256];
 static int parse(const char *uri) { return parse_core_uri(uri, &config, error, sizeof(error)); }
 
+static void check_session_identifier_space(void) {
+    vless_config_t settings={0}; char identifier[256],failure[128];
+    strcpy(settings.xhttp_mode,"packet-up"); strcpy(settings.xhttp_session_placement,"header");
+    strcpy(settings.xhttp_session_id_table,"AAAAAAAA"); settings.xhttp_session_id_length_min=settings.xhttp_session_id_length_max=16;
+    CHECK("xhttp/session-identical-symbols-do-not-inflate-space",core_xhttp_validate(&settings,failure,sizeof(failure)) < 0 && strstr(failure,"space"));
+    CHECK("xhttp/session-degenerate-alphabet-is-not-generated",core_xhttp_session(&settings,identifier,sizeof(identifier)) < 0 && !identifier[0]);
+    settings.xhttp_session_id_length_min=1; settings.xhttp_session_id_length_max=255;
+    CHECK("xhttp/session-single-symbol-variable-length-is-too-small",core_xhttp_validate(&settings,failure,sizeof(failure)) < 0);
+    strcpy(settings.xhttp_session_id_table,"AAAB"); settings.xhttp_session_id_length_min=settings.xhttp_session_id_length_max=30;
+    CHECK("xhttp/session-distinct-symbols-below-boundary",core_xhttp_validate(&settings,failure,sizeof(failure)) < 0);
+    settings.xhttp_session_id_length_min=settings.xhttp_session_id_length_max=31;
+    CHECK("xhttp/session-distinct-symbols-exact-boundary",core_xhttp_validate(&settings,failure,sizeof(failure)) == 0);
+    CHECK("xhttp/session-repeated-symbols-remain-usable",core_xhttp_session(&settings,identifier,sizeof(identifier)) == 0 && strlen(identifier) == 31 && strspn(identifier,"AB") == 31 && !strcmp(settings.xhttp_session_id_table,"AAAB"));
+    settings.xhttp_session_id_length_min=1; settings.xhttp_session_id_length_max=30;
+    CHECK("xhttp/session-length-range-below-boundary",core_xhttp_validate(&settings,failure,sizeof(failure)) < 0);
+    settings.xhttp_session_id_length_max=31;
+    CHECK("xhttp/session-length-range-reaches-boundary",core_xhttp_validate(&settings,failure,sizeof(failure)) == 0);
+    memset(settings.xhttp_session_id_table,'A',255); settings.xhttp_session_id_table[254]='B'; settings.xhttp_session_id_table[255]=0;
+    settings.xhttp_session_id_length_min=settings.xhttp_session_id_length_max=30;
+    CHECK("xhttp/session-long-repeated-table-still-has-two-symbols",core_xhttp_validate(&settings,failure,sizeof(failure)) < 0);
+    settings.xhttp_session_id_length_min=settings.xhttp_session_id_length_max=255;
+    CHECK("xhttp/session-space-saturates-without-overflow",core_xhttp_validate(&settings,failure,sizeof(failure)) == 0);
+    CHECK("uri/session-degenerate-table-rejected",parse(PREFIX "type=xhttp&extra=%7B%22sessionIDTable%22%3A%22AAAAAAAA%22%2C%22sessionIDLength%22%3A16%7D") < 0 && strstr(error,"space"));
+}
+
 static void check_session_identifiers(void) {
+    check_session_identifier_space();
     vless_config_t settings={0}; char identifier[256];
     strcpy(settings.xhttp_mode,"packet-up"); strcpy(settings.xhttp_session_placement,"header");
     CHECK("xhttp/default-session-uuid", core_xhttp_session(&settings,identifier,sizeof(identifier)) == 0 && strlen(identifier) == 36 && identifier[14] == '4' && strchr("89ab",identifier[19]));

@@ -337,9 +337,14 @@ int core_xhttp_validate(const vless_config_t *config, char *error, size_t capaci
         size_t count=strlen(table);
         int min=config->xhttp_session_id_length_min,max=config->xhttp_session_id_length_max;
         if (!count || min <= 0 || max < min || max > 255) return invalid("sessionIDLength",error,capacity);
+        unsigned char seen[256]={0}; size_t symbols=0;
+        for (size_t i=0;i<count;i++) {
+            unsigned char ch=(unsigned char)table[i];
+            if (!seen[ch]) { seen[ch]=1; symbols++; }
+        }
         uint64_t term=1,room=0,limit=UINT64_C(1)<<31;
         for (int length=1;length<=max && room<limit;length++) {
-            term=term > limit/count ? limit : term*count;
+            term=term > limit/symbols ? limit : term*symbols;
             if (length >= min) room=room > limit-term ? limit : room+term;
         }
         if (room < limit) return invalid("sessionIDTable/sessionIDLength space",error,capacity);
