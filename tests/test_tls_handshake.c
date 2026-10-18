@@ -5,6 +5,24 @@
 #include <openssl/pem.h>
 #include <signal.h>
 
+static _Thread_local int client_flight_variant,client_cipher_calls;
+static _Thread_local core_deadline_t *client_flight_deadline;
+ssize_t __real_send(int,const void *,size_t,int);
+EVP_CIPHER_CTX *__real_EVP_CIPHER_CTX_new(void);
+ssize_t __wrap_send(int fd,const void *data,size_t length,int flags) {
+    const uint8_t ccs[]={20,3,3,0,1,1};
+    int final=length >= sizeof(ccs) && !memcmp(data,ccs,sizeof(ccs));
+    if (final && client_flight_variant == 16) { errno=EIO; return -1; }
+    ssize_t result=__real_send(fd,data,length,flags);
+    if (final && result > 0 && client_flight_variant == 17 && client_flight_deadline)
+        client_flight_deadline->until_ms=core_now_ms();
+    return result;
+}
+EVP_CIPHER_CTX *__wrap_EVP_CIPHER_CTX_new(void) {
+    if (client_flight_variant == 18 && ++client_cipher_calls == 2) { errno=ENOMEM; return NULL; }
+    return __real_EVP_CIPHER_CTX_new();
+}
+
 typedef struct {
     int fd, variant;
     EVP_PKEY *key;
@@ -153,7 +171,16 @@ static void *peer_run(void *opaque) {
     if (transcript_hash(&server,transcript) || calc_finished_verify(&server,server.s_hs_traffic,transcript,finished)) goto done;
     if (peer->variant == 6) finished[0]^=1;
     if (peer_message(&flight,20,finished,32)) goto done;
+    if (peer->variant == 14 && db_append(&flight,(const uint8_t[]){99,0,0,0},4)) goto done;
+    if (peer->variant == 15 && db_append(&flight,(const uint8_t[]){0},1)) goto done;
     uint8_t *encrypted=NULL; size_t encrypted_length=0;
+    if (peer->variant == 19) {
+        size_t prefix=flight.len-1;
+        if (encrypt_record(&server,server.s_hs_key,server.s_hs_iv,&server.s_hs_seq,22,flight.data,prefix,&encrypted,&encrypted_length)) goto done;
+        int sent=write_exact(peer->fd,encrypted,encrypted_length); free(encrypted); encrypted=NULL;
+        if (sent) goto done;
+        db_consume(&flight,prefix);
+    }
     if (peer->variant == 12 || peer->variant == 13) {
         size_t prefix=peer->variant == 13 ? 6 : 0;
         if (prefix) {
@@ -168,7 +195,7 @@ static void *peer_run(void *opaque) {
     }
     if (encrypt_record(&server,server.s_hs_key,server.s_hs_iv,&server.s_hs_seq,22,flight.data,flight.len,&encrypted,&encrypted_length)) goto done;
     (void)write_exact(peer->fd,encrypted,encrypted_length); free(encrypted);
-    if (peer->variant == 7 || peer->alps) {
+    if (peer->variant == 7 || peer->variant == 19 || peer->alps) {
         uint8_t *record=NULL,*plain=NULL,inner=0; size_t record_size=0,plain_size=0;
         if (peer_message(&server.transcript,20,finished,32) || read_record(peer->fd,&type,&record,&record_size)) goto done;
         if (type == 20) { free(record); record=NULL; if (read_record(peer->fd,&type,&record,&record_size)) goto done; }
@@ -284,22 +311,44 @@ int main(void) {
         FILE *file=fopen(ca,"w"); REQUIRE("auth/ca-write",file && PEM_write_X509(file,certificate)); fclose(file);
         setenv("VLESS_CA_BUNDLE",ca,1); setenv("VLESS_XHTTP_PIN_FILE",pins,1);
         const char *modes[]={"strict","insecure","tofu"};
-        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 14);variant++) for (int alps=0;alps<2;alps++) {
+        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 21);variant++) for (int alps=0;alps<2;alps++) {
+            if (variant == 20 && mode != 2) continue;
             unlink(pins); int pair[2]; REQUIRE("auth/socketpair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
             peer_t peer={.fd=pair[1],.variant=variant,.key=key,.certificate=der,.certificate_length=(size_t)length,.alps=alps}; pthread_t thread;
             REQUIRE("auth/peer-thread",pthread_create(&thread,NULL,peer_run,&peer) == 0);
             vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); config.server_port=443; config.fp_mode=FP_QQ;
             setenv("VLESS_TLS_MODE",modes[mode],1);
             tls13_conn_t connection={.fd=pair[0]}; char error[256]={0};
+            int existing_pin=mode == 2 && !usage && ((alps && variant >= 14 && variant <= 18) || variant == 20 || (!variant && alps));
+            char previous_pin[65]={0};
+            if (existing_pin) {
+                REQUIRE("auth/existing-pin-hash",sha256_hex(der,(size_t)length,previous_pin) == 0);
+                if (variant == 20) { memset(previous_pin,'0',64); previous_pin[64]=0; }
+                int stored=0;
+                REQUIRE("auth/existing-pin-fixture",secure_tofu_verify_or_store("vless-core.test:443",previous_pin,&stored,error,sizeof(error)) == 0 && stored == 1);
+            }
             core_set_socket_io_timeout(pair[0],1000);
+            client_flight_variant=variant; client_cipher_calls=0;
+            core_deadline_t deadline;
+            if (variant == 17) { REQUIRE("auth/final-flight-deadline",core_deadline_attach(&deadline) == 0); core_deadline_begin(1000); client_flight_deadline=&deadline; }
             int result=run_tls_handshake(&config,&connection,TLS_CIPHER_OFFER_CHACHA,error,sizeof(error));
+            if (variant == 17) { core_deadline_detach(); client_flight_deadline=NULL; }
+            client_flight_variant=0;
             CHECK("auth/handshake-memory-released",connection.tls_handshake_bytes == 0);
             if (!variant && usage != 2 && result) fprintf(stderr,"valid handshake %d/%s: %s\n",kind,modes[mode],error);
-            if ((variant == 0 || variant == 7) && usage != 2) CHECK("auth/valid-signature",result == 0);
+            if ((variant == 0 || variant == 7 || variant == 19) && usage != 2) CHECK("auth/valid-signature",result == 0);
             else CHECK("auth/malformed-handshake-rejected",result != 0);
-            if (((variant && variant != 7) || usage == 2) && mode == 2) CHECK("auth/failed-handshake-no-tofu-pin",access(pins,F_OK) != 0);
+            if (variant == 16) CHECK("auth/client-finished-send-failure",result < 0 && strstr(error,"send client Finished"));
+            if (variant == 18) CHECK("auth/client-finished-allocation-failure",result < 0 && strstr(error,"encrypt client Finished"));
+            if (variant == 17) CHECK("auth/client-finished-expired-deadline",result < 0 && errno == ETIMEDOUT);
+            if (variant == 20) CHECK("auth/existing-pin-mismatch-rejected",result < 0 && strstr(error,"TOFU pin mismatch"));
+            if (existing_pin) {
+                int fd=open(pins,O_RDONLY); char retained[65];
+                CHECK("auth/existing-pin-preserved",fd >= 0 && find_pin_in_fd(fd,"vless-core.test:443",retained) == 0 && !strcmp(retained,previous_pin));
+                if (fd >= 0) close(fd);
+            } else if (((variant && variant != 7 && variant != 19) || usage == 2) && mode == 2) CHECK("auth/failed-handshake-no-tofu-pin",access(pins,F_OK) != 0);
             shutdown(pair[0],SHUT_RDWR); close(pair[0]); pthread_join(thread,NULL); db_free(&connection.transcript);
-            if (alps) CHECK("alps/authenticated-client-settings-and-finished",((variant == 0 || variant == 7) && usage != 2) ? peer.client_alps && peer.client_finished : !peer.client_alps);
+            if (alps) CHECK("alps/authenticated-client-settings-and-finished",((variant == 0 || variant == 7 || variant == 17 || variant == 19 || variant == 20) && usage != 2) ? peer.client_alps && peer.client_finished : !peer.client_alps);
             if (variant == 7) {
                 CHECK("auth/requested-empty-client-certificate",peer.empty_certificate);
                 CHECK("auth/requested-client-finished-transcript",peer.client_finished);

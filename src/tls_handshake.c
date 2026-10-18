@@ -142,8 +142,6 @@ static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, 
             calc_finished_verify(c,c->s_hs_traffic,transcript,finished) || CRYPTO_memcmp(finished,message+4,body_length)) {
             set_err(err,err_cap,"server Finished mismatch"); return -1;
         }
-        if (strcmp(cfg->security,"reality") && c->tls_verify_policy == TLS_VERIFY_MODE_TOFU &&
-            tcp_tls_tofu_verify_or_store(cfg,c->tls_certificate_message.data,c->tls_certificate_message.len,err,err_cap)) return -1;
     }
     if (append_transcript(c,message,length)) return -1;
     c->tls_auth_state++; return type == 20 ? 1 : 0;
@@ -846,6 +844,11 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     }
 
     if (tls_send_client_finished(c,err,err_cap)) goto handshake_failure;
+    if (core_deadline_active() && !core_deadline_remaining()) {
+        errno=ETIMEDOUT; set_err(err,err_cap,"TLS handshake deadline expired"); goto handshake_failure;
+    }
+    if (!use_reality && c->tls_verify_policy == TLS_VERIFY_MODE_TOFU &&
+        tcp_tls_tofu_verify_or_store(cfg,c->tls_certificate_message.data,c->tls_certificate_message.len,err,err_cap)) goto handshake_failure;
 handshake_complete:
     OPENSSL_cleanse(client_priv,sizeof(client_priv)); OPENSSL_cleanse(shared,sizeof(shared));
     tls_handshake_material_clear(c);
