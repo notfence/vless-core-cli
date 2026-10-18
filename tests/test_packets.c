@@ -2,8 +2,33 @@
 #include "uri.h"
 #include "vless.h"
 #include "vision.h"
+#include <errno.h>
+
+int __real_RAND_bytes(unsigned char *,int);
+static unsigned random_failure,random_calls;
+int __wrap_RAND_bytes(unsigned char *data,int length) {
+    if (!random_failure) return __real_RAND_bytes(data,length);
+    if (++random_calls == random_failure) { errno=EIO; return 0; }
+    memset(data,0x61,(size_t)length); uint32_t value=1000;
+    if (length == 2 || length == 4) memcpy(data,&value,(size_t)length);
+    return 1;
+}
+
+static void vision_random_failures(void) {
+    uint8_t uuid[16]={0};
+    for (unsigned failure=1;failure<=2;failure++) {
+        vision_wrap_t wrap; vision_wrap_init(&wrap,uuid); uint8_t *output=NULL; size_t length=0;
+        random_failure=failure; random_calls=0;
+        CHECK("vision/rng-failure-never-falls-back",vision_wrap_bootstrap(&wrap,&output,&length) < 0 && !output && !length);
+        CHECK("vision/rng-failure-does-not-commit-bootstrap",!wrap.uuid_sent && !wrap.bootstrap_sent);
+        free(output); random_failure=0;
+        CHECK("vision/rng-recovery-uses-cryptographic-generator",vision_wrap_bootstrap(&wrap,&output,&length) == 0 && output && length && wrap.uuid_sent && wrap.bootstrap_sent);
+        free(output);
+    }
+}
 
 static void response_vectors(void) {
+    vision_random_failures();
     const uint8_t response[]={0,3,'a','b','c','v','l','e','s','s','-','c','o','r','e'};
     for (size_t split=0;split<=sizeof(response);split++) {
         vless_response_t state={0}; uint8_t payload[10]; size_t total=0;

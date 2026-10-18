@@ -3,6 +3,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "http2_pool.h"
+#include "core_random.h"
 #include "deadline.h"
 #include "connection_trace.h"
 #include "socket_util.h"
@@ -15,7 +16,6 @@
 #include "xhttp_config.h"
 #include "xhttp_download.h"
 #include "blake3.h"
-#include <openssl/rand.h>
 #include <openssl/crypto.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -175,9 +175,10 @@ static void collect_stopped_actors(void) {
 }
 
 static int random_range(core_range_t range) {
-    uint32_t value, span=(uint32_t)(range.max-range.min)+1, threshold=(uint32_t)(-span)%span;
-    do { if (RAND_bytes((unsigned char *)&value,sizeof(value)) != 1) return -1; } while (value < threshold);
-    return range.min+(int)(value%span);
+    uint32_t value;
+    if (range.min < 0 || range.max < range.min) { errno=EINVAL; return -1; }
+    if (core_random_range((uint32_t)range.min,(uint32_t)range.max,&value)) return -1;
+    return (int)value;
 }
 
 static int queue_append(mux_queue_t *queue, const uint8_t *data, size_t length, size_t limit) {

@@ -1,6 +1,6 @@
 #include "xhttp_payload.h"
+#include "core_random.h"
 #include <openssl/evp.h>
-#include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -93,11 +93,11 @@ int core_xhttp_payload_build(const core_xhttp_payload_options_t *options, const 
     if (range.max < 64) range.max=64;
     size_t chunks[1024],count=0,covered=0,wanted=encoded_size(length);
     if (wanted > budget-initial) wanted=budget-initial;
-    uint32_t value,span=(uint32_t)(range.max-range.min)+1,threshold=(uint32_t)(-span)%span;
+    uint32_t value;
     while (covered < wanted) {
         if (count == sizeof(chunks)/sizeof(*chunks)) return fail(error,capacity,"XHTTP packet has too many chunks");
-        do { if (RAND_bytes((unsigned char *)&value,sizeof(value)) != 1) return fail(error,capacity,"XHTTP chunk sampling failed"); } while (value < threshold);
-        chunks[count]=(size_t)range.min+value%span; covered+=chunks[count++];
+        if (core_random_range((uint32_t)range.min,(uint32_t)range.max,&value)) return fail(error,capacity,"XHTTP chunk sampling failed");
+        chunks[count]=value; covered+=chunks[count++];
     }
     size_t low=0,high=length;
     while (low < high) {

@@ -1,6 +1,7 @@
 #include "vision.h"
+#include "core_random.h"
 
-#include <openssl/rand.h>
+#include <openssl/crypto.h>
 
 #include <errno.h>
 #include <stdlib.h>
@@ -47,20 +48,19 @@ static int read_pad_packets_env(void) {
     return (int)parsed;
 }
 
-static uint16_t rand_u16_mod(uint16_t mod) {
+static int rand_u16_mod(uint16_t mod, uint16_t *sampled) {
     if (mod == 0) {
-        return 0;
+        *sampled=0; return 0;
     }
-    uint16_t v = 0;
-    if (RAND_bytes((uint8_t *)&v, sizeof(v)) == 1) {
-        return (uint16_t)(v % mod);
-    }
-    return (uint16_t)(rand() % mod);
+    uint32_t value;
+    if (core_random_range(0,mod-1,&value)) return -1;
+    *sampled=(uint16_t)value; return 0;
 }
 
-static uint16_t vision_padding_len(size_t content_len, int long_padding) {
+static int vision_padding_len(size_t content_len, int long_padding, uint16_t *sampled) {
     if (long_padding && content_len < VISION_LONG_PAD_THRESHOLD) {
-        uint16_t extra = rand_u16_mod(VISION_LONG_PAD_RANDOM);
+        uint16_t extra;
+        if (rand_u16_mod(VISION_LONG_PAD_RANDOM,&extra)) return -1;
         size_t want = (size_t)VISION_LONG_PAD_BASE + (size_t)extra - content_len;
         if ((long)want < 0) {
             want = 0;
@@ -68,9 +68,9 @@ static uint16_t vision_padding_len(size_t content_len, int long_padding) {
         if (want > 0xFFFF) {
             want = 0xFFFF;
         }
-        return (uint16_t)want;
+        *sampled=(uint16_t)want; return 0;
     }
-    return rand_u16_mod(VISION_SHORT_PAD_RANDOM);
+    return rand_u16_mod(VISION_SHORT_PAD_RANDOM,sampled);
 }
 
 enum { VISION_HELLO_PREFIX, VISION_HELLO_CIPHERS, VISION_HELLO_COMPRESSION_LENGTH,
@@ -231,7 +231,8 @@ static int vision_build_block(vision_wrap_t *ctx, uint8_t command, const uint8_t
     }
 
     uint16_t content16 = (uint16_t)content_len;
-    uint16_t padding16 = vision_padding_len(content_len, long_padding);
+    uint16_t padding16;
+    if (vision_padding_len(content_len,long_padding,&padding16)) return -1;
     size_t prefix = ctx->uuid_sent ? 0 : 16;
     size_t total = prefix + 1 + 2 + 2 + content_len + (size_t)padding16;
 
@@ -242,7 +243,6 @@ static int vision_build_block(vision_wrap_t *ctx, uint8_t command, const uint8_t
     if (!ctx->uuid_sent) {
         memcpy(buf + off, ctx->uuid, 16);
         off += 16;
-        ctx->uuid_sent = 1;
     }
 
     buf[off++] = command;
@@ -257,13 +257,13 @@ static int vision_build_block(vision_wrap_t *ctx, uint8_t command, const uint8_t
     }
 
     if (padding16 > 0) {
-        if (RAND_bytes(buf + off, padding16) != 1) {
-            memset(buf + off, 0, padding16);
+        if (core_random_fill(buf + off, padding16)) {
+            int cause=errno; OPENSSL_cleanse(buf,out->capacity); core_relay_buffer_clear(out); errno=cause; return -1;
         }
         off += padding16;
     }
 
-    out->length=off;
+    ctx->uuid_sent=1; out->length=off;
     return 0;
 }
 
@@ -282,8 +282,9 @@ int vision_wrap_bootstrap_buffer(vision_wrap_t *ctx,core_relay_buffer_t *out) {
     if (!ctx->padding_active || ctx->bootstrap_sent) {
         return 0;
     }
-    ctx->bootstrap_sent = 1;
-    return vision_build_block(ctx, CMD_CONTINUE, NULL, 0, 1, out);
+    int result=vision_build_block(ctx,CMD_CONTINUE,NULL,0,1,out);
+    if (!result) ctx->bootstrap_sent=1;
+    return result;
 }
 
 int vision_wrap_bootstrap(vision_wrap_t *ctx,uint8_t **out,size_t *out_len) {

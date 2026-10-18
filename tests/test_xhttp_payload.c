@@ -4,6 +4,9 @@
 #include "check.h"
 #include <stdlib.h>
 #include <stdint.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 int __real_RAND_bytes(unsigned char *, int);
 static int controlled_random;
@@ -28,6 +31,10 @@ static size_t payload_values(const char *headers, const char *key, int cookie, c
 }
 
 int main(void) {
+    pid_t child=fork(); REQUIRE("xhttp/interval-rejection-child",child >= 0);
+    if (!child) { alarm(1); controlled_random=2; next_random=0; uint64_t due; _exit(core_xhttp_post_due((core_range_t){1,3},1000,1001,&due) < 0 ? 0 : 1); }
+    int status; REQUIRE("xhttp/interval-rejection-wait",waitpid(child,&status,0) == child);
+    CHECK("xhttp/interval-rejection-has-finite-bound",WIFEXITED(status) && WEXITSTATUS(status) == 0);
     uint64_t due;
     controlled_random=2; next_random=101;
     CHECK("xhttp/interval-zero-endpoint",core_xhttp_post_due((core_range_t){0,100},1000,1001,&due) == 0 && due == 1001);

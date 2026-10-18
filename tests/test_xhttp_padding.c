@@ -1,8 +1,31 @@
 #include "xhttp_padding.h"
 #include "hpack.h"
 #include "check.h"
+#include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int __real_RAND_bytes(unsigned char *,int);
+static int controlled_random;
+int __wrap_RAND_bytes(unsigned char *data,int length) {
+    if (!controlled_random) return __real_RAND_bytes(data,length);
+    if (controlled_random < 0) { errno=EIO; return 0; }
+    memset(data,255,(size_t)length); return 1;
+}
+
+static void tokenish_random_bound(void) {
+    pid_t child=fork(); REQUIRE("xhttp/tokenish-rejection-child",child >= 0);
+    if (!child) {
+        alarm(1); controlled_random=1; char output[16384];
+        _exit(core_xhttp_padding((core_range_t){100,100},"tokenish",output,sizeof(output)) < 0 && !output[0] ? 0 : 1);
+    }
+    int status; REQUIRE("xhttp/tokenish-rejection-wait",waitpid(child,&status,0) == child);
+    CHECK("xhttp/tokenish-rejection-has-finite-bound",WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
 
 int main(void) {
+    tokenish_random_bound();
     char value[16384];
     CHECK("hpack/huffman-padding-x-code-size",core_hpack_huffman_bits((uint8_t *)"XZ",2) == 16);
     CHECK("hpack/huffman-rfc-host-code-size",(core_hpack_huffman_bits((uint8_t *)"www.example.com",15)+7)/8 == 12);

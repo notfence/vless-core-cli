@@ -3,6 +3,7 @@
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+int __real_RAND_bytes(unsigned char *,int);
 static struct { void *pointer; size_t capacity; } observed_allocations[128];
 static unsigned observing,allocation_calls,allocation_failure,cipher_calls,cipher_failure,random_calls,random_failure,fault_triggered;
 static unsigned peer_mode,peer_ready,peer_cut,peer_building,peer_empty_padding,peer_corrupt;
@@ -49,17 +50,16 @@ static EVP_CIPHER_CTX *observe_cipher_new(void) {
 }
 static int observe_random(unsigned char *output, int size) {
     if (observing && !peer_building && ++random_calls == random_failure) { fault_triggered=1; errno=EIO; return 0; }
-    return RAND_bytes(output,size);
+    return __real_RAND_bytes(output,size);
 }
+int __wrap_RAND_bytes(unsigned char *output,int size) { return observe_random(output,size); }
 #define calloc observe_calloc
 #define malloc observe_malloc
 #define free observe_free
 #define EVP_CIPHER_CTX_new observe_cipher_new
-#define RAND_bytes observe_random
 #define OPENSSL_cleanse observe_cleanse
 #include "../src/vless_encryption.c"
 #undef OPENSSL_cleanse
-#undef RAND_bytes
 #undef EVP_CIPHER_CTX_new
 #undef free
 #undef malloc

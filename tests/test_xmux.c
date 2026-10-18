@@ -1,6 +1,8 @@
 #include "xmux.h"
 #include "../src/http2_pool.c"
 #include "check.h"
+#include <signal.h>
+#include <sys/wait.h>
 
 typedef struct { size_t pending; int frames, last_type, flags[16]; uint32_t last_id, ids[16], increment, request_id, reset_code; uint64_t enqueued, flushed; size_t payload_bytes,packet_requests; int last_role,end_frames; } wire_t;
 static int session_failure;
@@ -639,6 +641,26 @@ static void priority_stream_isolation(void) {
     }
 }
 
+static void random_range_bound(void) {
+    pid_t child=fork(); REQUIRE("xmux/random-rejection-child",child >= 0);
+    if (!child) { alarm(1); pacing_clock=1000; pacing_random=0; _exit(random_range((core_range_t){1,3}) < 0 ? 0 : 1); }
+    int status; REQUIRE("xmux/random-rejection-wait",waitpid(child,&status,0) == child);
+    CHECK("xmux/random-rejection-has-finite-bound",WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    vless_config_t config; core_config_defaults(&config); config.transport_mode=TRANSPORT_XHTTP;
+    config.xmux.present=1; config.xmux.max_concurrency=(core_range_t){1,3};
+    char error[160]; pacing_clock=1000; pacing_random=0;
+    CHECK("xmux/random-manager-failure",!core_xmux_connect(&config,&fixture_backend,error,sizeof(error)) && errno == EIO && !managers && !streams && !stream_count);
+    int unlocked=pthread_mutex_trylock(&mux_lock);
+    CHECK("xmux/random-failure-releases-pool-lock",!unlocked);
+    if (!unlocked) pthread_mutex_unlock(&mux_lock);
+    pacing_random=1;
+    mux_manager_t *manager=get_manager(&config,&fixture_backend);
+    REQUIRE("xmux/random-manager-recovers",manager && manager->concurrency == 2 && managers == manager);
+    CHECK("xmux/random-group-recovers",choose_group(manager) != NULL);
+    while (manager->groups) { mux_group_t *next=manager->groups->next; free(manager->groups); manager->groups=next; }
+    managers=manager->next; free(manager); pacing_clock=0;
+}
+
 static void rejected_priority_headers_keep_hpack(void) {
     wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
     mux_actor_t actor={.manager=&manager,.physical=&wire,.http2=1,.latest_stream=3}; actor.validation.settings_received=1;
@@ -657,6 +679,7 @@ static void rejected_priority_headers_keep_hpack(void) {
 }
 
 int main(void) {
+    random_range_bound();
     rejected_priority_headers_keep_hpack();
     priority_stream_isolation();
     head_upload_response();

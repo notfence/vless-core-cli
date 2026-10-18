@@ -1424,7 +1424,6 @@ int main(int argc, char **argv) {
         return 1;
     }
     setvbuf(stderr, NULL, _IONBF, 0);
-    srand((unsigned int)time(NULL));
 
     const char *prog = strrchr(argv[0], '/');
     prog = (prog != NULL) ? (prog + 1) : argv[0];

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "xhttp_config.h"
+#include "core_random.h"
 #include "core_log.h"
 #include "xhttp_payload.h"
 #include "http_headers.h"
@@ -13,7 +14,6 @@
 #include <stdio.h>
 #include <limits.h>
 #include <errno.h>
-#include <openssl/rand.h>
 
 typedef enum { FIELD_STRING, FIELD_LOWER, FIELD_UPPER, FIELD_BOOL, FIELD_RANGE, FIELD_HEADERS, FIELD_DOWNLOAD } field_kind_t;
 typedef struct { const char *key; size_t offset, size; field_kind_t kind; int maximum; } config_field_t;
@@ -363,10 +363,9 @@ int core_xhttp_validate(const vless_config_t *config, char *error, size_t capaci
 }
 
 static int sample(unsigned min, unsigned max, unsigned *sampled) {
-    if (max < min) return -1;
-    uint32_t span=max-min+1,threshold=(uint32_t)(-span)%span,value;
-    do { if (RAND_bytes((unsigned char *)&value,sizeof(value)) != 1) return -1; } while (value < threshold);
-    *sampled=min+value%span; return 0;
+    uint32_t value;
+    if (!sampled || core_random_range(min,max,&value)) return -1;
+    *sampled=value; return 0;
 }
 
 int core_xhttp_post_due(core_range_t range, uint64_t previous, uint64_t now, uint64_t *due) {
@@ -394,11 +393,11 @@ int core_xhttp_session(const vless_config_t *config, char *output, size_t capaci
     if (config->xhttp_session_id_table[0]) {
         const char *table=session_table(config->xhttp_session_id_table); unsigned length;
         if (sample((unsigned)config->xhttp_session_id_length_min,(unsigned)config->xhttp_session_id_length_max,&length) != 0 || length >= capacity) return -1;
-        for (size_t i=0;i<length;i++) { unsigned index; if (sample(0,(unsigned)strlen(table)-1,&index) != 0) return -1; output[i]=table[index]; }
+        for (size_t i=0;i<length;i++) { unsigned index; if (sample(0,(unsigned)strlen(table)-1,&index) != 0) { output[0]=0; return -1; } output[i]=table[index]; }
         output[length]=0; return 0;
     }
     if (capacity < 37) return -1;
-    uint8_t bytes[16]; if (RAND_bytes(bytes,sizeof(bytes)) != 1) return -1;
+    uint8_t bytes[16]; if (core_random_fill(bytes,sizeof(bytes))) return -1;
     bytes[6]=(uint8_t)((bytes[6]&15)|64); bytes[8]=(uint8_t)((bytes[8]&63)|128);
     size_t offset=0; const char *hex="0123456789abcdef";
     for (size_t i=0;i<sizeof(bytes);i++) {

@@ -1,8 +1,8 @@
 #include "vless_encryption.h"
+#include "core_random.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/rand.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,9 +130,9 @@ static void clear_free(void *memory, size_t capacity) {
 static int random_range(int min, int max) {
     if (min > max) { int temporary=min; min=max; max=temporary; }
     if (min == max) return min;
-    uint32_t value,span=(uint32_t)(max-min),threshold=(uint32_t)(-span)%span;
-    do { if (RAND_bytes((unsigned char *)&value,sizeof(value)) != 1) return -1; } while (value < threshold);
-    return min+(int)(value%span);
+    uint32_t value;
+    if (min < 0 || core_random_range((uint32_t)min,(uint32_t)max-1,&value)) return -1;
+    return (int)value;
 }
 
 static int padding_create(const vless_config_t *config, int lengths[14], int gaps[14], size_t *count) {
@@ -531,7 +531,7 @@ int vless_encryption_connect(const vless_config_t *cfg, tls13_conn_t *transport,
     const size_t pfs_exchange_len=18+1184+32+16;
     handshake.hello_length=16+relays_len+pfs_exchange_len+(size_t)padding_len;
     handshake.hello=calloc(1,handshake.hello_length);
-    if (!handshake.hello || RAND_bytes(handshake.hello,16) != 1) {
+    if (!handshake.hello || core_random_fill(handshake.hello,16)) {
         set_err(err,err_cap,"failed to allocate VLESS encryption hello"); goto cleanup;
     }
     memcpy(handshake.client_iv,handshake.hello,sizeof(handshake.client_iv));
