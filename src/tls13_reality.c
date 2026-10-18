@@ -353,7 +353,7 @@ void tls13_reality_close(tls13_conn_t *c) {
             (void)write_exact(upload_fd, "0\r\n\r\n", 5);
         }
     }
-    if (!c->send_closed && c->grpc_transport && !c->grpc_physical_only && c->h2_stream_id != 0 && c->fd >= 0) {
+    if (!c->send_closed && !c->h2_request_cancelled && c->grpc_transport && !c->grpc_physical_only && c->h2_stream_id != 0 && c->fd >= 0) {
         (void)h2_send_frame(c, H2_FRAME_DATA, H2_FLAG_END_STREAM, c->h2_stream_id, NULL, 0);
     }
     if (c->xhttp_upload_fd >= 0) {
@@ -586,9 +586,14 @@ int tls13_full_close(const tls13_conn_t *c) {
     return c && c->mode == CONN_MODE_WS && c->ws_decoder.closed;
 }
 
+int tls13_send_stopped(const tls13_conn_t *c) {
+    return c && (c->xmux_stream ? core_http2_send_stopped(c->xmux_stream) : c->h2_request_cancelled);
+}
+
 int tls13_finish_write(tls13_conn_t *c, int raw) {
     if (!c) return -1;
     if (c->send_closed) return 0;
+    if (tls13_send_stopped(c)) { c->send_closed=1; return 0; }
     int result=0;
     if (c->xmux_stream) result=core_http2_finish_write(c->xmux_stream);
     else if (c->mode == CONN_MODE_PLAIN || raw) {

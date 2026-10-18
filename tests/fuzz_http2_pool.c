@@ -1,10 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 #include "../src/http2_pool.c"
 
-typedef struct { size_t pending; uint64_t enqueued,flushed; uint32_t request_id; } fuzz_wire_t;
+typedef struct { size_t pending; uint64_t enqueued,flushed; uint32_t request_id; unsigned reset_streams; } fuzz_wire_t;
 static int fuzz_send(void *opaque, uint8_t type, uint8_t flags, uint32_t id, const uint8_t *data, size_t length) {
     (void)type; (void)flags; (void)id; (void)data;
-    fuzz_wire_t *wire=opaque; wire->pending+=length+9; wire->enqueued+=length+9; return 0;
+    fuzz_wire_t *wire=opaque;
+    if (type == 0 && id < 8 && (wire->reset_streams&(1U<<id))) abort();
+    wire->pending+=length+9; wire->enqueued+=length+9; return 0;
 }
 static size_t fuzz_pending(void *opaque) { return ((fuzz_wire_t *)opaque)->pending; }
 static uint64_t fuzz_enqueued(void *opaque) { return ((fuzz_wire_t *)opaque)->enqueued; }
@@ -46,6 +48,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t length) {
             .length=size,.data=(uint8_t *)data+offset};
         int result=process_frame(&actor,&frame); offset+=size;
         if (result < 0) break;
+        if (frame.type == 3 && frame.id < 8) wire.reset_streams|=1U<<frame.id;
         core_http2_stream_t *stream=frame.id&2 ? &second : &first;
         uint8_t output[31]; size_t received=0;
         if (frame.flags&2) (void)core_http2_read(stream,output,sizeof(output),&received);

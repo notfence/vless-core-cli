@@ -127,6 +127,8 @@ static unsigned h2_response_active(const tls13_conn_t *c) {
 }
 
 static int h2_stream_writable(tls13_conn_t *c, uint32_t id) {
+    uint32_t upload=!strcmp(c->xhttp_transport_mode,"stream-up") ? c->h2_upload_stream_id : c->h2_stream_id;
+    if (c->h2_request_cancelled && id == upload) { errno=EPIPE; return 0; }
     h2_response_entry_t *entry=h2_response_get(c,id,0);
     if (c->grpc_read_failed || (entry && entry->reset)) {
         core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_PROTOCOL,EPROTO)); errno=EPROTO; return 0;
@@ -571,8 +573,11 @@ static int h2_process_control_frame(tls13_conn_t *c, uint8_t type, uint8_t flags
             if (stream_id != c->h2_stream_id && !h2_response_get(c,stream_id,0)) return 0;
             uint32_t code = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
                             ((uint32_t)payload[2] << 8) | (uint32_t)payload[3];
-            if (code == 0 && stream_id == c->h2_stream_id && c->h2_stream_eof) {
-                c->h2_request_cancelled = 1;
+            h2_response_entry_t *entry=h2_response_get(c,stream_id,0);
+            if (code == 0 && ((entry && entry->response.ended) || (stream_id == c->h2_stream_id && c->h2_stream_eof))) {
+                if (entry) entry->reset=entry->request_ended=1;
+                uint32_t upload=!strcmp(c->xhttp_transport_mode,"stream-up") ? c->h2_upload_stream_id : c->h2_stream_id;
+                if (stream_id == upload && strcmp(c->xhttp_transport_mode,"packet-up")) c->h2_request_cancelled=1;
                 vc_log_debug(c->grpc_transport ? "grpc" : "xhttp", "h2 request closed after response fd=%d stream=%u", c->fd, (unsigned)stream_id);
                 return 0;
             }
@@ -645,12 +650,12 @@ int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
         if (!h2_stream_writable(c,stream_id)) return -1;
-        if (!stream_up && c->h2_request_cancelled) return 0;
+        if (!stream_up && c->h2_request_cancelled) { errno=EPIPE; return -1; }
         if (c->grpc_transport && tls13_drain_h2_input(c) < 0) {
             return -1;
         }
         while (c->h2_peer_conn_window <= 0 || *stream_window <= 0) {
-            if (!stream_up && c->h2_request_cancelled) return 0;
+            if (!stream_up && c->h2_request_cancelled) { errno=EPIPE; return -1; }
             if (h2_pump_one_frame(c) != 0) {
                 vc_log_error(c->grpc_transport ? "grpc" : "xhttp", "failed while waiting for h2 upload window");
                 return -1;
@@ -658,7 +663,7 @@ int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
             if (!h2_stream_writable(c,stream_id)) return -1;
         }
         if (!h2_stream_writable(c,stream_id)) return -1;
-        if (!stream_up && c->h2_request_cancelled) return 0;
+        if (!stream_up && c->h2_request_cancelled) { errno=EPIPE; return -1; }
         size_t chunk = len - off;
         if (chunk > c->h2_peer_max_frame_size) {
             chunk = c->h2_peer_max_frame_size;

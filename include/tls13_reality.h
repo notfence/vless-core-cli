@@ -27,6 +27,7 @@ int tls13_has_pending_raw(const tls13_conn_t *c);
 int tls13_finish_write(tls13_conn_t *c, int raw);
 int tls13_finish_pending(const tls13_conn_t *c);
 int tls13_full_close(const tls13_conn_t *c);
+int tls13_send_stopped(const tls13_conn_t *c);
 int tls13_uses_h2(const tls13_conn_t *c);
 int tls13_uses_async_io(const tls13_conn_t *c);
 int tls13_drain_h2_input(tls13_conn_t *c);

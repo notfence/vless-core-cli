@@ -65,7 +65,7 @@ struct core_http2_stream {
     int first_actor;
     mux_manager_t *waiting_manager;
     mux_manager_t *waiting_download;
-    int finish_requested, finish_sent, relay_async;
+    int finish_requested, finish_sent, relay_async, send_stopped;
     uint64_t finish_fence;
     core_connection_trace_t trace;
     core_connection_error_t failure;
@@ -234,6 +234,17 @@ static void fail_stream_error(core_http2_stream_t *stream, const char *error, co
             error,(unsigned long long)stream->trace.id,core_trace_stage_name(failure.stage),core_failure_name(failure.kind),failure.system_error);
         signal_stream(stream);
     }
+}
+
+static void stop_upload(core_http2_stream_t *stream) {
+    if (stream->send_stopped) return;
+    size_t previous=upload_bytes;
+    stream->send_stopped=stream->finish_sent=1; stream->finish_fence=0;
+    upload_bytes-=stream->tx.length+stream->reserved_upload;
+    stream->reserved_upload=stream->permanent_upload=0;
+    core_http2_queue_clear(&stream->tx); update_upload_budget(stream);
+    stream->write_fence=stream->upload_fence=0;
+    notify_write_capacity(previous); signal_stream(stream);
 }
 
 static void fail_stream(core_http2_stream_t *stream, const char *error) {
@@ -637,7 +648,9 @@ static int process_frame(mux_actor_t *actor, const core_http2_frame_t *frame) {
         if (request) {
             uint32_t code=((uint32_t)data[0]<<24)|((uint32_t)data[1]<<16)|((uint32_t)data[2]<<8)|data[3];
             if (code || !request->ended) fail_stream(request->stream,grpc_manager(actor->manager) ? "gRPC stream reset" : "xhttp h2 stream reset");
-            request->ended=1; request->reset=1;
+            else if (!packet_role(request->role) && request->stream->upload == actor && request->id == request->stream->up_id)
+                stop_upload(request->stream);
+            request->ended=request->reset=request->send_ended=1;
         }
     } else if (frame->type == 7) {
         if (frame->id || length < 8) return -1;
@@ -775,7 +788,7 @@ static int advance_streams(mux_actor_t *actor) {
                 request=actor->requests;
             }
         } else request=find_request(actor,stream->up_id);
-        if (!request || request->send_ended || (packet_role(request->role) && (request->ended || !request->remaining)) || actor->send_window <= 0 || request->send_window <= 0 || actor->net_accounted >= 64U*1024U) continue;
+        if (!request || request->reset || request->send_ended || (packet_role(request->role) && (request->ended || !request->remaining)) || actor->send_window <= 0 || request->send_window <= 0 || actor->net_accounted >= 64U*1024U) continue;
         size_t length=stream->tx.length;
         size_t span=core_http2_queue_span(&stream->tx);
         if (length > span) length=span;
@@ -807,7 +820,7 @@ static int advance_streams(mux_actor_t *actor) {
         } else {
             mux_request_t *request=find_request(actor,stream->up_id);
             if (!request) continue;
-            if (!request->send_ended && send_frame(actor,0,1,request->id,NULL,0)) return -1;
+            if (!request->reset && !request->send_ended && send_frame(actor,0,1,request->id,NULL,0)) return -1;
             request->send_ended=1;
         }
         stream->finish_sent=1; stream->finish_fence=actor->enqueued;
@@ -1138,7 +1151,7 @@ static int update_upload_budget(core_http2_stream_t *stream) {
 
 size_t core_http2_write_capacity(const core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
-    size_t capacity=stream && !stream->closed && !stream->failed && !stream->finish_requested ? XMUX_STREAM_LIMIT-stream->tx.length-stream->reserved_upload : 0;
+    size_t capacity=stream && !stream->closed && !stream->failed && !stream->finish_requested && !stream->send_stopped ? XMUX_STREAM_LIMIT-stream->tx.length-stream->reserved_upload : 0;
     size_t global=upload_bytes < XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE ? XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE-upload_bytes : 0;
     if (capacity > global) capacity=global;
     if (capacity) { size_t actual=allocated_write_capacity(stream); if (capacity > actual) capacity=actual; }
@@ -1148,7 +1161,7 @@ size_t core_http2_write_capacity(const core_http2_stream_t *stream) {
 int core_http2_reserve_write(core_http2_stream_t *stream, size_t capacity) {
     pthread_mutex_lock(&mux_lock);
     size_t global=upload_bytes < XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE ? XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE-upload_bytes : 0;
-    int available=stream && !stream->closed && !stream->failed && !stream->finish_requested && !stream->reserved_upload &&
+    int available=stream && !stream->closed && !stream->failed && !stream->finish_requested && !stream->send_stopped && !stream->reserved_upload &&
         capacity <= XMUX_STREAM_LIMIT-stream->tx.length && capacity <= global;
     if (available && capacity > allocated_write_capacity(stream)) available=0;
     if (available) {
@@ -1180,7 +1193,12 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
     while (offset < length) {
         if (core_deadline_active() && !core_deadline_remaining()) { errno=ETIMEDOUT; core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_DEADLINE,errno)); return -1; }
         pthread_mutex_lock(&mux_lock);
-        if (stream->failed || stream->closed || stream->finish_requested) { pthread_mutex_unlock(&mux_lock); stream_error(stream); return -1; }
+        if (stream->failed || stream->closed) { pthread_mutex_unlock(&mux_lock); stream_error(stream); return -1; }
+        if (stream->send_stopped) {
+            pthread_mutex_unlock(&mux_lock); errno=EPIPE;
+            core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,EPIPE)); return -1;
+        }
+        if (stream->finish_requested) { pthread_mutex_unlock(&mux_lock); stream_error(stream); return -1; }
         size_t available=XMUX_STREAM_LIMIT-stream->tx.length;
         size_t global=upload_bytes < XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE ? XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE-upload_bytes : 0;
         global+=stream->reserved_upload;
@@ -1232,7 +1250,7 @@ int core_http2_read(core_http2_stream_t *stream, uint8_t *data, size_t capacity,
 int core_http2_finish_write(core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
     int result=!stream || stream->failed || stream->closed ? -1 : 0;
-    if (!result) { stream->finish_requested=1; wake_actor(stream->upload); }
+    if (!result) { stream->finish_requested=1; if (!stream->send_stopped) wake_actor(stream->upload); }
     else if (stream) stream_error(stream);
     pthread_mutex_unlock(&mux_lock); return result;
 }
@@ -1243,6 +1261,10 @@ int core_http2_finish_pending(const core_http2_stream_t *stream) {
         (!stream->finish_sent || stream->finish_fence > stream->upload->flushed);
     if (result < 0 && stream) stream_error(stream);
     pthread_mutex_unlock(&mux_lock); return result;
+}
+
+int core_http2_send_stopped(const core_http2_stream_t *stream) {
+    pthread_mutex_lock(&mux_lock); int stopped=stream && stream->send_stopped; pthread_mutex_unlock(&mux_lock); return stopped;
 }
 
 void core_http2_close(core_http2_stream_t *stream) {

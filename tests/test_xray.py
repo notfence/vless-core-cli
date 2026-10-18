@@ -34,6 +34,70 @@ SUBSCRIPTION_EXTRA = {
 }
 
 class XrayTests(unittest.TestCase):
+    def test_completed_http2_response_reset_stops_upload_and_releases_client(self):
+        from test_grpc import frame, GRPC_HEADERS, envelope, literal
+        reply=b"vless-core last data"*1024; marker=b"vless-core finish-reset"
+        cert,_=certificate()
+        for transport,shared,upload in ((transport,shared,upload) for transport,shared in (("grpc",True),("xhttp",False),("xhttp",True)) for upload in (False,True)):
+            forbidden=[]
+            def handler(connection):
+                self.assertEqual(exact(connection,24),b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                connection.sendall(frame(4))
+                received={}; completed=set()
+                while True:
+                    header=exact(connection,9); size=int.from_bytes(header[:3],"big")
+                    kind,flags=header[3:5]; stream=int.from_bytes(header[5:],"big")&0x7fffffff
+                    payload=exact(connection,size)
+                    if kind == 4 and not flags&1: connection.sendall(frame(4,1))
+                    if kind == 1: received[stream]=bytearray()
+                    if kind != 0: continue
+                    if stream in completed: forbidden.append((kind,flags,stream)); continue
+                    received[stream].extend(payload)
+                    if size: connection.sendall(frame(8,payload=size.to_bytes(4,"big"))+frame(8,stream=stream,payload=size.to_bytes(4,"big")))
+                    if marker not in received[stream]: continue
+                    data=b"\x00\x00"+reply
+                    if transport == "grpc": data=envelope(data)
+                    response=frame(1,4,stream,GRPC_HEADERS if transport == "grpc" else b"\x88")
+                    for offset in range(0,len(data),16384):
+                        last=offset+16384 >= len(data)
+                        response+=frame(0,1 if last and transport != "grpc" else 0,stream,data[offset:offset+16384])
+                    if transport == "grpc": response+=frame(1,5,stream,literal("grpc-status","0"))
+                    response+=frame(3,stream=stream,payload=bytes(4))
+                    completed.add(stream); connection.sendall(response)
+            parameters={"mode":"stream-one","extra":json.dumps({"xmux":{"maxConnections":1}}) if shared else "{}"} if transport == "xhttp" else {}
+            with self.subTest(transport=transport,shared=shared,upload=upload), Server(handler,tls=True) as server, cli(uri(server.port,transport,"tls",**parameters),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                tasks=Path(f"/proc/{core.process.pid}/task"); descriptors=Path(f"/proc/{core.process.pid}/fd")
+                with socks_connect(core.port,80) as warmup:
+                    warmup.sendall(marker); self.assertEqual(exact(warmup,len(reply)),reply); self.assertEqual(warmup.recv(1),b"")
+                previous=None; stable=time.monotonic(); until=stable+3
+                while True:
+                    state=(len(list(tasks.iterdir())),len(list(descriptors.iterdir())))
+                    now=time.monotonic()
+                    if state != previous: previous=state; stable=now
+                    if now-stable >= 0.2: break
+                    self.assertLess(now,until); time.sleep(0.01)
+                baseline=state
+                with socks_connect(core.port,80) as tunnel:
+                    if upload:
+                        tunnel.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,4096)
+                        def send():
+                            try: tunnel.sendall(marker+bytes(1024*1024))
+                            except OSError: pass
+                        sender=threading.Thread(target=send,daemon=True); sender.start()
+                    else: tunnel.sendall(marker)
+                    self.assertEqual(exact(tunnel,len(reply)),reply)
+                    try: self.assertEqual(tunnel.recv(1),b"")
+                    except ConnectionError:
+                        if not upload: raise
+                    if upload: sender.join(3); self.assertFalse(sender.is_alive(),"cancelled upload did not unblock the sender")
+                    until=time.monotonic()+3
+                    while True:
+                        state=(len(list(tasks.iterdir())),len(list(descriptors.iterdir())))
+                        if state[0] <= baseline[0] and state[1] <= baseline[1]: break
+                        self.assertLess(time.monotonic(),until,"reset did not release the client without client FIN"); time.sleep(0.01)
+                if not upload: self.assertFalse(forbidden,"DATA or END_STREAM sent after completed response reset")
+                self.assertNotIn("stream reset id=",core.log)
+
     def test_blocked_log_receiver_keeps_http2_streams_alive(self):
         cert,_=certificate()
         with Server() as target,xray_server("xhttp","tls","stream-one") as reference:

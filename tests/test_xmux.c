@@ -309,6 +309,73 @@ static void receive_credit_batching(void) {
     streams=NULL; upload_bytes=0;
 }
 
+static void reset_after_response(void) {
+    static const uint8_t queued[XMUX_STREAM_LIMIT]={0};
+    for (int grpc=0;grpc<2;grpc++) for (int split=0;split<2;split++) for (int blocked=0;blocked<2;blocked++) for (int shared=0;shared<2;shared++) {
+        wire_t wire={0}; core_http2_backend_t backend=finish_backend; backend.send_frame=packet_send;
+        mux_manager_t manager={.backend=&backend}; manager.config.transport_mode=grpc ? TRANSPORT_GRPC : TRANSPORT_XHTTP;
+        mux_group_t group={.manager=&manager};
+        mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.peer_frame=16384,.send_window=blocked ? 0 : 65535,.receive_window=65535,.latest_stream=5};
+        actor.validation.settings_received=1;
+        core_http2_stream_t stream={.upload=&actor,.download=&actor,.ready=1,.down_id=split ? 3 : 1,.up_id=1,.references=3,.eof=!split};
+        core_http2_stream_t sibling={.upload=&actor,.download=&actor,.ready=1,.down_id=5,.up_id=5,.references=2};
+        stream.config.transport_mode=manager.config.transport_mode;
+        stream.config.xmux.present=shared;
+        strcpy(stream.config.xhttp_mode,split ? "stream-up" : "stream-one");
+        mux_request_t *request=calloc(1,sizeof(*request)),*other=calloc(1,sizeof(*other)),*download=split ? calloc(1,sizeof(*download)) : NULL;
+        REQUIRE("h2/reset-complete-requests",request && other && (!split || download));
+        *request=(mux_request_t){.stream=&stream,.id=1,.role=split ? 2 : 1,.ended=1,.send_window=65535,.response={.headers=1,.ended=1}};
+        *other=(mux_request_t){.stream=&sibling,.id=5,.role=1,.send_window=65535,.response={.headers=1}};
+        if (split) { *download=(mux_request_t){.stream=&stream,.id=3,.role=0,.response={.headers=1}}; request->next=download; download->next=other; }
+        else request->next=other;
+        actor.requests=request; stream.next=&sibling; streams=&stream;
+        REQUIRE("h2/reset-complete-notifications",notification_pair(actor.wake) == 0 && notification_pair(stream.notify) == 0 && notification_pair(sibling.notify) == 0);
+        size_t queued_length=blocked ? XMUX_STREAM_LIMIT-100 : 10;
+        REQUIRE("h2/reset-complete-upload",queue_append(&stream.tx,queued,queued_length,XMUX_STREAM_LIMIT) == 0);
+        stream.rx.memory.direction=CORE_BUFFER_DOWNLOAD;
+        REQUIRE("h2/reset-complete-response",queue_append(&stream.rx,(const uint8_t *)"reply",5,XMUX_STREAM_LIMIT) == 0);
+        upload_bytes=queued_length; download_bytes=5;
+        REQUIRE("h2/reset-complete-reservation",core_http2_reserve_write(&stream,100) == 1);
+        core_http2_frame_t reset={.type=3,.id=1,.data=(uint8_t[]){0,0,0,0},.length=4};
+        CHECK("h2/reset-complete-response-not-failed",process_frame(&actor,&reset) == 0 && request->reset && !stream.failed && !sibling.failed);
+        CHECK("h2/reset-complete-stops-upload",!core_http2_write_capacity(&stream) && !core_http2_reserve_write(&stream,1) && !stream.tx.length && !stream.reserved_upload);
+        CHECK("h2/reset-complete-new-write-is-epipe",core_http2_write(&stream,(const uint8_t *)"x",1) < 0 && errno == EPIPE);
+        CHECK("h2/reset-complete-finish-is-idempotent",core_http2_finish_write(&stream) == 0 && core_http2_finish_write(&stream) == 0 && core_http2_finish_pending(&stream) == 0);
+        CHECK("h2/reset-complete-write-after-finish-is-epipe",core_http2_write(&stream,(const uint8_t *)"x",1) < 0 && errno == EPIPE);
+        CHECK("h2/reset-complete-no-data-or-end-stream",advance_streams(&actor) == 0 && !wire.frames);
+        CHECK("h2/reset-complete-keeps-download-role",stream.eof == !split && !sibling.failed && !sibling.finish_requested);
+        uint8_t output[16]; size_t received=0;
+        CHECK("h2/reset-complete-preserves-response",core_http2_read(&stream,output,sizeof(output),&received) == 0 && received == 5 && !memcmp(output,"reply",5));
+        CHECK("h2/reset-complete-refunds-only-open-streams",advance_streams(&actor) == 0 && wire.frames == (split ? 2 : 1) && wire.last_type == 8 && wire.ids[0] == 0 && wire.last_id == (split ? 3U : 0U));
+        CHECK("h2/reset-complete-download-result",core_http2_read(&stream,output,sizeof(output),&received) == (split ? 1 : 0) && !received);
+        actor.send_window=65535;
+        REQUIRE("h2/reset-complete-neighbor-data",queue_append(&sibling.tx,(const uint8_t *)"ok",2,XMUX_STREAM_LIMIT) == 0); upload_bytes+=2;
+        CHECK("h2/reset-complete-neighbor-transfers",advance_streams(&actor) == 0 && wire.payload_bytes == 2 && wire.last_id == 5);
+        while (actor.requests) { mux_request_t *next=actor.requests->next; free(actor.requests); actor.requests=next; }
+        core_http2_queue_clear(&stream.tx); core_http2_queue_clear(&stream.rx); core_http2_queue_clear(&sibling.tx);
+        close(actor.wake[0]); close(actor.wake[1]); close(stream.notify[0]); close(stream.notify[1]); close(sibling.notify[0]); close(sibling.notify[1]);
+        streams=NULL; upload_bytes=download_bytes=0;
+    }
+    wire_t wire={0}; mux_manager_t manager={.backend=&finish_backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
+    mux_group_t group={.manager=&manager};
+    mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.send_window=65535,.latest_stream=3};
+    actor.validation.settings_received=1;
+    core_http2_stream_t stream={.upload=&actor,.download=&actor,.ready=1,.down_id=1,.references=3,.relay_async=1};
+    stream.config.transport_mode=TRANSPORT_XHTTP; strcpy(stream.config.xhttp_mode,"packet-up");
+    mux_request_t *posted=calloc(1,sizeof(*posted)),*download=calloc(1,sizeof(*download));
+    REQUIRE("h2/reset-packet-requests",posted && download);
+    *posted=(mux_request_t){.next=download,.stream=&stream,.id=3,.role=3,.ended=1,.send_ended=1,.response={.headers=1,.ended=1}};
+    *download=(mux_request_t){.stream=&stream,.id=1,.role=0,.response={.headers=1}};
+    actor.requests=posted; streams=&stream;
+    REQUIRE("h2/reset-packet-notifications",notification_pair(actor.wake) == 0 && notification_pair(stream.notify) == 0);
+    core_http2_frame_t reset={.type=3,.id=3,.data=(uint8_t[]){0,0,0,0},.length=4};
+    CHECK("h2/reset-packet-does-not-stop-session",process_frame(&actor,&reset) == 0 && !stream.failed && !stream.eof && core_http2_write_capacity(&stream));
+    CHECK("h2/reset-packet-releases-completed-request",advance_streams(&actor) == 0 && actor.requests == download && !wire.frames);
+    CHECK("h2/reset-packet-allows-next-data",core_http2_write(&stream,(const uint8_t *)"next",4) == 0 && stream.tx.length == 4);
+    core_http2_queue_clear(&stream.tx); free(download); close(actor.wake[0]); close(actor.wake[1]); close(stream.notify[0]); close(stream.notify[1]);
+    streams=NULL; upload_bytes=0;
+}
+
 static void directional_finish(void) {
     wire_t wire={0}; mux_manager_t manager={.backend=&finish_backend}; manager.config.transport_mode=TRANSPORT_GRPC;
     mux_group_t group={.manager=&manager};
@@ -680,6 +747,7 @@ static void rejected_priority_headers_keep_hpack(void) {
 }
 
 int main(void) {
+    reset_after_response();
     random_range_bound();
     rejected_priority_headers_keep_hpack();
     priority_stream_isolation();

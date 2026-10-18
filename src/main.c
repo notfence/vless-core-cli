@@ -1054,6 +1054,11 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
             if (!got_vless_response) response_failure(&response,1,errno);
             upstream_failed=client_eof=upstream_eof=1;
         }
+        if (!client_eof && tls13_send_stopped(tls)) {
+            client_eof=1; tls13_release_write(tls);
+            core_relay_memory_unwatch(memory,CORE_RELAY_INPUT_WAIT);
+            if (tls13_finish_write(tls,upstream_direct)) break;
+        }
         if (output_length) {
             ssize_t sent=core_send(cfd,output,output_length,MSG_DONTWAIT);
             if (sent > 0) {
@@ -1143,6 +1148,9 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
                                                         wrapped, wrapped_len);
                     if (write_rc != 0) {
                         core_relay_buffer_clear(&memory->wrapped);
+                        if (errno == EPIPE && tls13_send_stopped(tls)) {
+                            client_eof=1; tls13_release_write(tls); goto receive_upstream;
+                        }
                         break;
                     }
                 }
@@ -1157,6 +1165,9 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
             } else {
                 int written=upstream_encryption_direct ? vless_encryption_write_raw(encryption,cbuf,(size_t)n) : upstream_write(tls,encryption,cbuf,(size_t)n);
                 if (written != 0) {
+                    if (errno == EPIPE && tls13_send_stopped(tls)) {
+                        client_eof=1; tls13_release_write(tls); goto receive_upstream;
+                    }
                     break;
                 }
             }
