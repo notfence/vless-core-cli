@@ -309,6 +309,83 @@ static void receive_credit_batching(void) {
     streams=NULL; upload_bytes=0;
 }
 
+typedef struct {
+    core_http2_stream_t *stream;
+    const uint8_t *prefix,*data;
+    size_t prefix_length,length;
+    int timeout,result,error;
+} parts_writer_t;
+
+static void *write_parts(void *opaque) {
+    parts_writer_t *writer=opaque; core_deadline_t deadline;
+    if (core_deadline_attach(&deadline)) { writer->result=-1; writer->error=EIO; return NULL; }
+    core_deadline_begin(writer->timeout);
+    writer->result=core_http2_write_parts(writer->stream,writer->prefix,writer->prefix_length,writer->data,writer->length);
+    writer->error=errno; core_deadline_detach(); return NULL;
+}
+
+static void partial_parts_policy(void) {
+    uint8_t *payload=malloc(1024U*1024U); REQUIRE("h2/parts-payload",payload);
+    for (size_t i=0;i<1024U*1024U;i++) payload[i]=(uint8_t)(i%251);
+    const uint8_t prefix[]="vless-core:";
+    for (int failure=0;failure<3;failure++) {
+        wire_t wire={0}; mux_manager_t manager={.backend=&finish_backend}; manager.config.transport_mode=TRANSPORT_GRPC;
+        mux_actor_t actor={.manager=&manager,.physical=&wire,.http2=1,.latest_stream=1}; actor.validation.settings_received=1;
+        core_http2_stream_t stream={.upload=&actor,.download=&actor,.ready=1,.relay_async=1,.down_id=1,.up_id=1};
+        stream.config.transport_mode=TRANSPORT_GRPC;
+        mux_request_t request={.stream=&stream,.id=1,.role=1,.ended=1,.response={.headers=1,.ended=1}}; actor.requests=&request;
+        REQUIRE("h2/parts-notifications",notification_pair(actor.wake) == 0 && notification_pair(stream.notify) == 0);
+        streams=&stream; upload_bytes=0;
+        parts_writer_t writer={.stream=&stream,.prefix=prefix,.prefix_length=sizeof(prefix)-1,.data=payload,.length=1024U*1024U,.timeout=failure == 2 ? 200 : 2000};
+        pthread_t thread; REQUIRE("h2/parts-writer",pthread_create(&thread,NULL,write_parts,&writer) == 0);
+        size_t consumed=0;
+        if (!failure) while (consumed < writer.length+writer.prefix_length) {
+            REQUIRE("h2/parts-wake",core_wait_socket(actor.wake[0],POLLIN,2000) > 0);
+            pthread_mutex_lock(&mux_lock); core_drain_socket(actor.wake[0]);
+            while (stream.tx.length) {
+                uint8_t output[8192]; size_t take=stream.tx.length < sizeof(output) ? stream.tx.length : sizeof(output);
+                core_http2_queue_copy(&stream.tx,output,take);
+                for (size_t i=0;i<take;i++,consumed++) {
+                    uint8_t expected=consumed < writer.prefix_length ? prefix[consumed] : payload[consumed-writer.prefix_length];
+                    if (output[i] != expected) abort();
+                }
+                upload_bytes-=take; queue_consume(&stream.tx,take); update_upload_budget(&stream); signal_stream(&stream);
+            }
+            pthread_mutex_unlock(&mux_lock);
+        }
+        else if (failure == 1) {
+            REQUIRE("h2/parts-reset-wake",core_wait_socket(actor.wake[0],POLLIN,2000) > 0);
+            pthread_mutex_lock(&mux_lock);
+            core_http2_frame_t reset={.type=3,.id=1,.data=(uint8_t[]){0,0,0,0},.length=4};
+            CHECK("h2/parts-reset-accepted",process_frame(&actor,&reset) == 0);
+            pthread_mutex_unlock(&mux_lock);
+        }
+        pthread_join(thread,NULL);
+        CHECK("h2/parts-partial-data-preserved",failure ? writer.result < 0 && writer.error == (failure == 1 ? EPIPE : ETIMEDOUT) : writer.result == 0 && consumed == writer.length+writer.prefix_length);
+        if (failure == 1) CHECK("h2/parts-reset-releases-queue",!stream.tx.length && !stream.reserved_upload && !wire.frames);
+        core_http2_queue_clear(&stream.tx); close(actor.wake[0]); close(actor.wake[1]); close(stream.notify[0]); close(stream.notify[1]);
+        streams=NULL; upload_bytes=0;
+    }
+    core_http2_queue_cache_clear(); size_t bytes,reserved; core_buffer_snapshot(CORE_BUFFER_UPLOAD,&bytes,&reserved);
+    CHECK("h2/parts-memory-and-waiters-released",!bytes && !reserved);
+    mux_manager_t manager={0}; mux_actor_t actor={.manager=&manager};
+    core_http2_stream_t stream={.upload=&actor,.relay_async=1,.ready=1}; stream.config.transport_mode=TRANSPORT_GRPC;
+    REQUIRE("h2/parts-reserved-notifications",notification_pair(actor.wake) == 0 && notification_pair(stream.notify) == 0);
+    size_t length=65536,header=sizeof(prefix)-1;
+    REQUIRE("h2/parts-reserved-capacity",core_http2_reserve_write(&stream,length+header) == 1);
+    core_buffer_budget_t other={0};
+    REQUIRE("h2/parts-reserved-saturation",core_buffer_budget_init(&other,CORE_BUFFER_UPLOAD,CORE_BUFFER_TOTAL_LIMIT-stream.tx.memory.charged) == 0);
+    CHECK("h2/parts-reservation-survives-global-pressure",core_http2_write_parts(&stream,prefix,header,payload,length) == 0 && stream.tx.length == length+header && !stream.reserved_upload);
+    uint8_t output[65547]; core_http2_queue_copy(&stream.tx,output,stream.tx.length);
+    CHECK("h2/parts-reserved-content",!memcmp(output,prefix,header) && !memcmp(output+header,payload,length));
+    REQUIRE("h2/parts-reserved-other-released",core_buffer_budget_clear(&other) == 0);
+    core_http2_queue_clear(&stream.tx); core_http2_queue_cache_clear(); upload_bytes=0;
+    core_buffer_snapshot(CORE_BUFFER_UPLOAD,&bytes,&reserved);
+    CHECK("h2/parts-reserved-budget-restored",!bytes && !reserved);
+    close(actor.wake[0]); close(actor.wake[1]); close(stream.notify[0]); close(stream.notify[1]);
+    free(payload);
+}
+
 static void reset_after_response(void) {
     static const uint8_t queued[XMUX_STREAM_LIMIT]={0};
     for (int grpc=0;grpc<2;grpc++) for (int split=0;split<2;split++) for (int blocked=0;blocked<2;blocked++) for (int shared=0;shared<2;shared++) {
@@ -747,6 +824,7 @@ static void rejected_priority_headers_keep_hpack(void) {
 }
 
 int main(void) {
+    partial_parts_policy();
     reset_after_response();
     random_range_bound();
     rejected_priority_headers_keep_hpack();

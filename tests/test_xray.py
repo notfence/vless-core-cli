@@ -168,27 +168,49 @@ class XrayTests(unittest.TestCase):
                     with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core encoded separator")
 
     def test_http1_stream_upload_invalid_ack_aborts_session(self):
-        acknowledged=threading.Event()
-        def handler(connection):
-            request=bytearray()
-            while not request.endswith(b"\r\n\r\n"): request.extend(exact(connection,1))
-            if request.startswith(b"GET "):
-                self.assertTrue(acknowledged.wait(2))
-                connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n\x00\x00vless-core")
-                connection.recv(1); return
-            self.assertTrue(request.startswith(b"POST "))
-            connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\nx")
-            acknowledged.set()
-            while True:
-                line=bytearray()
-                while not line.endswith(b"\r\n"): line.extend(exact(connection,1))
-                size=int(line,16)
-                exact(connection,size+2)
-                if not size: return
-        with Server(handler) as server, cli(uri(server.port,"xhttp","none",mode="stream-up")) as core:
-            with self.assertRaises((AssertionError,EOFError,ConnectionError)):
-                with socks_connect(core.port,80) as tunnel: exchange(tunnel,b"vless-core")
-            self.assertIn("upload response failed",core.wait_log("upload response failed"))
+        for response_first in (False,True):
+            acknowledged=threading.Event(); release_ack=threading.Event()
+            if not response_first: release_ack.set()
+            def handler(connection):
+                request=bytearray()
+                while not request.endswith(b"\r\n\r\n"): request.extend(exact(connection,1))
+                if request.startswith(b"GET "):
+                    if not response_first: self.assertTrue(acknowledged.wait(2))
+                    connection.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nc\r\n\x00\x00vless-core\r\n")
+                    self.assertEqual(connection.recv(1),b""); return
+                self.assertTrue(request.startswith(b"POST "))
+                self.assertTrue(release_ack.wait(2))
+                connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\nx")
+                acknowledged.set()
+                while True:
+                    line=bytearray()
+                    while not line.endswith(b"\r\n"): line.extend(exact(connection,1))
+                    size=int(line,16)
+                    exact(connection,size+2)
+                    if not size: return
+            with self.subTest(response_first=response_first), Server(handler) as server, cli(uri(server.port,"xhttp","none",mode="stream-up")) as core:
+                tunnel=None; received=bytearray()
+                try:
+                    try:
+                        tunnel=socks_connect(core.port,80); tunnel.settimeout(2); tunnel.sendall(b"vless-core")
+                    except (AssertionError,EOFError,ConnectionError):
+                        if response_first: raise
+                    if response_first:
+                        received.extend(exact(tunnel,10)); self.assertEqual(received,b"vless-core"); release_ack.set()
+                    self.assertIn("upload response failed",core.wait_log("upload response failed"))
+                    if tunnel:
+                        try:
+                            while True:
+                                block=tunnel.recv(32)
+                                if not block: break
+                                received.extend(block)
+                        except ConnectionError:
+                            pass
+                    self.assertTrue(b"vless-core".startswith(received),received)
+                    self.assertIsNone(core.process.poll(),core.log)
+                finally:
+                    release_ack.set()
+                    if tunnel: tunnel.close()
 
     def test_http1_post_response_is_fully_validated(self):
         responses=[

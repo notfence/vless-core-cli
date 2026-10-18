@@ -2,6 +2,7 @@
 #define CORE_GRPC_H
 #include "types.h"
 #include "hpack.h"
+#define CORE_GRPC_DATA_PREFIX_MAX 11U
 typedef struct core_grpc_chunk core_grpc_chunk_t;
 typedef struct {
     uint8_t header[5];

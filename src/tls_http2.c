@@ -35,7 +35,9 @@ static int grpc_build_request_path(const char *service_name, int multi_mode, cha
 static int grpc_h2_start(tls13_conn_t *c, char *err, size_t err_cap);
 static int grpc_tls_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap);
 
-int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_id, const uint8_t *payload, size_t len) {
+static int h2_send_frame_parts(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_id, const uint8_t *prefix, size_t prefix_length, const uint8_t *payload, size_t payload_length) {
+    if (prefix_length > SIZE_MAX-payload_length || (prefix_length && !prefix) || (payload_length && !payload)) return -1;
+    size_t len=prefix_length+payload_length;
     if (len > 0xFFFFFFU) {
         return -1;
     }
@@ -54,9 +56,8 @@ int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_
     hdr[6] = (uint8_t)(stream_id >> 16);
     hdr[7] = (uint8_t)(stream_id >> 8);
     hdr[8] = (uint8_t)stream_id;
-    if (len > 0) {
-        memcpy(hdr + 9, payload, len);
-    }
+    if (prefix_length) memcpy(hdr+9,prefix,prefix_length);
+    if (payload_length) memcpy(hdr+9+prefix_length,payload,payload_length);
     c->h2_send_buf.len = 9 + len;
 
     if (c->xmux_async) {
@@ -80,6 +81,10 @@ int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_
         }
     }
     return 0;
+}
+
+int h2_send_frame(tls13_conn_t *c, uint8_t type, uint8_t flags, uint32_t stream_id, const uint8_t *payload, size_t len) {
+    return h2_send_frame_parts(c,type,flags,stream_id,NULL,0,payload,len);
 }
 
 static int h2_send_window_update(tls13_conn_t *c, uint32_t stream_id, uint32_t increment) {
@@ -639,7 +644,9 @@ static int h2_send_client_preface(tls13_conn_t *c, char *err, size_t err_cap) {
     return 0;
 }
 
-int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+static int h2_write_data_parts(tls13_conn_t *c, const uint8_t *prefix, size_t prefix_length, const uint8_t *buf, size_t data_length) {
+    if (prefix_length > SIZE_MAX-data_length || (prefix_length && !prefix) || (data_length && !buf)) return -1;
+    size_t len=prefix_length+data_length;
     int stream_up = strcmp(c->xhttp_transport_mode, "stream-up") == 0;
     uint32_t stream_id = stream_up ? c->h2_upload_stream_id : c->h2_stream_id;
     int64_t *stream_window = stream_up ? &c->h2_upload_stream_window : &c->h2_peer_stream_window;
@@ -674,7 +681,11 @@ int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
         if ((int64_t)chunk > *stream_window) {
             chunk = (size_t)*stream_window;
         }
-        if (chunk == 0 || h2_send_frame(c, H2_FRAME_DATA, 0, stream_id, buf + off, chunk) != 0) {
+        size_t head=off < prefix_length ? prefix_length-off : 0;
+        if (head > chunk) head=chunk;
+        const uint8_t *first=head ? prefix+off : NULL;
+        const uint8_t *second=chunk > head ? buf+(off > prefix_length ? off-prefix_length : 0) : NULL;
+        if (chunk == 0 || h2_send_frame_parts(c,H2_FRAME_DATA,0,stream_id,first,head,second,chunk-head) != 0) {
             return -1;
         }
         c->h2_peer_conn_window -= (int64_t)chunk;
@@ -682,6 +693,10 @@ int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
         off += chunk;
     }
     return 0;
+}
+
+int h2_write_data(tls13_conn_t *c, const uint8_t *buf, size_t len) {
+    return h2_write_data_parts(c,NULL,0,buf,len);
 }
 
 static size_t protobuf_varint_size(size_t value) {
@@ -759,11 +774,8 @@ int grpc_write_hunk(tls13_conn_t *c, const uint8_t *buf, size_t len) {
         return -1;
     }
     size_t msg_len = 1U + varint_len + len;
-    size_t frame_len = 5U + msg_len;
-    uint8_t *frame = (uint8_t *)malloc(frame_len);
-    if (frame == NULL) {
-        return -1;
-    }
+    uint8_t frame[CORE_GRPC_DATA_PREFIX_MAX];
+    if (len && !buf) return -1;
 
     frame[0] = 0;
     frame[1] = (uint8_t)(msg_len >> 24);
@@ -772,11 +784,7 @@ int grpc_write_hunk(tls13_conn_t *c, const uint8_t *buf, size_t len) {
     frame[4] = (uint8_t)msg_len;
     frame[5] = 0x0a;
     size_t written = protobuf_write_varint(frame + 6, len);
-    memcpy(frame + 6 + written, buf, len);
-
-    int rc = c->xmux_stream ? core_http2_write(c->xmux_stream,frame,frame_len) : h2_write_data(c, frame, frame_len);
-    free(frame);
-    return rc;
+    return c->xmux_stream ? core_http2_write_parts(c->xmux_stream,frame,6+written,buf,len) : h2_write_data_parts(c,frame,6+written,buf,len);
 }
 
 int h2_pump_one_frame(tls13_conn_t *c) {

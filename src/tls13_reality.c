@@ -195,10 +195,17 @@ size_t tls13_write_batch_size(const tls13_conn_t *c) {
 
 size_t tls13_write_capacity(const tls13_conn_t *c) {
     if (c && c->relay_async) return c->send_closed ? 0 : 256U*1024U-c->xmux_wire_output.len;
-    return c && c->xmux_stream ? core_xmux_write_capacity(c->xmux_stream) : SIZE_MAX;
+    size_t capacity=c && c->xmux_stream ? core_xmux_write_capacity(c->xmux_stream) : SIZE_MAX;
+    if (c && c->xmux_stream && c->grpc_transport)
+        return capacity > CORE_GRPC_DATA_PREFIX_MAX ? capacity-CORE_GRPC_DATA_PREFIX_MAX : 0;
+    return capacity;
 }
 
 int tls13_reserve_write(tls13_conn_t *c, size_t capacity) {
+    if (c && c->xmux_stream && c->grpc_transport) {
+        if (capacity > SIZE_MAX-CORE_GRPC_DATA_PREFIX_MAX) return 0;
+        capacity+=CORE_GRPC_DATA_PREFIX_MAX;
+    }
     return c && c->xmux_stream ? core_xmux_reserve_write(c->xmux_stream, capacity) : 1;
 }
 

@@ -57,6 +57,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t length) {
             size_t capacity=core_http2_write_capacity(stream),take=size < capacity ? size : capacity;
             if (take) (void)core_http2_write(stream,frame.data,take);
         }
+        if (frame.flags&32) {
+            const uint8_t prefix[]={0,0,0,0,2,10,0};
+            size_t capacity=core_http2_write_capacity(stream),take=capacity > sizeof(prefix) ? capacity-sizeof(prefix) : 0;
+            if (take > size) take=size;
+            if (take) (void)core_http2_write_parts(stream,prefix,sizeof(prefix),frame.data,take);
+        }
         if (packet && (frame.flags&64)) for (mux_request_t *request=actor.requests;request;request=request->next) request->packet_until_ms=core_now_ms();
         if (advance_streams(&actor)) break;
         wire.pending=0; wire.flushed=wire.enqueued; account_output(&actor);

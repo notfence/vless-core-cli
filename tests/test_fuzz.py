@@ -88,6 +88,7 @@ def seeds():
               frame(4,1,0,b""),frame(8,0,0,b"\x00\x00\x00\x01"),frame(3,0,1,bytes(4)),
               frame(0,1,1,b"\x00\x00\x00\x00\x0c\x0a\x0avless-core")],
         "pool":[frame(4,0,0,b"")+frame(1,4,1,b"\x88\x00\x0ccontent-type\x10application/grpc")+frame(0,24,1,b"vless-core")+frame(0,1,1,b""),
+                frame(4,0,0,b"")+frame(1,4,1,b"\x88\x00\x0ccontent-type\x10application/grpc")+frame(0,32,1,b"vless-core")+frame(1,5,1,b"\x00\x0bgrpc-status\x010"),
                 frame(4,0,0,b"")+frame(1,20,1,b"\x88\x00\x0ccontent-type\x10application/grpc")+frame(1,5,1,b"\x00\x0bgrpc-status\x010")+frame(3,16,1,bytes(4)),
                 frame(4,0,0,b"")+frame(1,4,3,b"\x88\x00\x0ccontent-type\x10application/grpc")+frame(3,0,1,bytes(4))+frame(0,2,3,b"vless-core"),
                 frame(7,0,0,b"\x00\x00\x00\x01"+bytes(4)),frame(4,0,0,b"\x00\x04\x00\x00\x04\x00"),

@@ -12,6 +12,52 @@
 #include <string.h>
 #include <unistd.h>
 
+static int fail_allocation;
+void *__real_malloc(size_t);
+void *__wrap_malloc(size_t size) {
+    if (fail_allocation && !--fail_allocation) { errno=ENOMEM; return NULL; }
+    return __real_malloc(size);
+}
+
+static void queue_parts_policy(void) {
+    uint8_t prefix[16385],data[65536],output[3+sizeof(prefix)+sizeof(data)];
+    memset(prefix,'p',sizeof(prefix)); for (size_t i=0;i<sizeof(data);i++) data[i]=(uint8_t)(i%251);
+    size_t prefixes[]={0,1,7,11,16383,16384,16385},lengths[]={0,1,127,128,16383,16384,65536};
+    for (unsigned direction=0;direction<2;direction++) for (unsigned blocked=0;blocked<2;blocked++)
+        for (size_t i=0;i<sizeof(prefixes)/sizeof(*prefixes);i++) for (size_t j=0;j<sizeof(lengths)/sizeof(*lengths);j++) {
+            core_http2_queue_t queue={.memory.direction=direction}; size_t limit=blocked ? CORE_HTTP2_STREAM_LIMIT : 1024U*1024U;
+            REQUIRE("buffers/parts-existing-data",core_http2_queue_append(&queue,(const uint8_t *)"saved",5,limit) == 0);
+            core_http2_queue_consume(&queue,2);
+            REQUIRE("buffers/parts-appended",core_http2_queue_append_parts(&queue,prefix,prefixes[i],data,lengths[j],limit) == 0);
+            core_http2_queue_copy(&queue,output,queue.length);
+            CHECK("buffers/parts-order-and-boundaries",queue.length == 3+prefixes[i]+lengths[j] && !memcmp(output,"ved",3) &&
+                !memcmp(output+3,prefix,prefixes[i]) && !memcmp(output+3+prefixes[i],data,lengths[j]));
+            core_http2_queue_clear(&queue);
+        }
+    core_http2_queue_cache_clear();
+    core_http2_queue_t queue={0};
+    REQUIRE("buffers/parts-failure-existing",core_http2_queue_append(&queue,(const uint8_t *)"saved",5,CORE_HTTP2_STREAM_LIMIT) == 0);
+    size_t allocated=queue.memory.allocated;
+    fail_allocation=2;
+    CHECK("buffers/parts-allocation-failure-atomic",core_http2_queue_append_parts(&queue,prefix,11,data,49152,CORE_HTTP2_STREAM_LIMIT) < 0 && errno == ENOMEM && queue.length == 5 && queue.memory.allocated == allocated);
+    fail_allocation=0; core_http2_queue_copy(&queue,output,5);
+    CHECK("buffers/parts-failure-keeps-bytes",!memcmp(output,"saved",5));
+    core_http2_queue_cache_clear();
+    core_buffer_budget_t other={0};
+    REQUIRE("buffers/parts-saturated-budget",core_buffer_budget_init(&other,CORE_BUFFER_UPLOAD,CORE_BUFFER_TOTAL_LIMIT-queue.memory.charged) == 0);
+    CHECK("buffers/parts-budget-failure-atomic",core_http2_queue_append_parts(&queue,prefix,11,data,49152,CORE_HTTP2_STREAM_LIMIT) < 0 && errno == ENOBUFS && queue.length == 5);
+    REQUIRE("buffers/parts-budget-released",core_buffer_budget_clear(&other) == 0);
+    REQUIRE("buffers/parts-recovers",core_http2_queue_append_parts(&queue,prefix,11,data,49152,CORE_HTTP2_STREAM_LIMIT) == 0);
+    core_http2_queue_copy(&queue,output,queue.length);
+    CHECK("buffers/parts-recovered-content",queue.length == 5+11+49152 && !memcmp(output,"saved",5) && !memcmp(output+5,prefix,11) && !memcmp(output+16,data,49152));
+    size_t previous=queue.length;
+    CHECK("buffers/parts-overflow-before-mutation",core_http2_queue_append_parts(&queue,prefix,SIZE_MAX,data,1,CORE_HTTP2_STREAM_LIMIT) < 0 && errno == EOVERFLOW && queue.length == previous);
+    CHECK("buffers/parts-null-before-mutation",core_http2_queue_append_parts(&queue,NULL,1,data,1,CORE_HTTP2_STREAM_LIMIT) < 0 && errno == EINVAL && queue.length == previous);
+    core_http2_queue_clear(&queue); core_http2_queue_cache_clear(); size_t bytes,reserved;
+    core_buffer_snapshot(CORE_BUFFER_UPLOAD,&bytes,&reserved);
+    CHECK("buffers/parts-all-memory-released",!bytes && !reserved);
+}
+
 static void *watcher_release(void *unused) {
     (void)unused; core_buffer_budget_t memory={0};
     for (unsigned i=0;i<1000;i++) {
@@ -63,6 +109,7 @@ static void notification_policy(void) {
 }
 
 int main(void) {
+    queue_parts_policy();
     notification_policy();
     core_buffer_budget_t account={0},other={0}; size_t bytes,reserved;
     REQUIRE("buffers/reserve-without-allocation",core_buffer_budget_init(&account,CORE_BUFFER_DOWNLOAD,CORE_BUFFER_TOTAL_LIMIT) == 0);

@@ -1134,6 +1134,7 @@ static size_t allocated_write_capacity(const core_http2_stream_t *stream) {
         core_http2_queue_cache_clear(); available=core_buffer_available(CORE_BUFFER_UPLOAD);
     }
     available+=stream->tx.memory.charged;
+    if (available >= core_http2_queue_reservation(XMUX_STREAM_LIMIT)) return XMUX_STREAM_LIMIT-stream->tx.length;
     size_t low=0,high=XMUX_STREAM_LIMIT-stream->tx.length;
     while (low < high) {
         size_t middle=low+(high-low+1)/2;
@@ -1186,7 +1187,19 @@ static int wait_for_output(core_http2_stream_t *stream) {
     return result;
 }
 
-int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t length) {
+static size_t output_room(core_http2_stream_t *stream) {
+    size_t available=XMUX_STREAM_LIMIT-stream->tx.length;
+    size_t global=upload_bytes < XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE ? XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE-upload_bytes : 0;
+    global+=stream->reserved_upload;
+    if (available > global) available=global;
+    size_t actual=allocated_write_capacity(stream);
+    return available > actual ? actual : available;
+}
+
+int core_http2_write_parts(core_http2_stream_t *stream, const uint8_t *prefix, size_t prefix_length, const uint8_t *data, size_t data_length) {
+    if (prefix_length > SIZE_MAX-data_length) { errno=EOVERFLOW; return -1; }
+    if (!stream || (prefix_length && !prefix) || (data_length && !data)) { errno=EINVAL; return -1; }
+    size_t length=prefix_length+data_length;
     size_t offset=0;
     int wait_ack=!stream->config.xmux.present && stream->config.transport_mode == TRANSPORT_XHTTP &&
         !strcmp(stream->config.xhttp_mode,"packet-up");
@@ -1199,19 +1212,29 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
             core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,EPIPE)); return -1;
         }
         if (stream->finish_requested) { pthread_mutex_unlock(&mux_lock); stream_error(stream); return -1; }
-        size_t available=XMUX_STREAM_LIMIT-stream->tx.length;
-        size_t global=upload_bytes < XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE ? XMUX_TOTAL_LIMIT-XMUX_TX_RESERVE-upload_bytes : 0;
-        global+=stream->reserved_upload;
-        if (available > global) available=global;
-        size_t block=length-offset; if (block > available) block=available;
-        if (block && queue_append(&stream->tx,data+offset,block,XMUX_STREAM_LIMIT) != 0) {
+        size_t block=length-offset;
+        size_t available=stream->reserved_upload >= block ? block : output_room(stream);
+        if (block > available) block=available;
+        size_t head=offset < prefix_length ? prefix_length-offset : 0;
+        if (head > block) head=block;
+        const uint8_t *first=head ? prefix+offset : NULL;
+        const uint8_t *second=block > head ? data+(offset > prefix_length ? offset-prefix_length : 0) : NULL;
+        if (block && core_http2_queue_append_parts(&stream->tx,first,head,second,block-head,XMUX_STREAM_LIMIT) != 0) {
             int cause=errno; pthread_mutex_unlock(&mux_lock); core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,cause)); errno=cause; return -1;
         }
         size_t reserved=block < stream->reserved_upload ? block : stream->reserved_upload;
         stream->reserved_upload-=reserved; upload_bytes+=block-reserved; offset+=block; wake_actor(stream->upload);
         update_upload_budget(stream);
+        core_buffer_waiter_t waiter={0}; int waiting=offset < length;
+        if (waiting) {
+            core_drain_socket(stream->notify[0]); stream->notified=0;
+            if (stream->tx.length < XMUX_STREAM_LIMIT) core_buffer_watch(&waiter,stream->notify[1],1U<<CORE_BUFFER_UPLOAD);
+            waiting=output_room(stream) == 0;
+        }
         pthread_mutex_unlock(&mux_lock);
-        if (offset < length && wait_for_output(stream) <= 0) { core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,errno ? errno : ETIMEDOUT)); return -1; }
+        int waited=waiting ? wait_for_output(stream) : 1;
+        int cause=errno; if (waiter.registered) core_buffer_unwatch(&waiter); errno=cause;
+        if (waited <= 0) { core_trace_error_set(core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_SYSTEM,errno ? errno : ETIMEDOUT)); return -1; }
     }
     while (!stream->relay_async && (core_deadline_active() || wait_ack)) {
         pthread_mutex_lock(&mux_lock);
@@ -1229,6 +1252,10 @@ int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t le
         stream->notified=0; pthread_mutex_unlock(&mux_lock);
     }
     return 0;
+}
+
+int core_http2_write(core_http2_stream_t *stream, const uint8_t *data, size_t length) {
+    return core_http2_write_parts(stream,NULL,0,data,length);
 }
 
 int core_http2_read(core_http2_stream_t *stream, uint8_t *data, size_t capacity, size_t *length) {

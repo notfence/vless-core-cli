@@ -57,7 +57,10 @@ size_t core_http2_queue_reservation(size_t length) {
     return count*sizeof(core_http2_block_t);
 }
 
-int core_http2_queue_append(core_http2_queue_t *queue, const uint8_t *data, size_t length, size_t limit) {
+int core_http2_queue_append_parts(core_http2_queue_t *queue, const uint8_t *prefix, size_t prefix_length, const uint8_t *data, size_t data_length, size_t limit) {
+    if (prefix_length > SIZE_MAX-data_length) { errno=EOVERFLOW; return -1; }
+    if (!queue || (prefix_length && !prefix) || (data_length && !data)) { errno=EINVAL; return -1; }
+    size_t length=prefix_length+data_length;
     if (queue->length > limit || length > limit-queue->length) { errno=ENOBUFS; return -1; }
     if (!length) return 0;
     if (limit != CORE_HTTP2_STREAM_LIMIT) {
@@ -71,7 +74,9 @@ int core_http2_queue_append(core_http2_queue_t *queue, const uint8_t *data, size
                 queue->data=replacement; queue->capacity=capacity;
             }
         }
-        memcpy(queue->data+queue->start+queue->length,data,length); queue->length+=length; return 0;
+        if (prefix_length) memcpy(queue->data+queue->start+queue->length,prefix,prefix_length);
+        if (data_length) memcpy(queue->data+queue->start+queue->length+prefix_length,data,data_length);
+        queue->length+=length; return 0;
     }
     size_t room=queue->tail ? CORE_HTTP2_QUEUE_BLOCK-queue->tail->end : 0;
     size_t needed=length > room ? (length-room+CORE_HTTP2_QUEUE_BLOCK-1)/CORE_HTTP2_QUEUE_BLOCK : 0;
@@ -93,10 +98,16 @@ int core_http2_queue_append(core_http2_queue_t *queue, const uint8_t *data, size
     while (offset < length) {
         size_t amount=CORE_HTTP2_QUEUE_BLOCK-write->end;
         if (amount > length-offset) amount=length-offset;
-        if (amount) memcpy(write->data+write->end,data+offset,amount);
-        write->end+=amount; offset+=amount; write=write->next;
+        if (offset < prefix_length && amount > prefix_length-offset) amount=prefix_length-offset;
+        if (amount) memcpy(write->data+write->end,offset < prefix_length ? prefix+offset : data+(offset-prefix_length),amount);
+        write->end+=amount; offset+=amount;
+        if (write->end == CORE_HTTP2_QUEUE_BLOCK) write=write->next;
     }
     queue->length+=length; queue->capacity+=needed*CORE_HTTP2_QUEUE_BLOCK; update_view(queue); return 0;
+}
+
+int core_http2_queue_append(core_http2_queue_t *queue, const uint8_t *data, size_t length, size_t limit) {
+    return core_http2_queue_append_parts(queue,NULL,0,data,length,limit);
 }
 
 void core_http2_queue_consume(core_http2_queue_t *queue, size_t length) {

@@ -1,6 +1,13 @@
 #include "check.h"
 #include "tls_fixture.h"
 
+static size_t grpc_allocation_size,grpc_full_allocations;
+void *__real_malloc(size_t);
+void *__wrap_malloc(size_t size) {
+    if (grpc_allocation_size && size == grpc_allocation_size) grpc_full_allocations++;
+    return __real_malloc(size);
+}
+
 int __wrap_RAND_bytes(unsigned char *data,int length) {
     for (int i=0;i<length;i++) data[i]=(unsigned char)i;
     return 1;
@@ -75,7 +82,33 @@ static void priority_headers_keep_hpack(void) {
     close(pair[0]); close(pair[1]);
 }
 
+static void grpc_body_vectors(void) {
+    static const struct { size_t length; const char *hash; } cases[]={
+        {0,"bab0fee62fe3218ca519daee866d9cdf3a943330f65bbe159eb4e9a3570f26b5"},
+        {1,"ce2f40eee0e1a17b3bd31e67c619ee4034d1a3774d7c4dae4f43003f07aabb00"},
+        {127,"3866d36006b44390131784f4a50aa92da5c8c13a4b00798cb2b6d52ee3a9e0e2"},
+        {128,"a3bb64aa73fa7f66fc5bb1d4589aaef0e84b0e49ad68af1c6ffb26c3f329abc9"},
+        {16375,"d5b93c62aff1b06dd4e6ff62e1ac7436a9ccd93915ca79db86336f03d8a62ef1"},
+        {16384,"87bb3d63b230393f6a932be4953c38c471bd0970dd3a2fdf144df0c6e7034f15"},
+        {65536,"a672a0b3d1e018d32c3f7cb8e27c244d6fcd5adb2c8959751274df30cb95a818"},
+        {131072,"2d69ef46747eeec19cbc4f0f105c79c9a2ab16a33cc9fe3176b5e543b3b3c89c"}
+    };
+    static uint8_t payload[131072]; for (size_t i=0;i<sizeof(payload);i++) payload[i]=(uint8_t)(i%251);
+    for (unsigned multi=0;multi<2;multi++) for (size_t i=0;i<sizeof(cases)/sizeof(*cases);i++) {
+        tls13_conn_t connection={.mode=CONN_MODE_GRPC_PLAIN,.fd=-1,.xmux_async=1,.h2_stream_id=1,.grpc_multi_mode=multi,
+            .h2_peer_max_frame_size=16384,.h2_peer_conn_window=INT_MAX,.h2_peer_stream_window=INT_MAX};
+        grpc_allocation_size=cases[i].length+6+protobuf_varint_size(cases[i].length); grpc_full_allocations=0;
+        REQUIRE("wire/grpc-body-written",grpc_write_hunk(&connection,payload,cases[i].length) == 0);
+        grpc_allocation_size=0;
+        CHECK("wire/grpc-no-full-protobuf-allocation",grpc_full_allocations == 0);
+        char scenario[64]; snprintf(scenario,sizeof(scenario),"grpc-body-%zu",cases[i].length);
+        vector(scenario,connection.xmux_plain_output.data,connection.xmux_plain_output.len,cases[i].hash);
+        db_free(&connection.h2_send_buf); db_free(&connection.xmux_plain_output);
+    }
+}
+
 int main(void) {
+    grpc_body_vectors();
     char authority[256];
     const char *invalid_hosts[]={"vless-core.test\r\nX-Audit: injected","bad host","bad\thost","bad\\host","[bad]","[::1]extra","vless-core.test:+80","vless-core.test:"};
     for (size_t i=0;i<sizeof(invalid_hosts)/sizeof(*invalid_hosts);i++)

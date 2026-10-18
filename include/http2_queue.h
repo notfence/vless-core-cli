@@ -15,6 +15,7 @@ typedef struct {
     core_buffer_budget_t *account;
 } core_http2_queue_t;
 int core_http2_queue_append(core_http2_queue_t *, const uint8_t *, size_t, size_t);
+int core_http2_queue_append_parts(core_http2_queue_t *, const uint8_t *, size_t, const uint8_t *, size_t, size_t);
 void core_http2_queue_consume(core_http2_queue_t *, size_t);
 void core_http2_queue_clear(core_http2_queue_t *);
 size_t core_http2_queue_span(const core_http2_queue_t *);
