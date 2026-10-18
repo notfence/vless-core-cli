@@ -109,6 +109,10 @@ static int headers(core_http1_response_t *parser, const uint8_t *data, size_t le
     if (seen_encoding && seen_length) return -1;
     event->kind=1; event->status=status; event->consumed=end;
     if (status < 200) return 0;
+    if (parser->head_response) {
+        parser->remaining=0; parser->state=1; parser->close_connection=close_connection;
+        event->close_connection=close_connection; return 0;
+    }
     parser->chunked=seen_encoding; parser->close_connection=close_connection;
     parser->close_delimited=!seen_length && !seen_encoding;
     parser->remaining=seen_length ? content_length : UINT64_MAX;

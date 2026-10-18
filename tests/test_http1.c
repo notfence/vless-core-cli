@@ -53,5 +53,17 @@ int main(void) {
     const char *response="HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     CHECK("http1/zero-response-headers", core_http1_next(&parser,(const uint8_t *)response,strlen(response),0,0,&event) == 0 && event.kind == 1);
     CHECK("http1/zero-response-fully-drained", core_http1_next(&parser,NULL,0,0,0,&event) == 0 && event.kind == 3 && !event.close_connection);
+    const char *heads[]={"HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n"};
+    for (size_t i=0;i<sizeof(heads)/sizeof(*heads);i++) {
+        parser=(core_http1_response_t){.head_response=1}; size_t length=strlen(heads[i]);
+        for (size_t part=0;part<length;part++) CHECK("http1/head-fragmented-headers",core_http1_next(&parser,(const uint8_t *)heads[i],part,0,8192,&event) == 1 && !event.consumed);
+        REQUIRE("http1/head-headers",core_http1_next(&parser,(const uint8_t *)heads[i],length,0,8192,&event) == 0 && event.kind == 1 && event.consumed == length);
+        CHECK("http1/head-no-body-with-persistent-connection",core_http1_next(&parser,(const uint8_t *)response,strlen(response),0,8192,&event) == 0 && event.kind == 3 && !event.consumed && !event.close_connection);
+        CHECK("http1/head-does-not-consume-next-response",core_http1_next(&parser,(const uint8_t *)response,strlen(response),0,8192,&event) < 0 && !event.consumed);
+    }
+    parser=(core_http1_response_t){.head_response=1}; const char *interim="HTTP/1.1 103 Early Hints\r\n\r\n";
+    REQUIRE("http1/head-interim-headers",core_http1_next(&parser,(const uint8_t *)interim,strlen(interim),0,0,&event) == 0 && event.status == 103 && !parser.state && parser.head_response);
+    REQUIRE("http1/head-final-after-interim",core_http1_next(&parser,(const uint8_t *)heads[0],strlen(heads[0]),0,0,&event) == 0);
+    CHECK("http1/head-completes-after-interim",core_http1_next(&parser,NULL,0,0,0,&event) == 0 && event.kind == 3);
     return test_result();
 }

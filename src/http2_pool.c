@@ -324,6 +324,7 @@ static int start_request(mux_actor_t *actor, core_http2_stream_t *stream, int ro
     account_output(actor);
     if (result) { free(request); return -1; }
     request->stream=stream; request->role=role; request->remaining=role == 4 ? (size_t)stream->packet_limit : body;
+    request->response.no_body=!grpc_manager(actor->manager) && role != 0 && !strcmp(config->xhttp_uplink_method,"HEAD");
     if (role == 4) { uint64_t now=core_now_ms(); request->packet_until_ms=now > UINT64_MAX-XMUX_PACKET_AGE_MS ? UINT64_MAX : now+XMUX_PACKET_AGE_MS; }
     request->send_ended=role == 0 || (role == 3 && !body);
     request->send_window=actor->peer_window;

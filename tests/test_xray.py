@@ -746,6 +746,20 @@ class XrayTests(unittest.TestCase):
                         for repetition in range(8): exchange(tunnel,b"vless-core HTTP/1.1 reused packet"*1000)
                     self.assertEqual(len(proxy.connections),2)
 
+    def test_xhttp_head_responses_and_reuse(self):
+        cert,_=certificate()
+        for security,alpn in (("none","http/1.1"),("tls","http/1.1"),("tls","h2"),("reality","h2")):
+            for pooled in (False,True):
+                options={"uplinkHTTPMethod":"HEAD"}
+                if pooled: options["xmux"]={"maxConnections":1}
+                with self.subTest(security=security,alpn=alpn,pooled=pooled), Server() as target, xray_server("xhttp",security,mode="packet-up",uplinkHTTPMethod="HEAD") as reference, CountingProxy(reference.port) as proxy:
+                    with cli(uri(proxy.port,"xhttp",security,mode="packet-up",alpn=alpn,extra=json.dumps(options)),["--connect-timeout-ms","1000"],environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                        with socks_connect(core.port,target.port) as tunnel:
+                            for index in range(4): exchange(tunnel,(b"vless-core HEAD response"+bytes([index]))*1000)
+                            tunnel.sendall(b"tail"); tunnel.shutdown(socket.SHUT_WR)
+                            self.assertEqual(exact(tunnel,4),b"tail")
+                        if pooled: self.assertEqual(len(proxy.connections),2 if alpn == "http/1.1" else 1)
+
     def test_xmux_http1_parallel_channels(self):
         cert,_=certificate()
         payload=bytes(range(251))*1024

@@ -599,7 +599,29 @@ static void drained_queue_memory(void) {
     for (size_t i=0;i<256;i++) core_http2_queue_clear(&queues[i]);
 }
 
+static void head_upload_response(void) {
+    core_http2_backend_t backend=finish_backend; backend.request=pacing_request;
+    mux_manager_t manager={.backend=&backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
+    mux_group_t group={.manager=&manager}; wire_t wire={0};
+    mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.peer_window=65535,.peer_concurrency=16,.peer_header_limit=8192};
+    actor.validation.settings_received=1;
+    for (int role=2;role<=3;role++) {
+        core_http2_stream_t stream={0}; stream.config.transport_mode=TRANSPORT_XHTTP;
+        strcpy(stream.config.xhttp_uplink_method,"HEAD"); strcpy(stream.config.xhttp_mode,role == 2 ? "stream-up" : "packet-up");
+        REQUIRE("xmux/head-notifications",notification_pair(stream.notify) == 0);
+        REQUIRE("xmux/head-start-request",start_request(&actor,&stream,role,0) == 0);
+        mux_request_t *request=actor.requests;
+        CHECK("xmux/head-response-method-state",request->response.no_body && !stream.eof);
+        const uint8_t headers[]={0x88,0x0f,0x0d,3,'1','2','3'};
+        core_http2_frame_t frame={.type=1,.flags=5,.id=request->id,.data=(uint8_t *)headers,.length=sizeof(headers)};
+        CHECK("xmux/head-ack-preserves-download-and-upload",process_frame(&actor,&frame) == 0 && request->ended && !stream.failed && !stream.eof && (role != 2 || !request->send_ended));
+        free(request); actor.requests=NULL; close(stream.notify[0]); close(stream.notify[1]);
+    }
+    core_hpack_clear(&actor.hpack); core_buffer_budget_clear(&actor.output_memory);
+}
+
 int main(void) {
+    head_upload_response();
     private_close_completes_cleanup();
     memory_admission_policy();
     drained_queue_memory();

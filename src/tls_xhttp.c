@@ -4,7 +4,7 @@ const char xhttp_user_agent[]="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWe
 
 static int normalize_xhttp_path(const char *in, char *out, size_t out_cap);
 static int random_xpadding_value(int min_len, int max_len, const char *method, char *buf, size_t cap);
-static int xhttp_read_http1_response(SSL *ssl, int fd, char *err, size_t err_cap);
+static int xhttp_read_http1_response(SSL *ssl, int fd, const char *method, char *err, size_t err_cap);
 static int xhttp_buffer_available(tls13_conn_t *c);
 static int xhttp_encode_component(const char *input, char *output, size_t capacity);
 static int xhttp_append_path_segment(char *path, size_t cap, const char *segment);
@@ -62,8 +62,8 @@ void trim_ascii(char *s) {
     s[end - start] = '\0';
 }
 
-static int xhttp_read_http1_response(SSL *ssl, int fd, char *err, size_t err_cap) {
-    core_http1_response_t parser={0}; dynbuf_t cache={.limit=73728}; int eof=0,result=-1;
+static int xhttp_read_http1_response(SSL *ssl, int fd, const char *method, char *err, size_t err_cap) {
+    core_http1_response_t parser={.head_response=!strcmp(method,"HEAD")}; dynbuf_t cache={.limit=73728}; int eof=0,result=-1;
     for (;;) {
         core_http1_event_t event;
         int parsed=core_http1_next(&parser,cache.data,cache.len,eof,8192,&event);
@@ -378,7 +378,7 @@ static int xhttp_conn_write_all(tls13_conn_t *c, const void *buf, size_t len) {
 
 static void *xhttp_plain_upload_reader(void *arg) {
     tls13_conn_t *connection=arg; char error[160]={0};
-    if (xhttp_read_http1_response(NULL,connection->xhttp_upload_fd,error,sizeof(error))) {
+    if (xhttp_read_http1_response(NULL,connection->xhttp_upload_fd,connection->xhttp_uplink_method,error,sizeof(error))) {
         pthread_mutex_lock(&g_tls_state_lock);
         int failed=!connection->xhttp_upload_stopping;
         if (failed) connection->xhttp_upload_failed=1;
@@ -440,7 +440,7 @@ static int xhttp_send_plain_stream_request(tls13_conn_t *c, int fd, char *err, s
         return -1;
     }
 
-    c->xhttp_http1_response=(core_http1_response_t){0};
+    c->xhttp_http1_response=(core_http1_response_t){.head_response=!strcmp(c->xhttp_uplink_method,"HEAD")};
     c->xhttp_eof=c->xhttp_wire_eof=0;
     return 0;
 }
@@ -532,7 +532,7 @@ static int xhttp_post_packet_plain(tls13_conn_t *c, const uint8_t *buf, size_t *
         rc = -1;
         set_err(err, err_cap, "failed to send xhttp POST");
     } else {
-        rc=xhttp_read_http1_response(NULL,fd,err,err_cap);
+        rc=xhttp_read_http1_response(NULL,fd,c->xhttp_uplink_method,err,err_cap);
     }
 
     core_xhttp_payload_clear(&packet); db_free(&request); close(fd);
@@ -606,7 +606,7 @@ int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length, char 
         rc = -1;
         set_err(err, err_cap, "failed to send xhttp POST");
     } else {
-        rc=xhttp_read_http1_response(ssl,fd,err,err_cap);
+        rc=xhttp_read_http1_response(ssl,fd,c->xhttp_uplink_method,err,err_cap);
     }
 
     core_xhttp_payload_clear(&packet); db_free(&request);

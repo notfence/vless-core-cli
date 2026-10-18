@@ -66,6 +66,10 @@ int main(void) {
     CHECK("h2/maximum-content-length-is-not-unknown",core_http2_response_headers(&response,&headers,0) == 0 && core_http2_response_data(&response,1,1) < 0);
     response=(core_http2_response_t){0}; headers=(core_hpack_headers_t){.status=304,.status_seen=1,.has_content_length=1,.content_length=10};
     CHECK("h2/304-length-describes-representation",core_http2_response_headers(&response,&headers,1) == 0 && response.ended);
+    response=(core_http2_response_t){.no_body=1}; headers=(core_hpack_headers_t){.status=200,.status_seen=1,.has_content_length=1,.content_length=123};
+    CHECK("h2/head-length-describes-representation",core_http2_response_headers(&response,&headers,1) == 0 && response.ended && response.no_body);
+    response=(core_http2_response_t){.no_body=1};
+    CHECK("h2/head-rejects-body",core_http2_response_headers(&response,&headers,0) == 0 && core_http2_response_data(&response,1,0) < 0);
     CHECK("h2/state-memory-bounded",sizeof(response)+sizeof(state) < 128);
     return test_result();
 }

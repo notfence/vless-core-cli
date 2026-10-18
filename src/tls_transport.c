@@ -1060,14 +1060,14 @@ static int xmux_transport_request(void *opaque, const vless_config_t *config, co
             if (!result) { result=db_append(&physical->xmux_plain_output,message.data,message.len); if (!result) physical->xmux_enqueued+=message.len; }
             db_free(&message); core_xhttp_payload_clear(&packet);
             if (result) return -1;
-            physical->xmux_http1_response=(core_http1_response_t){0};
+            physical->xmux_http1_response=(core_http1_response_t){.head_response=!strcmp(method,"HEAD")};
             physical->xmux_http1_id=*id; physical->xmux_http1_role=role; return 0;
         }
         dynbuf_t message={.limit=256U*1024U,.memory=physical->output_memory};
         int result=xhttp_http1_headers(&request,method,path,headers,role == 0 ? 0 : 2,0,role == 0 ? "keep-alive" : "close",&message);
         if (!result) { result=db_append(&physical->xmux_plain_output,message.data,message.len); if (!result) physical->xmux_enqueued+=message.len; }
         db_free(&message); if (result) return -1;
-        physical->xmux_http1_response=(core_http1_response_t){0};
+        physical->xmux_http1_response=(core_http1_response_t){.head_response=!strcmp(method,"HEAD")};
         physical->xmux_http1_id=*id; physical->xmux_http1_role=role; return 0;
     }
     int has_body=role == 4 || (role == 3 ? packet.body_size != 0 : role != 0);

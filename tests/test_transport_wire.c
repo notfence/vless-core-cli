@@ -18,7 +18,27 @@ static void vector(const char *name,const uint8_t *data,size_t length,const char
     putchar('\n');
 }
 
+static void head_response_backend(void) {
+    vless_config_t config={.transport_mode=TRANSPORT_XHTTP,.server_port=80,.xmux.present=1};
+    strcpy(config.server_host,"vless-core.test"); strcpy(config.xhttp_mode,"packet-up");
+    strcpy(config.xhttp_uplink_method,"HEAD"); strcpy(config.xhttp_path,"/vless-core");
+    tls13_conn_t physical={.mode=CONN_MODE_XHTTP_PLAIN,.fd=-1,.xmux_async=1,.h2_next_stream_id=1};
+    uint32_t id; size_t consumed,body; core_xmux_frame_t frame;
+    const char *responses[]={"HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n"};
+    for (int role=2;role<=3;role++) for (size_t i=0;i<sizeof(responses)/sizeof(*responses);i++) {
+        strcpy(config.xhttp_mode,role == 2 ? "stream-up" : "packet-up");
+        REQUIRE("wire/head-request",xmux_transport_request(&physical,&config,"vless-core",i,role,role == 2 ? NULL : (const uint8_t *)"vless-core",role == 2 ? 0 : 10,&id,8192,&consumed,&body) == 0);
+        CHECK("wire/head-method-is-sent",physical.xmux_plain_output.len >= 5 && !memcmp(physical.xmux_plain_output.data,"HEAD ",5));
+        REQUIRE("wire/head-response-input",db_append(&physical.h2_net_cache,responses[i],strlen(responses[i])) == 0);
+        CHECK("wire/head-response-headers",xmux_transport_read_frame(&physical,&frame,8192) == 0 && frame.event == 1 && frame.status == 200);
+        int result=xmux_transport_read_frame(&physical,&frame,8192);
+        CHECK("wire/head-completes-without-body-or-eof",result == 0 && frame.event == 3 && !physical.xmux_http1_id && !frame.close_connection && !physical.h2_net_cache.len);
+        physical.xmux_http1_id=0; db_free(&physical.h2_net_cache); db_free(&physical.xmux_plain_output);
+    }
+}
+
 int main(void) {
+    head_response_backend();
     tls13_conn_t connection={.mode=CONN_MODE_GRPC_PLAIN,.fd=-1,.xmux_async=1,.h2_stream_id=1};
     strcpy(connection.grpc_service_name,"vless-core"); strcpy(connection.grpc_authority,"vless-core.test");
     strcpy(connection.grpc_user_agent,"vless-core-wire"); strcpy(connection.xhttp_host,"vless-core.test");

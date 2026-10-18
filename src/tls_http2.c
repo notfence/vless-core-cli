@@ -895,6 +895,10 @@ static int h2_append_http1_header_lines(dynbuf_t *block, const char *headers, in
 int h2_send_xhttp_request_headers(tls13_conn_t *c, uint32_t stream_id, const char *method, const char *path,
                                          const char *extra_headers, size_t content_len, int has_body, int streaming_body, char *err,
                                          size_t err_cap) {
+    if (!c->xmux_async) {
+        h2_response_entry_t *entry=h2_response_get(c,stream_id,0);
+        if (entry) entry->response.no_body=!strcmp(method,"HEAD");
+    }
     dynbuf_t block = {.limit=1024U*1024U,.memory=c->output_memory};
     int rc = 0;
 

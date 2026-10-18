@@ -117,7 +117,7 @@ int core_http2_response_headers(core_http2_response_t *state, const core_hpack_h
     if (!state->headers) {
         if (!headers->status_seen || headers->status < 200 || headers->status > 599) return -1;
         state->headers=1; state->has_content_length=headers->has_content_length; state->content_length=headers->content_length;
-        state->no_body=headers->status == 204 || headers->status == 304;
+        state->no_body=state->no_body || headers->status == 204 || headers->status == 304;
         if (headers->status == 204 && headers->has_content_length) return -1;
     } else if (headers->status_seen || !end || headers->has_content_length) return -1;
     return finish_response(state,end);
