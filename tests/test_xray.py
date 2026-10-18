@@ -741,6 +741,31 @@ class XrayTests(unittest.TestCase):
                             exchange(tunnel,b"vless-core XMUX reuse"*10000)
                     self.assertEqual(len(proxy.connections),1)
 
+    def test_xmux_empty_ranges_preserve_pool_policy(self):
+        defaults={"maxConcurrency":"","maxConnections":3,"cMaxReuseTimes":0,
+                  "hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":0}
+        for connections in (1,2,3,"1-3"):
+            settings={**defaults,"maxConnections":connections}
+            with self.subTest(connections=connections), Server() as target:
+                with xray_server("xhttp","reality",flow="xtls-rprx-vision",decryption=f"mlkem768x25519plus.native.60s.{KEY}") as reference, CountingProxy(reference.port) as proxy:
+                    options=uri(proxy.port,"xhttp","reality",mode="stream-one",flow="xtls-rprx-vision",
+                                encryption=f"mlkem768x25519plus.native.0rtt.{PUBLIC_KEY}",extra=json.dumps({"xmux":settings}))
+                    with cli(options) as core:
+                        for index in range(6):
+                            with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core 3x-ui empty XMUX range"*2048+bytes([index]))
+                        if isinstance(connections,int): self.assertEqual(len(proxy.connections),connections)
+                        else: self.assertIn(len(proxy.connections),(1,2,3))
+        shared={"sessionIDPlacement":"header","sessionIDKey":"X-vless-core-session","seqPlacement":"header"}
+        with Server() as target, xray_server("xhttp","none",path="/",**shared) as reference, CountingProxy(reference.port) as upload, CountingProxy(reference.port,address="127.0.0.2") as download:
+            nested={"address":"127.0.0.2","port":download.port,"network":"xhttp","xhttpSettings":{"path":"/download","extra":{**shared,"xmux":{**defaults,"maxConnections":1}}}}
+            options={**shared,"xmux":defaults,"downloadSettings":nested}
+            with cli(uri(upload.port,"xhttp","none",mode="packet-up",path="/upload",extra=json.dumps(options))) as core:
+                for index in range(3):
+                    with socks_connect(core.port,target.port) as tunnel:
+                        for repetition in range(3): exchange(tunnel,b"vless-core empty download XMUX range"*1024+bytes([index,repetition]))
+                        self.assertEqual(len(download.connections),index+1)
+                self.assertGreater(len(upload.connections),0); self.assertEqual(len(download.connections),3)
+
     def test_xmux_http1_packet_reuse(self):
         cert,_=certificate()
         for security in ("none","tls"):

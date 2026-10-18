@@ -156,7 +156,8 @@ static int parse_xmux(vless_config_t *config, const core_json_t *value, const ch
         if (index == 6) { warning(scope,entry->key,0); continue; }
         char path[192]; snprintf(path,sizeof(path),"%s.%s",scope,names[index]);
         core_range_t number;
-        if (index == 5 && entry->type == CORE_JSON_NUMBER && !strcmp(entry->text,"-1")) number=(core_range_t){-1,-1};
+        if (index < 5 && entry->type == CORE_JSON_STRING && !entry->text[0]) number=(core_range_t){0,0};
+        else if (index == 5 && entry->type == CORE_JSON_NUMBER && !strcmp(entry->text,"-1")) number=(core_range_t){-1,-1};
         else if (core_xhttp_range(entry,&number,INT_MAX) != 0 || (index == 5 && (number.min != number.max || entry->type != CORE_JSON_NUMBER))) return invalid(path,error,capacity);
         if ((seen&(1U<<index)) && memcmp(&values[index],&number,sizeof(number))) return invalid(path,error,capacity);
         values[index]=number; seen|=1U<<index;

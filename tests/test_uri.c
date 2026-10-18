@@ -12,6 +12,36 @@ static vless_config_t config;
 static char error[256];
 static int parse(const char *uri) { return parse_core_uri(uri, &config, error, sizeof(error)); }
 
+static void check_xmux_empty_ranges(void) {
+    const char *names[]={"maxConcurrency","maxConnections","cMaxReuseTimes","hMaxRequestTimes","hMaxReusableSecs"};
+    const char *example="{\"xmux\":{\"maxConcurrency\":\"\",\"maxConnections\":3,\"cMaxReuseTimes\":0,\"hMaxRequestTimes\":\"600-900\",\"hMaxReusableSecs\":\"1800-3000\",\"hKeepAlivePeriod\":0}}";
+    vless_config_t settings; core_config_defaults(&settings);
+    CHECK("xmux/3x-ui-empty-range",!core_xhttp_extra(&settings,example,error,sizeof(error)) && settings.xmux.present && !settings.xmux.max_concurrency.max && settings.xmux.max_connections.min == 3 && settings.xmux.max_connections.max == 3 && !settings.xmux.reuse_times.max && settings.xmux.request_times.min == 600 && settings.xmux.request_times.max == 900 && settings.xmux.reusable_secs.min == 1800 && settings.xmux.reusable_secs.max == 3000 && !settings.xmux.keep_alive_period);
+    for (size_t i=0;i<5;i++) {
+        char json[512]; vless_config_t blank,zero;
+        core_config_defaults(&blank); core_config_defaults(&zero);
+        snprintf(json,sizeof(json),"{\"xmux\":{\"hKeepAlivePeriod\":-1,\"%s\":\"\"}}",names[i]);
+        int result=core_xhttp_extra(&blank,json,error,sizeof(error));
+        snprintf(json,sizeof(json),"{\"xmux\":{\"hKeepAlivePeriod\":-1,\"%s\":0}}",names[i]);
+        CHECK("xmux/empty-range-equivalent-to-zero",!result && !core_xhttp_extra(&zero,json,error,sizeof(error)) && !memcmp(&blank.xmux,&zero.xmux,sizeof(blank.xmux)) && blank.xmux.present);
+    }
+    core_config_defaults(&settings);
+    CHECK("xmux/all-empty-ranges-preserve-defaults",!core_xhttp_extra(&settings,"{\"xmux\":{\"maxConcurrency\":\"\",\"maxConnections\":\"\",\"cMaxReuseTimes\":\"\",\"hMaxRequestTimes\":\"\",\"hMaxReusableSecs\":\"\",\"hKeepAlivePeriod\":0}}",error,sizeof(error)) && settings.xmux.present && settings.xmux.max_connections.min == 6 && settings.xmux.request_times.min == 600 && settings.xmux.reusable_secs.min == 1800);
+    for (unsigned connections=1;connections<=4;connections++) {
+        char json[160]; core_config_defaults(&settings);
+        snprintf(json,sizeof(json),"{\"xmux\":{\"maxConcurrency\":\"\",\"maxConnections\":%u}}",connections);
+        CHECK("xmux/explicit-connection-limit-not-hardcoded",!core_xhttp_extra(&settings,json,error,sizeof(error)) && settings.xmux.max_connections.min == (int)connections && settings.xmux.max_connections.max == (int)connections);
+    }
+    core_config_defaults(&settings);
+    CHECK("xmux/normalized-alias-duplicates",!core_xhttp_extra(&settings,"{\"xmux\":{\"maxConcurrency\":\"\",\"MaxConcurrency\":0,\"maxConnections\":2}}",error,sizeof(error)));
+    const char *invalid[]={"{\"xmux\":{\"hKeepAlivePeriod\":\"\"}}","{\"xmux\":{\"maxConcurrency\":\" \"}}","{\"xmux\":{\"maxConnections\":null}}","{\"xmux\":{\"cMaxReuseTimes\":false}}","{\"xmux\":{\"hMaxRequestTimes\":\"-\"}}","{\"xmux\":{\"hMaxReusableSecs\":\"18446744073709551616\"}}","{\"xmux\":{\"maxConcurrency\":\"\",\"MaxConcurrency\":1}}","{\"xmux\":{\"maxConcurrency\":\"\",\"maxConcurrency\":0}}","{\"xmux\":{\"maxConcurrency\":1,\"maxConnections\":3}}","{\"xPaddingBytes\":\"\"}","{\"scMinPostsIntervalMs\":\"\"}"};
+    for (size_t i=0;i<sizeof(invalid)/sizeof(*invalid);i++) {
+        core_config_defaults(&settings);
+        CHECK("xmux/empty-range-does-not-weaken-validation",core_xhttp_extra(&settings,invalid[i],error,sizeof(error)) < 0 && error[0]);
+    }
+    CHECK("uri/xmux-empty-range-startup",!parse(PREFIX "type=xhttp&extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A%22%22%2C%22maxConnections%22%3A3%7D%7D") && config.xmux.present && config.xmux.max_connections.max == 3);
+}
+
 static void check_session_identifier_space(void) {
     vless_config_t settings={0}; char identifier[256],failure[128];
     strcpy(settings.xhttp_mode,"packet-up"); strcpy(settings.xhttp_session_placement,"header");
@@ -134,6 +164,7 @@ static void check_base64(void) {
 }
 
 int main(void) {
+    check_xmux_empty_ranges();
     const char *invalid_options[]={
         "{\"sessionIDPlacement\":\"invalid\"}","{\"seqPlacement\":\"invalid\"}","{\"xPaddingPlacement\":\"invalid\"}","{\"xPaddingMethod\":\"invalid\"}",
         "{\"sessionIDPlacement\":\"header\",\"sessionIDKey\":\"Host\"}","{\"seqPlacement\":\"header\",\"seqKey\":\"Content-Length\"}","{\"xPaddingHeader\":\"Transfer-Encoding\"}",

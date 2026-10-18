@@ -51,6 +51,11 @@ static void extra_precedence_cases(void) {
 int main(void) {
     extra_precedence_cases();
     vless_config_t config,download; char error[256];
+    for (unsigned alias=0;alias<2;alias++) for (unsigned nested=0;nested<2;nested++) {
+        char json[1024];
+        snprintf(json,sizeof(json),"{\"address\":\"127.0.0.2\",\"port\":8080,\"network\":\"xhttp\",\"%s\":{\"path\":\"/download\",%s\"xmux\":{\"maxConcurrency\":\"\",\"maxConnections\":3,\"cMaxReuseTimes\":\"\",\"hMaxRequestTimes\":\"600-900\",\"hMaxReusableSecs\":\"1800-3000\",\"hKeepAlivePeriod\":0}%s}}",alias ? "splithttpSettings" : "xhttpSettings",nested ? "\"extra\":{" : "",nested ? "}" : "");
+        CHECK("download/xmux-empty-ranges",!parse(json,&config,error) && config.xmux.present && !config.xmux.max_concurrency.max && config.xmux.max_connections.max == 3 && config.xmux.request_times.min == 600 && config.xmux.reusable_secs.max == 3000 && !strcmp(config.xhttp_path,"/download"));
+    }
     CHECK("download/escaped-request-target",parse("{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/vless core?keep=%2F\"}}",&config,error) == 0 && !strcmp(config.xhttp_path,"/vless%20core?keep=%2F"));
     CHECK("download/invalid-escaped-path",parse("{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"xhttpSettings\":{\"path\":\"/bad%00\"}}",&config,error) < 0 && strstr(error,"path"));
     CHECK("download/plain-endpoint",parse("{\"address\":\"127.0.0.2\",\"port\":8080,\"network\":\"xhttp\",\"security\":\"none\",\"xhttpSettings\":{\"path\":\"/download\",\"host\":\"vless-core.test\"}}",&config,error) == 0 && !strcmp(config.server_host,"127.0.0.2") && config.server_port == 8080 && !strcmp(config.xhttp_path,"/download") && config.xhttp_download_only);
