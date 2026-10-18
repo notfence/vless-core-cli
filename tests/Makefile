@@ -119,6 +119,9 @@ $(HOST_BUILD_DIR)/test_xhttp_payload: $(HOST_BUILD_DIR)/test_xhttp_payload.o $(B
 $(HOST_BUILD_DIR)/test_packets: $(HOST_BUILD_DIR)/test_packets.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes
 
+$(HOST_BUILD_DIR)/test_trojan: $(HOST_BUILD_DIR)/test_trojan.o $(BASE_OBJ) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=EVP_MD_CTX_new,--wrap=EVP_DigestInit_ex,--wrap=EVP_DigestUpdate,--wrap=EVP_DigestFinal_ex
+
 $(HOST_BUILD_DIR)/test_random: $(HOST_BUILD_DIR)/test_random.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes
 
