@@ -33,7 +33,10 @@
 #include "vless_encryption.h"
 #include "relay_memory.h"
 
-#define VLESS_CORE_VERSION "1.1.5"
+#define VLESS_CORE_VERSION "2.0.0"
+#ifndef VLESS_CORE_COMMIT
+#define VLESS_CORE_COMMIT "unknown"
+#endif
 #define MAX_CLIENT_CONNECTIONS 256
 #define SERVER_IP_LIST_MAX_LENGTH 511
 #ifndef VLESS_OPENSSL_PATCH_STATUS
@@ -1441,7 +1444,7 @@ int main(int argc, char **argv) {
     if (arguments.action && arguments.action != CORE_CLI_INSPECT) {
         core_cli_args_scrub(argc,argv);
         if (arguments.action == CORE_CLI_HELP) usage(prog);
-        else if (arguments.action == CORE_CLI_VERSION) printf("vless-core %s\n",VLESS_CORE_VERSION);
+        else if (arguments.action == CORE_CLI_VERSION) printf("vless-core %s (%s)\n",VLESS_CORE_VERSION,VLESS_CORE_COMMIT);
         else printf("%s\n",VLESS_OPENSSL_PATCH_STATUS);
         return 0;
     }

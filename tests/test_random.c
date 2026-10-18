@@ -2,6 +2,7 @@
 #include "core_random.h"
 #include "deadline.h"
 #include "xhttp_config.h"
+#include "uri.h"
 #include <errno.h>
 #include <limits.h>
 

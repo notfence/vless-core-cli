@@ -51,11 +51,13 @@ $(HOST_LIB_FILES): | requirements
 
 $(HOST_BUILD_DIR)/src/%.o: $(ROOT)/src/%.c | requirements
 	mkdir -p $(dir $@)
-	$(HOST_CC) $(HOST_FLAGS) -MMD -MP -c $< -o $@
+	$(HOST_CC) $(HOST_FLAGS) -MMD -MP $(if $(filter main,$*),-include $(HOST_BUILD_DIR)/build_version.h) -c $< -o $@
 
 $(HOST_BUILD_DIR)/%.o: $(ROOT)/tests/%.c $(ROOT)/tests/check.h | requirements
 	mkdir -p $(dir $@)
-	$(HOST_CC) $(HOST_FLAGS) -MMD -MP -c $< -o $@
+	$(HOST_CC) $(HOST_FLAGS) -MMD -MP $(if $(filter test_main,$*),-include $(HOST_BUILD_DIR)/build_version.h) -c $< -o $@
+
+$(HOST_BUILD_DIR)/src/main.o $(HOST_BUILD_DIR)/test_main.o: $(HOST_BUILD_DIR)/build_version.h
 
 $(HOST_BUILD_DIR)/test_main: $(HOST_BUILD_DIR)/test_main.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=calloc,--wrap=malloc,--wrap=pthread_create,--wrap=accept
@@ -177,3 +179,7 @@ coverage:
 -include $(wildcard $(HOST_BUILD_DIR)/*.d $(HOST_BUILD_DIR)/src/*.d $(HOST_BUILD_DIR)/fuzz-src/*.d)
 .SECONDARY: $(BASE_OBJ) $(addsuffix .o,$(addprefix $(HOST_BUILD_DIR)/,$(TEST_NAMES)))
 .PHONY: test native requirements FORCE asan sanitizers coverage fuzz
+
+CORE_VERSION_ROOT := $(ROOT)
+CORE_VERSION_FILES := $(HOST_BUILD_DIR)/build_version.h
+include $(ROOT)/include/build_version.mk

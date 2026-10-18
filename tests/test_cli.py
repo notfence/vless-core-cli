@@ -410,7 +410,7 @@ class CliTests(unittest.TestCase):
         return subprocess.run([str(BUILD/"vless-core-test"),*args],capture_output=True,text=True,pass_fds=pass_fds,timeout=5)
 
     def test_help_version_patch(self):
-        for option, expected in (("--help","--connection-fd"),("--version","vless-core 1.1.5"),("--openssl-patch-status","unpatched")):
+        for option, expected in (("--help","--connection-fd"),("--version","vless-core 2.0.0 ("),("--openssl-patch-status","unpatched")):
             with self.subTest(option=option):
                 result = self.invoke([option]); self.assertEqual(result.returncode,0); self.assertIn(expected,result.stdout+result.stderr)
 

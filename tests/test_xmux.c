@@ -1,4 +1,5 @@
 #include "xmux.h"
+#include "uri.h"
 #include "../src/http2_pool.c"
 #include "check.h"
 #include <signal.h>

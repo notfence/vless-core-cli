@@ -117,13 +117,17 @@ $(BIN_IOS_ARM64): $(OBJ_IOS_ARM64) $(IOS_ARM64_OPENSSL_PREFIX)/lib/libssl.a $(IO
 	python3 tests/test_build.py binary $@ arm64
 
 build/linux/%.o: src/%.c | preflight build/linux
-	$(CC) $(COMMON_CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(COMMON_CFLAGS) $(DEPFLAGS) $(INCLUDES) $(if $(filter main,$*),-include build/linux/build_version.h) -c $< -o $@
 
 build/ios/%.o: src/%.c | preflight build/ios
-	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_CFLAGS) $(DEPFLAGS) -c $< -o $@
+	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_CFLAGS) $(DEPFLAGS) $(if $(filter main,$*),-include build/ios/build_version.h) -c $< -o $@
 
 build/ios-arm64/%.o: src/%.c | preflight build/ios-arm64
-	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_ARM64_CFLAGS) $(DEPFLAGS) -c $< -o $@
+	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_ARM64_CFLAGS) $(DEPFLAGS) $(if $(filter main,$*),-include build/ios-arm64/build_version.h) -c $< -o $@
+
+build/linux/main.o: build/linux/build_version.h
+build/ios/main.o: build/ios/build_version.h
+build/ios-arm64/main.o: build/ios-arm64/build_version.h
 
 build/ios/main.o: $(IOS_OPENSSL_PATCH_STATUS_FILE)
 build/ios-arm64/main.o: $(IOS_ARM64_OPENSSL_PATCH_STATUS_FILE)
@@ -233,3 +237,7 @@ clean:
 -include $(OBJ_LINUX:.o=.d) $(OBJ_IOS:.o=.d) $(OBJ_IOS_ARM64:.o=.d)
 
 .PHONY: all linux ios ios-arm64 test preflight test-asan test-sanitizers test-fuzz test-coverage check-ios-toolchain check-ios-arm64-toolchain clean openssl-ios6 openssl-ios-arm64 zlib-ios6 zlib-ios-arm64 curl-ios6 curl-ios-arm64 curl-ios6-package release-packages
+
+CORE_VERSION_ROOT := $(ROOT_DIR)
+CORE_VERSION_FILES := build/linux/build_version.h build/ios/build_version.h build/ios-arm64/build_version.h
+include include/build_version.mk
