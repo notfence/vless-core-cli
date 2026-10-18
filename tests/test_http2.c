@@ -34,9 +34,13 @@ int main(void) {
     CHECK("h2/unknown-frame-and-flags-ignored",core_http2_validate_frame(&state,99,255,0x7fffffff,payload,16) == 0);
     CHECK("h2/priority-on-idle-stream",core_http2_validate_frame(&state,2,255,100,payload,5) == 0);
     CHECK("h2/priority-size-is-stream-error",core_http2_validate_frame(&state,2,0,1,payload,4) == -2);
+    CHECK("h2/priority-size-error-details",state.error.scope == CORE_HTTP2_ERROR_STREAM && state.error.code == 6);
     CHECK("h2/priority-self-dependency",core_http2_validate_frame(&state,2,0,1,(const uint8_t[]){0,0,0,1,0},5) == -2);
+    CHECK("h2/priority-dependency-error-details",state.error.scope == CORE_HTTP2_ERROR_STREAM && state.error.code == 1);
     CHECK("h2/stream-zero-window-increment",core_http2_validate_frame(&state,8,0,1,payload,4) == -2);
     CHECK("h2/connection-zero-window-increment",core_http2_validate_frame(&state,8,0,0,payload,4) == -1);
+    CHECK("h2/window-error-details",state.error.scope == CORE_HTTP2_ERROR_CONNECTION && state.error.code == 1);
+    CHECK("h2/error-details-cleared-on-valid-frame",core_http2_validate_frame(&state,2,0,1,payload,5) == 0 && state.error.scope == CORE_HTTP2_ERROR_NONE && !state.error.code);
     uint8_t *maximum=calloc(1,16385); REQUIRE("h2/frame-size-fixture",maximum != NULL);
     CHECK("h2/default-frame-limit",core_http2_validate_frame(&state,99,0,0,maximum,16384) == 0);
     CHECK("h2/frame-limit-before-payload-processing",core_http2_validate_frame(&state,99,0,0,maximum,16385) == -1); free(maximum);

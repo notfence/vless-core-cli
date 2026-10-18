@@ -482,10 +482,10 @@ static mux_manager_t *get_manager(const vless_config_t *config, const core_http2
     manager->next=managers; managers=manager; return manager;
 }
 
-static int reject_stream(mux_actor_t *actor, uint32_t id, const char *error, uint8_t code) {
+static int reject_stream(mux_actor_t *actor, uint32_t id, const char *error, uint32_t code) {
     mux_request_t *request=find_request(actor,id);
     if (request) { fail_stream(request->stream,error); request->ended=request->reset=1; }
-    const uint8_t payload[]={0,0,0,code};
+    const uint8_t payload[]={(uint8_t)(code>>24),(uint8_t)(code>>16),(uint8_t)(code>>8),(uint8_t)code};
     return send_frame(actor,3,0,id,payload,sizeof(payload));
 }
 
@@ -552,7 +552,7 @@ static int process_frame(mux_actor_t *actor, const core_http2_frame_t *frame) {
         int validation=core_http2_validate_frame(&actor->validation,frame->type,frame->flags,frame->id,frame->data,frame->length);
         if (validation == -1) { snprintf(actor->error,sizeof(actor->error),"invalid h2 frame sequence"); return -1; }
         if (validation == -2) {
-            if (reject_response(actor,frame->id,"invalid h2 stream frame")) return -1;
+            if (reject_stream(actor,frame->id,"invalid h2 stream frame",actor->validation.error.code)) return -1;
             if (frame->type != 1) return 0;
         }
         if ((frame->type == 0 || frame->type == 1 || frame->type == 3 || frame->type == 8) && frame->id && (!(frame->id&1) || frame->id > actor->latest_stream)) return -1;

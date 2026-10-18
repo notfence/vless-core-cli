@@ -4,7 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct { uint32_t continuation; unsigned settings_received, settings_pending; } core_http2_validation_t;
+enum { CORE_HTTP2_ERROR_NONE, CORE_HTTP2_ERROR_CONNECTION, CORE_HTTP2_ERROR_STREAM };
+typedef struct { unsigned scope; uint32_t code; } core_http2_error_t;
+typedef struct { uint32_t continuation; unsigned settings_received, settings_pending; core_http2_error_t error; } core_http2_validation_t;
 typedef struct {
     uint32_t table_size,concurrency,initial_window,max_frame,header_limit;
     unsigned received;

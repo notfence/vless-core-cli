@@ -37,7 +37,47 @@ static void head_response_backend(void) {
     }
 }
 
+static void priority_reset_wire(void) {
+    for (int self=0;self<2;self++) {
+        int pair[2]; REQUIRE("wire/priority-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        tls13_conn_t connection={.mode=CONN_MODE_GRPC_PLAIN,.fd=pair[0],.h2_stream_id=1,.h2_next_stream_id=7,.h2_receive_window=65535};
+        connection.h2_validation.settings_received=1;
+        uint8_t input[]={0,0,4,2,0,0,0,0,3,0,0,0,3,0};
+        if (self) input[2]=5;
+        REQUIRE("wire/priority-input",db_append(&connection.h2_net_cache,input,self ? sizeof(input) : sizeof(input)-1) == 0);
+        uint8_t type,flags,*payload=NULL; uint32_t id; size_t length;
+        CHECK("wire/priority-stream-error-does-not-close-connection",h2_read_frame(&connection,&type,&flags,&id,&payload,&length) == 0);
+        free(payload);
+        uint8_t reset[13]={0}; ssize_t count=recv(pair[1],reset,sizeof(reset),MSG_DONTWAIT);
+        CHECK("wire/priority-reset-code",count == 13 && reset[3] == 3 && reset[8] == 3 && reset[12] == (self ? 1 : 6));
+        const uint8_t sibling[]={0,0,1,1,4,0,0,0,1,0x88,0,0,10,0,1,0,0,0,1,'v','l','e','s','s','-','c','o','r','e'};
+        REQUIRE("wire/priority-sibling-input",db_append(&connection.h2_net_cache,sibling,sizeof(sibling)) == 0);
+        CHECK("wire/priority-sibling-response-survives",h2_pump_one_frame(&connection) == 0 && h2_pump_one_frame(&connection) == 0 && connection.app_cache.len == 10 && !memcmp(connection.app_cache.data,"vless-core",10));
+        db_free(&connection.h2_net_cache); db_free(&connection.app_cache); db_free(&connection.h2_send_buf); h2_response_clear(&connection); core_hpack_clear(&connection.hpack);
+        close(pair[0]); close(pair[1]);
+    }
+}
+
+static void priority_headers_keep_hpack(void) {
+    int pair[2]; REQUIRE("wire/priority-header-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    tls13_conn_t connection={.mode=CONN_MODE_GRPC_PLAIN,.fd=pair[0],.h2_stream_id=3,.h2_next_stream_id=7};
+    connection.h2_validation.settings_received=1;
+    REQUIRE("wire/priority-header-request",h2_response_get(&connection,1,1) != NULL);
+    const uint8_t input[]={0,0,7,1,32,0,0,0,1,0,0,0,1,0,0x88,0x40,0,0,4,9,4,0,0,0,1,1,'x',1,'v',0,0,2,1,4,0,0,0,3,0x88,0xbe};
+    REQUIRE("wire/priority-header-input",db_append(&connection.h2_net_cache,input,sizeof(input)) == 0);
+    CHECK("wire/priority-header-keeps-continuation",h2_pump_one_frame(&connection) == 0 && connection.h2_validation.continuation == 1);
+    uint8_t reset[13]={0}; ssize_t received=recv(pair[1],reset,sizeof(reset),MSG_DONTWAIT);
+    CHECK("wire/priority-header-reset-code",received == 13 && reset[3] == 3 && reset[8] == 1 && reset[12] == 1);
+    CHECK("wire/priority-header-decodes-closed-stream",h2_pump_one_frame(&connection) == 0 && connection.hpack.count == 1 && !connection.h2_validation.continuation);
+    CHECK("wire/priority-header-neighbor-dynamic-index",h2_pump_one_frame(&connection) == 0 && connection.h2_headers_received && !connection.grpc_read_failed);
+    char error[128]; CHECK("wire/reset-stream-cannot-send-final-data",h2_send_xhttp_body(&connection,1,NULL,0,error,sizeof(error)) < 0);
+    db_free(&connection.h2_net_cache); db_free(&connection.h2_header_block); db_free(&connection.h2_send_buf); h2_response_clear(&connection); core_hpack_clear(&connection.hpack);
+    close(pair[0]); close(pair[1]);
+}
+
 int main(void) {
+    priority_headers_keep_hpack();
+    priority_reset_wire();
     head_response_backend();
     tls13_conn_t connection={.mode=CONN_MODE_GRPC_PLAIN,.fd=-1,.xmux_async=1,.h2_stream_id=1};
     strcpy(connection.grpc_service_name,"vless-core"); strcpy(connection.grpc_authority,"vless-core.test");

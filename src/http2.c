@@ -43,8 +43,15 @@ int core_http2_alps_parse(const uint8_t *data,size_t length,core_http2_settings_
     *output=settings; return 0;
 }
 
+static int frame_error(core_http2_validation_t *state, unsigned scope, uint32_t code) {
+    state->error=(core_http2_error_t){scope,code}; return scope == CORE_HTTP2_ERROR_STREAM ? -2 : -1;
+}
+
 int core_http2_validate_frame(core_http2_validation_t *state, uint8_t type, uint8_t flags, uint32_t stream, const uint8_t *data, size_t length) {
-    if (!state || (!data && length) || length > 16384 || stream > 0x7fffffffU) return -1;
+    if (!state) return -1;
+    state->error=(core_http2_error_t){CORE_HTTP2_ERROR_CONNECTION,1};
+    if ((!data && length) || stream > 0x7fffffffU) return -1;
+    if (length > 16384) return frame_error(state,CORE_HTTP2_ERROR_CONNECTION,6);
     if (!state->settings_received && (type != 4 || (flags&1) || stream)) return -1;
     if (state->continuation && (type != 9 || stream != state->continuation)) return -1;
     int error=0;
@@ -57,7 +64,7 @@ int core_http2_validate_frame(core_http2_validation_t *state, uint8_t type, uint
         size_t start=0,end=length;
         if (flags&8) { if (!length || data[0] >= length) return -1; start=1; end-=data[0]; }
         if (flags&32) {
-            if (end-start < 5) return -1;
+            if (end-start < 5) return frame_error(state,CORE_HTTP2_ERROR_CONNECTION,6);
             if ((value32(data+start)&0x7fffffffU) == stream) error=-2;
         }
         if (!(flags&4)) state->continuation=stream;
@@ -65,20 +72,24 @@ int core_http2_validate_frame(core_http2_validation_t *state, uint8_t type, uint
     }
     case 2:
         if (!stream) return -1;
-        if (length != 5 || (value32(data)&0x7fffffffU) == stream) return -2;
+        if (length != 5) return frame_error(state,CORE_HTTP2_ERROR_STREAM,6);
+        if ((value32(data)&0x7fffffffU) == stream) return frame_error(state,CORE_HTTP2_ERROR_STREAM,1);
         break;
     case 3:
-        if (!stream || length != 4) return -1;
+        if (!stream) return -1;
+        if (length != 4) return frame_error(state,CORE_HTTP2_ERROR_CONNECTION,6);
         break;
     case 4:
-        if (stream || (flags&1 ? length != 0 : length%6 != 0)) return -1;
+        if (stream) return -1;
+        if (flags&1 ? length != 0 : length%6 != 0) return frame_error(state,CORE_HTTP2_ERROR_CONNECTION,6);
         if (flags&1) {
             if (!state->settings_pending) return -1;
             state->settings_pending--; break;
         }
         for (size_t i=0;i<length;i+=6) {
             unsigned id=((unsigned)data[i]<<8)|data[i+1]; uint32_t value=value32(data+i+2);
-            if ((id == 2 && value != 0) || (id == 4 && value > INT_MAX) || (id == 5 && (value < 16384 || value > 16777215))) return -1;
+            if (id == 4 && value > INT_MAX) return frame_error(state,CORE_HTTP2_ERROR_CONNECTION,3);
+            if ((id == 2 && value != 0) || (id == 5 && (value < 16384 || value > 16777215))) return -1;
         }
         if (!state->settings_received) state->settings_pending=1;
         state->settings_received=1;
@@ -86,14 +97,16 @@ int core_http2_validate_frame(core_http2_validation_t *state, uint8_t type, uint
     case 5:
         return -1;
     case 6:
-        if (stream || length != 8) return -1;
+        if (stream) return -1;
+        if (length != 8) return frame_error(state,CORE_HTTP2_ERROR_CONNECTION,6);
         break;
     case 7:
-        if (stream || length < 8) return -1;
+        if (stream) return -1;
+        if (length < 8) return frame_error(state,CORE_HTTP2_ERROR_CONNECTION,6);
         break;
     case 8:
-        if (length != 4) return -1;
-        if (!(value32(data)&0x7fffffffU)) return stream ? -2 : -1;
+        if (length != 4) return frame_error(state,CORE_HTTP2_ERROR_CONNECTION,6);
+        if (!(value32(data)&0x7fffffffU)) return frame_error(state,stream ? CORE_HTTP2_ERROR_STREAM : CORE_HTTP2_ERROR_CONNECTION,1);
         break;
     case 9:
         if (!state->continuation || stream != state->continuation) return -1;
@@ -102,7 +115,8 @@ int core_http2_validate_frame(core_http2_validation_t *state, uint8_t type, uint
     default:
         break;
     }
-    return error;
+    if (error) return frame_error(state,CORE_HTTP2_ERROR_STREAM,1);
+    state->error=(core_http2_error_t){0}; return 0;
 }
 
 static int finish_response(core_http2_response_t *state, int end) {

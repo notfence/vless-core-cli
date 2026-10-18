@@ -2,7 +2,7 @@
 #include "../src/http2_pool.c"
 #include "check.h"
 
-typedef struct { size_t pending; int frames, last_type, flags[16]; uint32_t last_id, ids[16], increment, request_id; uint64_t enqueued, flushed; size_t payload_bytes,packet_requests; int last_role,end_frames; } wire_t;
+typedef struct { size_t pending; int frames, last_type, flags[16]; uint32_t last_id, ids[16], increment, request_id, reset_code; uint64_t enqueued, flushed; size_t payload_bytes,packet_requests; int last_role,end_frames; } wire_t;
 static int session_failure;
 static uint64_t pacing_clock;
 static uint32_t pacing_random;
@@ -43,6 +43,7 @@ static size_t fixture_pending(void *opaque) { return ((wire_t *)opaque)->pending
 static int fixture_send(void *opaque, uint8_t type, uint8_t flags, uint32_t id, const uint8_t *data, size_t length) {
     wire_t *wire=opaque; wire->pending+=length+9; wire->enqueued+=length+9;
     if (type == 8 && length == 4) wire->increment=((uint32_t)data[0]<<24)|((uint32_t)data[1]<<16)|((uint32_t)data[2]<<8)|data[3];
+    if (type == 3 && length == 4) wire->reset_code=((uint32_t)data[0]<<24)|((uint32_t)data[1]<<16)|((uint32_t)data[2]<<8)|data[3];
     if (wire->frames < 16) { wire->flags[wire->frames]=flags; wire->ids[wire->frames]=id; }
     wire->frames++; wire->last_type=type; wire->last_id=id; return 0;
 }
@@ -620,7 +621,44 @@ static void head_upload_response(void) {
     core_hpack_clear(&actor.hpack); core_buffer_budget_clear(&actor.output_memory);
 }
 
+static void priority_stream_isolation(void) {
+    const struct { uint8_t type; size_t length; uint32_t code; } cases[]={{2,4,6},{2,6,6},{2,5,1},{8,4,1}};
+    for (size_t i=0;i<sizeof(cases)/sizeof(*cases);i++) {
+        wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
+        mux_actor_t actor={.manager=&manager,.physical=&wire,.http2=1,.latest_stream=3,.receive_window=65535}; actor.validation.settings_received=1;
+        core_http2_stream_t first={0},second={0};
+        REQUIRE("xmux/priority-notifications",notification_pair(first.notify) == 0 && notification_pair(second.notify) == 0);
+        mux_request_t a={.stream=&first,.id=1,.role=1,.response.headers=1},b={.stream=&second,.id=3,.role=1,.receive_window=65535,.response.headers=1}; a.next=&b; actor.requests=&a;
+        uint8_t payload[]={0,0,0,1,0,0}; if (cases[i].type == 8) payload[3]=0;
+        core_http2_frame_t frame={.type=cases[i].type,.id=1,.data=payload,.length=cases[i].length};
+        CHECK("xmux/priority-error-code-and-scope",process_frame(&actor,&frame) == 0 && wire.last_type == 3 && wire.last_id == 1 && wire.reset_code == cases[i].code && first.failed && !second.failed && !actor.failed);
+        frame=(core_http2_frame_t){.type=0,.id=3,.data=(uint8_t *)"vless-core",.length=10};
+        CHECK("xmux/priority-neighbor-still-receives",process_frame(&actor,&frame) == 0 && second.rx.length == 10 && !second.failed);
+        core_http2_queue_clear(&second.rx); download_bytes=0;
+        close(first.notify[0]); close(first.notify[1]); close(second.notify[0]); close(second.notify[1]);
+    }
+}
+
+static void rejected_priority_headers_keep_hpack(void) {
+    wire_t wire={0}; mux_manager_t manager={.backend=&fixture_backend}; manager.config.transport_mode=TRANSPORT_XHTTP;
+    mux_actor_t actor={.manager=&manager,.physical=&wire,.http2=1,.latest_stream=3}; actor.validation.settings_received=1;
+    core_http2_stream_t first={0},second={0};
+    REQUIRE("xmux/priority-header-notifications",notification_pair(first.notify) == 0 && notification_pair(second.notify) == 0);
+    mux_request_t a={.stream=&first,.id=1,.role=1},b={.stream=&second,.id=3,.role=1}; a.next=&b; actor.requests=&a;
+    const uint8_t start[]={0,0,0,1,0,0x88,0x40},finish[]={1,'x',1,'v'},neighbor[]={0x88,0xbe};
+    core_http2_frame_t frame={.type=1,.flags=32,.id=1,.data=(uint8_t *)start,.length=sizeof(start)};
+    CHECK("xmux/priority-header-error-preserves-continuation",process_frame(&actor,&frame) == 0 && first.failed && !second.failed && wire.reset_code == 1 && actor.validation.continuation == 1);
+    frame=(core_http2_frame_t){.type=9,.flags=4,.id=1,.data=(uint8_t *)finish,.length=sizeof(finish)};
+    CHECK("xmux/rejected-priority-header-updates-hpack",process_frame(&actor,&frame) == 0 && actor.hpack.count == 1 && !actor.validation.continuation);
+    frame=(core_http2_frame_t){.type=1,.flags=4,.id=3,.data=(uint8_t *)neighbor,.length=sizeof(neighbor)};
+    CHECK("xmux/neighbor-uses-rejected-stream-dynamic-entry",process_frame(&actor,&frame) == 0 && b.response.headers && !second.failed && !actor.failed);
+    core_http2_queue_clear(&actor.header_block); core_hpack_clear(&actor.hpack);
+    close(first.notify[0]); close(first.notify[1]); close(second.notify[0]); close(second.notify[1]);
+}
+
 int main(void) {
+    rejected_priority_headers_keep_hpack();
+    priority_stream_isolation();
     head_upload_response();
     private_close_completes_cleanup();
     memory_admission_policy();

@@ -138,7 +138,7 @@ typedef struct h2_response_entry {
     uint32_t id;
     core_http2_response_t response;
     int64_t receive_window;
-    int request_ended;
+    int request_ended, reset;
 } h2_response_entry_t;
 
 

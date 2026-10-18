@@ -63,7 +63,7 @@ class GrpcPeer(Server):
         self.maximum=maximum; self.acknowledge=acknowledge
         self.server_settings=settings
         self.responses=responses or {}
-        self.requests=[]; self.windows=[]; self.ping=threading.Event(); self.finished=threading.Event(); self.uploads=[]
+        self.requests=[]; self.windows=[]; self.resets=[]; self.ping=threading.Event(); self.finished=threading.Event(); self.uploads=[]
         super().__init__(self.handle)
 
     def handle(self, connection):
@@ -131,6 +131,9 @@ class GrpcPeer(Server):
                         if data == b"bad-length": connection.sendall(data_frames(stream,envelope(b"\x00\x00vless-core")))
                         if data == b"bad-trailers": connection.sendall(data_frames(stream,envelope(b"\x00\x00"))+frame(1,5,stream,b"\x88"+retained))
                         state["responded"]=state["ended"]=True; continue
+                    if data in (b"bad-priority-size",b"bad-priority-dependency"):
+                        priority=bytes(4) if data == b"bad-priority-size" else stream.to_bytes(4,"big")+b"\x00"
+                        connection.sendall(frame(2,stream=stream,payload=priority)); state["responded"]=state["ended"]=True; continue
                     if data == b"extension": connection.sendall(frame(99,255,9999,b"vless-core extension"))
                     if data == b"reset": connection.sendall(frame(3,stream=stream,payload=(8).to_bytes(4,"big"))); continue
                     if data == b"status":
@@ -154,9 +157,21 @@ class GrpcPeer(Server):
             elif kind == 6 and not flags&1:
                 self.ping.set()
                 if self.acknowledge: connection.sendall(frame(6,1,payload=payload))
-            elif kind == 3: streams.pop(stream,None)
+            elif kind == 3:
+                self.resets.append((stream,int.from_bytes(payload,"big"))); streams.pop(stream,None)
 
 class GrpcTests(unittest.TestCase):
+    def test_priority_rst_codes_preserve_neighbor_rpc(self):
+        for message,expected in ((b"bad-priority-size",6),(b"bad-priority-dependency",1)):
+            with self.subTest(message=message), GrpcPeer() as peer, cli(uri(peer.port,"grpc","none")) as core:
+                with socks_connect(core.port,80) as failed, socks_connect(core.port,81) as neighbor:
+                    failed.sendall(message); self.assertEqual(failed.recv(1),b"")
+                    exchange(neighbor,b"vless-core neighboring RPC survives")
+                    until=time.monotonic()+2
+                    while not peer.resets and time.monotonic() < until: time.sleep(0.001)
+                    self.assertEqual(peer.resets[0][1],expected)
+                    self.assertEqual(len(peer.connections),1)
+
     def test_reply_is_readable_before_upload_window_recovers(self):
         reply=b"vless-core readable while upload stalled"
         for transport, pooled in (("grpc",True),("xhttp",True),("xhttp",False)):
