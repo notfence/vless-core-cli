@@ -96,7 +96,9 @@ def seeds():
                 frame(4,0,0,b"")+frame(1,4,1,b"\x88\x40\x03x\x00y\x01v\x40\x01x\x01n")+frame(1,4,3,b"\x88\xbe"),
                 frame(4,0,0,b"")+frame(2,0,1,bytes(4))+frame(1,4,3,b"\x88"),
                 frame(4,0,0,b"")+frame(2,0,1,b"\x00\x00\x00\x01\x00")+frame(1,4,3,b"\x88"),
-                frame(4,0,0,b"")+frame(1,32,1,b"\x00\x00\x00\x01\x00\x88\x40")+frame(9,4,1,b"\x01x\x01v")+frame(1,4,3,b"\x88\xbe")],
+                frame(4,0,0,b"")+frame(1,32,1,b"\x00\x00\x00\x01\x00\x88\x40")+frame(9,4,1,b"\x01x\x01v")+frame(1,4,3,b"\x88\xbe"),
+                *[frame(4,0,0,b"")+frame(1,4,1,b"\x88\x00\x0ccontent-type\x10application/grpc")+frame(0,flags,1,b"vless-core"*50)+suffix
+                  for flags in (0,2) for suffix in (b"",frame(3,0,1,bytes(4)),frame(99,0,0,b""))]],
         "grpc":[b"\x00\x00\x00\x00\x0c\x0a\x0avless-core",b"\x0a\x0avless-core",b"\x00"*5,b"\xff"*12,
                 b"\x00\x00\x00\x00\x08\x0a\x03abc\x0a\x01x",b"\x00\x01\x00\x00\x00\x0a\xfb\xff\xff\x07x",
                 b"\x00\x00\x00\x00\x07\x0a\x03abc\x0a\x00",b"\x00\x00\x00\x00\x09\x13\x0a\x01x\x14\x0a\x02ok"],

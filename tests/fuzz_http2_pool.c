@@ -22,7 +22,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t length) {
     int packet=length&1;
     fuzz_wire_t wire={.request_id=3}; mux_manager_t manager={.backend=&fuzz_backend};
     manager.config.transport_mode=packet ? TRANSPORT_XHTTP : TRANSPORT_GRPC; manager.config.grpc_initial_window=1024;
-    mux_group_t group={.manager=&manager,.request_limit=INT_MAX,.expires_ms=UINT64_MAX};
+    mux_group_t group={.manager=&manager,.running=2,.request_limit=INT_MAX,.expires_ms=UINT64_MAX};
     mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.peer_frame=16384,
         .latest_stream=3,.send_window=65535,.receive_window=65535,.peer_window=1024,.peer_concurrency=100};
     core_http2_stream_t first={.download=&actor,.upload=&actor,.down_id=1,.up_id=1,.ready=1,.references=65536};
@@ -69,9 +69,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t length) {
         (void)core_http2_finish_pending(stream);
     }
     while (actor.requests) { mux_request_t *next=actor.requests->next; free(actor.requests); actor.requests=next; }
-    core_http2_queue_clear(&first.rx); core_http2_queue_clear(&first.tx); core_http2_queue_clear(&second.rx); core_http2_queue_clear(&second.tx);
+    int64_t before_credit=actor.receive_window;
+    size_t credit=first.consumed+first.rx.length+second.consumed+second.rx.length;
+    core_http2_close(&first); core_http2_close(&second);
+    if (advance_streams(&actor) || actor.receive_window != before_credit+(int64_t)credit || actor.pending_credit) abort();
     core_http2_queue_clear(&actor.header_block); core_hpack_clear(&actor.hpack);
-    close(first.notify[0]); close(first.notify[1]); close(second.notify[0]); close(second.notify[1]); close(actor.wake[0]); close(actor.wake[1]);
+    close(actor.wake[0]); close(actor.wake[1]);
     streams=NULL; upload_bytes=download_bytes=actor_count=0;
     return 0;
 }

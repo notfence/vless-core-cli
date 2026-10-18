@@ -85,10 +85,10 @@ struct mux_actor {
     core_trace_stage_t progress_stage;
     uint32_t header_id;
     uint32_t latest_stream;
-    uint8_t header_flags;
+    uint8_t header_flags, trace_present;
     int wake[2], opening, failed, draining, stopped, http2;
     int thread_started,closing,close_waiters;
-    int trace_present;
+    uint32_t pending_credit;
     int alive_period, receive_slots;
     uint64_t connect_until_ms, last_input_ms, ping_deadline_ms;
     uint8_t ping[8];
@@ -702,12 +702,13 @@ static int advance_streams(mux_actor_t *actor) {
         for (mux_request_t *request=actor->requests;request;request=request->next) request->send_window=INT_MAX;
     }
     for (core_http2_stream_t *stream=streams;stream;stream=stream->next) {
-        if (stream->download == actor && stream->consumed && stream->down_id) {
+        if (stream->download == actor && (stream->consumed || actor->pending_credit) && stream->down_id) {
             uint32_t amount=(uint32_t)stream->consumed;
             mux_request_t *request=find_request(actor,stream->down_id);
             if (receive_credit_due(actor,stream,request)) {
-                if (window_update(actor,0,amount) != 0 || (request && !request->ended && !stream->closed && window_update(actor,stream->down_id,amount) != 0)) return -1;
-                actor->receive_window+=amount; if (request) request->receive_window+=amount; stream->consumed=0;
+                uint32_t connection_amount=amount+actor->pending_credit;
+                if (window_update(actor,0,connection_amount) != 0 || (request && !request->ended && !stream->closed && window_update(actor,stream->down_id,amount) != 0)) return -1;
+                actor->receive_window+=connection_amount; actor->pending_credit=0; if (request) request->receive_window+=amount; stream->consumed=0;
             }
         }
         if (stream->failed || (stream->closed && !stream->tx.length)) continue;
@@ -1311,6 +1312,10 @@ void core_http2_close(core_http2_stream_t *stream) {
         upload_bytes-=stream->tx.length+stream->reserved_upload; stream->reserved_upload=0; core_http2_queue_clear(&stream->tx);
         notify_write_capacity(previous);
         stream->consumed+=stream->rx.length; download_bytes-=stream->rx.length; core_http2_queue_clear(&stream->rx);
+        if (stream->download && stream->download->http2) {
+            stream->download->pending_credit+=(uint32_t)stream->consumed;
+            stream->consumed=0;
+        }
         wake_admission();
         if (stream->download) {
             stream->download->group->running--; wake_actor(stream->download); wake_actor(stream->upload);

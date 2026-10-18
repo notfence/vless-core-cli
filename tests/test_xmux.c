@@ -823,7 +823,100 @@ static void rejected_priority_headers_keep_hpack(void) {
     close(first.notify[0]); close(first.notify[1]); close(second.notify[0]); close(second.notify[1]);
 }
 
+static int credit_send_failure;
+static int credit_send(void *physical,uint8_t type,uint8_t flags,uint32_t id,const uint8_t *data,size_t length) {
+    if (credit_send_failure) { credit_send_failure=0; errno=ENOMEM; return -1; }
+    return fixture_send(physical,type,flags,id,data,length);
+}
+
+static void final_stream_credit(void) {
+    printf("LAYOUT actor=%zu stream=%zu\n",sizeof(mux_actor_t),sizeof(core_http2_stream_t));
+    for (int transport=0;transport<2;transport++) for (int unread=0;unread<3;unread++) for (int failed=0;failed<2;failed++) {
+        wire_t wire={0};
+        mux_manager_t manager={.backend=&fixture_backend,.config.transport_mode=transport ? TRANSPORT_XHTTP : TRANSPORT_GRPC,.config.xmux.present=1};
+        mux_group_t group={.manager=&manager,.running=1,.expires_ms=UINT64_MAX};
+        mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.latest_stream=1,.receive_window=65535};
+        actor.validation.settings_received=1;
+        REQUIRE("h2/final-credit-wake-pair",!notification_pair(actor.wake));
+        core_http2_stream_t *stream=calloc(1,sizeof(*stream));
+        mux_request_t *request=calloc(1,sizeof(*request));
+        REQUIRE("h2/final-credit-state",stream && request);
+        stream->config=manager.config; strcpy(stream->config.xhttp_mode,"stream-one");
+        stream->download=stream->upload=&actor; stream->references=2; stream->down_id=stream->up_id=1; stream->ready=1;
+        REQUIRE("h2/final-credit-client-pair",!notification_pair(stream->notify));
+        *request=(mux_request_t){.stream=stream,.id=1,.role=1,.response.headers=1,.receive_window=65535};
+        actor.requests=request; streams=stream; stream_count++;
+        core_http2_frame_t frame={.type=0,.id=1,.data=(uint8_t *)"vless-core",.length=10};
+        REQUIRE("h2/final-credit-data",!process_frame(&actor,&frame) && actor.receive_window == 65525);
+        request->ended=request->send_ended=1; request->reset=failed; stream->failed=failed; stream->eof=1;
+        REQUIRE("h2/final-credit-request-released",!advance_streams(&actor) && !actor.requests && stream->references == 1 && !wire.frames);
+        if (unread != 1) {
+            uint8_t output[10]; size_t length=0;
+            REQUIRE("h2/final-credit-drain",!core_http2_read(stream,output,sizeof(output),&length) && length == sizeof(output) && !memcmp(output,"vless-core",10));
+        }
+        if (unread == 2) REQUIRE("h2/final-credit-already-returned",!advance_streams(&actor) && actor.receive_window == 65535 && wire.frames == 1);
+        int before_frames=wire.frames; int64_t before_window=actor.receive_window;
+        core_http2_close(stream);
+        CHECK("h2/final-credit-stream-freed",!streams && !stream_count && !download_bytes);
+        CHECK("h2/final-credit-not-written-by-client",wire.frames == before_frames && actor.receive_window == before_window);
+        REQUIRE("h2/final-credit-idle-owner",!advance_streams(&actor));
+        CHECK("h2/final-credit-idle-keeps-credit-without-frame",wire.frames == before_frames && actor.receive_window == before_window);
+        core_http2_stream_t peer={.config=manager.config,.download=&actor,.upload=&actor,.references=1,.down_id=3,.up_id=3,.ready=1};
+        strcpy(peer.config.xhttp_mode,"stream-one");
+        REQUIRE("h2/final-credit-peer-notify",!notification_pair(peer.notify));
+        streams=&peer; stream_count++; group.running++;
+        REQUIRE("h2/final-credit-owner-runs",!advance_streams(&actor));
+        CHECK("h2/final-credit-restored",actor.receive_window == 65535);
+        CHECK("h2/final-credit-connection-update",wire.frames == 1 && wire.last_type == 8 && wire.last_id == 0 && wire.increment == 10);
+        REQUIRE("h2/final-credit-idempotent-owner",!advance_streams(&actor));
+        CHECK("h2/final-credit-not-duplicated",actor.receive_window == 65535 && wire.frames == 1);
+        streams=NULL; stream_count--; group.running--; close(peer.notify[0]); close(peer.notify[1]);
+        wire.pending=0; account_output(&actor);
+        close(actor.wake[0]); close(actor.wake[1]);
+    }
+    const core_http2_backend_t backend={.send_frame=credit_send,.pending=fixture_pending};
+    wire_t wire={0}; mux_manager_t manager={.backend=&backend,.config.transport_mode=TRANSPORT_GRPC};
+    mux_group_t group={.manager=&manager,.running=2};
+    mux_actor_t actor={.manager=&manager,.group=&group,.physical=&wire,.http2=1,.receive_window=65505};
+    REQUIRE("h2/final-credit-batch-wake",!notification_pair(actor.wake));
+    for (unsigned i=0;i<2;i++) {
+        core_http2_stream_t *stream=calloc(1,sizeof(*stream)); REQUIRE("h2/final-credit-batch-state",stream != NULL);
+        stream->config.transport_mode=TRANSPORT_GRPC; stream->download=stream->upload=&actor; stream->references=1;
+        stream->consumed=(i+1)*10; stream->next=streams; streams=stream; stream_count++;
+        REQUIRE("h2/final-credit-batch-notify",!notification_pair(stream->notify));
+    }
+    while (streams) core_http2_close(streams);
+    CHECK("h2/final-credit-batch-deferred",!stream_count && !wire.frames && actor.receive_window == 65505);
+    REQUIRE("h2/final-credit-batch-idle-owner",!advance_streams(&actor));
+    CHECK("h2/final-credit-batch-no-idle-frame",!wire.frames && actor.receive_window == 65505);
+    core_http2_stream_t peer={.config.transport_mode=TRANSPORT_GRPC,.download=&actor,.upload=&actor,.references=1,.down_id=3,.up_id=3,.ready=1};
+    REQUIRE("h2/final-credit-batch-peer-notify",!notification_pair(peer.notify));
+    streams=&peer; stream_count++; group.running++;
+    credit_send_failure=1;
+    CHECK("h2/final-credit-failed-update-retained",advance_streams(&actor) < 0 && actor.receive_window == 65505 && !wire.frames);
+    credit_send_failure=0;
+    REQUIRE("h2/final-credit-batch-update",!advance_streams(&actor));
+    CHECK("h2/final-credit-batch-restored",actor.receive_window == 65535 && wire.frames == 1 && !wire.last_id && wire.increment == 30);
+    REQUIRE("h2/final-credit-batch-idempotent",!advance_streams(&actor));
+    CHECK("h2/final-credit-batch-not-duplicated",wire.frames == 1 && actor.receive_window == 65535);
+    core_http2_stream_t *closed=calloc(1,sizeof(*closed)); REQUIRE("h2/final-credit-mixed-state",closed != NULL);
+    closed->config.transport_mode=TRANSPORT_GRPC; closed->download=closed->upload=&actor; closed->references=1;
+    closed->consumed=30; closed->next=streams; streams=closed; stream_count++; group.running++;
+    REQUIRE("h2/final-credit-mixed-notify",!notification_pair(closed->notify));
+    actor.receive_window-=37; peer.consumed=7;
+    core_http2_close(closed);
+    mux_request_t request={.stream=&peer,.id=3,.role=1,.receive_window=65528}; actor.requests=&request;
+    REQUIRE("h2/final-credit-mixed-update",!advance_streams(&actor));
+    CHECK("h2/final-credit-mixed-connection",actor.receive_window == 65535 && wire.frames == 3);
+    CHECK("h2/final-credit-mixed-stream",request.receive_window == 65535 && !peer.consumed && wire.last_id == 3 && wire.increment == 7);
+    REQUIRE("h2/final-credit-mixed-idempotent",!advance_streams(&actor));
+    CHECK("h2/final-credit-mixed-not-duplicated",wire.frames == 3);
+    actor.requests=NULL; streams=NULL; stream_count--; group.running--; close(peer.notify[0]); close(peer.notify[1]);
+    wire.pending=0; account_output(&actor); close(actor.wake[0]); close(actor.wake[1]);
+}
+
 int main(void) {
+    final_stream_credit();
     partial_parts_policy();
     reset_after_response();
     random_range_bound();
