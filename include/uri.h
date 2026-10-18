@@ -10,5 +10,7 @@
 int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap);
 int parse_core_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap);
 void core_config_defaults(vless_config_t *);
+int core_server_host_valid(const char *);
+int core_http_authority_format(const char *, char *, size_t);
 
 #endif

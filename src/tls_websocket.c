@@ -1,4 +1,5 @@
 #include "tls_transport_internal.h"
+#include "uri.h"
 
 static int base64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap);
 static int normalize_ws_path(const char *in, char *out, size_t out_cap);
@@ -24,9 +25,7 @@ static int normalize_ws_path(const char *in, char *out, size_t out_cap) {
 }
 
 int http_host(const char *input, char *output, size_t capacity) {
-    uint8_t address[16];
-    int size=snprintf(output,capacity,inet_pton(AF_INET6,input,address) == 1 ? "[%s]" : "%s",input);
-    return size < 0 || (size_t)size >= capacity ? -1 : 0;
+    return core_http_authority_format(input,output,capacity);
 }
 
 static int ws_make_key(char out[25]) {
@@ -119,6 +118,10 @@ int ws_fill_app_cache(tls13_conn_t *c) {
 }
 
 int ws_upgrade(tls13_conn_t *c, const uint8_t *early, size_t early_length, char *err, size_t err_cap) {
+    char authority[sizeof(c->ws_host)+2];
+    if (http_host(c->ws_host,authority,sizeof(authority)) || strcmp(authority,c->ws_host)) {
+        set_err(err,err_cap,"invalid ws host"); return -1;
+    }
     char key[25],expected[29];
     if (ws_make_key(key) || ws_make_accept(key,expected)) { set_err(err,err_cap,"failed to build WebSocket key"); return -1; }
     char headers[8192]=

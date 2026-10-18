@@ -12,6 +12,20 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_invalid_endpoint_never_starts_listener(self):
+        configs=("vless://00000000-0000-0000-0000-000000000001@vless-core.test\r\nX-Audit: injected:443?type=ws&security=none",
+            uri(443,"ws","none",host="vless-core.test:+80"),
+            uri(443,"xhttp","none",downloadSettings=json.dumps({"address":"bad\\host","port":443,"network":"xhttp"})))
+        for config in configs:
+            for inspect in (False,True):
+                with self.subTest(inspect=inspect,index=configs.index(config)):
+                    command=[str(BUILD/"vless-core-test"),"--uri-fd","0","--server-ips","127.0.0.1"]
+                    if inspect: command.append("--inspect-config")
+                    result=subprocess.run(command,input=config,text=True,capture_output=True,timeout=3)
+                    self.assertNotEqual(result.returncode,0)
+                    self.assertNotIn("listening",result.stdout+result.stderr)
+                    self.assertNotIn("X-Audit",result.stdout+result.stderr)
+
     def test_inspection_is_private_and_offline(self):
         configurations=(("socks5://user:private-vless-core@no-dns.invalid:1080#vless-core", "PRIMARY\tno-dns.invalid\t1080\n"),
             (uri(443,"xhttp","none",downloadSettings=json.dumps({"address":"download.invalid","port":8443,"network":"xhttp"})), "PRIMARY\t127.0.0.1\t443\nDOWNLOAD\tdownload.invalid\t8443\n"))

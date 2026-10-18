@@ -76,6 +76,20 @@ static void priority_headers_keep_hpack(void) {
 }
 
 int main(void) {
+    char authority[256];
+    const char *invalid_hosts[]={"vless-core.test\r\nX-Audit: injected","bad host","bad\thost","bad\\host","[bad]","[::1]extra","vless-core.test:+80","vless-core.test:"};
+    for (size_t i=0;i<sizeof(invalid_hosts)/sizeof(*invalid_hosts);i++)
+        CHECK("wire/invalid-authority-rejected",http_host(invalid_hosts[i],authority,sizeof(authority)) < 0);
+    CHECK("wire/ipv6-authority-brackets",!http_host("::1",authority,sizeof(authority)) && !strcmp(authority,"[::1]"));
+    CHECK("wire/ipv6-authority-port",!http_host("[::1]:65535",authority,sizeof(authority)) && !strcmp(authority,"[::1]:65535"));
+    CHECK("wire/dns-authority-port",!http_host("vless_core.test.:00080",authority,sizeof(authority)) && !strcmp(authority,"vless_core.test.:00080"));
+    CHECK("wire/authority-capacity",http_host("::1",authority,5) < 0);
+    int injected_pair[2]; REQUIRE("wire/host-injection-pair",socketpair(AF_UNIX,SOCK_STREAM,0,injected_pair) == 0);
+    tls13_conn_t injected_websocket={.fd=injected_pair[0],.mode=CONN_MODE_WS}; char failure[128];
+    strcpy(injected_websocket.ws_path,"/vless-core"); strcpy(injected_websocket.ws_host,"vless-core.test\r\nX-Audit: injected");
+    CHECK("wire/upgrade-rejects-host-before-write",ws_upgrade(&injected_websocket,NULL,0,failure,sizeof(failure)) < 0 && !strstr(failure,"injected"));
+    uint8_t byte; CHECK("wire/invalid-host-emits-no-request",recv(injected_pair[1],&byte,1,MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    close(injected_pair[0]); close(injected_pair[1]);
     priority_headers_keep_hpack();
     priority_reset_wire();
     head_response_backend();

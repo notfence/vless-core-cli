@@ -1,13 +1,13 @@
 #include "config_inspect.h"
 #include "xhttp_download.h"
+#include "uri.h"
 #include <openssl/crypto.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static int endpoint(char *output, size_t capacity, size_t *used, const char *kind, const vless_config_t *config) {
-    for (const unsigned char *p=(const unsigned char *)config->server_host;*p;p++)
-        if (*p <= 0x20 || *p == 0x7f) return -1;
+    if (!core_server_host_valid(config->server_host) || !config->server_port) return -1;
     int length=snprintf(output+*used,capacity-*used,"%s\t%s\t%u\n",kind,config->server_host,(unsigned)config->server_port);
     if (length < 0 || (size_t)length >= capacity-*used) return -1;
     *used+=(size_t)length;

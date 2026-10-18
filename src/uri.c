@@ -118,6 +118,54 @@ void core_config_defaults(vless_config_t *cfg) {
     cfg->xhttp_max_each_post_max = 1000000;
 }
 
+int core_server_host_valid(const char *host) {
+    if (!host || !*host) return 0;
+    for (const unsigned char *p=(const unsigned char *)host;*p;p++)
+        if (*p <= 0x20 || *p == 0x7f || strchr("/?#@[]\\",*p)) return 0;
+    if (strchr(host,':')) { uint8_t address[16]; return inet_pton(AF_INET6,host,address) == 1; }
+    return 1;
+}
+
+static int endpoint_port(const char *text, uint16_t *port) {
+    if (!text || !*text) return -1;
+    unsigned value=0;
+    for (const unsigned char *p=(const unsigned char *)text;*p;p++) {
+        if (*p < '0' || *p > '9' || value > (65535U-(*p-'0'))/10U) return -1;
+        value=value*10U+(*p-'0');
+    }
+    if (!value) return -1;
+    *port=(uint16_t)value; return 0;
+}
+
+int core_http_authority_format(const char *input, char *output, size_t capacity) {
+    if (!input || !output || !*input) return -1;
+    uint8_t address[16];
+    int ipv6=inet_pton(AF_INET6,input,address) == 1;
+    if (!ipv6) {
+        char host[sizeof(((vless_config_t *)0)->xhttp_host)]; const char *port=NULL;
+        size_t length;
+        if (*input == '[') {
+            const char *end=strchr(input,']');
+            if (!end || (end[1] && end[1] != ':')) return -1;
+            length=(size_t)(end-input-1);
+            if (end[1]) port=end+2;
+            if (!length || length >= sizeof(host)) return -1;
+            memcpy(host,input+1,length); host[length]=0;
+            if (inet_pton(AF_INET6,host,address) != 1) return -1;
+        } else {
+            port=strchr(input,':'); length=port ? (size_t)(port-input) : strlen(input);
+            if (port) port++;
+            if (!length || length >= sizeof(host)) return -1;
+            memcpy(host,input,length); host[length]=0;
+            if (!core_server_host_valid(host)) return -1;
+        }
+        uint16_t value;
+        if (port && endpoint_port(port,&value)) return -1;
+    }
+    int length=snprintf(output,capacity,ipv6 ? "[%s]" : "%s",input);
+    return length < 0 || (size_t)length >= capacity ? -1 : 0;
+}
+
 static int parse_host_port(const char *s, char *host, size_t host_cap, uint16_t *port) {
     if (s == NULL || host == NULL || port == NULL) {
         return -1;
@@ -134,13 +182,8 @@ static int parse_host_port(const char *s, char *host, size_t host_cap, uint16_t 
         }
         memcpy(host, s + 1, hlen);
         host[hlen] = '\0';
-        char *port_end = NULL;
-        long p = strtol(end + 2, &port_end, 10);
-        if (p <= 0 || p > 65535 || port_end == end + 2 || *port_end != '\0') {
-            return -1;
-        }
-        *port = (uint16_t)p;
-        return 0;
+        uint8_t address[16];
+        return inet_pton(AF_INET6,host,address) == 1 ? endpoint_port(end+2,port) : -1;
     }
 
     const char *colon = strrchr(s, ':');
@@ -154,13 +197,7 @@ static int parse_host_port(const char *s, char *host, size_t host_cap, uint16_t 
     memcpy(host, s, hlen);
     host[hlen] = '\0';
 
-    char *port_end = NULL;
-    long p = strtol(colon + 1, &port_end, 10);
-    if (p <= 0 || p > 65535 || port_end == colon + 1 || *port_end != '\0') {
-        return -1;
-    }
-    *port = (uint16_t)p;
-    return 0;
+    return !strchr(host,':') && core_server_host_valid(host) ? endpoint_port(colon+1,port) : -1;
 }
 
 static int parse_host_optional_port(const char *s, uint16_t default_port, char *host, size_t host_cap, uint16_t *port) {
@@ -182,6 +219,8 @@ static int parse_host_optional_port(const char *s, uint16_t default_port, char *
         }
         memcpy(host, s + 1, hlen);
         host[hlen] = '\0';
+        uint8_t address[16];
+        if (inet_pton(AF_INET6,host,address) != 1) return -1;
         *port = default_port;
         return 0;
     }
@@ -195,6 +234,7 @@ static int parse_host_optional_port(const char *s, uint16_t default_port, char *
     }
     memcpy(host, s, hlen);
     host[hlen] = '\0';
+    if (!core_server_host_valid(host)) return -1;
     *port = default_port;
     return 0;
 }
@@ -697,6 +737,11 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         return -1;
     }
     if (cfg->transport_mode == TRANSPORT_WS && core_ws_configure(cfg,err,err_cap)) return -1;
+    if (cfg->transport_mode == TRANSPORT_WS) {
+        char authority[sizeof(cfg->xhttp_host)+2];
+        const char *host=cfg->xhttp_host[0] ? cfg->xhttp_host : strcmp(cfg->security,"none") && cfg->sni[0] ? cfg->sni : cfg->server_host;
+        if (core_http_authority_format(host,authority,sizeof(authority))) { set_err(err,err_cap,"invalid WebSocket host"); return -1; }
+    }
     if (cfg->transport_mode == TRANSPORT_WS || cfg->transport_mode == TRANSPORT_XHTTP) {
         char escaped[sizeof(cfg->xhttp_path)],target[sizeof(cfg->xhttp_path)+2];
         if (core_request_target(cfg->xhttp_path,escaped,sizeof(escaped)) ||

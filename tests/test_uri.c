@@ -12,6 +12,32 @@ static vless_config_t config;
 static char error[256];
 static int parse(const char *uri) { return parse_core_uri(uri, &config, error, sizeof(error)); }
 
+static void check_endpoint_validation(void) {
+    const char *invalid[]={"vless-core.test\r\nX-Audit: injected:443","vless core.test:443","vless-core.test\\bad:443",
+        "vless-core.test:443/path","[vless-core.test]:443","[::1]extra:443","::1:443",
+        "vless-core.test:+443","vless-core.test: 443","vless-core.test:443x","vless-core.test:0",
+        "vless-core.test:65536","vless-core.test:184467440737095516160"};
+    char value[1024];
+    for (size_t i=0;i<sizeof(invalid)/sizeof(*invalid);i++) {
+        snprintf(value,sizeof(value),"vless://00000000-0000-0000-0000-000000000001@%s?type=ws&security=none",invalid[i]);
+        CHECK("uri/invalid-endpoint-rejected",parse(value) < 0 && !strstr(error,"injected"));
+        snprintf(value,sizeof(value),"socks5://%s",invalid[i]);
+        if (i != 3) CHECK("uri/invalid-socks-endpoint-rejected",parse(value) < 0);
+    }
+    const char *valid[]={"vless-core.test:1","vless_core.test.:65535","127.0.0.1:443","[::1]:443","[2001:db8::1]:443"};
+    for (size_t i=0;i<sizeof(valid)/sizeof(*valid);i++) {
+        snprintf(value,sizeof(value),"vless://00000000-0000-0000-0000-000000000001@%s?type=tcp&security=none",valid[i]);
+        CHECK("uri/valid-endpoint-preserved",parse(value) == 0);
+    }
+    CHECK("uri/socks-default-port-preserved",parse("socks5://vless_core.test.") == 0 && config.server_port == 1080);
+    CHECK("uri/socks-ipv6-default-port-preserved",parse("socks5://[::1]") == 0 && config.server_port == 1080 && !strcmp(config.server_host,"::1"));
+    const char *hosts[]={"bad%20host","bad%5Chost","%5Bnot-ip%5D","vless-core.test%3A%2B80","vless-core.test%3A0","%5B%3A%3A1%5Dextra"};
+    for (size_t i=0;i<sizeof(hosts)/sizeof(*hosts);i++) {
+        snprintf(value,sizeof(value),PREFIX "type=ws&security=none&host=%s",hosts[i]);
+        CHECK("uri/invalid-websocket-host-before-connect",parse(value) < 0 && !strstr(error,"bad host"));
+    }
+}
+
 static void check_xmux_empty_ranges(void) {
     const char *names[]={"maxConcurrency","maxConnections","cMaxReuseTimes","hMaxRequestTimes","hMaxReusableSecs"};
     const char *example="{\"xmux\":{\"maxConcurrency\":\"\",\"maxConnections\":3,\"cMaxReuseTimes\":0,\"hMaxRequestTimes\":\"600-900\",\"hMaxReusableSecs\":\"1800-3000\",\"hKeepAlivePeriod\":0}}";
@@ -164,6 +190,7 @@ static void check_base64(void) {
 }
 
 int main(void) {
+    check_endpoint_validation();
     check_xmux_empty_ranges();
     const char *invalid_options[]={
         "{\"sessionIDPlacement\":\"invalid\"}","{\"seqPlacement\":\"invalid\"}","{\"xPaddingPlacement\":\"invalid\"}","{\"xPaddingMethod\":\"invalid\"}",

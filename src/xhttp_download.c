@@ -91,7 +91,7 @@ int core_xhttp_download_parse(const core_json_t *root, vless_config_t *config, c
     for (const core_json_t *entry=root->child;entry;entry=entry->next) {
         if (!strcasecmp(entry->key,"address")) {
             if (string(entry,config->server_host,sizeof(config->server_host),"address",error,capacity) != 0 || !config->server_host[0]) return invalid("address",error,capacity);
-            for (const unsigned char *p=(const unsigned char *)config->server_host;*p;p++) if (*p <= ' ' || strchr("/?#@[]",*p)) return invalid("address",error,capacity);
+            if (!core_server_host_valid(config->server_host)) return invalid("address",error,capacity);
             address=1;
         } else if (!strcasecmp(entry->key,"port")) {
             core_range_t range;

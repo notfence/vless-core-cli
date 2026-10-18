@@ -13,6 +13,11 @@ int main(void) {
     for (size_t size=0;size<required;size++) CHECK("inspect/capacity",core_config_inspect(&config,output,size,error,sizeof(error)) < 0);
     memcpy(config.server_host,"bad\tname",9);
     CHECK("inspect/no-control-injection",core_config_inspect(&config,output,sizeof(output),error,sizeof(error)) < 0);
+    const char *hosts[]={"bad name","bad\\name","bad/name","[::1]","not:ipv6"};
+    for (size_t i=0;i<sizeof(hosts)/sizeof(*hosts);i++) {
+        strcpy(config.server_host,hosts[i]);
+        CHECK("inspect/shared-address-validation",core_config_inspect(&config,output,sizeof(output),error,sizeof(error)) < 0);
+    }
     core_config_defaults(&config); config.ignore_server_ips=1;
     CHECK("pins/legacy-independent-download",core_config_ip_source(&config) == CORE_IP_NONE);
     REQUIRE("pins/primary-list",core_set_server_ips("127.0.0.1") == 0);
