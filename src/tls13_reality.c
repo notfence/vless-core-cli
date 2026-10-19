@@ -39,6 +39,7 @@ int tls13_tick(tls13_conn_t *c) {
 int tls13_start_relay(tls13_conn_t *c) {
     if (c && c->xmux_stream) return core_http2_start_relay(c->xmux_stream);
     if (!c || (c->mode != CONN_MODE_PLAIN && c->mode != CONN_MODE_TLS && c->mode != CONN_MODE_REALITY && c->mode != CONN_MODE_WS)) return 0;
+    if (c->mode == CONN_MODE_WS && !c->ws_upgraded) return 0;
     int flags=fcntl(c->fd,F_GETFL,0);
     if (flags < 0 || fcntl(c->fd,F_SETFL,flags|O_NONBLOCK)) return -1;
     if (c->ssl) SSL_set_mode(c->ssl,SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER|SSL_MODE_ENABLE_PARTIAL_WRITE);
@@ -74,7 +75,7 @@ int tls13_flush(tls13_conn_t *c) {
 }
 
 void tls13_set_request_fence(tls13_conn_t *c) {
-    if (c) c->request_wire_left=c->xmux_wire_output.len;
+    if (c) { c->request_wire_left=c->xmux_wire_output.len; c->credential_write=0; }
 }
 
 int tls13_request_pending(const tls13_conn_t *c) {
@@ -253,6 +254,7 @@ int tls13_connect_budgeted(const vless_config_t *cfg, tls13_conn_t **out, char *
         return -1;
     }
     c->fd = -1;
+    c->credential_write=cfg->protocol == CORE_PROTOCOL_TROJAN;
     c->ignore_server_ips=cfg->ignore_server_ips;
     c->ip_source=core_config_ip_source(cfg);
     c->xhttp_upload_fd = -1;

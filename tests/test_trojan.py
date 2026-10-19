@@ -120,3 +120,70 @@ class TrojanTests(unittest.TestCase):
                 self.assertEqual(f.exact(tunnel,10),b'\x00\x00response')
                 self.assertEqual(f.exact(tunnel,8),b'complete')
                 sender.join(3); self.assertFalse(sender.is_alive())
+
+    def test_websocket_reference_early_data_and_headers(self):
+        certificate,_=f.certificate()
+        for security in ('none','tls'):
+            for early in (0,1,67,68,69,16384):
+                with self.subTest(security=security,early=early),f.Server() as target,f.xray_server('ws',security,protocol='trojan') as reference,f.cli(f.uri(reference.port,'ws',security,protocol='trojan',ed=early,headers=json.dumps({'X-Trojan-Fixture':'custom'})),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        f.exchange(tunnel,b'\x00\x00trojan websocket'+bytes(range(256))*300)
+                        f.exchange(tunnel,b'last')
+
+    def test_websocket_server_first_early_boundaries_and_close(self):
+        import base64
+        from test_websocket import upgrade,client_frame,frame
+        expected=hashlib.sha224(f.TROJAN_PASSWORD.encode()).hexdigest().encode()+b'\r\n\x01\x01\x7f\x00\x00\x01\x00\x50\r\n'
+        for security in ('none','tls'):
+            for early in (0,1,67,68,69,16384):
+                closed=threading.Event()
+                def handler(connection):
+                    line,headers=upgrade(connection)
+                    self.assertEqual(line,'GET /vless-core?custom=1 HTTP/1.1')
+                    self.assertEqual(headers['host'],'trojan-host.test:8443')
+                    self.assertEqual(headers['x-trojan-fixture'],'custom')
+                    encoded=headers.get('sec-websocket-protocol')
+                    if encoded:
+                        self.assertNotIn('=',encoded)
+                        request=base64.urlsafe_b64decode(encoded+'='*(-len(encoded)%4))
+                    else:
+                        opcode,request=client_frame(connection); self.assertEqual(opcode,2)
+                    self.assertEqual(request,expected)
+                    self.assertEqual(bool(encoded),early >= len(expected))
+                    connection.sendall(frame(2,b'\x00\x00hello'))
+                    self.assertEqual(client_frame(connection),(2,b'client'))
+                    connection.sendall(frame(2,b'la',final=False))
+                    opcode,payload=client_frame(connection); self.assertEqual(opcode,8)
+                    connection.sendall(frame(0,b'st')+frame(8,payload)); closed.set()
+                certificate,_=f.certificate()
+                with self.subTest(security=security,early=early),f.Server(handler,tls=security == 'tls') as upstream,f.cli(f.uri(upstream.port,'ws',security,protocol='trojan',ed=early,path='/vless-core?ed=4096&custom=1',host='trojan-host.test:8443',headers=json.dumps({'X-Trojan-Fixture':'custom'})),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,80) as tunnel:
+                        self.assertEqual(f.exact(tunnel,7),b'\x00\x00hello')
+                        tunnel.sendall(b'client'); self.assertEqual(f.exact(tunnel,2),b'la')
+                        tunnel.shutdown(socket.SHUT_WR)
+                        self.assertEqual(f.exact(tunnel,2),b'st'); self.assertEqual(tunnel.recv(1),b'')
+                    self.assertTrue(closed.wait(1))
+
+    def test_websocket_heartbeat_and_rejected_upgrade(self):
+        from test_websocket import upgrade,client_frame,frame
+        def handler(connection):
+            upgrade(connection); opcode,request=client_frame(connection)
+            self.assertEqual((opcode,len(request)),(2,68))
+            connection.sendall(frame(2,b'\x00\x00hello'))
+            opcode,payload=client_frame(connection)
+            self.assertEqual(opcode,9); connection.sendall(frame(10,payload))
+            connection.sendall(frame(2,b'tick'))
+            opcode,payload=client_frame(connection); self.assertEqual(opcode,8)
+            connection.sendall(frame(8,payload))
+        certificate,_=f.certificate()
+        with f.Server(handler,tls=True) as upstream,f.cli(f.uri(upstream.port,'ws','tls',protocol='trojan',heartbeatPeriod=1),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+            with f.socks_connect(core.port,80) as tunnel:
+                self.assertEqual(f.exact(tunnel,7),b'\x00\x00hello')
+                self.assertEqual(f.exact(tunnel,4),b'tick'); tunnel.shutdown(socket.SHUT_WR)
+                self.assertEqual(tunnel.recv(1),b'')
+        def invalid(connection):
+            upgrade(connection,lambda reply,headers,accept:reply.replace(accept,b'bad-accept'))
+        with f.Server(invalid) as upstream,f.cli(f.uri(upstream.port,'ws','none',protocol='trojan')) as core:
+            with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                with f.socks_connect(core.port,80) as tunnel: tunnel.recv(1)
+            self.assertIn('invalid WebSocket upgrade response',core.wait_log('invalid WebSocket upgrade response'))

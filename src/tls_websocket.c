@@ -57,6 +57,7 @@ static int parse_ws_upgrade_response(tls13_conn_t *c, dynbuf_t *cache, const cha
             if (core_ws_validate_upgrade(cache->data,headers,accept,protocol)) {
                 set_err(err,err_cap,"invalid WebSocket upgrade response"); return -1;
             }
+            if (c->credential_write) OPENSSL_cleanse(cache->data,headers);
             db_consume(cache,headers); return 0;
         }
         if (cache->len >= 32768) { set_err(err,err_cap,"WebSocket response headers too large"); return -1; }
@@ -64,7 +65,9 @@ static int parse_ws_upgrade_response(tls13_conn_t *c, dynbuf_t *cache, const cha
         if (ws_conn_read_some(c,input,sizeof(input),&received) || !received) {
             set_err(err,err_cap,"failed to read WebSocket upgrade response"); return -1;
         }
-        if (db_append(cache,input,received)) { set_err(err,err_cap,"oom"); return -1; }
+        int result=db_append(cache,input,received);
+        if (c->credential_write) OPENSSL_cleanse(input,sizeof(input));
+        if (result) { set_err(err,err_cap,"oom"); return -1; }
     }
 }
 
@@ -86,7 +89,9 @@ int ws_write_frame(tls13_conn_t *c, uint8_t opcode, const uint8_t *buf, size_t l
     for (size_t offset=0;offset<len;) {
         size_t take=len-offset < sizeof(chunk) ? len-offset : sizeof(chunk);
         for (size_t i=0;i<take;i++) chunk[i]=buf[offset+i]^mask[(offset+i)%4];
-        if (ws_conn_write_all(c,chunk,take)) return -1;
+        int result=ws_conn_write_all(c,chunk,take);
+        if (c->credential_write) OPENSSL_cleanse(chunk,take);
+        if (result) return -1;
         offset+=take;
     }
     return 0;
@@ -145,7 +150,7 @@ int ws_upgrade(tls13_conn_t *c, const uint8_t *early, size_t early_length, char 
     char *encoded=calloc(1,encoded_capacity);
     if (!encoded) return -1;
     if (early_length) {
-        if (base64_encode(early,early_length,encoded,encoded_capacity)) { free(encoded); return -1; }
+        if (base64_encode(early,early_length,encoded,encoded_capacity)) { OPENSSL_clear_free(encoded,encoded_capacity); return -1; }
         for (char *byte=encoded;*byte;byte++) {
             if (*byte == '+') *byte='-';
             else if (*byte == '/') *byte='_';
@@ -154,18 +159,18 @@ int ws_upgrade(tls13_conn_t *c, const uint8_t *early, size_t early_length, char 
     }
     size_t capacity=strlen(headers)+strlen(c->ws_path)+strlen(c->ws_host)+strlen(encoded)+256;
     char *request=malloc(capacity);
-    if (!request) { free(encoded); return -1; }
+    if (!request) { OPENSSL_clear_free(encoded,encoded_capacity); return -1; }
     int length=snprintf(request,capacity,
         "GET %s HTTP/1.1\r\nHost: %s\r\n%sConnection: Upgrade\r\nUpgrade: websocket\r\n"
         "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n%s%s%s\r\n",
         c->ws_path,c->ws_host,headers,key,early_length ? "Sec-WebSocket-Protocol: " : "",
         early_length ? encoded : "",early_length ? "\r\n" : "");
     int result=length > 0 && (size_t)length < capacity ? ws_conn_write_all(c,request,(size_t)length) : -1;
-    free(request);
-    if (result) { free(encoded); set_err(err,err_cap,"failed to send WebSocket upgrade request"); return -1; }
+    OPENSSL_clear_free(request,capacity);
+    if (result) { OPENSSL_clear_free(encoded,encoded_capacity); set_err(err,err_cap,"failed to send WebSocket upgrade request"); return -1; }
     result=parse_ws_upgrade_response(c,&c->ws_net_cache,expected,encoded,err,err_cap);
-    free(encoded);
-    if (result) return -1;
+    OPENSSL_clear_free(encoded,encoded_capacity);
+    if (result) { if (c->credential_write) OPENSSL_cleanse(c->ws_net_cache.data,c->ws_net_cache.cap); return -1; }
     int flags=fcntl(c->fd,F_GETFL,0);
     if (flags < 0 || fcntl(c->fd,F_SETFL,flags|O_NONBLOCK)) return -1;
     c->ws_upgraded=1;
@@ -196,6 +201,7 @@ int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err
             set_err(err,err_cap,"WebSocket requires http/1.1 ALPN"); return -1;
         }
         vless_config_t tls_config=*cfg;
+        OPENSSL_cleanse(tls_config.trojan_hash,sizeof(tls_config.trojan_hash));
         snprintf(tls_config.alpn,sizeof(tls_config.alpn),"%s",protocols);
         if (connect_manual_tls(&tls_config,c,err,err_cap)) return -1;
         if (c->tls_selected_alpn[0] && strcmp(c->tls_selected_alpn,"http/1.1")) {

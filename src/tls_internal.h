@@ -261,6 +261,7 @@ struct tls13_conn {
     char ws_headers[4096];
     core_ws_decoder_t ws_decoder;
     int ws_upgraded, ws_early_data, ws_want_write, ws_close_sent;
+    int credential_write;
     uint64_t ws_heartbeat_ms, ws_next_heartbeat;
     char grpc_service_name[256];
     char grpc_authority[320];
