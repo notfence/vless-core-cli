@@ -122,6 +122,9 @@ $(HOST_BUILD_DIR)/test_packets: $(HOST_BUILD_DIR)/test_packets.o $(BASE_OBJ) $(N
 $(HOST_BUILD_DIR)/test_trojan: $(HOST_BUILD_DIR)/test_trojan.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=EVP_MD_CTX_new,--wrap=EVP_DigestInit_ex,--wrap=EVP_DigestUpdate,--wrap=EVP_DigestFinal_ex
 
+$(HOST_BUILD_DIR)/test_vmess: $(HOST_BUILD_DIR)/test_vmess.o $(BASE_OBJ) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes,--wrap=EVP_CIPHER_CTX_new,--wrap=EVP_MD_CTX_new,--wrap=HMAC_CTX_new,--wrap=core_vmess_time,--wrap=EVP_EncryptUpdate,--wrap=EVP_EncryptFinal_ex,--wrap=EVP_CipherUpdate,--wrap=EVP_CipherFinal_ex
+
 $(HOST_BUILD_DIR)/test_random: $(HOST_BUILD_DIR)/test_random.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes
 
