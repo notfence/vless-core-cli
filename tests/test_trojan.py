@@ -187,3 +187,128 @@ class TrojanTests(unittest.TestCase):
             with self.assertRaises((AssertionError,EOFError,ConnectionError)):
                 with f.socks_connect(core.port,80) as tunnel: tunnel.recv(1)
             self.assertIn('invalid WebSocket upgrade response',core.wait_log('invalid WebSocket upgrade response'))
+
+    def test_grpc_reference_modes_pool_and_parallel_rpc(self):
+        import concurrent.futures
+        certificate,_=f.certificate()
+        for security in ('none','tls','reality'):
+            for mode in ('gun','multi'):
+                with self.subTest(security=security,mode=mode),f.Server() as target,f.xray_server('grpc',security,mode=mode,protocol='trojan') as reference,f.CountingProxy(reference.port) as proxy,f.cli(f.uri(proxy.port,'grpc',security,protocol='trojan',mode=mode,initialWindowsSize=1024),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    def exchange(index):
+                        with f.socks_connect(core.port,target.port) as tunnel:
+                            f.exchange(tunnel,b'\x00\x00grpc'+bytes([index])+bytes(range(251))*1100)
+                    for index in range(3): exchange(index)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool: list(pool.map(exchange,range(4)))
+                    self.assertEqual(len(proxy.connections),1)
+
+    def test_grpc_reference_server_first(self):
+        certificate,_=f.certificate()
+        for security in ('none','tls','reality'):
+            for mode in ('gun','multi'):
+                def handler(connection):
+                    connection.sendall(b'\x00\x00server-first')
+                    self.assertEqual(f.exact(connection,7),b'client!')
+                    connection.sendall(b'last'); connection.shutdown(socket.SHUT_WR)
+                with self.subTest(security=security,mode=mode),f.Server(handler) as target,f.xray_server('grpc',security,mode=mode,protocol='trojan') as reference,f.cli(f.uri(reference.port,'grpc',security,protocol='trojan',mode=mode),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        self.assertEqual(f.exact(tunnel,14),b'\x00\x00server-first')
+                        tunnel.sendall(b'client!')
+                        self.assertEqual(f.exact(tunnel,4),b'last'); self.assertEqual(tunnel.recv(1),b'')
+
+    def test_grpc_status_reset_and_goaway_keep_neighbors(self):
+        from test_grpc import GrpcPeer
+        responses={b'bad-status':{'content_type':'application/grpc','status':'7','body':b'\x00\x00last'},
+                   b'complete-reset':{'content_type':'application/grpc','status':'0','body':b'\x00\x00complete','reset':0}}
+        with GrpcPeer(protocol='trojan',responses=responses) as peer,f.cli(f.uri(peer.port,'grpc','none',protocol='trojan')) as core:
+            with f.socks_connect(core.port,80) as neighbor:
+                for command,reply in ((b'bad-status',b'\x00\x00last'),(b'complete-reset',b'\x00\x00complete')):
+                    with f.socks_connect(core.port,80) as tunnel:
+                        tunnel.sendall(command); self.assertEqual(f.exact(tunnel,len(reply)),reply)
+                        self.assertEqual(tunnel.recv(1),b'')
+                        if command == b'complete-reset':
+                            try: tunnel.sendall(b'after-reset')
+                            except ConnectionError: pass
+                    f.exchange(neighbor,b'\x00\x00neighbor')
+                with f.socks_connect(core.port,80) as reset:
+                    reset.sendall(b'reset'); self.assertEqual(reset.recv(1),b'')
+                f.exchange(neighbor,b'alive')
+                self.assertEqual(len(peer.connections),1)
+                f.exchange(neighbor,b'goaway')
+                with f.socks_connect(core.port,80) as replacement: f.exchange(replacement,b'replacement')
+                self.assertGreaterEqual(len(peer.connections),2)
+            self.assertNotIn(b'after-reset',[data for _,data in peer.uploads])
+
+    def test_grpc_server_fin_keeps_upload_and_client_fin_drains_reply(self):
+        from test_grpc import GrpcPeer
+        with GrpcPeer(protocol='trojan') as peer,f.cli(f.uri(peer.port,'grpc','none',protocol='trojan')) as core:
+            with f.socks_connect(core.port,80) as sibling,f.socks_connect(core.port,80) as tunnel:
+                f.exchange(tunnel,b'server-fin'); self.assertEqual(tunnel.recv(1),b'')
+                tunnel.sendall(b'after-server-fin'); tunnel.shutdown(socket.SHUT_WR)
+                self.assertTrue(peer.finished.wait(1))
+                f.exchange(sibling,b'alive'); sibling.shutdown(socket.SHUT_WR)
+                self.assertEqual(f.exact(sibling,len(b'vless-core final reply')),b'vless-core final reply')
+                self.assertEqual(sibling.recv(1),b'')
+            self.assertIn(b'after-server-fin',[data for _,data in peer.uploads])
+    def test_initial_request_fence_preserves_duplex_and_deadline(self):
+        import select
+        import struct
+        from test_grpc import frame,envelope,GRPC_HEADERS
+        for transport,pooled in (('grpc',True),):
+            for release in (True,False):
+                replied=threading.Event(); recovered=threading.Event(); stopped=threading.Event(); sent=threading.Event()
+                uploaded=bytearray(); reply=b'\x00\x00before-full-request'
+                def handler(connection):
+                    self.assertEqual(f.exact(connection,24),b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n')
+                    connection.sendall(frame(4,payload=struct.pack('!HI',4,0)))
+                    stream_id=0; primer_id=0; primer_data=bytearray(); primer_done=False
+                    while not stopped.is_set():
+                        if release and replied.is_set() and not recovered.is_set():
+                            connection.sendall(frame(8,stream=stream_id,payload=(4096).to_bytes(4,'big')))
+                            recovered.set()
+                        if not (transport == 'xhttp' and connection.pending()) and not select.select([connection],[],[],.01)[0]: continue
+                        header=f.exact(connection,9); size=int.from_bytes(header[:3],'big')
+                        kind,flags=header[3:5]; stream=int.from_bytes(header[5:],'big')&0x7fffffff
+                        data=f.exact(connection,size)
+                        if kind == 4 and not flags&1: connection.sendall(frame(4,1))
+                        if kind == 1:
+                            if not primer_id: primer_id=stream
+                            else: stream_id=stream
+                            connection.sendall(frame(8,stream=stream,payload=(4096 if stream == primer_id else 32).to_bytes(4,'big')))
+                        if kind == 0:
+                            if stream == primer_id:
+                                primer_data.extend(data)
+                                if len(primer_data) >= (75 if transport == 'grpc' else 68) and not primer_done:
+                                    response=frame(1,4,stream,GRPC_HEADERS if transport == 'grpc' else b'\x88')
+                                    response+=frame(0,0 if transport == 'grpc' else 1,stream,envelope(b'warm') if transport == 'grpc' else b'warm')
+                                    if transport == 'grpc':
+                                        from test_grpc import literal
+                                        response+=frame(1,5,stream,literal('grpc-status','0'))
+                                    connection.sendall(response); primer_done=True
+                                continue
+                            uploaded.extend(data)
+                            if not sent.is_set():
+                                self.assertEqual(len(uploaded),32)
+                                connection.sendall(frame(1,4,stream,GRPC_HEADERS if transport == 'grpc' else b'\x88')+frame(0,stream=stream,payload=envelope(reply) if transport == 'grpc' else reply))
+                                sent.set()
+                certificate,_=f.certificate()
+                options={'mode':'stream-one'} if transport == 'xhttp' else {}
+                if transport == 'xhttp' and pooled: options['extra']=json.dumps({'xmux':{'maxConnections':1}})
+                with self.subTest(transport=transport,pooled=pooled,release=release),f.Server(handler,tls=transport == 'xhttp') as peer,f.cli(f.uri(peer.port,transport,'tls' if transport == 'xhttp' else 'none',protocol='trojan',**options),extra=['--connect-timeout-ms','800'],environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    try:
+                        with f.socks_connect(core.port,80) as warmup: self.assertEqual(f.exact(warmup,4),b'warm')
+                        with f.socks_connect(core.port,80) as tunnel:
+                            self.assertEqual(f.exact(tunnel,len(reply)),reply)
+                            self.assertFalse(recovered.is_set()); replied.set()
+                            if release:
+                                self.assertTrue(recovered.wait(1))
+                                until=time.monotonic()+1
+                                minimum=75 if transport == 'grpc' else 68
+                                while len(uploaded) < minimum and time.monotonic() < until: time.sleep(.001)
+                                self.assertEqual(len(uploaded),minimum)
+                                time.sleep(1)
+                                tunnel.settimeout(.1)
+                                with self.assertRaises(TimeoutError): tunnel.recv(1)
+                            else:
+                                self.assertEqual(tunnel.recv(1),b'')
+                                self.assertIn('Trojan request deadline expired',core.wait_log('Trojan request deadline expired'))
+                    finally: stopped.set()

@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <openssl/crypto.h>
 
 struct core_http2_block {
     core_http2_block_t *next;
@@ -114,6 +115,7 @@ void core_http2_queue_consume(core_http2_queue_t *queue, size_t length) {
     if (length > queue->length) length=queue->length;
     queue->length-=length;
     if (!queue->head) {
+        if (queue->cleanse && length) OPENSSL_cleanse(queue->data+queue->start,length);
         queue->start+=length;
         if (!queue->length) {
             core_buffer_free(queue_memory(queue),queue->data,queue->capacity);
@@ -125,6 +127,7 @@ void core_http2_queue_consume(core_http2_queue_t *queue, size_t length) {
         core_http2_block_t *block=queue->head;
         size_t amount=block->end-block->start;
         if (amount > length) amount=length;
+        if (queue->cleanse) OPENSSL_cleanse(block->data+block->start,amount);
         block->start+=amount; length-=amount;
         if (block->start == block->end) {
             queue->head=block->next; queue->capacity-=CORE_HTTP2_QUEUE_BLOCK; block_free(queue_memory(queue),block);

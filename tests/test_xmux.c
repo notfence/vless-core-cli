@@ -915,7 +915,36 @@ static void final_stream_credit(void) {
     wire.pending=0; account_output(&actor); close(actor.wake[0]); close(actor.wake[1]);
 }
 
+static void protocol_pool_identity(void) {
+    mux_manager_t *saved=managers;
+    vless_config_t config; core_config_defaults(&config);
+    config.transport_mode=TRANSPORT_GRPC; strcpy(config.security,"none"); strcpy(config.server_host,"127.0.0.1"); config.server_port=443;
+    mux_manager_t *vless=get_manager(&config,&fixture_backend);
+    config.protocol=CORE_PROTOCOL_TROJAN; memset(config.trojan_hash,0x31,sizeof(config.trojan_hash));
+    mux_manager_t *first=get_manager(&config,&fixture_backend),*same=get_manager(&config,&fixture_backend);
+    config.trojan_hash[27]^=1;
+    mux_manager_t *second=get_manager(&config,&fixture_backend);
+    REQUIRE("trojan/pool-managers-created",vless && first && second);
+    CHECK("trojan/pool-credential-and-protocol-isolation",first == same && first != second && vless != first && vless != second);
+    while (managers != saved) { mux_manager_t *next=managers->next; OPENSSL_cleanse(managers,sizeof(*managers)); free(managers); managers=next; }
+    OPENSSL_cleanse(&config,sizeof(config));
+    mux_actor_t actor={0}; core_http2_stream_t stream={.upload=&actor};
+    stream.tx.length=1; CHECK("trojan/pool-request-queued-not-transmitted",core_http2_write_pending(&stream));
+    stream.tx.length=0; actor.opening=1; CHECK("trojan/pool-opening-request-not-transmitted",core_http2_write_pending(&stream));
+    actor.opening=0; actor.flushed=99; stream.write_fence=100;
+    CHECK("trojan/pool-request-awaits-physical-flush",core_http2_write_pending(&stream));
+    actor.flushed=100; CHECK("trojan/pool-request-physical-flush-complete",!core_http2_write_pending(&stream));
+    stream.tx.length=1; stream.send_stopped=1;
+    CHECK("trojan/pool-reset-unblocks-request-wait",!core_http2_write_pending(&stream));
+    core_http2_queue_t secret={.cleanse=1};
+    REQUIRE("trojan/pool-credential-buffer",!core_http2_queue_append(&secret,(const uint8_t *)"private-fixture",15,CORE_HTTP2_STREAM_LIMIT));
+    core_http2_queue_consume(&secret,4);
+    CHECK("trojan/pool-consumed-credential-cleared",!memcmp(secret.data,(uint8_t[4]){0},4) && !memcmp(secret.data+secret.start,"ate-fixture",11));
+    core_http2_queue_clear(&secret); core_http2_queue_cache_clear();
+}
+
 int main(void) {
+    protocol_pool_identity();
     final_stream_credit();
     partial_parts_policy();
     reset_after_response();

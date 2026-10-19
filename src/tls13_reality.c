@@ -64,7 +64,9 @@ int tls13_flush(tls13_conn_t *c) {
             if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
             if (sent <= 0) return -1;
         }
-        c->request_wire_left=(size_t)sent >= c->request_wire_left ? 0 : c->request_wire_left-(size_t)sent;
+        size_t credential=(size_t)sent < c->request_wire_left ? (size_t)sent : c->request_wire_left;
+        if (credential) OPENSSL_cleanse(c->xmux_wire_output.data,credential);
+        c->request_wire_left-=credential;
         db_consume(&c->xmux_wire_output,(size_t)sent);
     }
     if (c->relay_raw_finish && !c->xmux_wire_output.len) {
@@ -408,6 +410,10 @@ void tls13_reality_close(tls13_conn_t *c) {
     db_free(&c->h2_header_block);
     db_free(&c->transcript);
     db_free(&c->app_cache);
+    if (c->credential_write || c->request_wire_left) {
+        OPENSSL_cleanse(c->xmux_plain_output.data,c->xmux_plain_output.cap);
+        OPENSSL_cleanse(c->xmux_wire_output.data,c->xmux_wire_output.cap);
+    }
     db_free(&c->xmux_raw_input); db_free(&c->xmux_plain_output); db_free(&c->xmux_wire_output);
     tls_record_work_clear(c);
     OPENSSL_cleanse(c,sizeof(*c));

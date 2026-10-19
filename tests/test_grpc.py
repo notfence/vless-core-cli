@@ -1,11 +1,12 @@
 import struct
+import hashlib
 import json
 import socket
 import select
 import threading
 import time
 import unittest
-from fixtures import Server, cli, exact, exchange, socks_connect, uri, certificate
+from fixtures import Server, cli, exact, exchange, socks_connect, uri, certificate, TROJAN_PASSWORD
 
 def frame(kind, flags=0, stream=0, payload=b""):
     return len(payload).to_bytes(3,"big")+bytes([kind,flags])+stream.to_bytes(4,"big")+payload
@@ -59,8 +60,9 @@ def varint(data, offset):
         shift+=7
 
 class GrpcPeer(Server):
-    def __init__(self, maximum=100, acknowledge=True, settings=None, responses=None):
+    def __init__(self, maximum=100, acknowledge=True, settings=None, responses=None, protocol='vless', password=TROJAN_PASSWORD):
         self.maximum=maximum; self.acknowledge=acknowledge
+        self.protocol=protocol; self.password=password; self.reply_prefix=b'' if protocol == 'trojan' else b'\x00\x00'
         self.server_settings=settings
         self.responses=responses or {}
         self.requests=[]; self.windows=[]; self.resets=[]; self.ping=threading.Event(); self.finished=threading.Event(); self.uploads=[]
@@ -92,8 +94,14 @@ class GrpcPeer(Server):
                     if message[0] != 10: raise AssertionError("missing gRPC bytes field")
                     length,offset=varint(message,1); data=message[offset:offset+length]
                     if not state["started"]:
-                        if len(data) < 26 or data[0] != 0: raise AssertionError("invalid VLESS request")
-                        state["started"]=True; data=data[26:]
+                        if self.protocol == 'trojan':
+                            prefix=hashlib.sha224(self.password.encode()).hexdigest().encode()+b'\r\n\x01\x01'
+                            if len(data) < 68 or not data.startswith(prefix) or data[66:68] != b'\r\n': raise AssertionError('invalid Trojan request')
+                            data=data[68:]
+                        else:
+                            if len(data) < 26 or data[0] != 0: raise AssertionError("invalid VLESS request")
+                            data=data[26:]
+                        state["started"]=True
                     if not data: continue
                     with self.lock: self.uploads.append((stream,data))
                     if state["ended"]: continue
@@ -114,13 +122,14 @@ class GrpcPeer(Server):
                                     response["sent"].set()
                                     if not response["release"].wait(2): raise AssertionError("gRPC message fragment not released")
                                 if split < len(encoded): connection.sendall(data_frames(stream,encoded[split:]))
-                            elif body: connection.sendall(data_frames(stream,envelope(b"\x00\x00"+body)))
+                            elif body: connection.sendall(data_frames(stream,envelope(self.reply_prefix+body)))
                             if response.get("hold"):
                                 state["responded"]=True; continue
                             if response.get("data_end"): connection.sendall(frame(0,1,stream))
                             else:
                                 final=b"" if response.get("status") is None else literal("grpc-status",response["status"])
                                 connection.sendall(frame(1,5,stream,final))
+                        if 'reset' in response: connection.sendall(frame(3,stream=stream,payload=response['reset'].to_bytes(4,'big')))
                         state["responded"]=state["ended"]=True; continue
                     if data in (b"bad-order",b"bad-nul",b"bad-pseudo",b"bad-compression",b"bad-length",b"bad-trailers"):
                         retained=b"\x40\x0cx-vless-core\x08retained"
@@ -128,8 +137,8 @@ class GrpcPeer(Server):
                                 b"bad-pseudo":b"\x88\x44\x01/"+retained,b"bad-compression":b"\x88\xff\xff\xff\xff\xff\x10",
                                 b"bad-length":GRPC_HEADERS+b"\x0f\x0d\x010"+retained,b"bad-trailers":GRPC_HEADERS}
                         connection.sendall(frame(1,4,stream,blocks[data]))
-                        if data == b"bad-length": connection.sendall(data_frames(stream,envelope(b"\x00\x00vless-core")))
-                        if data == b"bad-trailers": connection.sendall(data_frames(stream,envelope(b"\x00\x00"))+frame(1,5,stream,b"\x88"+retained))
+                        if data == b"bad-length": connection.sendall(data_frames(stream,envelope(self.reply_prefix+b"vless-core")))
+                        if data == b"bad-trailers": connection.sendall(data_frames(stream,envelope(self.reply_prefix))+frame(1,5,stream,b"\x88"+retained))
                         state["responded"]=state["ended"]=True; continue
                     if data in (b"bad-priority-size",b"bad-priority-dependency"):
                         priority=bytes(4) if data == b"bad-priority-size" else stream.to_bytes(4,"big")+b"\x00"
@@ -141,7 +150,7 @@ class GrpcPeer(Server):
                         connection.sendall(frame(1,5,stream,b"\x00\x0bgrpc-status\x017")); continue
                     if not state["responded"]:
                         connection.sendall(frame(1,4,stream,GRPC_HEADERS+b"\xbe" if data == b"indexed" else GRPC_HEADERS)); state["responded"]=True
-                        data=b"\x00\x00"+data
+                        data=self.reply_prefix+data
                     connection.sendall(data_frames(stream,envelope(data)))
                     if data.endswith(b"server-fin"):
                         connection.sendall(frame(1,5,stream,b"\x00\x0bgrpc-status\x010")); state["ended"]=True
@@ -151,7 +160,7 @@ class GrpcPeer(Server):
                     if not state["ended"]:
                         data=b"vless-core final reply"
                         if not state["responded"]:
-                            connection.sendall(frame(1,4,stream,GRPC_HEADERS)); state["responded"]=True; data=b"\x00\x00"+data
+                            connection.sendall(frame(1,4,stream,GRPC_HEADERS)); state["responded"]=True; data=self.reply_prefix+data
                         connection.sendall(data_frames(stream,envelope(data))+frame(1,5,stream,b"\x00\x0bgrpc-status\x010")); state["ended"]=True
                     self.finished.set()
             elif kind == 6 and not flags&1:

@@ -34,7 +34,7 @@ static void uri_vectors(void) {
         snprintf(value,sizeof(value),"trojan://private-fixture@127.0.0.1:%s",ports[i]);
         CHECK("trojan/invalid-port",parse_core_uri(value,&config,error,sizeof(error)) < 0 && !strstr(error,"private-fixture"));
     }
-    const char *queries[]={"flow=xtls-rprx-vision","encryption=private-fixture","security=","type=ws&security=reality","type=grpc","type=xhttp"};
+    const char *queries[]={"flow=xtls-rprx-vision","encryption=private-fixture","security=","type=ws&security=reality","type=grpc&security=invalid","type=xhttp"};
     for (size_t i=0;i<sizeof(queries)/sizeof(*queries);i++) {
         snprintf(value,sizeof(value),"trojan://private-fixture@127.0.0.1:443?%s",queries[i]);
         CHECK("trojan/invalid-combination",parse_core_uri(value,&config,error,sizeof(error)) < 0 && !strstr(error,"private-fixture"));

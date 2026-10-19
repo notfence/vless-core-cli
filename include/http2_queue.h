@@ -13,6 +13,7 @@ typedef struct {
     core_http2_block_t *head, *tail;
     core_buffer_budget_t memory;
     core_buffer_budget_t *account;
+    int cleanse;
 } core_http2_queue_t;
 int core_http2_queue_append(core_http2_queue_t *, const uint8_t *, size_t, size_t);
 int core_http2_queue_append_parts(core_http2_queue_t *, const uint8_t *, size_t, const uint8_t *, size_t, size_t);
