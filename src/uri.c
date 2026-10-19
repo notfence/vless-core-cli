@@ -916,7 +916,6 @@ static int parse_trojan_uri(const char *uri, vless_config_t *cfg, char *err, siz
     if (query && *query && parse_query(cfg,query,err,err_cap)) goto cleanup;
     if (cfg->flow[0]) { set_err(err,err_cap,"Trojan does not support flow"); goto cleanup; }
     if (strcasecmp(cfg->encryption,"none")) { set_err(err,err_cap,"Trojan supports only encryption=none"); goto cleanup; }
-    if (cfg->transport_mode != TRANSPORT_VISION && cfg->transport_mode != TRANSPORT_WS && cfg->transport_mode != TRANSPORT_GRPC) { set_err(err,err_cap,"Trojan transport is not supported"); goto cleanup; }
     if (finalize_stream_config(cfg,err,err_cap)) goto cleanup;
     if (core_trojan_password((const uint8_t *)work,password_length,cfg->trojan_hash)) {
         set_err(err,err_cap,"failed to prepare Trojan credentials"); goto cleanup;

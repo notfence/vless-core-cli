@@ -147,6 +147,10 @@ int core_xhttp_download_config(const vless_config_t *parent, vless_config_t *dow
     core_json_t *root=core_json_parse(parent->xhttp_download_settings,error,capacity);
     if (!root) return -1;
     int result=core_xhttp_download_parse(root,download,error,capacity); core_json_free(root);
-    if (!result) download->ignore_server_ips=strcmp(parent->server_host,download->server_host) || parent->server_port != download->server_port;
+    if (!result) {
+        download->ignore_server_ips=strcmp(parent->server_host,download->server_host) || parent->server_port != download->server_port;
+        download->protocol=parent->protocol;
+        memcpy(download->trojan_hash,parent->trojan_hash,sizeof(download->trojan_hash));
+    }
     return result;
 }

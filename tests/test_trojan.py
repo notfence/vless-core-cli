@@ -253,7 +253,7 @@ class TrojanTests(unittest.TestCase):
         import select
         import struct
         from test_grpc import frame,envelope,GRPC_HEADERS
-        for transport,pooled in (('grpc',True),):
+        for transport,pooled in (('grpc',True),('xhttp',True)):
             for release in (True,False):
                 replied=threading.Event(); recovered=threading.Event(); stopped=threading.Event(); sent=threading.Event()
                 uploaded=bytearray(); reply=b'\x00\x00before-full-request'
@@ -312,3 +312,130 @@ class TrojanTests(unittest.TestCase):
                                 self.assertEqual(tunnel.recv(1),b'')
                                 self.assertIn('Trojan request deadline expired',core.wait_log('Trojan request deadline expired'))
                     finally: stopped.set()
+
+    def test_xhttp_reference_modes_security_and_reuse(self):
+        certificate,_=f.certificate()
+        for security,alpn in (('none',None),('tls',None),('tls','http/1.1'),('reality',None)):
+            for mode in ('stream-one','stream-up','packet-up'):
+                for pooled in (False,True):
+                    options={'mode':mode,'extra':json.dumps({'xmux':{'maxConnections':1}}) if pooled else '{}'}
+                    if alpn: options['alpn']=alpn
+                    with self.subTest(security=security,alpn=alpn,mode=mode,pooled=pooled),f.Server() as target,f.xray_server('xhttp',security,mode=mode,protocol='trojan') as reference,f.CountingProxy(reference.port) as proxy,f.cli(f.uri(proxy.port,'xhttp',security,protocol='trojan',**options),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        for index in range(3):
+                            with f.socks_connect(core.port,target.port) as tunnel:
+                                f.exchange(tunnel,b'\x00\x00trojan XHTTP'+bytes([index])+bytes(range(251))*1100)
+                                f.exchange(tunnel,b'last')
+                        if pooled and security != 'none' and not alpn:
+                            self.assertEqual(len(proxy.connections),1)
+                        if not pooled: self.assertGreaterEqual(len(proxy.connections),3)
+
+    def test_xhttp_server_first_and_last_bytes(self):
+        certificate,_=f.certificate()
+        for mode in ('stream-one','stream-up','packet-up'):
+            for pooled in (False,True):
+                def handler(connection):
+                    connection.sendall(b'\x00\x00server-first')
+                    self.assertEqual(f.exact(connection,7),b'client!')
+                    connection.sendall(b'last'); connection.shutdown(socket.SHUT_WR)
+                options={'mode':mode,'extra':json.dumps({'xmux':{'maxConnections':1}}) if pooled else '{}'}
+                with self.subTest(mode=mode,pooled=pooled),f.Server(handler) as target,f.xray_server('xhttp','tls',mode=mode,protocol='trojan') as reference,f.cli(f.uri(reference.port,'xhttp','tls',protocol='trojan',**options),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        self.assertEqual(f.exact(tunnel,14),b'\x00\x00server-first')
+                        tunnel.sendall(b'client!'); self.assertEqual(f.exact(tunnel,4),b'last')
+                        self.assertEqual(tunnel.recv(1),b'')
+
+    def test_xhttp_independent_download_security_and_pins(self):
+        certificate,_=f.certificate()
+        shared={'sessionIDPlacement':'header','seqPlacement':'header'}
+        for mode in ('stream-up','packet-up'):
+            for upload_tls,download_tls in ((False,False),(True,False),(False,True)):
+                for pooled in (False,True):
+                    with self.subTest(mode=mode,upload_tls=upload_tls,download_tls=download_tls,pooled=pooled),f.Server() as target,f.xray_server('xhttp','none',path='/',protocol='trojan',**shared) as reference,f.CountingProxy(reference.port,tls=upload_tls) as upload,f.CountingProxy(reference.port,address='127.0.0.2',tls=download_tls) as download:
+                        settings={'address':'download.invalid','port':download.port,'network':'xhttp','security':'tls' if download_tls else 'none','xhttpSettings':{'path':'/download',**shared}}
+                        if download_tls: settings['tlsSettings']={'serverName':'vless-core.test','alpn':['http/1.1']}
+                        extra={'downloadSettings':settings,**shared}
+                        if pooled: extra['xmux']={'maxConnections':1}
+                        options={'mode':mode,'path':'/upload','extra':json.dumps(extra)}
+                        if upload_tls: options['alpn']='http/1.1'
+                        config=f.uri(upload.port,'xhttp','tls' if upload_tls else 'none',protocol='trojan',**options).replace('@127.0.0.1:','@upload.invalid:')
+                        result=subprocess.run([str(f.BUILD/'vless-core-test'),'--inspect-config','--uri-fd','0'],input=config,text=True,capture_output=True,timeout=3)
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        self.assertEqual(result.stdout,f'CONFIG\t1\nPRIMARY\tupload.invalid\t{upload.port}\nDOWNLOAD\tdownload.invalid\t{download.port}\nEND\n')
+                        with f.cli(config,extra=['--server-ips','127.0.0.1','--download-server-ips','127.0.0.2'],environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                            for index in range(2):
+                                with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'\x00\x00independent Trojan'+bytes(range(251))*100+bytes([index]))
+                            self.assertGreater(len(upload.client_data),0); self.assertGreater(len(download.client_data),0)
+                            requests=b'\r\n'.join(bytes(data).lower() for data in download.client_data)
+                            self.assertIn(b'get /download/',requests)
+                            self.assertNotIn(hashlib.sha224(f.TROJAN_PASSWORD.encode()).hexdigest().encode(),requests)
+
+    def test_xhttp_reality_download_and_parallel_sessions(self):
+        import concurrent.futures
+        shared={'sessionIDPlacement':'header','seqPlacement':'header'}
+        for mode in ('stream-up','packet-up'):
+            for pooled in (False,True):
+                with self.subTest(mode=mode,pooled=pooled),f.Server() as target,f.xray_server('xhttp','reality',path='/',protocol='trojan',**shared) as reference,f.CountingProxy(reference.port) as upload,f.CountingProxy(reference.port,address='127.0.0.2') as download:
+                    settings={'address':'download.invalid','port':download.port,'network':'xhttp','security':'reality','realitySettings':{'serverName':'vless-core.test','publicKey':f.PUBLIC_KEY,'shortId':'01020304','fingerprint':'firefox'},'xhttpSettings':{'path':'/download',**shared}}
+                    extra={'downloadSettings':settings,**shared}
+                    if pooled: extra['xmux']={'maxConnections':1}
+                    config=f.uri(upload.port,'xhttp','reality',protocol='trojan',mode=mode,path='/upload',extra=json.dumps(extra)).replace('@127.0.0.1:','@upload.invalid:')
+                    with f.cli(config,extra=['--server-ips','127.0.0.1','--download-server-ips','127.0.0.2']) as core:
+                        def transfer(index):
+                            with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'\x00\x00separate REALITY download'+bytes([index])+bytes(range(251))*1100)
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers: list(workers.map(transfer,range(4)))
+                        self.assertGreater(len(upload.connections),0); self.assertGreater(len(download.connections),0)
+
+    def test_configuration_pipes_keep_credentials_out_of_arguments(self):
+        import os
+        for option in ('--uri-fd','--connection-fd'):
+            def handler(connection):
+                self.read_request(connection)
+                connection.sendall(b'\x00\x00from-pipe')
+            with self.subTest(option=option),f.Server(handler) as upstream:
+                config=f.uri(upstream.port,protocol='trojan').replace('@127.0.0.1:','@offline.invalid:')
+                read,write=os.pipe()
+                try:
+                    os.write(write,(config+('\n127.0.0.1' if option == '--connection-fd' else '')).encode()); os.close(write); write=-1
+                    extra=[option,str(read)]
+                    if option == '--uri-fd': extra+=['--server-ips','127.0.0.1']
+                    with f.cli(None,extra=extra,pass_fds=(read,)) as core:
+                        with f.socks_connect(core.port,80) as tunnel: self.assertEqual(f.exact(tunnel,11),b'\x00\x00from-pipe')
+                        self.assertNotIn(f.TROJAN_PASSWORD.encode(),Path(f'/proc/{core.process.pid}/cmdline').read_bytes())
+                        self.assertNotIn(hashlib.sha224(f.TROJAN_PASSWORD.encode()).hexdigest(),core.log)
+                finally:
+                    os.close(read)
+                    if write >= 0: os.close(write)
+
+    def test_packet_post_ack_keeps_deadline_and_does_not_block_download(self):
+        for acknowledge in (False,True):
+            ready=threading.Event(); read_reply=threading.Event(); acknowledged=threading.Event(); finished=threading.Event()
+            downstream=[]; reply=b'\x00\x00while-post-awaits-ack'
+            def handler(connection):
+                request=bytearray()
+                while not request.endswith(b'\r\n\r\n'): request.extend(f.exact(connection,1))
+                if request.startswith(b'GET '):
+                    connection.sendall(b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n')
+                    downstream.append(connection); ready.set(); finished.wait(3); return
+                self.assertTrue(request.startswith(b'POST '))
+                headers=dict(line.split(b':',1) for line in bytes(request).lower().split(b'\r\n')[1:] if b':' in line)
+                body=f.exact(connection,int(headers[b'content-length']))
+                self.assertEqual(len(body),68)
+                self.assertEqual(body[:56],hashlib.sha224(f.TROJAN_PASSWORD.encode()).hexdigest().encode())
+                self.assertTrue(ready.wait(1))
+                downstream[0].sendall(f'{len(reply):x}\r\n'.encode()+reply+b'\r\n')
+                if acknowledge:
+                    self.assertTrue(read_reply.wait(1))
+                    connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'); acknowledged.set()
+                finished.wait(3)
+            with self.subTest(acknowledge=acknowledge),f.Server(handler) as peer,f.cli(f.uri(peer.port,'xhttp','none',protocol='trojan',mode='packet-up'),extra=['--connect-timeout-ms','800']) as core:
+                try:
+                    with f.socks_connect(core.port,80) as tunnel:
+                        self.assertEqual(f.exact(tunnel,len(reply)),reply); read_reply.set()
+                        if acknowledge:
+                            self.assertTrue(acknowledged.wait(1)); time.sleep(1)
+                            tunnel.settimeout(.1)
+                            with self.assertRaises(TimeoutError): tunnel.recv(1)
+                        else:
+                            tunnel.settimeout(1.5); self.assertEqual(tunnel.recv(1),b'')
+                            self.assertIn('Trojan request deadline expired',core.wait_log('Trojan request deadline expired'))
+                finally: finished.set()

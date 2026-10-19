@@ -77,6 +77,9 @@ int main(void) {
     const char *extra="{\"downloadSettings\":{\"address\":\"127.0.0.2\",\"port\":443,\"network\":\"xhttp\"}}";
     REQUIRE("download/parent-uri-parsed",parent(extra,"",&config,error) == 0 && config.xhttp_download_settings[0]);
     CHECK("download/separate-endpoint-excludes-main-ip-override",core_xhttp_download_config(&config,&download,error,sizeof(error)) == 0 && download.ignore_server_ips);
+    config.protocol=CORE_PROTOCOL_TROJAN; memset(config.trojan_hash,0x5a,sizeof(config.trojan_hash));
+    CHECK("trojan/download-preserves-protocol-and-credential-identity",!core_xhttp_download_config(&config,&download,error,sizeof(error)) && download.protocol == CORE_PROTOCOL_TROJAN && !memcmp(download.trojan_hash,config.trojan_hash,sizeof(config.trojan_hash)));
+    CHECK("trojan/download-keeps-independent-protection",!strcmp(download.security,"none") && !download.encryption_enabled && !download.flow[0] && download.ignore_server_ips);
     CHECK("download/stream-one-rejected",parent(extra,"&mode=stream-one",&config,error) != 0 && strstr(error,"stream-one"));
     CHECK("download/reality-auto-selects-stream-up",parent(extra,"&security=reality&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",&config,error) == 0 && !strcmp(config.xhttp_mode,"stream-up"));
     CHECK("download/explicit-query-overrides-extra",parent(extra,"&downloadSettings=%7B%22address%22%3A%22127.0.0.1%22%2C%22port%22%3A443%2C%22network%22%3A%22xhttp%22%7D",&config,error) == 0 && core_xhttp_download_config(&config,&download,error,sizeof(error)) == 0 && !download.ignore_server_ips);

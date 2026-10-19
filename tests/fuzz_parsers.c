@@ -6,6 +6,7 @@
 #include "routing.h"
 #include "vision.h"
 #include "vless.h"
+#include "trojan.h"
 #include "xhttp_download.h"
 #include "xhttp_padding.h"
 #include "cli_args.h"
@@ -76,10 +77,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (!text) abort();
         memcpy(text, data, size);
         text[size] = '\0';
+        uint8_t trojan_hash[CORE_TROJAN_HASH_SIZE],request[CORE_TROJAN_HEADER_MAX]; size_t request_length=0;
+        size_t request_capacity=size ? data[0] : 0;
+        if (!core_trojan_password(data,size,trojan_hash)) {
+            (void)core_trojan_request(request,request_capacity,&request_length,trojan_hash,text,size > 1 ? (uint16_t)((data[0]<<8)|data[1]) : 0);
+            if (request_length > request_capacity || request_length > sizeof(request)) abort();
+        }
+        OPENSSL_cleanse(trojan_hash,sizeof(trojan_hash)); OPENSSL_cleanse(request,sizeof(request));
         vless_config_t config;
         if (parse_core_uri(text, &config, error, sizeof(error)) == 0 && config.xhttp_download_settings[0]) {
             vless_config_t download;
             (void)core_xhttp_download_config(&config,&download,error,sizeof(error));
+            OPENSSL_cleanse(&download,sizeof(download));
         }
         core_json_t *json = core_json_parse(text, error, sizeof(error));
         if (json) {
@@ -114,7 +123,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             (void)routing_decide(&routes,"192.0.2.1",443,NULL,NULL,0,NULL);
             (void)routing_decide(&routes,"2001:db8::1",443,NULL,NULL,0,NULL);
         }
-        free(text);
+        OPENSSL_cleanse(&config,sizeof(config)); OPENSSL_cleanse(text,size); free(text);
         break;
     }
     case 1: {

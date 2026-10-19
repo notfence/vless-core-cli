@@ -28,6 +28,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t length) {
     core_http2_stream_t first={.download=&actor,.upload=&actor,.down_id=1,.up_id=1,.ready=1,.references=65536};
     core_http2_stream_t second={.download=&actor,.upload=&actor,.down_id=3,.up_id=3,.ready=1,.references=65536};
     first.next=&second; streams=&first;
+    first.config.protocol=second.config.protocol=length&2 ? CORE_PROTOCOL_TROJAN : CORE_PROTOCOL_VLESS;
+    first.tx.cleanse=second.tx.cleanse=length&2;
+    first.config.xmux.present=second.config.xmux.present=length&4;
     if (packet) {
         first.config.transport_mode=second.config.transport_mode=TRANSPORT_XHTTP;
         strcpy(first.config.xhttp_mode,"packet-up"); strcpy(second.config.xhttp_mode,"packet-up");
@@ -67,6 +70,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t length) {
         if (advance_streams(&actor)) break;
         wire.pending=0; wire.flushed=wire.enqueued; account_output(&actor);
         (void)core_http2_finish_pending(stream);
+        int pending=core_http2_write_pending(stream);
+        if ((stream->failed || stream->closed || stream->send_stopped) && pending) abort();
     }
     while (actor.requests) { mux_request_t *next=actor.requests->next; free(actor.requests); actor.requests=next; }
     int64_t before_credit=actor.receive_window;

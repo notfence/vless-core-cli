@@ -1051,20 +1051,21 @@ core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core
     int independent=config->transport_mode == TRANSPORT_XHTTP && config->xhttp_download_settings[0] != 0;
     if (independent && core_xhttp_download_config(config,&download_config,error,capacity) != 0) return NULL;
     core_http2_stream_t *stream=calloc(1,sizeof(*stream));
-    if (!stream) { if (error && capacity) snprintf(error,capacity,"XHTTP client allocation failed"); return NULL; }
+    if (!stream) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP client allocation failed"); return NULL; }
     stream->config=*config; stream->references=1;
     OPENSSL_cleanse(stream->config.trojan_hash,sizeof(stream->config.trojan_hash));
     stream->tx.cleanse=config->protocol == CORE_PROTOCOL_TROJAN;
     stream->packet_limit=config->transport_mode == TRANSPORT_GRPC ? 0 : core_xhttp_post_limit(config);
-    if (stream->packet_limit < 0) { if (error && capacity) snprintf(error,capacity,"XHTTP packet size sampling failed"); free(stream); return NULL; }
+    if (stream->packet_limit < 0) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP packet size sampling failed"); free(stream); return NULL; }
     stream->trace_present=core_trace_snapshot(&stream->trace);
     stream->until_ms=core_now_ms()+(unsigned)(core_deadline_active() ? core_deadline_remaining() : 30000);
-    if (notification_pair(stream->notify) != 0) { if (error && capacity) snprintf(error,capacity,"XHTTP notification channel failed: %s",strerror(errno)); free(stream); return NULL; }
-    if (config->transport_mode != TRANSPORT_GRPC && backend->session(config,stream->session,sizeof(stream->session)) != 0) { if (error && capacity) snprintf(error,capacity,"XHTTP session generation failed"); close(stream->notify[0]); close(stream->notify[1]); free(stream); return NULL; }
+    if (notification_pair(stream->notify) != 0) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP notification channel failed: %s",strerror(errno)); free(stream); return NULL; }
+    if (config->transport_mode != TRANSPORT_GRPC && backend->session(config,stream->session,sizeof(stream->session)) != 0) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP session generation failed"); close(stream->notify[0]); close(stream->notify[1]); free(stream); return NULL; }
     pthread_mutex_lock(&mux_lock);
     mux_manager_t *manager=stream_count < 256 ? get_manager(config,backend) : NULL;
     if (stream_count >= 256) errno=EAGAIN;
     mux_manager_t *down_manager=manager && independent ? get_manager(&download_config,backend) : manager;
+    if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash));
     int bound=manager && down_manager && !allocate_channels(stream,manager,down_manager,core_deadline_active() ? core_deadline_remaining() : 30000);
     int waiting=manager && down_manager && !bound && errno == EAGAIN;
     if (bound || waiting) {
@@ -1127,8 +1128,14 @@ int core_http2_start_relay(core_http2_stream_t *stream) {
 
 int core_http2_write_pending(const core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
-    int pending=stream && !stream->failed && !stream->closed && !stream->send_stopped &&
-        (stream->tx.length || stream->upload->opening || stream->write_fence > stream->upload->flushed);
+    int pending=0;
+    if (stream && !stream->failed && !stream->closed && !stream->send_stopped) {
+        pending=stream->tx.length || stream->upload->opening || stream->write_fence > stream->upload->flushed;
+        if (stream->config.transport_mode == TRANSPORT_XHTTP && !strcmp(stream->config.xhttp_mode,"packet-up"))
+            for (const mux_request_t *request=stream->upload->requests;request;request=request->next)
+                if (request->stream == stream && !request->reset && packet_role(request->role) &&
+                    (!request->send_ended || (!stream->config.xmux.present && !request->ended))) pending=1;
+    }
     pthread_mutex_unlock(&mux_lock); return pending;
 }
 

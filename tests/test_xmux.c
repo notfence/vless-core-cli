@@ -936,6 +936,17 @@ static void protocol_pool_identity(void) {
     actor.flushed=100; CHECK("trojan/pool-request-physical-flush-complete",!core_http2_write_pending(&stream));
     stream.tx.length=1; stream.send_stopped=1;
     CHECK("trojan/pool-reset-unblocks-request-wait",!core_http2_write_pending(&stream));
+    stream.send_stopped=0; stream.tx.length=0; stream.config.transport_mode=TRANSPORT_XHTTP; strcpy(stream.config.xhttp_mode,"packet-up");
+    mux_request_t request={.stream=&stream,.role=4}; actor.requests=&request;
+    CHECK("trojan/packet-request-awaits-post-end",core_http2_write_pending(&stream));
+    request.send_ended=1;
+    CHECK("trojan/private-packet-request-awaits-post-ack",core_http2_write_pending(&stream));
+    stream.config.xmux.present=1;
+    CHECK("trojan/shared-packet-request-keeps-asynchronous-ack-policy",!core_http2_write_pending(&stream));
+    stream.config.xmux.present=0; request.ended=1;
+    CHECK("trojan/private-packet-request-ack-completes-fence",!core_http2_write_pending(&stream));
+    request.send_ended=0; request.reset=1;
+    CHECK("trojan/reset-packet-does-not-await-forbidden-end-stream",!core_http2_write_pending(&stream));
     core_http2_queue_t secret={.cleanse=1};
     REQUIRE("trojan/pool-credential-buffer",!core_http2_queue_append(&secret,(const uint8_t *)"private-fixture",15,CORE_HTTP2_STREAM_LIMIT));
     core_http2_queue_consume(&secret,4);
