@@ -22,7 +22,8 @@ typedef enum {
 
 typedef enum {
     CORE_PROTOCOL_VLESS = 0,
-    CORE_PROTOCOL_SOCKS5 = 1
+    CORE_PROTOCOL_SOCKS5 = 1,
+    CORE_PROTOCOL_TROJAN = 2
 } core_protocol_t;
 
 #define VLESS_ENCRYPTION_MAX_RELAYS 4
@@ -45,6 +46,7 @@ typedef struct {
     core_protocol_t protocol;
 
     uint8_t uuid[16];
+    uint8_t trojan_hash[28];
 
     char server_host[256];
     uint16_t server_port;

@@ -12,6 +12,8 @@
 #include "core_log.h"
 #include "websocket.h"
 #include "grpc.h"
+#include "trojan.h"
+#include <openssl/crypto.h>
 
 static void set_err(char *err, size_t cap, const char *msg) {
     if (err != NULL && cap > 0) {
@@ -463,6 +465,7 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
         } else if (strcmp(key, "encryption") == 0) {
             copy_trunc(cfg->encryption, sizeof(cfg->encryption), decoded);
         } else if (strcmp(key, "security") == 0) {
+            if (cfg->protocol == CORE_PROTOCOL_TROJAN && !decoded_lower[0]) { set_err(err,err_cap,"invalid Trojan security"); return -1; }
             copy_trunc(cfg->security, sizeof(cfg->security), decoded_lower[0] != '\0' ? decoded_lower : "none");
         } else if (strcmp(key, "alpn") == 0) {
             copy_trunc(cfg->alpn, sizeof(cfg->alpn), decoded);
@@ -677,65 +680,7 @@ static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, siz
     return query && *query ? parse_query(cfg,query,err,err_cap) : 0;
 }
 
-int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {
-    if (uri == NULL || cfg == NULL) {
-        set_err(err, err_cap, "null input");
-        return -1;
-    }
-
-    core_config_defaults(cfg);
-
-    if (!starts_with_ci(uri, "vless://")) {
-        set_err(err, err_cap, "URI must start with vless://");
-        return -1;
-    }
-    if (strlen(uri) > CORE_URI_MAX_LENGTH) {
-        set_err(err, err_cap, "URI is too long");
-        return -1;
-    }
-
-    char work[4096];
-    memcpy(work, uri + 8, strlen(uri + 8) + 1);
-
-    char *hash = strchr(work, '#');
-    if (hash != NULL) {
-        *hash = '\0';
-    }
-
-    char *query = strchr(work, '?');
-    if (query != NULL) {
-        *query = '\0';
-        query++;
-    }
-
-    char *at = strchr(work, '@');
-    if (at == NULL) {
-        set_err(err, err_cap, "missing user@host part");
-        return -1;
-    }
-    *at = '\0';
-
-    if (parse_uuid(work, cfg->uuid) != 0) {
-        set_err(err, err_cap, "invalid UUID in URI");
-        return -1;
-    }
-
-    if (parse_host_port(at + 1, cfg->server_host, sizeof(cfg->server_host), &cfg->server_port) != 0) {
-        set_err(err, err_cap, "invalid host:port in URI");
-        return -1;
-    }
-
-    snprintf(cfg->sni, sizeof(cfg->sni), "%s", cfg->server_host);
-
-    if (query != NULL && *query != '\0') {
-        if (parse_query(cfg, query, err, err_cap) != 0) {
-            return -1;
-        }
-    }
-
-    if (parse_vless_encryption(cfg, err, err_cap) != 0) {
-        return -1;
-    }
+static int finalize_stream_config(vless_config_t *cfg, char *err, size_t err_cap) {
     if (cfg->transport_mode == TRANSPORT_WS && core_ws_configure(cfg,err,err_cap)) return -1;
     if (cfg->transport_mode == TRANSPORT_WS) {
         char authority[sizeof(cfg->xhttp_host)+2];
@@ -876,17 +821,126 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     return 0;
 }
 
+int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {
+    if (uri == NULL || cfg == NULL) {
+        set_err(err, err_cap, "null input");
+        return -1;
+    }
+
+    core_config_defaults(cfg);
+
+    if (!starts_with_ci(uri, "vless://")) {
+        set_err(err, err_cap, "URI must start with vless://");
+        return -1;
+    }
+    if (strlen(uri) > CORE_URI_MAX_LENGTH) {
+        set_err(err, err_cap, "URI is too long");
+        return -1;
+    }
+
+    char work[4096];
+    memcpy(work, uri + 8, strlen(uri + 8) + 1);
+
+    char *hash = strchr(work, '#');
+    if (hash != NULL) {
+        *hash = '\0';
+    }
+
+    char *query = strchr(work, '?');
+    if (query != NULL) {
+        *query = '\0';
+        query++;
+    }
+
+    char *at = strchr(work, '@');
+    if (at == NULL) {
+        set_err(err, err_cap, "missing user@host part");
+        return -1;
+    }
+    *at = '\0';
+
+    if (parse_uuid(work, cfg->uuid) != 0) {
+        set_err(err, err_cap, "invalid UUID in URI");
+        return -1;
+    }
+
+    if (parse_host_port(at + 1, cfg->server_host, sizeof(cfg->server_host), &cfg->server_port) != 0) {
+        set_err(err, err_cap, "invalid host:port in URI");
+        return -1;
+    }
+
+    snprintf(cfg->sni, sizeof(cfg->sni), "%s", cfg->server_host);
+
+    if (query != NULL && *query != '\0') {
+        if (parse_query(cfg, query, err, err_cap) != 0) {
+            return -1;
+        }
+    }
+
+    if (parse_vless_encryption(cfg, err, err_cap) != 0) {
+        return -1;
+    }
+    return finalize_stream_config(cfg,err,err_cap);
+}
+
+static int parse_trojan_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {
+    if (!uri || !cfg) { set_err(err,err_cap,"null input"); return -1; }
+    core_config_defaults(cfg); cfg->protocol=CORE_PROTOCOL_TROJAN;
+    strcpy(cfg->security,"tls");
+    if (strlen(uri) > CORE_URI_MAX_LENGTH) { set_err(err,err_cap,"URI is too long"); return -1; }
+    char work[CORE_URI_MAX_LENGTH+1]={0}; int result=-1;
+    memcpy(work,uri+9,strlen(uri+9)+1);
+    char *fragment=strchr(work,'#'); if (fragment) *fragment=0;
+    char *query=strchr(work,'?'); if (query) *query++=0;
+    char *at=strchr(work,'@');
+    if (!at || at == work) { set_err(err,err_cap,"missing Trojan password or server"); goto cleanup; }
+    *at=0;
+    size_t encoded=strlen(work),password_length=0;
+    for (size_t i=0;i<encoded;i++) {
+        unsigned char value=(unsigned char)work[i];
+        if (value == '%') {
+            if (i+2 >= encoded || !isxdigit((unsigned char)work[i+1]) || !isxdigit((unsigned char)work[i+2])) {
+                set_err(err,err_cap,"invalid Trojan password encoding"); goto cleanup;
+            }
+            unsigned a=(unsigned char)work[++i],b=(unsigned char)work[++i];
+            a=a <= '9' ? a-'0' : (a|32U)-'a'+10U;
+            b=b <= '9' ? b-'0' : (b|32U)-'a'+10U;
+            value=(unsigned char)((a<<4)|b);
+        }
+        work[password_length++]=(char)value;
+    }
+    if (parse_host_port(at+1,cfg->server_host,sizeof(cfg->server_host),&cfg->server_port)) {
+        set_err(err,err_cap,"invalid Trojan host:port"); goto cleanup;
+    }
+    snprintf(cfg->sni,sizeof(cfg->sni),"%s",cfg->server_host);
+    if (query && *query && parse_query(cfg,query,err,err_cap)) goto cleanup;
+    if (cfg->flow[0]) { set_err(err,err_cap,"Trojan does not support flow"); goto cleanup; }
+    if (strcasecmp(cfg->encryption,"none")) { set_err(err,err_cap,"Trojan supports only encryption=none"); goto cleanup; }
+    if (cfg->transport_mode != TRANSPORT_VISION) { set_err(err,err_cap,"Trojan transport is not supported"); goto cleanup; }
+    if (finalize_stream_config(cfg,err,err_cap)) goto cleanup;
+    if (core_trojan_password((const uint8_t *)work,password_length,cfg->trojan_hash)) {
+        set_err(err,err_cap,"failed to prepare Trojan credentials"); goto cleanup;
+    }
+    if (!strcmp(cfg->security,"none")) vc_log_warning("uri","Trojan security=none exposes the authentication credential; use only on a trusted link");
+    result=0;
+cleanup:
+    OPENSSL_cleanse(work,sizeof(work));
+    if (result) OPENSSL_cleanse(cfg,sizeof(*cfg));
+    return result;
+}
+
 int parse_core_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {
     if (uri == NULL) {
         set_err(err, err_cap, "null input");
         return -1;
     }
+    if (starts_with_ci(uri, "trojan://")) return parse_trojan_uri(uri,cfg,err,err_cap);
     if (starts_with_ci(uri, "socks5://")) {
         return parse_socks5_uri(uri, cfg, err, err_cap);
     }
     if (starts_with_ci(uri, "vless://")) {
         return parse_vless_uri(uri, cfg, err, err_cap);
     }
-    set_err(err, err_cap, "URI must start with vless:// or socks5://");
+    set_err(err, err_cap, "URI must start with vless://, trojan://, or socks5://");
     return -1;
 }

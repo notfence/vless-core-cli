@@ -19,6 +19,7 @@ PRIVATE = Path(os.environ["TEST_PRIVATE_ROOT"])
 UUID = "00000000-0000-0000-0000-000000000001"
 KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHl8"
 PUBLIC_KEY = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8"
+TROJAN_PASSWORD = "trojan-core+fixture:@%"
 
 def exact(connection, length):
     data = bytearray()
@@ -37,12 +38,14 @@ def port():
         connection.bind(("127.0.0.1", 0))
         return connection.getsockname()[1]
 
-def uri(server_port, transport="tcp", security="none", **parameters):
+def uri(server_port, transport="tcp", security="none", protocol="vless", password=TROJAN_PASSWORD, **parameters):
     query = dict(type=transport, security=security, sni="vless-core.test", path="/vless-core", serviceName="vless-core")
     query.update(parameters)
     if security == "reality":
         query.update(pbk=PUBLIC_KEY, sid="01020304")
-    return f"vless://{UUID}@127.0.0.1:{server_port}?{urllib.parse.urlencode(query)}#vless-core"
+    if protocol not in ("vless","trojan"): raise ValueError("unsupported fixture protocol")
+    credential=UUID if protocol == "vless" else urllib.parse.quote(password,safe="")
+    return f"{protocol}://{credential}@127.0.0.1:{server_port}?{urllib.parse.urlencode(query)}#vless-core"
 
 def certificate():
     cert, key = PRIVATE / "certificate.pem", PRIVATE / "key.pem"
@@ -292,7 +295,7 @@ def xray_tls_target(groups=None):
         yield process
 
 @contextlib.contextmanager
-def xray_server(transport, security, mode=None, flow="", decryption="none", tls_certificate=None, reality_target_groups=None, tls_settings=None, **transport_parameters):
+def xray_server(transport, security, mode=None, flow="", decryption="none", tls_certificate=None, reality_target_groups=None, tls_settings=None, protocol="vless", password=TROJAN_PASSWORD, **transport_parameters):
     cert, key = certificate()
     cert = tls_certificate or cert
     with contextlib.ExitStack() as stack:
@@ -310,6 +313,10 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
             mask = stack.enter_context(xray_tls_target(reality_target_groups))
             stream["realitySettings"] = {"target":f"127.0.0.1:{mask.port}", "serverNames":["vless-core.test"], "privateKey":KEY, "shortIds":["01020304"], "maxTimeDiff":60000}
         config = {"log":{"loglevel":"info"}, "inbounds":[{"listen":"127.0.0.1", "port":0, "protocol":"vless", "settings":{"clients":[{"id":UUID,"flow":flow}],"decryption":decryption}, "streamSettings":stream}], "outbounds":[{"protocol":"freedom","settings":{"domainStrategy":"AsIs"},"tag":"local"},{"protocol":"blackhole","tag":"deny"}], "routing":{"rules":[{"type":"field","ip":["127.0.0.0/8","::1/128"],"outboundTag":"local"},{"type":"field","network":"tcp,udp","outboundTag":"deny"}]}}
+        if protocol == "trojan":
+            config["inbounds"][0]["protocol"]="trojan"
+            config["inbounds"][0]["settings"]={"clients":[{"password":password}]}
+        elif protocol != "vless": raise ValueError("unsupported fixture protocol")
         config["outbounds"][0]["settings"]["finalRules"] = [{"action":"allow","ip":["127.0.0.0/8","::1/128"]}]
         def command(listen_port):
             config["inbounds"][0]["port"] = listen_port
@@ -327,13 +334,13 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
             health_settings=dict(transport_parameters)
             if transport == "xhttp" and "path" in health_settings:
                 health_settings["path"]=urllib.parse.urlsplit(health_settings["path"]).path
-            with Server() as health, xray_client(process.port,transport,security,mode,flow,encryption,health_settings) as client:
+            with Server() as health, xray_client(process.port,transport,security,mode,flow,encryption,health_settings,protocol=protocol,password=password) as client:
                 with socks_connect(client.port,health.port) as connection:
                     exchange(connection,b"vless-core reference readiness")
         yield process
 
 @contextlib.contextmanager
-def xray_client(server_port, transport="tcp", security="reality", mode=None, flow="", encryption="none", extra=None, fingerprint="firefox", alpn=None):
+def xray_client(server_port, transport="tcp", security="reality", mode=None, flow="", encryption="none", extra=None, fingerprint="firefox", alpn=None, protocol="vless", password=TROJAN_PASSWORD):
     cert, _ = certificate()
     stream = {"network":"raw" if transport == "tcp" else transport, "security":security}
     if security == "reality":
@@ -348,6 +355,9 @@ def xray_client(server_port, transport="tcp", security="reality", mode=None, flo
     elif transport == "grpc":
         stream["grpcSettings"] = {"serviceName":"vless-core", "multiMode":mode == "multi", **(extra or {})}
     config = {"log":{"loglevel":"info"}, "inbounds":[{"listen":"127.0.0.1", "port":0, "protocol":"socks", "settings":{"auth":"noauth", "udp":False}}], "outbounds":[{"protocol":"vless", "settings":{"vnext":[{"address":"127.0.0.1", "port":server_port, "users":[{"id":UUID, "encryption":encryption, "flow":flow}]}]}, "streamSettings":stream}]}
+    if protocol == "trojan":
+        config["outbounds"][0]={"protocol":"trojan","settings":{"address":"127.0.0.1","port":server_port,"password":password},"streamSettings":stream}
+    elif protocol != "vless": raise ValueError("unsupported fixture protocol")
     def command(listen_port):
         config["inbounds"][0]["port"] = listen_port
         path = PRIVATE / f"reference-client-{listen_port}.json"

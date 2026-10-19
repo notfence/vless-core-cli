@@ -3,6 +3,8 @@
 #include <errno.h>
 #include <openssl/evp.h>
 #include "trojan.h"
+#include "uri.h"
+#include "config_inspect.h"
 
 EVP_MD_CTX *__real_EVP_MD_CTX_new(void);
 int __real_EVP_DigestInit_ex(EVP_MD_CTX *, const EVP_MD *, ENGINE *);
@@ -15,7 +17,39 @@ int __wrap_EVP_DigestInit_ex(EVP_MD_CTX *c, const EVP_MD *m, ENGINE *e) { return
 int __wrap_EVP_DigestUpdate(EVP_MD_CTX *c, const void *p, size_t n) { return failing() ? 0 : __real_EVP_DigestUpdate(c,p,n); }
 int __wrap_EVP_DigestFinal_ex(EVP_MD_CTX *c, unsigned char *p, unsigned int *n) { return failing() ? 0 : __real_EVP_DigestFinal_ex(c,p,n); }
 
+static void uri_vectors(void) {
+    vless_config_t config; char error[256],output[1024]; uint8_t expected[28];
+    const uint8_t password[]="A+B:@%\xc3\xa9\0Tail";
+    const char *uri="trojan://A+B%3A%40%25%C3%A9%00Tail@offline.invalid:443";
+    REQUIRE("trojan/uri-password-vector",!core_trojan_password(password,sizeof(password)-1,expected));
+    REQUIRE("trojan/uri-default",!parse_core_uri(uri,&config,error,sizeof(error)));
+    CHECK("trojan/uri-defaults-tcp-tls",config.protocol == CORE_PROTOCOL_TROJAN && config.transport_mode == TRANSPORT_VISION && !strcmp(config.security,"tls") && config.fp_mode == FP_CHROME);
+    CHECK("trojan/uri-password-exact-bytes",!memcmp(expected,config.trojan_hash,28));
+    CHECK("trojan/inspect-offline-endpoints",!core_config_inspect(&config,output,sizeof(output),error,sizeof(error)) && !strcmp(output,"CONFIG\t1\nPRIMARY\toffline.invalid\t443\nEND\n"));
+    CHECK("trojan/uri-percent-once",!parse_core_uri("trojan://%252B@127.0.0.1:443",&config,error,sizeof(error)) && !core_trojan_password((const uint8_t *)"%2B",3,expected) && !memcmp(expected,config.trojan_hash,28));
+    CHECK("trojan/uri-ipv6",!parse_core_uri("trojan://fixture@[::1]:65535?security=none&type=raw",&config,error,sizeof(error)) && config.server_port == 65535 && !strcmp(config.server_host,"::1"));
+    const char *ports[]={"0","65536","4294967296","184467440737095516160","+443","-1","443x"," 443",""};
+    char value[256];
+    for (size_t i=0;i<sizeof(ports)/sizeof(*ports);i++) {
+        snprintf(value,sizeof(value),"trojan://private-fixture@127.0.0.1:%s",ports[i]);
+        CHECK("trojan/invalid-port",parse_core_uri(value,&config,error,sizeof(error)) < 0 && !strstr(error,"private-fixture"));
+    }
+    const char *queries[]={"flow=xtls-rprx-vision","encryption=private-fixture","security=","type=ws","type=grpc","type=xhttp"};
+    for (size_t i=0;i<sizeof(queries)/sizeof(*queries);i++) {
+        snprintf(value,sizeof(value),"trojan://private-fixture@127.0.0.1:443?%s",queries[i]);
+        CHECK("trojan/invalid-combination",parse_core_uri(value,&config,error,sizeof(error)) < 0 && !strstr(error,"private-fixture"));
+        uint8_t zero[28]={0}; CHECK("trojan/invalid-config-cleans-credential",!memcmp(config.trojan_hash,zero,28));
+    }
+    for (unsigned stage=1;stage<=4;stage++) {
+        fail_at=stage; calls=0;
+        CHECK("trojan/uri-crypto-failure",parse_core_uri(uri,&config,error,sizeof(error)) < 0 && !strstr(error,"A+B"));
+        fail_at=0;
+        uint8_t zero[28]={0}; CHECK("trojan/uri-crypto-failure-cleans-credential",!memcmp(config.trojan_hash,zero,28));
+    }
+}
+
 int main(void) {
+    uri_vectors();
     uint8_t digest[28], wire[321]; size_t length=999;
     const char *hex="23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7";
     REQUIRE("trojan/sha224-known-vector",!core_trojan_password((const uint8_t *)"abc",3,digest));

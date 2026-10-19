@@ -41,6 +41,7 @@ core_http2_stream_t *core_http2_connect(const vless_config_t *, const core_http2
 int core_http2_fd(const core_http2_stream_t *);
 int core_http2_pending(const core_http2_stream_t *);
 int core_http2_start_relay(core_http2_stream_t *);
+int core_http2_write_pending(const core_http2_stream_t *);
 void core_http2_drain_notifications(core_http2_stream_t *);
 size_t core_http2_write_capacity(const core_http2_stream_t *);
 int core_http2_reserve_write(core_http2_stream_t *, size_t);

@@ -21,6 +21,8 @@ int tls13_idle_timeout(const tls13_conn_t *c);
 int tls13_tick(tls13_conn_t *c);
 int tls13_start_relay(tls13_conn_t *c);
 int tls13_flush(tls13_conn_t *c);
+void tls13_set_request_fence(tls13_conn_t *c);
+int tls13_request_pending(const tls13_conn_t *c);
 int tls13_write_raw(tls13_conn_t *c, const uint8_t *buf, size_t len);
 int tls13_read_raw(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len);
 int tls13_has_pending_raw(const tls13_conn_t *c);

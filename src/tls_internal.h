@@ -154,6 +154,7 @@ struct tls13_conn {
     int relay_async,relay_raw_finish;
     dynbuf_t xmux_raw_input, xmux_plain_output, xmux_wire_output;
     size_t xmux_ssl_write_length;
+    size_t request_wire_left;
     uint64_t xmux_enqueued, xmux_flushed;
     size_t xmux_wire_plain_length;
     int xmux_read_wants_write, xmux_write_wants_read;

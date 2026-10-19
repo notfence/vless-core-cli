@@ -933,6 +933,23 @@ static void pooled_input_backpressure(void) {
     clear_conn(&connection); close(pair[0]); close(pair[1]);
 }
 
+static void request_write_fence(void) {
+    int pair[2]; REQUIRE("trojan/fence-socketpair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+    int size=4096; REQUIRE("trojan/fence-small-send-buffer",setsockopt(pair[0],SOL_SOCKET,SO_SNDBUF,&size,sizeof(size)) == 0);
+    uint8_t bytes[4096]={0};
+    while (send(pair[0],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {}
+    REQUIRE("trojan/fence-blocked-fixture",errno == EAGAIN || errno == EWOULDBLOCK);
+    tls13_conn_t connection={.fd=pair[0],.mode=CONN_MODE_PLAIN,.relay_async=1};
+    REQUIRE("trojan/fence-queued-header",tls13_write_app(&connection,(const uint8_t *)"header",6) == 0);
+    tls13_set_request_fence(&connection);
+    CHECK("trojan/queue-is-not-send-confirmation",tls13_flush(&connection) == 0 && tls13_request_pending(&connection));
+    while (recv(pair[1],bytes,sizeof(bytes),MSG_DONTWAIT) > 0) {}
+    CHECK("trojan/actual-send-completes-fence",tls13_flush(&connection) == 0 && !tls13_request_pending(&connection) && recv(pair[1],bytes,sizeof(bytes),MSG_DONTWAIT) == 6 && !memcmp(bytes,"header",6));
+    REQUIRE("trojan/fence-later-control-record",relay_write_wire(&connection,"later",5) == 0);
+    CHECK("trojan/later-record-does-not-extend-setup",!tls13_request_pending(&connection));
+    db_free(&connection.xmux_wire_output); close(pair[0]); close(pair[1]);
+}
+
 int main(int argc, char **argv) {
     if (signal(SIGPIPE,SIG_IGN) == SIG_ERR) return 2;
     if (argc == 1) { pooled_receive_window(); pooled_input_backpressure(); }
@@ -955,6 +972,7 @@ int main(int argc, char **argv) {
         }
         return test_result();
     }
+    request_write_fence();
     grpc_pooled_buffer_readiness();
     http2_single_wire_vectors();
     xhttp_http1_vectors();

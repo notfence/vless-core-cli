@@ -1122,6 +1122,13 @@ int core_http2_start_relay(core_http2_stream_t *stream) {
     pthread_mutex_unlock(&mux_lock); return result;
 }
 
+int core_http2_write_pending(const core_http2_stream_t *stream) {
+    pthread_mutex_lock(&mux_lock);
+    int pending=stream && !stream->failed && !stream->closed && !stream->send_stopped &&
+        (stream->tx.length || stream->upload->opening || stream->write_fence > stream->upload->flushed);
+    pthread_mutex_unlock(&mux_lock); return pending;
+}
+
 void core_http2_drain_notifications(core_http2_stream_t *stream) {
     pthread_mutex_lock(&mux_lock);
     core_drain_socket(stream->notify[0]);

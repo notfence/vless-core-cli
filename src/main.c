@@ -31,6 +31,7 @@
 #include "vision.h"
 #include "vless.h"
 #include "vless_encryption.h"
+#include "trojan.h"
 #include "relay_memory.h"
 
 #define VLESS_CORE_VERSION "2.0.0"
@@ -605,11 +606,21 @@ static int relay_output_room(core_relay_memory_t *memory,const vision_unpad_t *v
     return 0;
 }
 
+static void protocol_failure(const vless_config_t *config, const vless_response_t *response, int transport_error, int cause) {
+    if (config->protocol != CORE_PROTOCOL_TROJAN) { response_failure(response,transport_error,cause); return; }
+    if (core_deadline_active() && !core_deadline_remaining()) {
+        connection_log_failure("Trojan request deadline expired",NULL,core_connection_error(CORE_TRACE_PROTOCOL,CORE_FAILURE_DEADLINE,ETIMEDOUT));
+    } else if (transport_error) {
+        connection_log_failure("Trojan request send failed","transport failure",connection_failure(cause));
+    } else {
+        connection_log_failure("Trojan request send failed","transport closed before request completed",core_connection_error(CORE_TRACE_PROTOCOL,CORE_FAILURE_EOF,0));
+    }
+}
+
 static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
     client_ctx_t *ctx = (client_ctx_t *)arg;
     int cfd = ctx->client_fd;
-    vless_config_t cfg = ctx->cfg;
-    free(ctx);
+    vless_config_t *cfg = &ctx->cfg;
 
     char target_host[512];
     uint16_t target_port = 0;
@@ -727,7 +738,7 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
         return NULL;
     }
 
-    if (cfg.protocol == CORE_PROTOCOL_SOCKS5) {
+    if (cfg->protocol == CORE_PROTOCOL_SOCKS5) {
         char err[256] = {0};
         char upstream_target[512];
         snprintf(upstream_target, sizeof(upstream_target), "%s", target_host);
@@ -760,12 +771,12 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
 
         core_deadline_begin(g_connect_timeout_ms);
         uint8_t failure=1;
-        int upstream_fd = socks5_upstream_connect(&cfg,upstream_target,target_port,err,sizeof(err),&failure);
+        int upstream_fd = socks5_upstream_connect(cfg,upstream_target,target_port,err,sizeof(err),&failure);
         if (upstream_fd < 0) {
             core_trace_error_set(connection_failure(errno));
             vc_log_error("socks5", "upstream connect failed for %s:%u via %s:%u: %s id=%llu",
                          upstream_target, (unsigned)target_port,
-                         cfg.server_host, (unsigned)cfg.server_port, err,(unsigned long long)core_trace_id());
+                         cfg->server_host, (unsigned)cfg->server_port, err,(unsigned long long)core_trace_id());
             if (!socks_success_sent) {
                 socks5_send_failure(cfd,failure);
             }
@@ -789,9 +800,9 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
                     (unsigned)target_port,
                     upstream_target,
                     (unsigned)target_port,
-                    cfg.server_host,
-                    (unsigned)cfg.server_port,
-                    (cfg.socks5_user[0] != '\0' ? "userpass" : "none"));
+                    cfg->server_host,
+                    (unsigned)cfg->server_port,
+                    (cfg->socks5_user[0] != '\0' ? "userpass" : "none"));
         core_deadline_end();
         relay_tcp_pair(cfd, upstream_fd);
         close(upstream_fd);
@@ -802,7 +813,7 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
     char err[256] = {0};
     tls13_conn_t *tls = NULL;
     core_deadline_begin(g_connect_timeout_ms);
-    if (tls13_reality_connect(&cfg, &tls, err, sizeof(err)) != 0) {
+    if (tls13_reality_connect(cfg, &tls, err, sizeof(err)) != 0) {
         core_connection_error_t result=connection_failure(errno);
         uint8_t failure=result.kind == CORE_FAILURE_SYSTEM ? socks5_error_reply(result.system_error) : 1;
         connection_log_failure("upstream connect failed",err,result);
@@ -816,8 +827,8 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
     vless_encryption_conn_t *encryption = NULL;
     core_trace_stage(CORE_TRACE_PROTOCOL);
     errno=0;
-    if (cfg.encryption_enabled &&
-        vless_encryption_connect(&cfg, tls, &encryption, err,
+    if (cfg->encryption_enabled &&
+        vless_encryption_connect(cfg, tls, &encryption, err,
                                  sizeof(err)) != 0) {
         connection_log_failure("VLESS encryption handshake failed",err,core_connection_error(CORE_TRACE_PROTOCOL,CORE_FAILURE_PROTOCOL,errno ? errno : EPROTO));
         if (!socks_success_sent) {
@@ -828,23 +839,59 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
         return NULL;
     }
 
-    int use_vision = (strcmp(cfg.flow, "xtls-rprx-vision") == 0);
-    if (relay_prepare_memory(memory,tls,cfd,use_vision || cfg.transport_mode == TRANSPORT_WS)) {
+    int use_vision = (strcmp(cfg->flow, "xtls-rprx-vision") == 0);
+    if (relay_prepare_memory(memory,tls,cfd,use_vision || cfg->transport_mode == TRANSPORT_WS)) {
         connection_log_failure("relay buffer preparation failed","resources unavailable",connection_failure(errno));
         if (!socks_success_sent) socks5_send_failure(cfd,1);
         upstream_close(tls,encryption); close(cfd); return NULL;
     }
     int allow_raw_vision =
-        (cfg.transport_mode == TRANSPORT_VISION && encryption == NULL);
+        (cfg->transport_mode == TRANSPORT_VISION && encryption == NULL);
     vision_wrap_t vwrap;
     vision_unpad_t vunpad;
     if (use_vision) {
-        vision_wrap_init(&vwrap, cfg.uuid);
-        vision_unpad_init(&vunpad, cfg.uuid);
+        vision_wrap_init(&vwrap, cfg->uuid);
+        vision_unpad_init(&vunpad, cfg->uuid);
         vunpad.memory=&memory->temporary;
     }
 
-    if (use_vision) {
+    if (cfg->protocol == CORE_PROTOCOL_TROJAN) {
+        uint8_t request[CORE_TROJAN_HEADER_MAX]; size_t request_length=0;
+        if (core_trojan_request(request,sizeof(request),&request_length,cfg->trojan_hash,target_host,target_port)) {
+            OPENSSL_cleanse(request,sizeof(request));
+            connection_log_failure("Trojan request build failed",NULL,core_connection_error(CORE_TRACE_PROTOCOL,CORE_FAILURE_PROTOCOL,errno));
+            if (!socks_success_sent) socks5_send_failure(cfd,1);
+            upstream_close(tls,encryption); close(cfd); return NULL;
+        }
+        if (!socks_success_sent && socks5_send_success(cfd)) {
+            OPENSSL_cleanse(request,sizeof(request)); upstream_close(tls,encryption); close(cfd); return NULL;
+        }
+        socks_success_sent=1;
+        if (!first_payload_len) {
+            do { first_payload_len=core_recv(cfd,first_payload,sizeof(first_payload),MSG_DONTWAIT); } while (first_payload_len < 0 && errno == EINTR && core_deadline_remaining());
+            if (first_payload_len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) first_payload_len=0;
+            if (first_payload_len < 0) {
+                OPENSSL_cleanse(request,sizeof(request)); upstream_close(tls,encryption); close(cfd); return NULL;
+            }
+        }
+        size_t length=request_length+(size_t)first_payload_len;
+        if (core_relay_buffer_reserve(&memory->packet,length) != 1) {
+            OPENSSL_cleanse(request,sizeof(request));
+            connection_log_failure("Trojan request preparation failed","resources unavailable",connection_failure(errno));
+            upstream_close(tls,encryption); close(cfd); return NULL;
+        }
+        memcpy(memory->packet.data,request,request_length);
+        if (first_payload_len) memcpy(memory->packet.data+request_length,first_payload,(size_t)first_payload_len);
+        OPENSSL_cleanse(request,sizeof(request));
+        int result=tls13_start_relay(tls);
+        if (!result) result=upstream_write(tls,encryption,memory->packet.data,length);
+        OPENSSL_cleanse(memory->packet.data,memory->packet.capacity); core_relay_buffer_clear(&memory->packet);
+        if (result) {
+            connection_log_failure("Trojan request send failed",NULL,connection_failure(errno));
+            upstream_close(tls,encryption); close(cfd); return NULL;
+        }
+        tls13_set_request_fence(tls);
+    } else if (use_vision) {
         uint8_t vless_req[2048];
         size_t vless_req_len = 0;
         uint8_t *vision_first = NULL;
@@ -872,7 +919,7 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
             }
         }
 
-        if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
+        if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, cfg, target_host, target_port) != 0) {
             vc_log_error("connection", "VLESS/Vision request build failed for %s:%u",
                          target_host, (unsigned)target_port);
             vision_unpad_free(&vunpad);
@@ -930,7 +977,7 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
         }
         core_relay_buffer_clear(&memory->packet);
 
-    } else if (cfg.transport_mode == TRANSPORT_WS) {
+    } else if (cfg->transport_mode == TRANSPORT_WS) {
         uint8_t vless_req[2048];
         size_t vless_req_len = 0;
         uint8_t *first_packet = NULL;
@@ -954,7 +1001,7 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
             }
         }
 
-        if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, &cfg, target_host, target_port) != 0) {
+        if (vless_build_request(vless_req, sizeof(vless_req), &vless_req_len, cfg, target_host, target_port) != 0) {
             vc_log_error("connection", "VLESS/WS request build failed for %s:%u",
                          target_host, (unsigned)target_port);
             upstream_close(tls, encryption);
@@ -988,7 +1035,7 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
         }
         core_relay_buffer_clear(&memory->packet);
     } else {
-        if (vless_send_request(tls, encryption, &cfg, target_host,
+        if (vless_send_request(tls, encryption, cfg, target_host,
                                target_port) != 0) {
             vc_log_error("connection", "VLESS request send failed for %s:%u",
                          target_host, (unsigned)target_port);
@@ -1030,10 +1077,11 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
         close(cfd);
         return NULL;
     }
-    int waiting_initial_payload=first_payload_len == 0;
+    int trojan=cfg->protocol == CORE_PROTOCOL_TROJAN;
+    int waiting_initial_payload=first_payload_len == 0 && !trojan;
     if (waiting_initial_payload) core_deadline_pause();
     uint8_t tbuf[8192];
-    int got_vless_response = 0;
+    int protocol_ready = 0;
     int received_reply = 0;
     int upstream_direct = 0;
     int downstream_direct = 0;
@@ -1049,10 +1097,13 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
         memory->output.length=output_length;
         if (core_relay_buffer_trim(&memory->output) != 1) break;
         uint8_t *output=memory->output.data;
-        if (!got_vless_response && core_deadline_active() && !core_deadline_remaining()) break;
+        if (!protocol_ready && core_deadline_active() && !core_deadline_remaining()) break;
         if (!upstream_failed && (tls13_flush(tls) || tls13_tick(tls))) {
-            if (!got_vless_response) response_failure(&response,1,errno);
+            if (!protocol_ready) protocol_failure(cfg,&response,1,errno);
             upstream_failed=client_eof=upstream_eof=1;
+        }
+        if (!upstream_failed && trojan && !protocol_ready && !tls13_request_pending(tls)) {
+            protocol_ready=1; core_deadline_end(); core_trace_stage(CORE_TRACE_CARRY);
         }
         if (!client_eof && tls13_send_stopped(tls)) {
             client_eof=1; tls13_release_write(tls);
@@ -1076,7 +1127,7 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory) {
         if (client_eof && upstream_eof && !finishing && !output_length) break;
         int client_ready = 0;
         size_t receive_read_capacity=0;
-        int client_writable = !client_eof && !(memory->waiting&CORE_RELAY_INPUT_WAIT) && tls13_write_capacity(tls) >= 128U*1024U;
+        int client_writable = (!trojan || protocol_ready) && !client_eof && !(memory->waiting&CORE_RELAY_INPUT_WAIT) && tls13_write_capacity(tls) >= 128U*1024U;
         size_t extra=use_vision && !vision_unpad_is_raw(&vunpad) ? vunpad.stash_len : 0;
         int receive_capacity=output_length+extra < memory->output.limit && !(memory->waiting&CORE_RELAY_OUTPUT_WAIT);
         int upstream_ready = !upstream_eof && receive_capacity &&
@@ -1191,7 +1242,7 @@ receive_upstream:
             output=memory->output.data;
             int drained = tls13_drain_h2_input(tls);
             if (drained < 0) {
-                if (!got_vless_response) response_failure(&response,1,errno);
+                if (!protocol_ready) protocol_failure(cfg,&response,1,errno);
                 upstream_failed=client_eof=upstream_eof=1; continue;
             }
             if (tls13_uses_h2(tls) || tls13_uses_async_io(tls)) {
@@ -1221,15 +1272,15 @@ receive_upstream:
                               : upstream_read(tls, encryption, tbuf,
                                               receive_read_capacity, &got);
             if (read_rc < 0) {
-                if (!got_vless_response) response_failure(&response,1,errno);
+                if (!protocol_ready) protocol_failure(cfg,&response,1,errno);
                 upstream_failed=client_eof=upstream_eof=1; continue;
             }
             if (read_rc > 0) {
                 continue;
             }
             if (!got) {
-                if (!got_vless_response) {
-                    response_failure(&response,0,0); break;
+                if (!trojan && !protocol_ready) {
+                    protocol_failure(cfg,&response,0,0); break;
                 }
                 if (use_vision && !vision_unpad_complete(&vunpad)) { vc_log_error("connection","truncated Vision response"); break; }
                 upstream_eof=1;
@@ -1239,7 +1290,7 @@ receive_upstream:
                 }
                 continue;
             }
-            if (!got_vless_response) {
+            if (!trojan && !protocol_ready) {
                 if (waiting_initial_payload) { core_deadline_resume(); waiting_initial_payload=0; }
                 size_t consumed=0;
                 int parsed=vless_consume_response(&response,tbuf,got,&consumed);
@@ -1247,7 +1298,7 @@ receive_upstream:
                 got-=consumed;
                 if (got) memmove(tbuf,tbuf+consumed,got);
                 if (!parsed) continue;
-                got_vless_response=1; core_deadline_end(); core_trace_stage(CORE_TRACE_CARRY);
+                protocol_ready=1; core_deadline_end(); core_trace_stage(CORE_TRACE_CARRY);
                 if (!got) continue;
             }
 
@@ -1296,9 +1347,9 @@ receive_upstream:
         }
     }
 
-    if (!got_vless_response && core_deadline_active() && !core_deadline_remaining()) {
+    if (!protocol_ready && core_deadline_active() && !core_deadline_remaining()) {
         core_connection_error_t failure;
-        if (!core_trace_error_get(&failure) || failure.kind != CORE_FAILURE_DEADLINE) response_failure(&response,0,ETIMEDOUT);
+        if (!core_trace_error_get(&failure) || failure.kind != CORE_FAILURE_DEADLINE) protocol_failure(cfg,&response,0,ETIMEDOUT);
     }
     if (use_vision) {
         vision_unpad_free(&vunpad);
@@ -1313,12 +1364,13 @@ static void *client_worker(void *arg) {
     core_deadline_t deadline;
     if (core_deadline_attach(&deadline) != 0) {
         client_ctx_t *ctx = arg;
-        close(ctx->client_fd); free(ctx); release_client_slot();
+        close(ctx->client_fd); OPENSSL_cleanse(ctx,sizeof(*ctx)); free(ctx); release_client_slot();
         return NULL;
     }
     int attached = core_trace_attach(&trace) == 0;
     core_relay_memory_t memory={0};
     void *result = client_worker_run(arg,&memory);
+    OPENSSL_cleanse(arg,sizeof(client_ctx_t)); free(arg);
     core_relay_memory_clear(&memory);
     if (attached) {
         core_trace_complete(0);
@@ -1332,7 +1384,7 @@ static void *client_worker(void *arg) {
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s (--uri <uri> | --uri-fd <fd> | --connection-fd <fd>) --listen-port <port>\n", argv0);
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  --uri <uri>              VLESS URI or SOCKS5 upstream URI\n");
+    fprintf(stderr, "  --uri <uri>              VLESS, Trojan, or SOCKS5 upstream URI\n");
     fprintf(stderr, "  --uri-fd <fd>            Read the URI from a file descriptor\n");
     fprintf(stderr, "  --connection-fd <fd>     Read URI and pre-resolved server IPs from a file descriptor\n");
     fprintf(stderr, "  --inspect-config        Validate --uri-fd and print server endpoints without connecting\n");
@@ -1539,7 +1591,7 @@ int main(int argc, char **argv) {
     if (lfd < 0) {
         int error_number = errno;
         vc_log_error("startup", "socket failed: %s", strerror(error_number));
-        return 1;
+        goto startup_failure;
     }
 
     int one = 1;
@@ -1555,20 +1607,21 @@ int main(int argc, char **argv) {
         int error_number = errno;
         vc_log_error("startup", "bind failed: %s", strerror(error_number));
         close(lfd);
-        return 1;
+        goto startup_failure;
     }
 
     if (listen(lfd, 128) != 0) {
         int error_number = errno;
         vc_log_error("startup", "listen failed: %s", strerror(error_number));
         close(lfd);
-        return 1;
+        goto startup_failure;
     }
 
     if (core_resolver_init() != 0) {
-        vc_log_error("startup", "failed to start DNS workers"); close(lfd); return 1;
+        vc_log_error("startup", "failed to start DNS workers"); close(lfd); goto startup_failure;
     }
 
+    if (cfg.protocol == CORE_PROTOCOL_TROJAN) vc_log_info("core","upstream protocol=trojan");
     if (cfg.protocol == CORE_PROTOCOL_SOCKS5) {
         vc_log_info("core", "%s listening on 127.0.0.1:%d (upstream=socks5://%s:%u, auth=%s)",
                     prog,
@@ -1656,7 +1709,7 @@ int main(int argc, char **argv) {
 
         pthread_t th;
         if (pthread_create(&th, NULL, client_worker, ctx) != 0) {
-            free(ctx);
+            OPENSSL_cleanse(ctx,sizeof(*ctx)); free(ctx);
             release_client_slot();
             close(cfd);
             continue;
@@ -1665,6 +1718,7 @@ int main(int argc, char **argv) {
     }
 
     close(lfd);
+    OPENSSL_cleanse(&cfg,sizeof(cfg));
     return listener_result;
 startup_failure:
     core_cli_args_scrub(argc,argv);

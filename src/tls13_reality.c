@@ -63,6 +63,7 @@ int tls13_flush(tls13_conn_t *c) {
             if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
             if (sent <= 0) return -1;
         }
+        c->request_wire_left=(size_t)sent >= c->request_wire_left ? 0 : c->request_wire_left-(size_t)sent;
         db_consume(&c->xmux_wire_output,(size_t)sent);
     }
     if (c->relay_raw_finish && !c->xmux_wire_output.len) {
@@ -70,6 +71,14 @@ int tls13_flush(tls13_conn_t *c) {
         return shutdown(c->fd,SHUT_WR);
     }
     return 0;
+}
+
+void tls13_set_request_fence(tls13_conn_t *c) {
+    if (c) c->request_wire_left=c->xmux_wire_output.len;
+}
+
+int tls13_request_pending(const tls13_conn_t *c) {
+    return c && (c->xmux_stream ? core_http2_write_pending(c->xmux_stream) : c->request_wire_left != 0);
 }
 
 int tls13_write_raw(tls13_conn_t *c, const uint8_t *buf, size_t len) {
