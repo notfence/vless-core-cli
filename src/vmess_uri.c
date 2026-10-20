@@ -86,10 +86,10 @@ static const char *canonical(const char *key) {
 static int json_config(vless_config_t *config,const char *text,char *error,size_t capacity) {
     char reason[128]; core_json_t *root=core_json_parse(text,reason,sizeof(reason)); int result=-1;
     if (!root || root->type != CORE_JSON_OBJECT) { invalid(error,capacity,"JSON"); goto cleanup; }
-    const core_json_t *network=core_json_get(root,"net");
-    if (!network) network=core_json_get(root,"network");
-    if (!network) network=core_json_get(root,"transport");
-    if (network && (network->type != CORE_JSON_STRING || core_config_parameter(config,"transport",network->text,error,capacity) < 0)) { invalid(error,capacity,"net"); goto cleanup; }
+    for (const core_json_t *network=root->child;network;network=network->next) {
+        if (strcasecmp(network->key,"net") && strcasecmp(network->key,"network") && strcasecmp(network->key,"transport")) continue;
+        if (network->type != CORE_JSON_STRING || core_config_parameter(config,"transport",network->text,error,capacity) < 0) { invalid(error,capacity,"net"); goto cleanup; }
+    }
     char seen_keys[128][128]; const core_json_t *seen_values[128]; size_t seen=0;
     for (const core_json_t *node=root->child;node;node=node->next) {
         char lowered[128]; size_t length=strlen(node->key);
@@ -182,7 +182,7 @@ int core_vmess_parse_uri(const char *uri,vless_config_t *config,char *error,size
         if (query && *query && core_config_query(config,query,error,capacity)) goto cleanup;
     } else if (decode_base64(work,decoded,sizeof(decoded)) || json_config(config,decoded,error,capacity)) { if (!error || !*error) invalid(error,capacity,"Base64 JSON"); goto cleanup; }
     if (config->flow[0]) { invalid(error,capacity,"flow"); goto cleanup; }
-    if (config->transport_mode != TRANSPORT_VISION) { invalid(error,capacity,"transport not yet supported"); goto cleanup; }
+    if (config->transport_mode != TRANSPORT_VISION && config->transport_mode != TRANSPORT_WS) { invalid(error,capacity,"transport not yet supported"); goto cleanup; }
     if (core_config_finalize(config,error,capacity)) goto cleanup;
     result=0;
 cleanup:

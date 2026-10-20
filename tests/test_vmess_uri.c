@@ -9,7 +9,29 @@ static int parse_json(const char *json,vless_config_t *config,char error[256]) {
     return parse_core_uri(uri,config,error,256);
 }
 
+static void websocket_json(void) {
+    vless_config_t *config=calloc(1,sizeof(*config)),*address=calloc(1,sizeof(*address)); char error[256];
+    REQUIRE("vmess/ws-config-storage",config && address);
+    const char *json="{\"add\":\"127.0.0.1\",\"port\":443,\"id\":\"00000000-0000-0000-0000-000000000001\",\"net\":\"ws\",\"tls\":\"tls\",\"scy\":\"chacha20-poly1305\",\"host\":\"ws.test:8443\",\"path\":\"/socket?ed=128\",\"headers\":{\"X-Fixture\":\"present\"},\"heartbeatPeriod\":1}";
+    REQUIRE("vmess/ws-json-config",!parse_json(json,config,error));
+    REQUIRE("vmess/ws-address-config",!parse_core_uri("vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?type=ws&security=tls&scy=chacha20-poly1305&host=ws.test%3A8443&path=%2Fsocket%3Fed%3D128&headers=%7B%22X-Fixture%22%3A%22present%22%7D&heartbeatPeriod=1",address,error,sizeof(error)));
+    CHECK("vmess/ws-json-and-address-effective-config",!memcmp(config,address,sizeof(*config)));
+    const char *late_network="{\"add\":\"127.0.0.1\",\"port\":443,\"id\":\"00000000-0000-0000-0000-000000000001\",\"headers\":{\"X-Fixture\":\"present\"},\"heartbeatPeriod\":1,\"NET\":\"ws\"}";
+    CHECK("vmess/ws-json-network-before-dependent-options",!parse_json(late_network,config,error) && config->transport_mode == TRANSPORT_WS && config->ws_heartbeat_period == 1 && strstr(config->ws_headers,"present"));
+    for (unsigned alias=0;alias<2;alias++) {
+        char text[512]; snprintf(text,sizeof(text),"{\"add\":\"127.0.0.1\",\"port\":443,\"id\":\"00000000-0000-0000-0000-000000000001\",\"net\":\"ws\",\"%s\":0,\"heartbeatPeriod\":0}",alias ? "maxEarlyData" : "ed");
+        CHECK("vmess/ws-json-false-zero-preserved",!parse_json(text,config,error) && !config->ws_early_data && config->ws_early_explicit && !config->ws_heartbeat_period);
+    }
+    const char *bad[]={"\"headers\":{\"X-Fixture\":\"bad\\r\\nInjected: true\"}","\"host\":\"ws.test\\r\\nInjected: true\"","\"heartbeatPeriod\":-1","\"ed\":184467440737095516160","\"ed\":false","\"ed\":1,\"maxEarlyData\":2","\"tls\":\"reality\",\"pbk\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\""};
+    for (size_t i=0;i<sizeof(bad)/sizeof(*bad);i++) {
+        char text[1024]; snprintf(text,sizeof(text),"{\"add\":\"127.0.0.1\",\"port\":443,\"id\":\"00000000-0000-0000-0000-000000000001\",\"net\":\"ws\",%s}",bad[i]);
+        CHECK("vmess/ws-json-invalid-setting",parse_json(text,config,error) < 0);
+    }
+    free(config); free(address);
+}
+
 int main(void) {
+    websocket_json();
     vless_config_t *config=calloc(1,sizeof(*config)); char error[256];
     REQUIRE("vmess/uri-storage",config);
     const char *modes[]={"auto","aes-128-gcm","chacha20-poly1305","none","zero"};
@@ -22,7 +44,7 @@ int main(void) {
         REQUIRE("vmess/base64-json-form",!parse_json(json,config,error));
         CHECK("vmess/base64-json-effective-config",config->protocol == CORE_PROTOCOL_VMESS && config->vmess_security == expected[i] && config->server_port == 443 && !strcmp(config->server_host,"127.0.0.1") && !strcmp(config->security,"none"));
     }
-    const char *bad[]={"aid=1","aid=-0","alterId=4294967296","encryption=aes-128-cfb","encryption=mlkem768x25519plus.native.0rtt.key","encryption=auto&scy=none","flow=xtls-rprx-vision","type=ws","type=grpc","type=xhttp","security=invalid","authenticatedLength=true"};
+    const char *bad[]={"aid=1","aid=-0","alterId=4294967296","encryption=aes-128-cfb","encryption=mlkem768x25519plus.native.0rtt.key","encryption=auto&scy=none","flow=xtls-rprx-vision","type=grpc","type=xhttp","security=invalid","authenticatedLength=true"};
     for (size_t i=0;i<sizeof(bad)/sizeof(*bad);i++) {
         char uri[512]; snprintf(uri,sizeof(uri),"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?%s",bad[i]);
         CHECK("vmess/unsupported-setting-rejected",parse_core_uri(uri,config,error,sizeof(error)) < 0);

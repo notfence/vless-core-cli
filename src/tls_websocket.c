@@ -202,6 +202,7 @@ int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err
         }
         vless_config_t tls_config=*cfg;
         OPENSSL_cleanse(tls_config.trojan_hash,sizeof(tls_config.trojan_hash));
+        if (tls_config.protocol == CORE_PROTOCOL_VMESS) OPENSSL_cleanse(tls_config.uuid,sizeof(tls_config.uuid));
         snprintf(tls_config.alpn,sizeof(tls_config.alpn),"%s",protocols);
         if (connect_manual_tls(&tls_config,c,err,err_cap)) return -1;
         if (c->tls_selected_alpn[0] && strcmp(c->tls_selected_alpn,"http/1.1")) {

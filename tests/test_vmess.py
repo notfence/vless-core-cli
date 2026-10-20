@@ -157,4 +157,74 @@ class VMessTests(unittest.TestCase):
                     if writer >= 0: os.close(writer)
 
 
+    def test_websocket_base64_json_settings(self):
+        certificate,_=f.certificate()
+        for security in ('none','tls'):
+            for early in (0,16384):
+                with self.subTest(security=security,early=early),f.Server() as target,f.xray_server('ws',security,protocol='vmess') as reference:
+                    value=dict(v='2',add='127.0.0.1',port=reference.port,id=f.UUID,aid='0',scy='aes-128-gcm',net='ws',tls=security,sni='vless-core.test',host='ws.test:8443',path=f'/vless-core?ed={early}',maxEarlyData=early,heartbeatPeriod=1,headers={'X-VMess-Fixture':'JSON'},insecure=False)
+                    config='vmess://'+base64.b64encode(json.dumps(value).encode()).decode()
+                    with f.cli(config,environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        with f.socks_connect(core.port,target.port) as tunnel:
+                            f.exchange(tunnel,b'\x00\x00JSON WS'+bytes(range(251))*300)
+                            tunnel.shutdown(socket.SHUT_WR); self.assertEqual(tunnel.recv(1),b'')
+
+    def test_websocket_modes_early_data_and_headers(self):
+        certificate,_=f.certificate()
+        payload=b'\x00\x00VMess websocket'+bytes(range(256))*1024
+        for security in ('none','tls'):
+            for body in ('auto','aes-128-gcm','chacha20-poly1305','none','zero'):
+                for early in (0,1,128,16384):
+                    with self.subTest(security=security,body=body,early=early),f.Server() as target,f.xray_server('ws',security,protocol='vmess') as reference,f.cli(f.uri(reference.port,'ws',security,protocol='vmess',encryption=body,ed=early,headers=json.dumps({'X-VMess-Fixture':'custom'})),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        with f.socks_connect(core.port,target.port) as tunnel:
+                            f.exchange(tunnel,payload)
+                            f.exchange(tunnel,b'last websocket bytes')
+
+    def test_websocket_first_block_matches_early_data_limit(self):
+        import io
+        from test_websocket import client_frame
+        certificate,_=f.certificate()
+        for outer_tls in (False,True):
+            for early in (0,1,116,127,128,129,132,133,16384):
+                with self.subTest(tls=outer_tls,early=early),f.Server() as target,f.xray_server('ws','none',protocol='vmess') as reference,f.CountingProxy(reference.port,tls=outer_tls) as proxy:
+                    options=dict(protocol='vmess',ed=early,encryption='aes-128-gcm',headers=json.dumps({'X-VMess-Fixture':'custom'}),host='vmess-host.test:8443')
+                    with f.cli(f.uri(proxy.port,'ws','tls' if outer_tls else 'none',**options),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        with f.socks_connect(core.port,target.port) as tunnel:
+                            f.exchange(tunnel,b'\x00\x00first block')
+                            f.exchange(tunnel,b'not a repeated header')
+                        raw=bytes(proxy.client_data[0]); headers,_,frames=raw.partition(b'\r\n\r\n')
+                        values=dict(line.split(b':',1) for line in headers.split(b'\r\n')[1:])
+                        values={key.lower():value.strip() for key,value in values.items()}
+                        encoded=values.get(b'sec-websocket-protocol')
+                        if encoded: first=base64.urlsafe_b64decode(encoded+b'='*(-len(encoded)%4))
+                        else:
+                            reader=type('Reader',(),{'recv':lambda self,size:self.source.read(size)})(); reader.source=io.BytesIO(frames)
+                            opcode,first=client_frame(reader); self.assertEqual(opcode,2)
+                        self.assertEqual(bool(encoded),early >= len(first))
+                        self.assertEqual(values[b'host'],b'vmess-host.test:8443')
+                        self.assertEqual(values[b'x-vmess-fixture'],b'custom')
+
+    def test_websocket_server_first_fin_and_heartbeat(self):
+        certificate,_=f.certificate()
+        for security in ('none','tls'):
+            for body in ('aes-128-gcm','chacha20-poly1305','none','zero'):
+                def handler(connection):
+                    time.sleep(.1)
+                    connection.sendall(b'\x00\x00server-first')
+                    self.assertEqual(f.exact(connection,4),b'ping')
+                    connection.sendall(b'pong')
+                with self.subTest(security=security,body=body),f.Server(handler) as target,f.xray_server('ws',security,protocol='vmess') as reference,f.cli(f.uri(reference.port,'ws',security,protocol='vmess',encryption=body,ed=16384,heartbeatPeriod=1),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        self.assertEqual(f.exact(tunnel,14),b'\x00\x00server-first')
+                        time.sleep(1.05)
+                        tunnel.sendall(b'ping'); self.assertEqual(f.exact(tunnel,4),b'pong')
+                        tunnel.shutdown(socket.SHUT_WR); self.assertEqual(tunnel.recv(1),b'')
+        def invalid(connection):
+            from test_websocket import upgrade
+            upgrade(connection,lambda reply,headers,accept:reply.replace(accept,b'invalid'))
+        with f.Server(invalid) as peer,f.cli(f.uri(peer.port,'ws','none',protocol='vmess')) as core:
+            with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                with f.socks_connect(core.port,80) as tunnel: tunnel.recv(1)
+            core.wait_log('invalid WebSocket upgrade response')
+
 if __name__ == '__main__': unittest.main()
