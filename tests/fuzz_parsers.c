@@ -7,11 +7,12 @@
 #include "vision.h"
 #include "vless.h"
 #include "trojan.h"
+#include "../src/vmess_internal.h"
 #include "xhttp_download.h"
 #include "xhttp_padding.h"
 #include "cli_args.h"
 
-static const char *const fuzz_names[] = {"uri", "hpack", "h2", "grpc", "http", "xhttp", "ws", "vision", "tls", "arguments"};
+static const char *const fuzz_names[] = {"uri", "hpack", "h2", "grpc", "http", "xhttp", "ws", "vision", "tls", "arguments", "vmess"};
 static size_t fuzz_target;
 
 int LLVMFuzzerInitialize(int *argc, char ***argv) {
@@ -53,6 +54,28 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                      .h2_peer_initial_window = H2_DEFAULT_WINDOW, .h2_peer_stream_window = H2_DEFAULT_WINDOW,
                      .h2_peer_conn_window = H2_DEFAULT_WINDOW};
     switch (fuzz_target) {
+    case 10: {
+        core_vmess_header_t header={.ready=1,.security=(core_vmess_security_t)(3+(size ? data[0]%4 : 0))};
+        for (unsigned i=0;i<16;i++) header.request_key[i]=header.response_key[i]=(uint8_t)i,header.request_iv[i]=header.response_iv[i]=(uint8_t)(i+16);
+        core_vmess_body_t body={0}; uint8_t plain[256];
+        if (core_vmess_body_init(&body,&header,0,NULL)) abort();
+        size_t offset=size ? 1 : 0;
+        while (offset<size) {
+            size_t got=0;
+            if (body.plain_length) { if (core_vmess_body_read(&body,plain,sizeof(plain),&got)) break; continue; }
+            uint8_t *span=NULL; size_t capacity=0;
+            if (core_vmess_body_prepare(&body,&span,&capacity) || !capacity) break;
+            size_t take=size-offset;
+            if (take > capacity) take=capacity;
+            if (take > 1+(size ? data[size-1]%64 : 0)) take=1+data[size-1]%64;
+            memcpy(span,data+offset,take); offset+=take;
+            if (core_vmess_body_commit(&body,take)) break;
+        }
+        (void)core_vmess_body_eof(&body); core_vmess_body_clear(&body);
+        header.response_needed=18; header.authentication=36;
+        size_t used=0; (void)core_vmess_response(&header,data,size,&used); core_vmess_header_clear(&header);
+        break;
+    }
     case 9: {
         char *input=malloc(size+1);
         if (!input) abort();

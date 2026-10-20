@@ -122,6 +122,10 @@ def seeds():
                b"\x04\x00\x00\x0e\x00\x00\x00\x3c\x00\x00\x00\x00\x00\x00\x01x\x00\x00\x18\x00\x00\x01\x01",
                b"\x18\x00\x00\x01\x01\x04\x00\x00\x0e\x00\x00\x00\x3c\x00\x00\x00\x00\x00\x00\x01x\x00\x00"],
         "encryption":[b"\x02vless-core",b"\x03vless-core",b"\x06vless-core",b"\x07vless-core",b"\x0bvless-core",b"\x12vless-core",b"\x16vless-core",bytes(21)],
+        "vmess":[bytes([index])+bytes.fromhex(wire) for index,wire in (
+            (0,"8e739d3ecdca9a91f13b0d502be14505dfbe2dd4de1d95f19597ba58acd8ab0183000102030405060708090a0b0c0d0e0f10"),
+            (1,"8e73e9de6f49187cc2fd3924770f46360c94c95a8bc51bb435194c8de1c431c87f000102030405060708090a0b0c0d0e0f10"),
+            (2,"fc9e564d657373204145414420626f6479"),(3,"564d657373204145414420626f6479"))],
     }
 
 class FuzzTests(unittest.TestCase):
