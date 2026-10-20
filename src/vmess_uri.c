@@ -78,17 +78,36 @@ static const char *canonical(const char *key) {
     const struct { const char *from,*to; } aliases[]={
         {"scy","encryption"},{"alterid","aid"},{"net","transport"},{"network","transport"},{"tls","security"},
         {"insecure","allowinsecure"},{"service_name","servicename"},{"maxearlydata","ed"},{"x_padding_bytes","xpaddingbytes"},
+        {"idle_timeout","idletimeout"},{"health_check_timeout","healthchecktimeout"},{"permit_without_stream","permitwithoutstream"},
+        {"initial_windows_size","initialwindowssize"},{"user_agent","useragent"},
         {"sc_max_each_post_bytes","scmaxeachpostbytes"},{"sessionidplacement","sessionplacement"},{"sessionidkey","sessionkey"}};
     for (size_t i=0;i<sizeof(aliases)/sizeof(*aliases);i++) if (!strcmp(key,aliases[i].from)) return aliases[i].to;
     return key;
 }
 
+static int mapped_scalar(const core_json_t *node,transport_mode_t transport,const char **value) {
+    if (scalar(node,value)) return -1;
+    if (!strcasecmp(node->key,"tls") && !**value) *value="none";
+    if (transport != TRANSPORT_GRPC) return 0;
+    if (!strcasecmp(node->key,"type")) {
+        if (node->type != CORE_JSON_STRING) return -1;
+        if (!**value || !strcmp(*value,"none") || !strcmp(*value,"gun")) *value="gun";
+        else if (strcmp(*value,"multi")) return -1;
+    } else if (!strcasecmp(node->key,"multimode")) {
+        if (node->type != CORE_JSON_BOOL) return -1;
+        if (!strcmp(*value,"true") || !strcmp(*value,"1")) *value="multi";
+        else if (!strcmp(*value,"false") || !strcmp(*value,"0")) *value="gun";
+        else return -1;
+    }
+    return 0;
+}
+
 static int json_config(vless_config_t *config,const char *text,char *error,size_t capacity) {
     char reason[128]; core_json_t *root=core_json_parse(text,reason,sizeof(reason)); int result=-1;
     if (!root || root->type != CORE_JSON_OBJECT) { invalid(error,capacity,"JSON"); goto cleanup; }
-    for (const core_json_t *network=root->child;network;network=network->next) {
-        if (strcasecmp(network->key,"net") && strcasecmp(network->key,"network") && strcasecmp(network->key,"transport")) continue;
-        if (network->type != CORE_JSON_STRING || core_config_parameter(config,"transport",network->text,error,capacity) < 0) { invalid(error,capacity,"net"); goto cleanup; }
+    for (const core_json_t *node=root->child;node;node=node->next) {
+        if (strcasecmp(node->key,"net") && strcasecmp(node->key,"network") && strcasecmp(node->key,"transport")) continue;
+        if (node->type != CORE_JSON_STRING || core_config_parameter(config,"transport",node->text,error,capacity) < 0) { invalid(error,capacity,"net"); goto cleanup; }
     }
     char seen_keys[128][128]; const core_json_t *seen_values[128]; size_t seen=0;
     for (const core_json_t *node=root->child;node;node=node->next) {
@@ -100,13 +119,21 @@ static int json_config(vless_config_t *config,const char *text,char *error,size_
             lowered[i]=(char)tolower(c);
         }
         const char *key=canonical(lowered),*value=NULL;
+        if (config->transport_mode == TRANSPORT_GRPC) {
+            if (!strcmp(key,"path")) key="servicename";
+            else if (!strcmp(key,"host")) key="authority";
+            else if (!strcmp(key,"type") || !strcmp(key,"multimode")) key="mode";
+        }
         if (!strcmp(key,"ps")) { if (node->type != CORE_JSON_STRING) { invalid(error,capacity,"ps"); goto cleanup; } continue; }
+        if (config->transport_mode == TRANSPORT_GRPC && !strcmp(key,"permitwithoutstream") && node->type != CORE_JSON_BOOL) {
+            invalid(error,capacity,key); goto cleanup;
+        }
         size_t previous=0;
         for (;previous<seen;previous++) if (!strcmp(seen_keys[previous],key)) break;
         if (previous<seen) {
             if (!core_json_equal(seen_values[previous],node)) {
                 const char *old=NULL;
-                if (scalar(seen_values[previous],&old) || scalar(node,&value) || strcmp(old,value)) { invalid(error,capacity,"conflicting aliases"); goto cleanup; }
+                if (mapped_scalar(seen_values[previous],config->transport_mode,&old) || mapped_scalar(node,config->transport_mode,&value) || strcmp(old,value)) { invalid(error,capacity,"conflicting aliases"); goto cleanup; }
             }
             continue;
         }
@@ -122,7 +149,7 @@ static int json_config(vless_config_t *config,const char *text,char *error,size_
             OPENSSL_cleanse(object,sizeof(object)); if (applied) goto cleanup;
             continue;
         }
-        if (scalar(node,&value)) {
+        if (mapped_scalar(node,config->transport_mode,&value)) {
             if (!strcmp(key,"id") || !strcmp(key,"add") || !strcmp(key,"port") || !strcmp(key,"aid") || !strcmp(key,"v") || !strcmp(key,"type")) { invalid(error,capacity,key); goto cleanup; }
             int applied=core_config_parameter(config,key,"",error,capacity);
             if (applied == 1) continue;
@@ -154,7 +181,8 @@ static int json_config(vless_config_t *config,const char *text,char *error,size_
             if (applied < 0) goto cleanup;
             if (!applied && (node->type == CORE_JSON_NUMBER || node->type == CORE_JSON_BOOL)) {
                 static const char *numeric[]={"ed","heartbeatperiod","idletimeout","healthchecktimeout","initialwindowssize","permitwithoutstream","allowinsecure"};
-                int allowed=0; for (size_t i=0;i<sizeof(numeric)/sizeof(*numeric);i++) if (!strcmp(key,numeric[i])) allowed=1;
+                int allowed=!strcasecmp(node->key,"multimode") && config->transport_mode == TRANSPORT_GRPC;
+                for (size_t i=0;i<sizeof(numeric)/sizeof(*numeric);i++) if (!strcmp(key,numeric[i])) allowed=1;
                 if (!allowed) { invalid(error,capacity,key); goto cleanup; }
             }
         }
@@ -182,7 +210,7 @@ int core_vmess_parse_uri(const char *uri,vless_config_t *config,char *error,size
         if (query && *query && core_config_query(config,query,error,capacity)) goto cleanup;
     } else if (decode_base64(work,decoded,sizeof(decoded)) || json_config(config,decoded,error,capacity)) { if (!error || !*error) invalid(error,capacity,"Base64 JSON"); goto cleanup; }
     if (config->flow[0]) { invalid(error,capacity,"flow"); goto cleanup; }
-    if (config->transport_mode != TRANSPORT_VISION && config->transport_mode != TRANSPORT_WS) { invalid(error,capacity,"transport not yet supported"); goto cleanup; }
+    if (config->transport_mode != TRANSPORT_VISION && config->transport_mode != TRANSPORT_WS && config->transport_mode != TRANSPORT_GRPC) { invalid(error,capacity,"transport not yet supported"); goto cleanup; }
     if (core_config_finalize(config,error,capacity)) goto cleanup;
     result=0;
 cleanup:

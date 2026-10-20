@@ -30,7 +30,28 @@ static void websocket_json(void) {
     free(config); free(address);
 }
 
+static void grpc_json(void) {
+    vless_config_t *config=calloc(1,sizeof(*config)),*address=calloc(1,sizeof(*address)); char error[256];
+    REQUIRE("vmess/grpc-config-storage",config && address);
+    const char *options[]={"\"idleTimeout\":0,\"healthCheckTimeout\":0,\"permitWithoutStream\":false,\"initialWindowsSize\":1024,\"userAgent\":\"fixture\"","\"idle_timeout\":\"0\",\"health_check_timeout\":0,\"permit_without_stream\":false,\"initial_windows_size\":\"1024\",\"user_agent\":\"fixture\""};
+    for (unsigned mode=0;mode<2;mode++) {
+        char text[1024],uri[1024];
+        snprintf(text,sizeof(text),"{\"add\":\"127.0.0.1\",\"port\":443,\"id\":\"00000000-0000-0000-0000-000000000001\",\"path\":\"/service/name\",\"host\":\"grpc.test\",\"type\":\"%s\",\"multiMode\":%s,\"net\":\"grpc\",%s}",mode ? "multi" : "none",mode ? "true" : "false",options[mode]);
+        snprintf(uri,sizeof(uri),"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?type=grpc&serviceName=%%2Fservice%%2Fname&authority=grpc.test&mode=%s&idleTimeout=0&healthCheckTimeout=0&permitWithoutStream=false&initialWindowsSize=1024&userAgent=fixture",mode ? "multi" : "gun");
+        REQUIRE("vmess/grpc-json-config",!parse_json(text,config,error));
+        REQUIRE("vmess/grpc-address-config",!parse_core_uri(uri,address,error,sizeof(error)));
+        CHECK("vmess/grpc-json-and-address-effective-config",!memcmp(config,address,sizeof(*config)));
+    }
+    const char *bad[]={"\"type\":\"gun\",\"multiMode\":true","\"path\":\"one\",\"serviceName\":\"two\"","\"host\":\"one\",\"authority\":\"two\"","\"multiMode\":42","\"multiMode\":\"true\"","\"type\":\"invalid\"","\"type\":{}","\"initialWindowsSize\":184467440737095516160","\"healthCheckTimeout\":-1","\"permitWithoutStream\":[]","\"permitWithoutStream\":1","\"permitWithoutStream\":\"false\"","\"permit_without_stream\":1","\"idle_timeout\":1,\"idleTimeout\":2"};
+    for (size_t i=0;i<sizeof(bad)/sizeof(*bad);i++) {
+        char text[1024]; snprintf(text,sizeof(text),"{\"add\":\"127.0.0.1\",\"port\":443,\"id\":\"00000000-0000-0000-0000-000000000001\",\"net\":\"grpc\",%s}",bad[i]);
+        CHECK("vmess/grpc-json-invalid-setting",parse_json(text,config,error) < 0);
+    }
+    free(config); free(address);
+}
+
 int main(void) {
+    grpc_json();
     websocket_json();
     vless_config_t *config=calloc(1,sizeof(*config)); char error[256];
     REQUIRE("vmess/uri-storage",config);
@@ -44,7 +65,7 @@ int main(void) {
         REQUIRE("vmess/base64-json-form",!parse_json(json,config,error));
         CHECK("vmess/base64-json-effective-config",config->protocol == CORE_PROTOCOL_VMESS && config->vmess_security == expected[i] && config->server_port == 443 && !strcmp(config->server_host,"127.0.0.1") && !strcmp(config->security,"none"));
     }
-    const char *bad[]={"aid=1","aid=-0","alterId=4294967296","encryption=aes-128-cfb","encryption=mlkem768x25519plus.native.0rtt.key","encryption=auto&scy=none","flow=xtls-rprx-vision","type=grpc","type=xhttp","security=invalid","authenticatedLength=true"};
+    const char *bad[]={"aid=1","aid=-0","alterId=4294967296","encryption=aes-128-cfb","encryption=mlkem768x25519plus.native.0rtt.key","encryption=auto&scy=none","flow=xtls-rprx-vision","type=xhttp","security=invalid","authenticatedLength=true"};
     for (size_t i=0;i<sizeof(bad)/sizeof(*bad);i++) {
         char uri[512]; snprintf(uri,sizeof(uri),"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?%s",bad[i]);
         CHECK("vmess/unsupported-setting-rejected",parse_core_uri(uri,config,error,sizeof(error)) < 0);

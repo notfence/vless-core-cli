@@ -326,7 +326,7 @@ static int start_request(mux_actor_t *actor, core_http2_stream_t *stream, int ro
     size_t consumed=payload,body=payload;
     const vless_config_t *config=role == 0 ? &actor->manager->config : &stream->config;
     int result=actor->manager->backend->request(actor->physical,config,stream->session,stream->sequence,role,data,payload,&request->id,actor->peer_header_limit,&consumed,&body);
-    if (copy && stream->config.protocol == CORE_PROTOCOL_TROJAN) OPENSSL_cleanse(copy,payload);
+    if (copy && (stream->config.protocol == CORE_PROTOCOL_TROJAN || stream->config.protocol == CORE_PROTOCOL_VMESS)) OPENSSL_cleanse(copy,payload);
     core_buffer_free(&actor->output_memory,copy,payload);
     core_buffer_budget_init(&actor->output_memory,CORE_BUFFER_UPLOAD,minimum);
     if (!result && (role == 4 ? consumed || body != SIZE_MAX : consumed > payload || (payload && !consumed) || (body && body != consumed))) result=-1;
@@ -1054,7 +1054,8 @@ core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core
     if (!stream) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP client allocation failed"); return NULL; }
     stream->config=*config; stream->references=1;
     OPENSSL_cleanse(stream->config.trojan_hash,sizeof(stream->config.trojan_hash));
-    stream->tx.cleanse=config->protocol == CORE_PROTOCOL_TROJAN;
+    if (stream->config.protocol == CORE_PROTOCOL_VMESS) OPENSSL_cleanse(stream->config.uuid,sizeof(stream->config.uuid));
+    stream->tx.cleanse=config->protocol == CORE_PROTOCOL_TROJAN || config->protocol == CORE_PROTOCOL_VMESS;
     stream->packet_limit=config->transport_mode == TRANSPORT_GRPC ? 0 : core_xhttp_post_limit(config);
     if (stream->packet_limit < 0) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP packet size sampling failed"); free(stream); return NULL; }
     stream->trace_present=core_trace_snapshot(&stream->trace);

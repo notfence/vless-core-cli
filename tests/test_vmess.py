@@ -227,4 +227,75 @@ class VMessTests(unittest.TestCase):
                 with f.socks_connect(core.port,80) as tunnel: tunnel.recv(1)
             core.wait_log('invalid WebSocket upgrade response')
 
+    def test_grpc_base64_json_and_xray_option_names(self):
+        certificate,_=f.certificate()
+        for security in ('none','tls','reality'):
+            for mode in ('gun','multi'):
+                with self.subTest(security=security,mode=mode),f.Server() as target,f.xray_server('grpc',security,mode=mode,protocol='vmess') as reference:
+                    value=dict(v='2',add='127.0.0.1',port=str(reference.port),id=f.UUID,aid=0,scy='chacha20-poly1305',net='grpc',tls=security,path='vless-core',host='grpc.test',type=mode,multiMode=mode == 'multi',sni='vless-core.test',idle_timeout=0,health_check_timeout=0,permit_without_stream=False,initial_windows_size=1024,user_agent='VMess fixture')
+                    if security == 'reality': value.update(pbk=f.PUBLIC_KEY,sid='01020304')
+                    config='vmess://'+base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip('=')
+                    with f.cli(config,environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        with f.socks_connect(core.port,target.port) as tunnel:
+                            f.exchange(tunnel,b'\x00\x00JSON RPC'+bytes(range(251))*300)
+                            tunnel.shutdown(socket.SHUT_WR); self.assertEqual(tunnel.recv(1),b'')
+
+    def test_grpc_security_modes_and_body_algorithms(self):
+        certificate,_=f.certificate()
+        for security in ('none','tls','reality'):
+            for mode in ('gun','multi'):
+                for body in ('auto','aes-128-gcm','chacha20-poly1305','none','zero'):
+                    with self.subTest(security=security,mode=mode,body=body),f.Server() as target,f.xray_server('grpc',security,mode=mode,protocol='vmess') as reference,f.cli(f.uri(reference.port,'grpc',security,protocol='vmess',encryption=body,mode=mode,initialWindowsSize=1024),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        for index in range(2):
+                            with f.socks_connect(core.port,target.port) as tunnel:
+                                f.exchange(tunnel,b'\x00\x00VMess gRPC'+bytes(range(256))*500+bytes([index]))
+                                f.exchange(tunnel,b'last RPC bytes')
+
+    def test_grpc_reuse_parallel_rpc_and_slow_sibling(self):
+        import concurrent.futures
+        certificate,_=f.certificate()
+        payload=bytes(range(251))*600
+        for mode in ('gun','multi'):
+            with self.subTest(mode=mode),f.Server() as target,f.xray_server('grpc','tls',mode=mode,protocol='vmess') as reference,f.CountingProxy(reference.port) as proxy,f.cli(f.uri(proxy.port,'grpc','tls',protocol='vmess',mode=mode),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                for _ in range(2):
+                    with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'warm VMess RPC')
+                def exchange(index):
+                    with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,payload+bytes([index]))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool: list(pool.map(exchange,range(16)))
+                self.assertEqual(len(proxy.connections),1)
+                def slow(connection):
+                    while True: connection.sendall(b's'*65536)
+                with f.Server(slow) as download:
+                    blocked=f.socks_connect(core.port,download.port)
+                    try:
+                        time.sleep(.2)
+                        for index in range(4): exchange(index)
+                    finally: blocked.close()
+                with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'after cancelled RPC')
+
+    def test_grpc_server_first_and_fin(self):
+        certificate,_=f.certificate()
+        for security in ('none','tls','reality'):
+            for mode in ('gun','multi'):
+                def handler(connection):
+                    connection.sendall(b'\x00\x00server-first')
+                    self.assertEqual(f.exact(connection,4),b'ping')
+                    time.sleep(.1)
+                    connection.sendall(b'pong')
+                with self.subTest(security=security,mode=mode),f.Server(handler) as target,f.xray_server('grpc',security,mode=mode,protocol='vmess') as reference,f.cli(f.uri(reference.port,'grpc',security,protocol='vmess',mode=mode),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        self.assertEqual(f.exact(tunnel,14),b'\x00\x00server-first')
+                        tunnel.sendall(b'ping'); tunnel.shutdown(socket.SHUT_WR)
+                        self.assertEqual(f.exact(tunnel,4),b'pong')
+                        self.assertEqual(tunnel.recv(1),b'')
+
+    def test_grpc_fixture_waits_for_its_actual_listener(self):
+        import contextlib
+        from unittest import mock
+        with f.Server(tls=True) as occupied,contextlib.ExitStack() as stack:
+            candidate=f.port()
+            with mock.patch.object(f,'port',side_effect=[occupied.port,candidate]):
+                reference=stack.enter_context(f.xray_server('grpc','tls',protocol='vmess'))
+            self.assertEqual(reference.port,candidate)
+
 if __name__ == '__main__': unittest.main()

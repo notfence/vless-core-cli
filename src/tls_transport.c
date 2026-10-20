@@ -764,6 +764,7 @@ static int xmux_transport_open_budgeted(const vless_config_t *config, void **out
                                        core_buffer_budget_t *upload, core_buffer_budget_t *download) {
     vless_config_t physical_config=*config;
     OPENSSL_cleanse(physical_config.trojan_hash,sizeof(physical_config.trojan_hash));
+    if (physical_config.protocol == CORE_PROTOCOL_VMESS) OPENSSL_cleanse(physical_config.uuid,sizeof(physical_config.uuid));
     physical_config.xmux.present=0; physical_config.xhttp_physical_only=1;
     physical_config.grpc_physical_only=config->transport_mode == TRANSPORT_GRPC;
     tls13_conn_t *connection=NULL;

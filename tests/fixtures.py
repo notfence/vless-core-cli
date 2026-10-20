@@ -313,6 +313,7 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
             mask = stack.enter_context(xray_tls_target(reality_target_groups))
             stream["realitySettings"] = {"target":f"127.0.0.1:{mask.port}", "serverNames":["vless-core.test"], "privateKey":KEY, "shortIds":["01020304"], "maxTimeDiff":60000}
         config = {"log":{"loglevel":"info"}, "inbounds":[{"listen":"127.0.0.1", "port":0, "protocol":"vless", "settings":{"clients":[{"id":UUID,"flow":flow}],"decryption":decryption}, "streamSettings":stream}], "outbounds":[{"protocol":"freedom","settings":{"domainStrategy":"AsIs"},"tag":"local"},{"protocol":"blackhole","tag":"deny"}], "routing":{"rules":[{"type":"field","ip":["127.0.0.0/8","::1/128"],"outboundTag":"local"},{"type":"field","network":"tcp,udp","outboundTag":"deny"}]}}
+        if transport == "grpc": config["log"]["loglevel"]="debug"
         if protocol == "trojan":
             config["inbounds"][0]["protocol"]="trojan"
             config["inbounds"][0]["settings"]={"clients":[{"password":password}]}
@@ -326,7 +327,7 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
             path = PRIVATE/f"xray-{listen_port}.json"
             path.write_text(json.dumps(config))
             return [str(XRAY),"run","-c",str(path)]
-        process = stack.enter_context(start_listener(command,"xray","started"))
+        process = stack.enter_context(start_listener(command,"xray","gRPC listen for service name" if transport == "grpc" else "started"))
         if security == "reality":
             encryption="none"
             if decryption != "none":

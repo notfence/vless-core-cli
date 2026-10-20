@@ -926,6 +926,15 @@ static void protocol_pool_identity(void) {
     mux_manager_t *second=get_manager(&config,&fixture_backend);
     REQUIRE("trojan/pool-managers-created",vless && first && second);
     CHECK("trojan/pool-credential-and-protocol-isolation",first == same && first != second && vless != first && vless != second);
+    memset(config.trojan_hash,0,sizeof(config.trojan_hash)); config.uuid[15]=1; config.vmess_security=CORE_VMESS_AUTO;
+    config.protocol=CORE_PROTOCOL_VLESS; mux_manager_t *same_fields_vless=get_manager(&config,&fixture_backend);
+    config.protocol=CORE_PROTOCOL_VMESS;
+    mux_manager_t *vmess=get_manager(&config,&fixture_backend),*vmess_same=get_manager(&config,&fixture_backend);
+    config.uuid[15]=2; mux_manager_t *different_uuid=get_manager(&config,&fixture_backend);
+    config.uuid[15]=1; config.vmess_security=CORE_VMESS_AES128_GCM;
+    mux_manager_t *different_cipher=get_manager(&config,&fixture_backend);
+    REQUIRE("vmess/pool-managers-created",vmess && vmess_same && different_uuid && different_cipher && same_fields_vless);
+    CHECK("vmess/pool-protocol-uuid-and-cipher-isolation",vmess == vmess_same && vmess != same_fields_vless && vmess != first && vmess != vless && vmess != different_uuid && vmess != different_cipher && different_uuid != different_cipher);
     while (managers != saved) { mux_manager_t *next=managers->next; OPENSSL_cleanse(managers,sizeof(*managers)); free(managers); managers=next; }
     OPENSSL_cleanse(&config,sizeof(config));
     mux_actor_t actor={0}; core_http2_stream_t stream={.upload=&actor};

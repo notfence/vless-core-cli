@@ -13,7 +13,7 @@
 
 static uint8_t receive_wire[32768],send_wire[32768];
 static size_t receive_length,receive_offset,send_length,fragment=32768;
-static int at_eof,send_stopped,write_fail,start_fail,finish_calls,fences;
+static int at_eof,send_stopped,write_fail,start_fail,finish_calls,fences,read_fail;
 
 int fixture_start(tls13_conn_t *transport) { (void)transport; return start_fail ? -1 : 0; }
 int fixture_write(tls13_conn_t *transport,const uint8_t *input,size_t length) {
@@ -23,6 +23,7 @@ int fixture_write(tls13_conn_t *transport,const uint8_t *input,size_t length) {
 }
 int fixture_read(tls13_conn_t *transport,uint8_t *output,size_t capacity,size_t *written) {
     (void)transport; *written=0;
+    if (read_fail) { errno=EPROTO; return -1; }
     size_t take=receive_length-receive_offset;
     if (!take && !at_eof) { errno=EAGAIN; return 1; }
     if (take > capacity) take=capacity;
@@ -39,7 +40,7 @@ int fixture_pending(const tls13_conn_t *transport) { (void)transport; return 0; 
 
 static void reset(void) {
     receive_length=receive_offset=send_length=0; fragment=32768;
-    at_eof=send_stopped=write_fail=start_fail=finish_calls=fences=0;
+    at_eof=send_stopped=write_fail=start_fail=finish_calls=fences=read_fail=0;
 }
 
 static void response(core_vmess_conn_t *connection) {
@@ -114,6 +115,10 @@ static void failures(void) {
     CHECK("vmess/raw-half-close-keeps-transport-control-readable",core_vmess_drain_pending(connection));
     REQUIRE("vmess/raw-half-close-local-finish",!core_vmess_finish(connection));
     CHECK("vmess/raw-both-directions-finished-can-close",!core_vmess_drain_pending(connection));
+    core_vmess_close(connection);
+    reset(); connection=open_stream(CORE_VMESS_AES128_GCM,1);
+    connection->incoming.finished=connection->eof_reported=1; read_fail=1;
+    CHECK("vmess/inner-eof-does-not-bypass-outer-grpc-status",core_vmess_drain_pending(connection) && core_vmess_read(connection,plain,sizeof(plain),&got) < 0 && errno == EPROTO && !connection->transport_eof && !got);
     core_vmess_close(connection);
     reset(); connection=open_stream(CORE_VMESS_AES128_GCM,0); at_eof=1;
     CHECK("vmess/stream-no-header-error",core_vmess_read(connection,plain,sizeof(plain),&got) < 0 && strstr(core_vmess_error(connection),"not received"));
