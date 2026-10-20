@@ -43,8 +43,8 @@ def uri(server_port, transport="tcp", security="none", protocol="vless", passwor
     query.update(parameters)
     if security == "reality":
         query.update(pbk=PUBLIC_KEY, sid="01020304")
-    if protocol not in ("vless","trojan"): raise ValueError("unsupported fixture protocol")
-    credential=UUID if protocol == "vless" else urllib.parse.quote(password,safe="")
+    if protocol not in ("vless","trojan","vmess"): raise ValueError("unsupported fixture protocol")
+    credential=urllib.parse.quote(password,safe="") if protocol == "trojan" else UUID
     return f"{protocol}://{credential}@127.0.0.1:{server_port}?{urllib.parse.urlencode(query)}#vless-core"
 
 def certificate():
@@ -316,6 +316,9 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
         if protocol == "trojan":
             config["inbounds"][0]["protocol"]="trojan"
             config["inbounds"][0]["settings"]={"clients":[{"password":password}]}
+        elif protocol == "vmess":
+            config["inbounds"][0]["protocol"]="vmess"
+            config["inbounds"][0]["settings"]={"clients":[{"id":UUID,"alterId":0}]}
         elif protocol != "vless": raise ValueError("unsupported fixture protocol")
         config["outbounds"][0]["settings"]["finalRules"] = [{"action":"allow","ip":["127.0.0.0/8","::1/128"]}]
         def command(listen_port):
@@ -340,7 +343,7 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
         yield process
 
 @contextlib.contextmanager
-def xray_client(server_port, transport="tcp", security="reality", mode=None, flow="", encryption="none", extra=None, fingerprint="firefox", alpn=None, protocol="vless", password=TROJAN_PASSWORD):
+def xray_client(server_port, transport="tcp", security="reality", mode=None, flow="", encryption="none", extra=None, fingerprint="firefox", alpn=None, protocol="vless", password=TROJAN_PASSWORD, vmess_security="auto"):
     cert, _ = certificate()
     stream = {"network":"raw" if transport == "tcp" else transport, "security":security}
     if security == "reality":
@@ -357,6 +360,8 @@ def xray_client(server_port, transport="tcp", security="reality", mode=None, flo
     config = {"log":{"loglevel":"info"}, "inbounds":[{"listen":"127.0.0.1", "port":0, "protocol":"socks", "settings":{"auth":"noauth", "udp":False}}], "outbounds":[{"protocol":"vless", "settings":{"vnext":[{"address":"127.0.0.1", "port":server_port, "users":[{"id":UUID, "encryption":encryption, "flow":flow}]}]}, "streamSettings":stream}]}
     if protocol == "trojan":
         config["outbounds"][0]={"protocol":"trojan","settings":{"address":"127.0.0.1","port":server_port,"password":password},"streamSettings":stream}
+    elif protocol == "vmess":
+        config["outbounds"][0]={"protocol":"vmess","settings":{"vnext":[{"address":"127.0.0.1","port":server_port,"users":[{"id":UUID,"alterId":0,"security":vmess_security}]}]},"streamSettings":stream}
     elif protocol != "vless": raise ValueError("unsupported fixture protocol")
     def command(listen_port):
         config["inbounds"][0]["port"] = listen_port

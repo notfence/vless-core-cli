@@ -13,6 +13,7 @@
 #include "websocket.h"
 #include "grpc.h"
 #include "trojan.h"
+#include "config_internal.h"
 #include <openssl/crypto.h>
 
 static void set_err(char *err, size_t cap, const char *msg) {
@@ -168,7 +169,7 @@ int core_http_authority_format(const char *input, char *output, size_t capacity)
     return length < 0 || (size_t)length >= capacity ? -1 : 0;
 }
 
-static int parse_host_port(const char *s, char *host, size_t host_cap, uint16_t *port) {
+int core_config_endpoint(const char *s, char *host, size_t host_cap, uint16_t *port) {
     if (s == NULL || host == NULL || port == NULL) {
         return -1;
     }
@@ -206,7 +207,7 @@ static int parse_host_optional_port(const char *s, uint16_t default_port, char *
     if (s == NULL || host == NULL || port == NULL) {
         return -1;
     }
-    if (parse_host_port(s, host, host_cap, port) == 0) {
+    if (core_config_endpoint(s, host, host_cap, port) == 0) {
         return 0;
     }
 
@@ -317,7 +318,105 @@ static int normalize_query_key(const char *encoded, char *normalized, size_t nor
     return 0;
 }
 
-static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_cap) {
+int core_config_parameter(vless_config_t *cfg,const char *key,const char *decoded,char *err,size_t err_cap) {
+    if (strcmp(key,"extra") && strcmp(key,"headers") && strcmp(key,"downloadsettings") && !query_value_is_valid_utf8((const unsigned char *)decoded)) { set_err(err,err_cap,"invalid configuration parameter value"); return -1; }
+    if (cfg->protocol == CORE_PROTOCOL_VMESS) {
+        int result=core_vmess_parameter(cfg,key,decoded,err,err_cap);
+        if (result) return result < 0 ? -1 : 0;
+    }
+    if (!strcmp(key,"extra")) return cfg->transport_mode == TRANSPORT_XHTTP ? core_xhttp_extra(cfg,decoded,err,err_cap) : 0;
+    char decoded_lower[4096];
+    copy_lower_trunc(decoded_lower, sizeof(decoded_lower), decoded);
+
+    const struct { const char *key; size_t capacity; } capacities[]={
+        {"sni",sizeof(cfg->sni)},{"flow",sizeof(cfg->flow)},{"encryption",sizeof(cfg->encryption)},
+        {"security",sizeof(cfg->security)},{"alpn",sizeof(cfg->alpn)},{"path",sizeof(cfg->xhttp_path)},
+        {"host",sizeof(cfg->xhttp_host)},{"servicename",sizeof(cfg->grpc_service_name)},
+        {"authority",sizeof(cfg->grpc_authority)},{"mode",sizeof(cfg->xhttp_mode)},{"spx",sizeof(cfg->spider_x)}
+    };
+    for (size_t i=0;i<sizeof(capacities)/sizeof(*capacities);i++) if (!strcmp(key,capacities[i].key) && strlen(decoded) >= capacities[i].capacity) {
+        if (err && err_cap) snprintf(err,err_cap,"query field %s exceeds capacity",key);
+        return -1;
+    }
+    int common=!strcmp(key,"path") || !strcmp(key,"host") || !strcmp(key,"mode");
+    int ws_parameter=cfg->transport_mode == TRANSPORT_WS ? core_ws_parameter(cfg,key,decoded,err,err_cap) : 0;
+    if (ws_parameter < 0) return -1;
+    int grpc_parameter=cfg->transport_mode == TRANSPORT_GRPC ? core_grpc_parameter(cfg,key,decoded,err,err_cap) : 0;
+    if (grpc_parameter < 0) return -1;
+    int xhttp_parameter = ws_parameter || grpc_parameter || common ? 0 : core_xhttp_parameter(cfg, key, decoded, err, err_cap);
+    if (xhttp_parameter < 0) return -1;
+    if (ws_parameter > 0 || grpc_parameter > 0 || xhttp_parameter > 0 || !strcmp(key, "extra")) {
+        if (xhttp_parameter > 0 && cfg->transport_mode != TRANSPORT_XHTTP)
+            vc_log_warning("uri","field query.%s is not applied to this transport",key);
+        return 0;
+    }
+    if (strcmp(key, "pbk") == 0) {
+        size_t n = 0;
+        if (base64url_decode(decoded,cfg->pbk,sizeof(cfg->pbk),&n) || n != 32) { set_err(err,err_cap,"pbk is required and must decode to 32 bytes"); return -1; }
+        cfg->pbk_len=n;
+    } else if (strcmp(key, "sid") == 0) {
+        size_t n = 0;
+        if (hex_to_bytes(decoded,cfg->short_id,8,&n)) { set_err(err,err_cap,"invalid sid"); return -1; }
+        cfg->short_id_len=n;
+    } else if (strcmp(key, "sni") == 0) {
+        copy_trunc(cfg->sni, sizeof(cfg->sni), decoded);
+    } else if (strcmp(key, "fp") == 0) {
+        if (strcmp(decoded_lower, "random") == 0) {
+            cfg->fp_mode = FP_RANDOM;
+        } else if (strcmp(decoded_lower, "randomized") == 0) {
+            cfg->fp_mode = FP_RANDOMIZED;
+        } else if (strcmp(decoded_lower, "qq") == 0) {
+            cfg->fp_mode = FP_QQ;
+        } else if (strcmp(decoded_lower, "firefox") == 0) {
+            cfg->fp_mode = FP_FIREFOX;
+        } else if (strcmp(decoded_lower, "edge") == 0) {
+            cfg->fp_mode = FP_EDGE;
+        } else if (!strcmp(decoded_lower,"chrome")) {
+            cfg->fp_mode = FP_CHROME;
+        } else { set_err(err,err_cap,"unsupported fp"); return -1; }
+    } else if (strcmp(key, "flow") == 0) {
+        copy_trunc(cfg->flow, sizeof(cfg->flow), decoded_lower);
+    } else if (strcmp(key, "encryption") == 0) {
+        copy_trunc(cfg->encryption, sizeof(cfg->encryption), decoded);
+    } else if (strcmp(key, "security") == 0) {
+        if (cfg->protocol == CORE_PROTOCOL_TROJAN && !decoded_lower[0]) { set_err(err,err_cap,"invalid Trojan security"); return -1; }
+        copy_trunc(cfg->security, sizeof(cfg->security), decoded_lower[0] != '\0' ? decoded_lower : "none");
+    } else if (strcmp(key, "alpn") == 0) {
+        copy_trunc(cfg->alpn, sizeof(cfg->alpn), decoded);
+    } else if (strcmp(key, "allowinsecure") == 0) {
+        if (strcmp(decoded_lower,"1") && strcmp(decoded_lower,"0") && strcmp(decoded_lower,"true") && strcmp(decoded_lower,"false")) { set_err(err,err_cap,"invalid allowInsecure"); return -1; }
+        cfg->allow_insecure = (strcmp(decoded_lower, "1") == 0 || strcmp(decoded_lower, "true") == 0);
+    } else if (strcmp(key, "transport") == 0) {
+        if (strcmp(decoded_lower, "xhttp") == 0 || strcmp(decoded_lower, "splithttp") == 0) {
+            cfg->transport_mode = TRANSPORT_XHTTP;
+        } else if (strcmp(decoded_lower, "ws") == 0 || strcmp(decoded_lower, "websocket") == 0) {
+            cfg->transport_mode = TRANSPORT_WS;
+        } else if (strcmp(decoded_lower, "grpc") == 0) {
+            cfg->transport_mode = TRANSPORT_GRPC;
+        } else if (decoded_lower[0] == '\0' || strcmp(decoded_lower, "tcp") == 0 || !strcmp(decoded_lower,"raw")) {
+            cfg->transport_mode = TRANSPORT_VISION;
+        } else { set_err(err,err_cap,"unsupported transport"); return -1; }
+    } else if (strcmp(key, "path") == 0) {
+        copy_trunc(cfg->xhttp_path, sizeof(cfg->xhttp_path), decoded);
+    } else if (strcmp(key, "host") == 0) {
+        copy_trunc(cfg->xhttp_host, sizeof(cfg->xhttp_host), decoded);
+    } else if (strcmp(key, "servicename") == 0) {
+        copy_trunc(cfg->grpc_service_name, sizeof(cfg->grpc_service_name), decoded);
+    } else if (strcmp(key, "authority") == 0) {
+        copy_trunc(cfg->grpc_authority, sizeof(cfg->grpc_authority), decoded);
+    } else if (strcmp(key, "mode") == 0) {
+        copy_lower_trunc(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), decoded);
+    } else if (strcmp(key, "spx") == 0) {
+        copy_trunc(cfg->spider_x, sizeof(cfg->spider_x), decoded);
+    } else { vc_log_warning("uri","unknown field query.%s ignored",key); return 1; }
+    if (((!strcmp(key,"path") || !strcmp(key,"host") || !strcmp(key,"mode")) && cfg->transport_mode == TRANSPORT_VISION) ||
+        ((!strcmp(key,"servicename") || !strcmp(key,"authority")) && cfg->transport_mode != TRANSPORT_GRPC) ||
+        (!strcmp(key,"host") && cfg->transport_mode == TRANSPORT_GRPC) || !strcmp(key,"spx")) vc_log_warning("uri","field query.%s is not applied to this transport",key);
+
+    return 0;
+}
+
+int core_config_query(vless_config_t *cfg, char *query, char *err, size_t err_cap) {
     char *scan = malloc(strlen(query) + 1);
     if (!scan) { set_err(err, err_cap, "failed to allocate query"); return -1; }
     memcpy(scan, query, strlen(query) + 1);
@@ -408,96 +507,13 @@ static int parse_query(vless_config_t *cfg, char *query, char *err, size_t err_c
             if (err && err_cap) snprintf(err,err_cap,"invalid query parameter value: %s",key);
             return -1;
         }
-        char decoded_lower[4096];
-        copy_lower_trunc(decoded_lower, sizeof(decoded_lower), decoded);
-
-        const struct { const char *key; size_t capacity; } capacities[]={
-            {"sni",sizeof(cfg->sni)},{"flow",sizeof(cfg->flow)},{"encryption",sizeof(cfg->encryption)},
-            {"security",sizeof(cfg->security)},{"alpn",sizeof(cfg->alpn)},{"path",sizeof(cfg->xhttp_path)},
-            {"host",sizeof(cfg->xhttp_host)},{"servicename",sizeof(cfg->grpc_service_name)},
-            {"authority",sizeof(cfg->grpc_authority)},{"mode",sizeof(cfg->xhttp_mode)},{"spx",sizeof(cfg->spider_x)}
-        };
-        for (size_t i=0;i<sizeof(capacities)/sizeof(*capacities);i++) if (!strcmp(key,capacities[i].key) && strlen(decoded) >= capacities[i].capacity) {
-            if (err && err_cap) snprintf(err,err_cap,"query field %s exceeds capacity",key);
-            return -1;
-        }
-        int common=!strcmp(key,"path") || !strcmp(key,"host") || !strcmp(key,"mode");
-        int ws_parameter=cfg->transport_mode == TRANSPORT_WS ? core_ws_parameter(cfg,key,decoded,err,err_cap) : 0;
-        if (ws_parameter < 0) return -1;
-        int grpc_parameter=cfg->transport_mode == TRANSPORT_GRPC ? core_grpc_parameter(cfg,key,decoded,err,err_cap) : 0;
-        if (grpc_parameter < 0) return -1;
-        int xhttp_parameter = ws_parameter || grpc_parameter || common ? 0 : core_xhttp_parameter(cfg, key, decoded, err, err_cap);
-        if (xhttp_parameter < 0) return -1;
-        if (ws_parameter > 0 || grpc_parameter > 0 || xhttp_parameter > 0 || !strcmp(key, "extra")) {
-            if (xhttp_parameter > 0 && cfg->transport_mode != TRANSPORT_XHTTP)
-                vc_log_warning("uri","field query.%s is not applied to this transport",key);
-            if (next == NULL) break;
-            cursor = next + 1;
-            if (*cursor == '\0') { set_err(err, err_cap, "invalid trailing query separator"); return -1; }
-            continue;
-        }
-        if (strcmp(key, "pbk") == 0) {
-            size_t n = 0;
-            if (base64url_decode(decoded,cfg->pbk,sizeof(cfg->pbk),&n) || n != 32) { set_err(err,err_cap,"pbk is required and must decode to 32 bytes"); return -1; }
-            cfg->pbk_len=n;
-        } else if (strcmp(key, "sid") == 0) {
-            size_t n = 0;
-            if (hex_to_bytes(decoded,cfg->short_id,8,&n)) { set_err(err,err_cap,"invalid sid"); return -1; }
-            cfg->short_id_len=n;
-        } else if (strcmp(key, "sni") == 0) {
-            copy_trunc(cfg->sni, sizeof(cfg->sni), decoded);
-        } else if (strcmp(key, "fp") == 0) {
-            if (strcmp(decoded_lower, "random") == 0) {
-                cfg->fp_mode = FP_RANDOM;
-            } else if (strcmp(decoded_lower, "randomized") == 0) {
-                cfg->fp_mode = FP_RANDOMIZED;
-            } else if (strcmp(decoded_lower, "qq") == 0) {
-                cfg->fp_mode = FP_QQ;
-            } else if (strcmp(decoded_lower, "firefox") == 0) {
-                cfg->fp_mode = FP_FIREFOX;
-            } else if (strcmp(decoded_lower, "edge") == 0) {
-                cfg->fp_mode = FP_EDGE;
-            } else if (!strcmp(decoded_lower,"chrome")) {
-                cfg->fp_mode = FP_CHROME;
-            } else { set_err(err,err_cap,"unsupported fp"); return -1; }
-        } else if (strcmp(key, "flow") == 0) {
-            copy_trunc(cfg->flow, sizeof(cfg->flow), decoded_lower);
-        } else if (strcmp(key, "encryption") == 0) {
-            copy_trunc(cfg->encryption, sizeof(cfg->encryption), decoded);
-        } else if (strcmp(key, "security") == 0) {
-            if (cfg->protocol == CORE_PROTOCOL_TROJAN && !decoded_lower[0]) { set_err(err,err_cap,"invalid Trojan security"); return -1; }
-            copy_trunc(cfg->security, sizeof(cfg->security), decoded_lower[0] != '\0' ? decoded_lower : "none");
-        } else if (strcmp(key, "alpn") == 0) {
-            copy_trunc(cfg->alpn, sizeof(cfg->alpn), decoded);
-        } else if (strcmp(key, "allowinsecure") == 0) {
-            if (strcmp(decoded_lower,"1") && strcmp(decoded_lower,"0") && strcmp(decoded_lower,"true") && strcmp(decoded_lower,"false")) { set_err(err,err_cap,"invalid allowInsecure"); return -1; }
-            cfg->allow_insecure = (strcmp(decoded_lower, "1") == 0 || strcmp(decoded_lower, "true") == 0);
-        } else if (strcmp(key, "transport") == 0) {
-            if (strcmp(decoded_lower, "xhttp") == 0 || strcmp(decoded_lower, "splithttp") == 0) {
-                cfg->transport_mode = TRANSPORT_XHTTP;
-            } else if (strcmp(decoded_lower, "ws") == 0 || strcmp(decoded_lower, "websocket") == 0) {
-                cfg->transport_mode = TRANSPORT_WS;
-            } else if (strcmp(decoded_lower, "grpc") == 0) {
-                cfg->transport_mode = TRANSPORT_GRPC;
-            } else if (decoded_lower[0] == '\0' || strcmp(decoded_lower, "tcp") == 0 || !strcmp(decoded_lower,"raw")) {
-                cfg->transport_mode = TRANSPORT_VISION;
+        if (cfg->protocol == CORE_PROTOCOL_VMESS && (!strcmp(key,"scy") || !strcmp(key,"encryption"))) {
+            const char *alias=!strcmp(key,"scy") ? "encryption" : "scy";
+            for (size_t i=0;i+1<seen_count;i++) if (!strcmp(seen[i],alias) && strcmp(cfg->encryption,decoded)) {
+                set_err(err,err_cap,"conflicting VMess encryption aliases"); return -1;
             }
-        } else if (strcmp(key, "path") == 0) {
-            copy_trunc(cfg->xhttp_path, sizeof(cfg->xhttp_path), decoded);
-        } else if (strcmp(key, "host") == 0) {
-            copy_trunc(cfg->xhttp_host, sizeof(cfg->xhttp_host), decoded);
-        } else if (strcmp(key, "servicename") == 0) {
-            copy_trunc(cfg->grpc_service_name, sizeof(cfg->grpc_service_name), decoded);
-        } else if (strcmp(key, "authority") == 0) {
-            copy_trunc(cfg->grpc_authority, sizeof(cfg->grpc_authority), decoded);
-        } else if (strcmp(key, "mode") == 0) {
-            copy_lower_trunc(cfg->xhttp_mode, sizeof(cfg->xhttp_mode), decoded);
-        } else if (strcmp(key, "spx") == 0) {
-            copy_trunc(cfg->spider_x, sizeof(cfg->spider_x), decoded);
-        } else vc_log_warning("uri","unknown field query.%s ignored",key);
-        if (((!strcmp(key,"path") || !strcmp(key,"host") || !strcmp(key,"mode")) && cfg->transport_mode == TRANSPORT_VISION) ||
-            ((!strcmp(key,"servicename") || !strcmp(key,"authority")) && cfg->transport_mode != TRANSPORT_GRPC) ||
-            (!strcmp(key,"host") && cfg->transport_mode == TRANSPORT_GRPC) || !strcmp(key,"spx")) vc_log_warning("uri","field query.%s is not applied to this transport",key);
+        }
+        if (strcmp(key,"extra") && core_config_parameter(cfg,key,decoded,err,err_cap) < 0) return -1;
 
         if (next == NULL) break;
         cursor = next + 1;
@@ -677,10 +693,10 @@ static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, siz
         return -1;
     }
     snprintf(cfg->sni, sizeof(cfg->sni), "%s", cfg->server_host);
-    return query && *query ? parse_query(cfg,query,err,err_cap) : 0;
+    return query && *query ? core_config_query(cfg,query,err,err_cap) : 0;
 }
 
-static int finalize_stream_config(vless_config_t *cfg, char *err, size_t err_cap) {
+int core_config_finalize(vless_config_t *cfg, char *err, size_t err_cap) {
     if (cfg->transport_mode == TRANSPORT_WS && core_ws_configure(cfg,err,err_cap)) return -1;
     if (cfg->transport_mode == TRANSPORT_WS) {
         char authority[sizeof(cfg->xhttp_host)+2];
@@ -864,7 +880,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
         return -1;
     }
 
-    if (parse_host_port(at + 1, cfg->server_host, sizeof(cfg->server_host), &cfg->server_port) != 0) {
+    if (core_config_endpoint(at + 1, cfg->server_host, sizeof(cfg->server_host), &cfg->server_port) != 0) {
         set_err(err, err_cap, "invalid host:port in URI");
         return -1;
     }
@@ -872,7 +888,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     snprintf(cfg->sni, sizeof(cfg->sni), "%s", cfg->server_host);
 
     if (query != NULL && *query != '\0') {
-        if (parse_query(cfg, query, err, err_cap) != 0) {
+        if (core_config_query(cfg, query, err, err_cap) != 0) {
             return -1;
         }
     }
@@ -880,7 +896,7 @@ int parse_vless_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_
     if (parse_vless_encryption(cfg, err, err_cap) != 0) {
         return -1;
     }
-    return finalize_stream_config(cfg,err,err_cap);
+    return core_config_finalize(cfg,err,err_cap);
 }
 
 static int parse_trojan_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_cap) {
@@ -909,14 +925,14 @@ static int parse_trojan_uri(const char *uri, vless_config_t *cfg, char *err, siz
         }
         work[password_length++]=(char)value;
     }
-    if (parse_host_port(at+1,cfg->server_host,sizeof(cfg->server_host),&cfg->server_port)) {
+    if (core_config_endpoint(at+1,cfg->server_host,sizeof(cfg->server_host),&cfg->server_port)) {
         set_err(err,err_cap,"invalid Trojan host:port"); goto cleanup;
     }
     snprintf(cfg->sni,sizeof(cfg->sni),"%s",cfg->server_host);
-    if (query && *query && parse_query(cfg,query,err,err_cap)) goto cleanup;
+    if (query && *query && core_config_query(cfg,query,err,err_cap)) goto cleanup;
     if (cfg->flow[0]) { set_err(err,err_cap,"Trojan does not support flow"); goto cleanup; }
     if (strcasecmp(cfg->encryption,"none")) { set_err(err,err_cap,"Trojan supports only encryption=none"); goto cleanup; }
-    if (finalize_stream_config(cfg,err,err_cap)) goto cleanup;
+    if (core_config_finalize(cfg,err,err_cap)) goto cleanup;
     if (core_trojan_password((const uint8_t *)work,password_length,cfg->trojan_hash)) {
         set_err(err,err_cap,"failed to prepare Trojan credentials"); goto cleanup;
     }
@@ -933,6 +949,7 @@ int parse_core_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_c
         set_err(err, err_cap, "null input");
         return -1;
     }
+    if (starts_with_ci(uri, "vmess://")) return core_vmess_parse_uri(uri,cfg,err,err_cap);
     if (starts_with_ci(uri, "trojan://")) return parse_trojan_uri(uri,cfg,err,err_cap);
     if (starts_with_ci(uri, "socks5://")) {
         return parse_socks5_uri(uri, cfg, err, err_cap);
@@ -940,6 +957,6 @@ int parse_core_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_c
     if (starts_with_ci(uri, "vless://")) {
         return parse_vless_uri(uri, cfg, err, err_cap);
     }
-    set_err(err, err_cap, "URI must start with vless://, trojan://, or socks5://");
+    set_err(err, err_cap, "URI must start with vless://, vmess://, trojan://, or socks5://");
     return -1;
 }

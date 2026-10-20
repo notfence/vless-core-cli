@@ -256,7 +256,7 @@ int tls13_connect_budgeted(const vless_config_t *cfg, tls13_conn_t **out, char *
         return -1;
     }
     c->fd = -1;
-    c->credential_write=cfg->protocol == CORE_PROTOCOL_TROJAN;
+    c->credential_write=cfg->protocol == CORE_PROTOCOL_TROJAN || cfg->protocol == CORE_PROTOCOL_VMESS;
     c->ignore_server_ips=cfg->ignore_server_ips;
     c->ip_source=core_config_ip_source(cfg);
     c->xhttp_upload_fd = -1;

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <openssl/crypto.h>
 
 typedef struct { const char *start, *cursor, *end; size_t nodes; char *error; size_t capacity; } json_reader_t;
 
@@ -15,7 +16,10 @@ static void fail(json_reader_t *reader, const char *reason) {
 void core_json_free(core_json_t *value) {
     while (value) {
         core_json_t *next=value->next;
-        core_json_free(value->child); free(value->key); free(value->text); free(value); value=next;
+        core_json_free(value->child);
+        if (value->key) OPENSSL_cleanse(value->key,strlen(value->key));
+        if (value->text) OPENSSL_cleanse(value->text,strlen(value->text));
+        free(value->key); free(value->text); OPENSSL_cleanse(value,sizeof(*value)); free(value); value=next;
     }
 }
 
@@ -102,7 +106,7 @@ static char *read_string(json_reader_t *reader) {
             text[used++]=(char)ch; memcpy(text+used,reader->cursor,bytes); used+=bytes; reader->cursor+=bytes;
         } else text[used++]=(char)ch;
     }
-    fail(reader,"unterminated string"); free(text); return NULL;
+    fail(reader,"unterminated string"); OPENSSL_cleanse(text,used); free(text); return NULL;
 }
 
 static core_json_t *read_value(json_reader_t *reader, unsigned depth) {
@@ -122,10 +126,10 @@ static core_json_t *read_value(json_reader_t *reader, unsigned depth) {
             if (ch == '{') {
                 key=read_string(reader); if (!key) goto failure;
                 whitespace(reader);
-                if (reader->cursor == reader->end || *reader->cursor++ != ':') { free(key); fail(reader,"expected colon"); goto failure; }
+                if (reader->cursor == reader->end || *reader->cursor++ != ':') { OPENSSL_cleanse(key,strlen(key)); free(key); fail(reader,"expected colon"); goto failure; }
             }
             core_json_t *entry=read_value(reader,depth+1);
-            if (!entry) { free(key); goto failure; }
+            if (!entry) { if (key) OPENSSL_cleanse(key,strlen(key)); free(key); goto failure; }
             entry->key=key;
             const core_json_t *duplicate=key ? core_json_get(value,key) : NULL;
             if (duplicate) {

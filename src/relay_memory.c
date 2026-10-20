@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <openssl/crypto.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -26,8 +27,16 @@ int core_relay_buffer_reserve(core_relay_buffer_t *buffer,size_t needed) {
     size_t capacity=core_relay_capacity(needed);
     if (capacity < buffer->minimum) capacity=buffer->minimum;
     if (capacity > limit) capacity=limit;
-    void *data=buffer->memory ? core_buffer_realloc(buffer->memory,buffer->data,buffer->capacity,capacity) : realloc(buffer->data,capacity);
+    void *previous=buffer->cleanse ? NULL : buffer->data;
+    size_t previous_size=buffer->cleanse ? 0 : buffer->capacity;
+    void *data=buffer->memory ? core_buffer_realloc(buffer->memory,previous,previous_size,capacity) : realloc(previous,capacity);
     if (!data) return errno == ENOBUFS ? 0 : -1;
+    if (buffer->cleanse && buffer->data) {
+        memcpy(data,buffer->data,buffer->capacity);
+        OPENSSL_cleanse(buffer->data,buffer->capacity);
+        if (buffer->memory) core_buffer_free(buffer->memory,buffer->data,buffer->capacity);
+        else free(buffer->data);
+    }
     buffer->data=data; buffer->capacity=capacity; return 1;
 }
 
@@ -42,9 +51,11 @@ void core_relay_buffer_consume(core_relay_buffer_t *buffer,size_t length) {
     if (length > buffer->length) length=buffer->length;
     buffer->length-=length;
     if (buffer->length) memmove(buffer->data,buffer->data+length,buffer->length);
+    if (buffer->cleanse && length) OPENSSL_cleanse(buffer->data+buffer->length,length);
 }
 
 void core_relay_buffer_clear(core_relay_buffer_t *buffer) {
+    if (buffer->cleanse && buffer->data) OPENSSL_cleanse(buffer->data,buffer->capacity);
     if (buffer->memory) core_buffer_free(buffer->memory,buffer->data,buffer->capacity);
     else free(buffer->data);
     buffer->data=NULL; buffer->length=buffer->capacity=0;

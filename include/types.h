@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "vmess.h"
 
 typedef enum {
     FP_CHROME = 0,
@@ -23,7 +24,8 @@ typedef enum {
 typedef enum {
     CORE_PROTOCOL_VLESS = 0,
     CORE_PROTOCOL_SOCKS5 = 1,
-    CORE_PROTOCOL_TROJAN = 2
+    CORE_PROTOCOL_TROJAN = 2,
+    CORE_PROTOCOL_VMESS = 3
 } core_protocol_t;
 
 #define VLESS_ENCRYPTION_MAX_RELAYS 4
@@ -47,6 +49,7 @@ typedef struct {
 
     uint8_t uuid[16];
     uint8_t trojan_hash[28];
+    core_vmess_security_t vmess_security;
 
     char server_host[256];
     uint16_t server_port;

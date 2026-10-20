@@ -1,6 +1,19 @@
 #include "json.h"
 #include "check.h"
 
+void __real_free(void *);
+static const void *watched_text;
+static size_t watched_length;
+static int cleared_text;
+void __wrap_free(void *memory) {
+    if (memory && memory == watched_text) {
+        cleared_text=1;
+        for (size_t i=0;i<watched_length;i++) if (((const unsigned char *)memory)[i]) cleared_text=0;
+        watched_text=NULL;
+    }
+    __real_free(memory);
+}
+
 int main(void) {
     char error[160];
     core_json_t *value=core_json_parse(" {\"escaped\":\"a\\\"b\\\\c\\u0410\\ud83d\\ude80\",\"nested\":{\"n\":12,\"a\":[true,false,null,-1.5e+2]},\"same\":1,\"same\":1} ",error,sizeof(error));
@@ -13,6 +26,11 @@ int main(void) {
     const core_json_t *array=core_json_get(core_json_get(value,"nested"),"a");
     CHECK("json/typed-values", array->type == CORE_JSON_ARRAY && array->child->type == CORE_JSON_BOOL && array->child->next->next->type == CORE_JSON_NULL && array->child->next->next->next->type == CORE_JSON_NUMBER);
     core_json_free(value);
+    value=core_json_parse("{\"id\":\"private-UUID-fixture\"}",error,sizeof(error));
+    REQUIRE("json/secret-fixture",value);
+    watched_text=core_json_get(value,"id")->text; watched_length=strlen(watched_text);
+    core_json_free(value);
+    CHECK("json/secret-text-cleared-before-free",cleared_text && !watched_text);
     const char *invalid[]={"", "{", "{\"a\":1", "{\"a\":1,}", "[1,]", "truefalse", "00", "01", "+1", "1.", "1e", "{\"a\":1,\"a\":2}", "\"\\uD800\"", "\"\\uDC00\"", "\"\\uD800\\u0041\"", "\"\\u0000\"", "\"\\x11\"", "\"a\n\"", "\"\xc0\x80\"", "{}[]"};
     for (size_t i=0;i<sizeof(invalid)/sizeof(*invalid);i++) CHECK("json/malformed-rejected", !core_json_parse(invalid[i],error,sizeof(error)) && error[0]);
     value=core_json_parse("{\"x\":{\"a\":1,\"b\":2},\"x\":{\"b\":2,\"a\":1}}",error,sizeof(error));

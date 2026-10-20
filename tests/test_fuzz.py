@@ -1,4 +1,5 @@
 import os
+import base64
 import json
 import re
 from pathlib import Path
@@ -64,7 +65,11 @@ def seeds():
                      b"--uri-fd\x000\x00--xray-version\x004294967296.6.27",
                      b"--uri-fd\x000\x00--xray-version\x001.2.18446744073709551616",
                      b"--uri-fd\x000\x00--xray-version\x001.+2.3"],
-        "uri":[b"trojan://public-fixture@127.0.0.1:443",b"trojan://A+B%00%3A%40%25@[::1]:65535?security=none",
+        "uri":[b"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=auto",
+               b"vmess://00000000-0000-0000-0000-000000000001@[::1]:65535?scy=zero&aid=0",
+               b"vmess://"+base64.b64encode(b'{"v":"2","add":"127.0.0.1","port":443,"id":"00000000-0000-0000-0000-000000000001","aid":"0","scy":"auto","net":"tcp","tls":""}'),
+               b"vmess://e31=",b"vmess://e3+_",b"vmess://e30===",
+               b"trojan://public-fixture@127.0.0.1:443",b"trojan://A+B%00%3A%40%25@[::1]:65535?security=none",
                b"trojan://user:pass@127.0.0.1:443?type=ws&ed=69",b"trojan://fixture@127.0.0.1:443?type=grpc&mode=multi",
                b"trojan://fixture@127.0.0.1:443?type=xhttp&mode=packet-up&extra=%7B%22xmux%22%3A%7B%22maxConnections%22%3A1%7D%7D",
                b"trojan://fixture@127.0.0.1:443?flow=xtls-rprx-vision",b"trojan://fixture@127.0.0.1:443?encryption=invalid",

@@ -10,6 +10,7 @@ typedef struct {
     uint8_t *data;
     size_t length,capacity,minimum,limit;
     core_buffer_budget_t *memory;
+    int cleanse;
 } core_relay_buffer_t;
 typedef struct core_relay_memory {
     core_buffer_budget_t upload,download,temporary;
