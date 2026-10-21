@@ -22,6 +22,7 @@ int __real_EVP_CipherInit_ex(EVP_CIPHER_CTX *,const EVP_CIPHER *,ENGINE *,const 
 int __real_EVP_CIPHER_CTX_ctrl(EVP_CIPHER_CTX *,int,int,void *);
 int __real_EVP_CipherUpdate(EVP_CIPHER_CTX *,unsigned char *,int *,const unsigned char *,int);
 int __real_EVP_CipherFinal_ex(EVP_CIPHER_CTX *,unsigned char *,int *);
+int __real_EVP_CIPHER_CTX_set_padding(EVP_CIPHER_CTX *,int);
 static int failed(void) { return ++crypto_calls == crypto_fail; }
 EVP_MD_CTX *__wrap_EVP_MD_CTX_new(void) { return failed() ? NULL : __real_EVP_MD_CTX_new(); }
 HMAC_CTX *__wrap_HMAC_CTX_new(void) { return failed() ? NULL : __real_HMAC_CTX_new(); }
@@ -37,6 +38,12 @@ int __wrap_EVP_CipherInit_ex(EVP_CIPHER_CTX *c,const EVP_CIPHER *m,ENGINE *e,con
 int __wrap_EVP_CIPHER_CTX_ctrl(EVP_CIPHER_CTX *c,int t,int n,void *p) { return failed() ? 0 : __real_EVP_CIPHER_CTX_ctrl(c,t,n,p); }
 int __wrap_EVP_CipherUpdate(EVP_CIPHER_CTX *c,unsigned char *o,int *n,const unsigned char *i,int l) { return failed() ? 0 : __real_EVP_CipherUpdate(c,o,n,i,l); }
 int __wrap_EVP_CipherFinal_ex(EVP_CIPHER_CTX *c,unsigned char *o,int *n) { return failed() ? 0 : __real_EVP_CipherFinal_ex(c,o,n); }
+int __wrap_EVP_CIPHER_CTX_set_padding(EVP_CIPHER_CTX *c,int padding) { return failed() ? 0 : __real_EVP_CIPHER_CTX_set_padding(c,padding); }
+int __wrap_RAND_bytes(unsigned char *output,int length) {
+    if (length == 4) { uint32_t value=906; memcpy(output,&value,4); }
+    else for (int i=0;i<length;i++) output[i]=(uint8_t)i;
+    return 1;
+}
 
 static void expect_hex(const char *name,const uint8_t *actual,size_t length,const char *expected) {
     uint8_t bytes[128]; size_t count=0;
@@ -160,7 +167,29 @@ static void methods(void) {
     for (size_t i=0;i<sizeof(bad)/sizeof(*bad);i++) CHECK("shadowsocks/unsupported-method",core_ss_method(bad[i],&method) < 0);
 }
 
+static void request_failures(void) {
+    uint8_t keys[96],wire[4096],zero[sizeof(wire)]={0}; size_t written;
+    for (size_t i=0;i<sizeof(keys);i++) keys[i]=(uint8_t)i;
+    for (unsigned method=0;method<7;method++) {
+        size_t count=method == 4 || method == 5 ? 3 : 1,size=core_ss_key_size((core_ss_method_t)method);
+        core_ss_body_t body={0};
+        REQUIRE("shadowsocks/request-fault-warmup",!core_ss_body_init(&body,(core_ss_method_t)method,keys+(count-1)*size,1,NULL,NULL) && !core_ss_request(&body,keys,count,"example.test",443,NULL,0,wire,sizeof(wire),&written));
+        core_ss_body_clear(&body);
+        REQUIRE("shadowsocks/request-fault-baseline-state",!core_ss_body_init(&body,(core_ss_method_t)method,keys+(count-1)*size,1,NULL,NULL));
+        crypto_calls=0;
+        REQUIRE("shadowsocks/request-fault-baseline",!core_ss_request(&body,keys,count,"example.test",443,NULL,0,wire,sizeof(wire),&written));
+        unsigned calls=crypto_calls; core_ss_body_clear(&body);
+        for (unsigned stage=1;stage<=calls;stage++) {
+            REQUIRE("shadowsocks/request-injected-state",!core_ss_body_init(&body,(core_ss_method_t)method,keys+(count-1)*size,1,NULL,NULL));
+            crypto_calls=0; crypto_fail=stage; memset(wire,0xa5,sizeof(wire));
+            CHECK("shadowsocks/every-request-crypto-operation-fails-closed",core_ss_request(&body,keys,count,"example.test",443,NULL,0,wire,sizeof(wire),&written)<0 && !written && body.failed);
+            CHECK("shadowsocks/request-op-failure-wipes-wire",!memcmp(wire,zero,sizeof(wire)));
+            crypto_fail=0; core_ss_body_clear(&body);
+        }
+    }
+}
+
 int main(void) {
-    methods(); key_vectors(); hchacha_vector(); crypt_vectors(); key_failures();
+    methods(); key_vectors(); hchacha_vector(); crypt_vectors(); key_failures(); request_failures();
     return test_result();
 }

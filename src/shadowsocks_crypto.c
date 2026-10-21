@@ -7,6 +7,9 @@
 #include <openssl/hmac.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
+
+int64_t core_ss_time(void) { time_t now=time(NULL); return now < 0 ? -1 : (int64_t)now; }
 
 size_t core_ss_key_size(core_ss_method_t method) {
     if (method < CORE_SS_AES128_GCM || method > CORE_SS_2022_CHACHA20_POLY1305) return 0;
