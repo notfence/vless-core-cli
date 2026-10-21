@@ -1046,27 +1046,32 @@ static int allocate_channels(core_http2_stream_t *stream, mux_manager_t *manager
     wake_actor(upload); wake_actor(download); return 0;
 }
 
+static void clear_protocol_credential(vless_config_t *config) {
+    OPENSSL_cleanse(config->trojan_hash,sizeof(config->trojan_hash));
+    if (config->protocol == CORE_PROTOCOL_VMESS) OPENSSL_cleanse(config->uuid,sizeof(config->uuid));
+}
+
 core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core_http2_backend_t *backend, char *error, size_t capacity) {
     vless_config_t download_config;
     int independent=config->transport_mode == TRANSPORT_XHTTP && config->xhttp_download_settings[0] != 0;
     if (independent && core_xhttp_download_config(config,&download_config,error,capacity) != 0) return NULL;
     core_http2_stream_t *stream=calloc(1,sizeof(*stream));
-    if (!stream) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP client allocation failed"); return NULL; }
+    if (!stream) { if (independent) clear_protocol_credential(&download_config); if (error && capacity) snprintf(error,capacity,"XHTTP client allocation failed"); return NULL; }
     stream->config=*config; stream->references=1;
     OPENSSL_cleanse(stream->config.trojan_hash,sizeof(stream->config.trojan_hash));
     if (stream->config.protocol == CORE_PROTOCOL_VMESS) OPENSSL_cleanse(stream->config.uuid,sizeof(stream->config.uuid));
     stream->tx.cleanse=config->protocol == CORE_PROTOCOL_TROJAN || config->protocol == CORE_PROTOCOL_VMESS;
     stream->packet_limit=config->transport_mode == TRANSPORT_GRPC ? 0 : core_xhttp_post_limit(config);
-    if (stream->packet_limit < 0) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP packet size sampling failed"); free(stream); return NULL; }
+    if (stream->packet_limit < 0) { if (independent) clear_protocol_credential(&download_config); if (error && capacity) snprintf(error,capacity,"XHTTP packet size sampling failed"); free(stream); return NULL; }
     stream->trace_present=core_trace_snapshot(&stream->trace);
     stream->until_ms=core_now_ms()+(unsigned)(core_deadline_active() ? core_deadline_remaining() : 30000);
-    if (notification_pair(stream->notify) != 0) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP notification channel failed: %s",strerror(errno)); free(stream); return NULL; }
-    if (config->transport_mode != TRANSPORT_GRPC && backend->session(config,stream->session,sizeof(stream->session)) != 0) { if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash)); if (error && capacity) snprintf(error,capacity,"XHTTP session generation failed"); close(stream->notify[0]); close(stream->notify[1]); free(stream); return NULL; }
+    if (notification_pair(stream->notify) != 0) { if (independent) clear_protocol_credential(&download_config); if (error && capacity) snprintf(error,capacity,"XHTTP notification channel failed: %s",strerror(errno)); free(stream); return NULL; }
+    if (config->transport_mode != TRANSPORT_GRPC && backend->session(config,stream->session,sizeof(stream->session)) != 0) { if (independent) clear_protocol_credential(&download_config); if (error && capacity) snprintf(error,capacity,"XHTTP session generation failed"); close(stream->notify[0]); close(stream->notify[1]); free(stream); return NULL; }
     pthread_mutex_lock(&mux_lock);
     mux_manager_t *manager=stream_count < 256 ? get_manager(config,backend) : NULL;
     if (stream_count >= 256) errno=EAGAIN;
     mux_manager_t *down_manager=manager && independent ? get_manager(&download_config,backend) : manager;
-    if (independent) OPENSSL_cleanse(download_config.trojan_hash,sizeof(download_config.trojan_hash));
+    if (independent) clear_protocol_credential(&download_config);
     int bound=manager && down_manager && !allocate_channels(stream,manager,down_manager,core_deadline_active() ? core_deadline_remaining() : 30000);
     int waiting=manager && down_manager && !bound && errno == EAGAIN;
     if (bound || waiting) {

@@ -195,6 +195,10 @@ class BuildTests(unittest.TestCase):
             for name in ("MAKEFLAGS","MFLAGS","MAKELEVEL","MAKEOVERRIDES"):
                 env.pop(name,None)
             settings = [f"HOST_BUILD_DIR={directory/'host-tests'}",f"TEST_OPENSSL_PREFIX={os.environ['TEST_OPENSSL_PREFIX']}",f"TEST_XRAY_BIN={os.environ['TEST_XRAY_BIN']}",f"CC={compiler}",f"IOS_CC={compiler}",f"IOS_TOOLCHAIN={ROOT.parent/'toolchains/ios6'}",f"IOS_ARM64_SDK={ROOT.parent/'toolchains/sdks/iPhoneOS11.4.sdk'}",f"HOST_FLAGS={os.environ['TEST_HOST_FLAGS']}",f"HOST_LIBS={os.environ['TEST_HOST_LIBS']}",f"HOST_CC={os.environ['TEST_HOST_CC']}","BIN_LINUX=vless-core-linux-amd64","BIN_IOS=vless-core-darwin-armv7","BIN_IOS_ARM64=vless-core-darwin-arm64","RELEASE_DIR=build/release"]
+            fixtures = [str(directory/"host-tests"/name) for name in ("fuzz-parsers","fuzz-encryption","fuzz-http2-pool")]
+            prepared = subprocess.run(["make","-j8","-C",str(project/"tests"),"native",*fixtures,*settings],cwd=project,env=env,capture_output=True,text=True,timeout=180)
+            self.assertEqual(prepared.returncode,0,prepared.stdout+prepared.stderr)
+            self.assertFalse(marker.exists(),prepared.stdout+prepared.stderr)
             targets = ("linux","ios","ios-arm64","all","release-packages","build/linux/main.o","build/ios/main.o","build/ios-arm64/main.o","vless-core-linux-amd64","vless-core-darwin-armv7","vless-core-darwin-arm64")
             for target in targets:
                 with self.subTest(target=target):

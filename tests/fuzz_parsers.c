@@ -59,8 +59,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         for (unsigned i=0;i<16;i++) header.request_key[i]=header.response_key[i]=(uint8_t)i,header.request_iv[i]=header.response_iv[i]=(uint8_t)(i+16);
         core_vmess_body_t body={0}; uint8_t plain[256];
         if (core_vmess_body_init(&body,&header,0,NULL)) abort();
+        body.counter=size && (data[0]&128) ? 65536U : size && (data[0]&64) ? 65535U : 0;
         size_t offset=size ? 1 : 0;
-        while (offset<size) {
+        while (offset<size || body.plain_length) {
             size_t got=0;
             if (body.plain_length) { if (core_vmess_body_read(&body,plain,sizeof(plain),&got)) break; continue; }
             uint8_t *span=NULL; size_t capacity=0;
@@ -72,8 +73,31 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (core_vmess_body_commit(&body,take)) break;
         }
         (void)core_vmess_body_eof(&body); core_vmess_body_clear(&body);
-        header.response_needed=18; header.authentication=36;
-        size_t used=0; (void)core_vmess_response(&header,data,size,&used); core_vmess_header_clear(&header);
+        core_vmess_body_t sender={0}; uint8_t encoded[8192];
+        if (core_vmess_body_init(&sender,&header,1,NULL)) abort();
+        sender.counter=size && (data[0]&128) ? 65536U : size && (data[0]&64) ? 65535U : 0;
+        offset=size ? 1 : 0;
+        while (offset<size) {
+            size_t consumed=0,written=0;
+            if (core_vmess_body_encode(&sender,data+offset,size-offset,&consumed,encoded,sizeof(encoded),&written,0)) break;
+            if (!consumed || written > sizeof(encoded)) abort();
+            offset+=consumed;
+        }
+        if (!sender.failed) { size_t consumed=0,written=0; (void)core_vmess_body_encode(&sender,NULL,0,&consumed,encoded,sizeof(encoded),&written,1); }
+        core_vmess_body_clear(&sender); OPENSSL_cleanse(encoded,sizeof(encoded));
+        const uint8_t key[]={0x57,0x04,0x56,0x79,0x6f,0xf0,0x36,0xc6,0xf2,0xc6,0x19,0x80,0x41,0xa8,0x0b,0xe9};
+        const uint8_t iv[]={0x0d,0x3b,0x40,0xf3,0x09,0x67,0xc5,0x89,0x5a,0x48,0x2a,0xef,0x36,0x29,0xa6,0x83};
+        memcpy(header.response_key,key,sizeof(key)); memcpy(header.response_iv,iv,sizeof(iv));
+        header.response_needed=18; header.authentication=36; offset=size ? 1 : 0;
+        while (offset<size) {
+            size_t used=0,take=size-offset,fragment=1+data[0]%17;
+            if (take > fragment) take=fragment;
+            int result=core_vmess_response(&header,data+offset,take,&used);
+            if (used > take) abort();
+            offset+=used;
+            if (result || !used) break;
+        }
+        core_vmess_header_clear(&header);
         break;
     }
     case 9: {
@@ -108,10 +132,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
         OPENSSL_cleanse(trojan_hash,sizeof(trojan_hash)); OPENSSL_cleanse(request,sizeof(request));
         vless_config_t config;
-        if (parse_core_uri(text, &config, error, sizeof(error)) == 0 && config.xhttp_download_settings[0]) {
-            vless_config_t download;
-            (void)core_xhttp_download_config(&config,&download,error,sizeof(error));
-            OPENSSL_cleanse(&download,sizeof(download));
+        if (parse_core_uri(text,&config,error,sizeof(error)) == 0) {
+            if (config.protocol == CORE_PROTOCOL_VMESS) {
+                core_vmess_header_t header={0}; uint8_t wire[CORE_VMESS_HEADER_MAX]; size_t written=0,capacity=size%(sizeof(wire)+1);
+                (void)core_vmess_request(&header,config.uuid,config.server_host,config.server_port,config.vmess_security,wire,capacity,&written);
+                if (written > capacity) abort();
+                core_vmess_header_clear(&header); OPENSSL_cleanse(wire,sizeof(wire));
+            }
+            if (config.xhttp_download_settings[0]) {
+                vless_config_t download;
+                (void)core_xhttp_download_config(&config,&download,error,sizeof(error));
+                OPENSSL_cleanse(&download,sizeof(download));
+            }
         }
         core_json_t *json = core_json_parse(text, error, sizeof(error));
         if (json) {

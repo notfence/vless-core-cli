@@ -151,6 +151,9 @@ int core_xhttp_download_config(const vless_config_t *parent, vless_config_t *dow
         download->ignore_server_ips=strcmp(parent->server_host,download->server_host) || parent->server_port != download->server_port;
         download->protocol=parent->protocol;
         memcpy(download->trojan_hash,parent->trojan_hash,sizeof(download->trojan_hash));
+        if (parent->protocol == CORE_PROTOCOL_VMESS) {
+            memcpy(download->uuid,parent->uuid,sizeof(download->uuid)); download->vmess_security=parent->vmess_security;
+        }
     }
     return result;
 }

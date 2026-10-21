@@ -50,7 +50,30 @@ static void grpc_json(void) {
     free(config); free(address);
 }
 
+static void xhttp_json(void) {
+    vless_config_t *config=calloc(1,sizeof(*config)),*address=calloc(1,sizeof(*address)); char error[256];
+    REQUIRE("vmess/xhttp-config-storage",config && address);
+    const char *prefix="{\"add\":\"127.0.0.1\",\"port\":443,\"id\":\"00000000-0000-0000-0000-000000000001\",\"net\":\"xhttp\",";
+    for (unsigned order=0;order<2;order++) {
+        const char *fields="\"host\":\"outer.test\",\"path\":\"/outer\",\"mode\":\"packet-up\",\"noGRPCHeader\":true,\"xPaddingBytes\":0";
+        const char *extra="\"extra\":{\"host\":\"inner.test\",\"path\":\"/inner\",\"mode\":\"stream-up\",\"noGRPCHeader\":false,\"xPaddingBytes\":\"7-8\",\"xmux\":{\"maxConnections\":3}}";
+        char text[2048]; snprintf(text,sizeof(text),"%s%s,%s}",prefix,order ? extra : fields,order ? fields : extra);
+        REQUIRE("vmess/xhttp-json-config",!parse_json(text,config,error));
+        REQUIRE("vmess/xhttp-address-config",!parse_core_uri("vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?type=xhttp&host=outer.test&path=%2Fouter&mode=packet-up&noGRPCHeader=true&xPaddingBytes=0&extra=%7B%22host%22%3A%22inner.test%22%2C%22path%22%3A%22%2Finner%22%2C%22mode%22%3A%22stream-up%22%2C%22noGRPCHeader%22%3Afalse%2C%22xPaddingBytes%22%3A%227-8%22%2C%22xmux%22%3A%7B%22maxConnections%22%3A3%7D%7D",address,error,sizeof(error)));
+        CHECK("vmess/xhttp-json-and-address-effective-config",!memcmp(config,address,sizeof(*config)));
+    }
+    char text[2048]; snprintf(text,sizeof(text),"%s\"xmux\":{\"maxConcurrency\":\"\",\"maxConnections\":3},\"sessionIDPlacement\":\"header\",\"sessionIDLength\":16,\"xPaddingObfsMode\":false,\"scMinPostsIntervalMs\":0}",prefix);
+    CHECK("vmess/xhttp-json-xmux-and-numeric-settings",!parse_json(text,config,error) && config->xmux.present && config->xmux.max_connections.min == 3 && config->xmux.max_connections.max == 3 && !config->xmux.max_concurrency.max && config->xhttp_session_id_length_min == 16 && !config->xhttp_padding_obfs && !config->xhttp_min_posts_interval_max);
+    const char *bad[]={"\"xmux\":false","\"xmux\":{\"maxConnections\":184467440737095516160}","\"extra\":[]","\"extra\":{\"xmux\":{\"maxConnections\":3,\"maxConcurrency\":8}}","\"path\":\"/bad%00\"","\"headers\":{\"X-Fixture\":\"bad\\nInjected\"}","\"xPaddingBytes\":false","\"sessionIDLength\":null","\"noGRPCHeader\":1","\"xPaddingObfsMode\":0","\"noGRPCHeader\":\"false\"","\"downloadSettings\":{\"address\":\"bad host\",\"port\":443,\"network\":\"xhttp\"}"};
+    for (size_t i=0;i<sizeof(bad)/sizeof(*bad);i++) {
+        snprintf(text,sizeof(text),"%s%s}",prefix,bad[i]);
+        CHECK("vmess/xhttp-json-invalid-setting",parse_json(text,config,error) < 0);
+    }
+    free(config); free(address);
+}
+
 int main(void) {
+    xhttp_json();
     grpc_json();
     websocket_json();
     vless_config_t *config=calloc(1,sizeof(*config)); char error[256];
@@ -65,7 +88,7 @@ int main(void) {
         REQUIRE("vmess/base64-json-form",!parse_json(json,config,error));
         CHECK("vmess/base64-json-effective-config",config->protocol == CORE_PROTOCOL_VMESS && config->vmess_security == expected[i] && config->server_port == 443 && !strcmp(config->server_host,"127.0.0.1") && !strcmp(config->security,"none"));
     }
-    const char *bad[]={"aid=1","aid=-0","alterId=4294967296","encryption=aes-128-cfb","encryption=mlkem768x25519plus.native.0rtt.key","encryption=auto&scy=none","flow=xtls-rprx-vision","type=xhttp","security=invalid","authenticatedLength=true"};
+    const char *bad[]={"aid=1","aid=-0","alterId=4294967296","encryption=aes-128-cfb","encryption=mlkem768x25519plus.native.0rtt.key","encryption=auto&scy=none","flow=xtls-rprx-vision","security=invalid","authenticatedLength=true"};
     for (size_t i=0;i<sizeof(bad)/sizeof(*bad);i++) {
         char uri[512]; snprintf(uri,sizeof(uri),"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?%s",bad[i]);
         CHECK("vmess/unsupported-setting-rejected",parse_core_uri(uri,config,error,sizeof(error)) < 0);

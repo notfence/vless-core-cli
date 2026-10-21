@@ -55,6 +55,30 @@ def seeds():
                        b'{"headers":{"Cookie":"x_data_0=old"},"uplinkDataPlacement":"cookie"}',
                        b'{"xmux":{"maxConnections":1,"maxConcurrency":1}}',
                        b'{"mode":"packet-up","uplinkDataPlacement":"cookie","sessionIDPlacement":"cookie","sessionIDKey":"x_data_0"}'))
+    vmess_uris=[]
+    vmess_settings=[
+        dict(net='ws',tls='tls',host='vless-core.test',path='/vless-core?ed=16384',headers={'X-Fixture':'present'},heartbeatPeriod=1),
+        dict(net='grpc',tls='none',path='vless-core',host='grpc.test',type='multi',multiMode=True,permit_without_stream=False,initial_windows_size=1024),
+        dict(net='grpc',tls='tls',type='gun',multiMode=42),
+        dict(net='xhttp',tls='tls',mode='stream-up',extra=dict(xmux=dict(maxConcurrency='',maxConnections=3),downloadSettings=download)),
+        dict(net='xhttp',tls='none',mode='packet-up',xmux=dict(maxConnections=1),noGRPCHeader=True,xPaddingBytes=0),
+        dict(net='xhttp',tls='tls',extra=dict(downloadSettings=download),downloadSettings=download),
+        dict(net='tcp',scy='none',vcn='unsupported'),
+    ]
+    for options in vmess_settings:
+        value=dict(v='2',add='127.0.0.1',port=443,id='00000000-0000-0000-0000-000000000001',aid=0,scy='auto')
+        value.update(options)
+        encoded=json.dumps(value,separators=(',',':')).encode()
+        vmess_uris.extend((b'vmess://'+base64.b64encode(encoded),b'vmess://'+base64.urlsafe_b64encode(encoded).rstrip(b'=')))
+    vmess_uris.extend(b'vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?'+query for query in (
+        b'type=ws&security=tls&ed=16384',b'type=grpc&mode=multi&initialWindowsSize=1024',
+        b'type=xhttp&mode=stream-up&extra='+quote(json.dumps({'downloadSettings':download}),safe='').encode()))
+    vmess_frames=[bytes([flag])+bytes.fromhex(wire) for flag in (0,64,128) for wire in (
+        'dc0e6902de0ac0cc128a15fa7a2dbce8e547098c1d2776a32aa0d6c303e36cb4f4ee2321d750',
+        'dc0e6902de0ac0cc128a15fa7a2dbce8e547088c1d2775f2ef7f4f2a3c35c7739e35725a28f6',
+        'dc01d6432a2b799bd7c4ca22575a36af9c91098c7e2039a172b928ce39c5223a9048fcda32fde30ab3778dd14b',
+        '8e739d3ecdca9a91f13b0d502be14505dfbe2dd4de1d95f19597ba58acd8ab0183000102030405060708090a0b0c0d0e0f10')]
+    vmess_frames.append(b'\x02\xbc\x91'+b'v'*16384)
     return {
         "arguments":[b"--version",b"-v",b"--version\x00--version",
                      b"--uri\x00socks5://127.0.0.1:1080#vless-core\x00--listen-port\x001080",
@@ -65,7 +89,7 @@ def seeds():
                      b"--uri-fd\x000\x00--xray-version\x004294967296.6.27",
                      b"--uri-fd\x000\x00--xray-version\x001.2.18446744073709551616",
                      b"--uri-fd\x000\x00--xray-version\x001.+2.3"],
-        "uri":[b"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=auto",
+        "uri":[*vmess_uris,b"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=auto",
                b"vmess://00000000-0000-0000-0000-000000000001@[::1]:65535?scy=zero&aid=0",
                b"vmess://"+base64.b64encode(b'{"v":"2","add":"127.0.0.1","port":443,"id":"00000000-0000-0000-0000-000000000001","aid":"0","scy":"auto","net":"tcp","tls":""}'),
                b"vmess://e31=",b"vmess://e3+_",b"vmess://e30===",
@@ -130,7 +154,7 @@ def seeds():
         "vmess":[bytes([index])+bytes.fromhex(wire) for index,wire in (
             (0,"8e739d3ecdca9a91f13b0d502be14505dfbe2dd4de1d95f19597ba58acd8ab0183000102030405060708090a0b0c0d0e0f10"),
             (1,"8e73e9de6f49187cc2fd3924770f46360c94c95a8bc51bb435194c8de1c431c87f000102030405060708090a0b0c0d0e0f10"),
-            (2,"fc9e564d657373204145414420626f6479"),(3,"564d657373204145414420626f6479"))],
+            (2,"fc9e564d657373204145414420626f6479"),(3,"564d657373204145414420626f6479"))]+vmess_frames,
     }
 
 class FuzzTests(unittest.TestCase):
@@ -147,7 +171,7 @@ class FuzzTests(unittest.TestCase):
                 for index, sample in enumerate(samples):
                     (corpus/str(index)).write_bytes(sample)
                 log = BUILD/f"fuzz-{parser}-{time.monotonic_ns()}.log"
-                command = [str(binary),str(corpus),f"-runs={runs}","-seed=13371337","-max_len=4096","-timeout=3",
+                command = [str(binary),str(corpus),f"-runs={runs}","-seed=13371337",f"-max_len={16400 if parser == 'vmess' else 4096}","-timeout=3",
                            "-rss_limit_mb=1024",f"-artifact_prefix={BUILD}/fuzz-{parser}-"]
                 environment = dict(os.environ,VC_FUZZ_PARSER=parser,ASAN_OPTIONS="detect_leaks=1",UBSAN_OPTIONS="halt_on_error=1",DEBUGINFOD_URLS="")
                 with log.open("wb") as output:

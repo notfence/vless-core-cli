@@ -298,4 +298,97 @@ class VMessTests(unittest.TestCase):
                 reference=stack.enter_context(f.xray_server('grpc','tls',protocol='vmess'))
             self.assertEqual(reference.port,candidate)
 
+    def test_destination_addresses_across_transports(self):
+        for transport in ('tcp','ws','grpc','xhttp'):
+            for address in ('127.0.0.1','localhost','::1'):
+                with self.subTest(transport=transport,address=address),f.Server(address='::1' if address == '::1' else '127.0.0.1') as target,f.xray_server(transport,'none',protocol='vmess') as reference,f.cli(f.uri(reference.port,transport,'none',protocol='vmess')) as core:
+                    with f.socks_connect(core.port,target.port,address) as tunnel:
+                        f.exchange(tunnel,b'\x00\x00destination address'+bytes(range(251))*40)
+                        tunnel.shutdown(socket.SHUT_WR); self.assertEqual(tunnel.recv(1),b'')
+
+    def test_xhttp_head_packet_responses(self):
+        certificate,_=f.certificate()
+        for security,alpn in (('none',None),('tls','h2'),('tls','http/1.1')):
+            for pooled in (False,True):
+                options=dict(protocol='vmess',mode='packet-up',uplinkHTTPMethod='HEAD',extra=json.dumps({'xmux':{'maxConnections':1}}) if pooled else '{}')
+                if alpn: options['alpn']=alpn
+                with self.subTest(security=security,alpn=alpn,pooled=pooled),f.Server() as target,f.xray_server('xhttp',security,mode='packet-up',protocol='vmess',uplinkHTTPMethod='HEAD') as reference,f.cli(f.uri(reference.port,'xhttp',security,**options),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    for _ in range(2):
+                        with f.socks_connect(core.port,target.port) as tunnel:
+                            for index in range(4): f.exchange(tunnel,(b'\x00\x00VMess HEAD response'+bytes([index]))*1000)
+
+    def test_xhttp_reality_download_and_parallel_sessions(self):
+        import concurrent.futures
+        shared=dict(sessionIDPlacement='header',seqPlacement='header')
+        for mode in ('stream-up','packet-up'):
+            for pooled in (False,True):
+                with self.subTest(mode=mode,pooled=pooled),f.Server() as target,f.xray_server('xhttp','reality',path='/',protocol='vmess',**shared) as reference,f.CountingProxy(reference.port) as upload,f.CountingProxy(reference.port,address='127.0.0.2') as download:
+                    settings=dict(address='download.invalid',port=download.port,network='xhttp',security='reality',realitySettings=dict(serverName='vless-core.test',publicKey=f.PUBLIC_KEY,shortId='01020304',fingerprint='firefox'),xhttpSettings=dict(path='/download',**shared))
+                    extra=dict(downloadSettings=settings,**shared)
+                    if pooled: extra['xmux']=dict(maxConnections=1)
+                    config=f.uri(upload.port,'xhttp','reality',protocol='vmess',mode=mode,path='/upload',extra=json.dumps(extra)).replace('@127.0.0.1:','@upload.invalid:')
+                    with f.cli(config,extra=['--server-ips','127.0.0.1','--download-server-ips','127.0.0.2']) as core:
+                        def transfer(index):
+                            with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'\x00\x00separate REALITY download'+bytes([index])+bytes(range(251))*1100)
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers: list(workers.map(transfer,range(4)))
+                        self.assertGreater(len(upload.connections),0); self.assertGreater(len(download.connections),0)
+
+    def test_xhttp_modes_security_body_algorithms_and_reuse(self):
+        certificate,_=f.certificate()
+        payload=b'\x00\x00VMess XHTTP'+bytes(range(251))*1100
+        for security,alpn in (('none',None),('tls',None),('tls','http/1.1'),('reality',None)):
+            for mode in ('stream-one','stream-up','packet-up'):
+                for pooled in (False,True):
+                    options=dict(protocol='vmess',mode=mode,extra=json.dumps({'xmux':{'maxConnections':1}}) if pooled else '{}')
+                    if alpn: options['alpn']=alpn
+                    with self.subTest(security=security,alpn=alpn,mode=mode,pooled=pooled),f.Server() as target,f.xray_server('xhttp',security,mode=mode,protocol='vmess') as reference,f.CountingProxy(reference.port) as proxy:
+                        for body in ('auto','aes-128-gcm','chacha20-poly1305','none','zero'):
+                            with f.cli(f.uri(proxy.port,'xhttp',security,encryption=body,**options),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                                for index in range(2):
+                                    with f.socks_connect(core.port,target.port) as tunnel:
+                                        f.exchange(tunnel,payload+bytes([index]))
+                                        f.exchange(tunnel,b'last XHTTP bytes')
+                        if not pooled: self.assertGreaterEqual(len(proxy.connections),10)
+
+    def test_xhttp_server_first_and_last_bytes(self):
+        certificate,_=f.certificate()
+        for mode in ('stream-one','stream-up','packet-up'):
+            for pooled in (False,True):
+                def handler(connection):
+                    connection.sendall(b'\x00\x00server-first')
+                    self.assertEqual(f.exact(connection,7),b'client!')
+                    time.sleep(.1); connection.sendall(b'last')
+                options=dict(protocol='vmess',mode=mode,extra=json.dumps({'xmux':{'maxConnections':1}}) if pooled else '{}')
+                with self.subTest(mode=mode,pooled=pooled),f.Server(handler) as target,f.xray_server('xhttp','tls',mode=mode,protocol='vmess') as reference,f.cli(f.uri(reference.port,'xhttp','tls',**options),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        self.assertEqual(f.exact(tunnel,14),b'\x00\x00server-first')
+                        tunnel.sendall(b'client!'); tunnel.shutdown(socket.SHUT_WR)
+                        self.assertEqual(f.exact(tunnel,4),b'last')
+                        self.assertEqual(tunnel.recv(1),b'')
+
+    def test_xhttp_independent_download_settings_pins_and_json(self):
+        certificate,_=f.certificate(); shared=dict(sessionIDPlacement='header',seqPlacement='header')
+        for mode in ('stream-up','packet-up'):
+            for upload_tls,download_tls in ((False,False),(True,False),(False,True)):
+                for pooled in (False,True):
+                    with self.subTest(mode=mode,upload_tls=upload_tls,download_tls=download_tls,pooled=pooled),f.Server() as target,f.xray_server('xhttp','none',path='/',protocol='vmess',**shared) as reference,f.CountingProxy(reference.port,tls=upload_tls) as upload,f.CountingProxy(reference.port,address='127.0.0.2',tls=download_tls) as download:
+                        settings=dict(address='download.invalid',port=download.port,network='xhttp',security='tls' if download_tls else 'none',xhttpSettings=dict(path='/download',**shared))
+                        if download_tls: settings['tlsSettings']=dict(serverName='vless-core.test',alpn=['http/1.1'])
+                        extra=dict(downloadSettings=settings,**shared)
+                        if pooled: extra['xmux']=dict(maxConnections=1)
+                        for encoded in (False,True):
+                            if encoded:
+                                value=dict(add='upload.invalid',port=upload.port,id=f.UUID,net='xhttp',tls='tls' if upload_tls else '',scy='auto',sni='vless-core.test',mode=mode,path='/upload',extra=extra)
+                                if upload_tls: value['alpn']='http/1.1'
+                                config='vmess://'+base64.b64encode(json.dumps(value).encode()).decode()
+                            else:
+                                options=dict(protocol='vmess',mode=mode,path='/upload',extra=json.dumps(extra))
+                                if upload_tls: options['alpn']='http/1.1'
+                                config=f.uri(upload.port,'xhttp','tls' if upload_tls else 'none',**options).replace('@127.0.0.1:','@upload.invalid:')
+                            with f.cli(config,extra=['--server-ips','127.0.0.1','--download-server-ips','127.0.0.2'],environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                                for index in range(2):
+                                    with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'\x00\x00independent VMess'+bytes(range(251))*300+bytes([index]))
+                        self.assertGreater(len(upload.connections),0); self.assertGreater(len(download.connections),0)
+                        self.assertIn(b'get /download/',b'\r\n'.join(bytes(data).lower() for data in download.client_data))
+
 if __name__ == '__main__': unittest.main()

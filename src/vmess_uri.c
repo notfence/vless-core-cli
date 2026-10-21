@@ -1,6 +1,7 @@
 #include "config_internal.h"
 #include "json.h"
 #include "core_log.h"
+#include "xhttp_config.h"
 #include "utils.h"
 #include <ctype.h>
 #include <openssl/crypto.h>
@@ -109,6 +110,15 @@ static int json_config(vless_config_t *config,const char *text,char *error,size_
         if (strcasecmp(node->key,"net") && strcasecmp(node->key,"network") && strcasecmp(node->key,"transport")) continue;
         if (node->type != CORE_JSON_STRING || core_config_parameter(config,"transport",node->text,error,capacity) < 0) { invalid(error,capacity,"net"); goto cleanup; }
     }
+    for (const core_json_t *node=root->child;node;node=node->next) if (!strcasecmp(node->key,"extra")) {
+        char object[4096]; const char *value=NULL;
+        if (node->type == CORE_JSON_STRING) value=node->text;
+        else if (node->type == CORE_JSON_OBJECT && node->source_length < sizeof(object)) {
+            memcpy(object,node->source,node->source_length); object[node->source_length]=0; value=object;
+        } else { invalid(error,capacity,"extra"); goto cleanup; }
+        int applied=core_config_parameter(config,"extra",value,error,capacity);
+        OPENSSL_cleanse(object,sizeof(object)); if (applied < 0) goto cleanup;
+    }
     char seen_keys[128][128]; const core_json_t *seen_values[128]; size_t seen=0;
     for (const core_json_t *node=root->child;node;node=node->next) {
         char lowered[128]; size_t length=strlen(node->key);
@@ -125,7 +135,8 @@ static int json_config(vless_config_t *config,const char *text,char *error,size_
             else if (!strcmp(key,"type") || !strcmp(key,"multimode")) key="mode";
         }
         if (!strcmp(key,"ps")) { if (node->type != CORE_JSON_STRING) { invalid(error,capacity,"ps"); goto cleanup; } continue; }
-        if (config->transport_mode == TRANSPORT_GRPC && !strcmp(key,"permitwithoutstream") && node->type != CORE_JSON_BOOL) {
+        if (((config->transport_mode == TRANSPORT_GRPC && !strcmp(key,"permitwithoutstream")) ||
+            (config->transport_mode == TRANSPORT_XHTTP && (!strcmp(key,"nogrpcheader") || !strcmp(key,"xpaddingobfsmode")))) && node->type != CORE_JSON_BOOL) {
             invalid(error,capacity,key); goto cleanup;
         }
         size_t previous=0;
@@ -139,7 +150,14 @@ static int json_config(vless_config_t *config,const char *text,char *error,size_
         }
         if (seen == 128) { invalid(error,capacity,"field count"); goto cleanup; }
         strcpy(seen_keys[seen],key); seen_values[seen++]=node;
-        if (!strcmp(key,"extra") || !strcmp(key,"headers") || !strcmp(key,"downloadsettings")) {
+        if (!strcmp(key,"extra")) continue;
+        if (!strcmp(key,"xmux")) {
+            if (node->type != CORE_JSON_OBJECT || config->transport_mode != TRANSPORT_XHTTP) { invalid(error,capacity,"xmux"); goto cleanup; }
+            core_json_t field=*node,object={.type=CORE_JSON_OBJECT,.child=&field}; field.key="xmux"; field.next=NULL;
+            if (core_xhttp_apply_object(config,&object,"JSON",error,capacity)) goto cleanup;
+            continue;
+        }
+        if (!strcmp(key,"headers") || !strcmp(key,"downloadsettings")) {
             char object[4096];
             if (node->type == CORE_JSON_STRING) value=node->text;
             else if (node->type == CORE_JSON_OBJECT && node->source_length < sizeof(object)) {
@@ -180,7 +198,7 @@ static int json_config(vless_config_t *config,const char *text,char *error,size_
             int applied=core_config_parameter(config,key,value,error,capacity);
             if (applied < 0) goto cleanup;
             if (!applied && (node->type == CORE_JSON_NUMBER || node->type == CORE_JSON_BOOL)) {
-                static const char *numeric[]={"ed","heartbeatperiod","idletimeout","healthchecktimeout","initialwindowssize","permitwithoutstream","allowinsecure"};
+                static const char *numeric[]={"ed","heartbeatperiod","idletimeout","healthchecktimeout","initialwindowssize","permitwithoutstream","allowinsecure","nogrpcheader","xpaddingobfsmode","xpaddingbytes","scmaxeachpostbytes","scminpostsintervalms","sessionidlength","uplinkchunksize"};
                 int allowed=!strcasecmp(node->key,"multimode") && config->transport_mode == TRANSPORT_GRPC;
                 for (size_t i=0;i<sizeof(numeric)/sizeof(*numeric);i++) if (!strcmp(key,numeric[i])) allowed=1;
                 if (!allowed) { invalid(error,capacity,key); goto cleanup; }
@@ -210,7 +228,6 @@ int core_vmess_parse_uri(const char *uri,vless_config_t *config,char *error,size
         if (query && *query && core_config_query(config,query,error,capacity)) goto cleanup;
     } else if (decode_base64(work,decoded,sizeof(decoded)) || json_config(config,decoded,error,capacity)) { if (!error || !*error) invalid(error,capacity,"Base64 JSON"); goto cleanup; }
     if (config->flow[0]) { invalid(error,capacity,"flow"); goto cleanup; }
-    if (config->transport_mode != TRANSPORT_VISION && config->transport_mode != TRANSPORT_WS && config->transport_mode != TRANSPORT_GRPC) { invalid(error,capacity,"transport not yet supported"); goto cleanup; }
     if (core_config_finalize(config,error,capacity)) goto cleanup;
     result=0;
 cleanup:

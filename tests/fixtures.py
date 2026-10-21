@@ -322,6 +322,7 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
             config["inbounds"][0]["settings"]={"clients":[{"id":UUID,"alterId":0}]}
         elif protocol != "vless": raise ValueError("unsupported fixture protocol")
         config["outbounds"][0]["settings"]["finalRules"] = [{"action":"allow","ip":["127.0.0.0/8","::1/128"]}]
+        config["routing"]["rules"].insert(1,{"type":"field","domain":["full:localhost"],"outboundTag":"local"})
         def command(listen_port):
             config["inbounds"][0]["port"] = listen_port
             path = PRIVATE/f"xray-{listen_port}.json"

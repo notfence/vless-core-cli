@@ -80,6 +80,9 @@ int main(void) {
     config.protocol=CORE_PROTOCOL_TROJAN; memset(config.trojan_hash,0x5a,sizeof(config.trojan_hash));
     CHECK("trojan/download-preserves-protocol-and-credential-identity",!core_xhttp_download_config(&config,&download,error,sizeof(error)) && download.protocol == CORE_PROTOCOL_TROJAN && !memcmp(download.trojan_hash,config.trojan_hash,sizeof(config.trojan_hash)));
     CHECK("trojan/download-keeps-independent-protection",!strcmp(download.security,"none") && !download.encryption_enabled && !download.flow[0] && download.ignore_server_ips);
+    config.protocol=CORE_PROTOCOL_VMESS; memset(config.uuid,0x5b,sizeof(config.uuid)); config.vmess_security=CORE_VMESS_CHACHA20_POLY1305;
+    CHECK("vmess/download-preserves-protocol-uuid-and-cipher",!core_xhttp_download_config(&config,&download,error,sizeof(error)) && download.protocol == CORE_PROTOCOL_VMESS && download.vmess_security == CORE_VMESS_CHACHA20_POLY1305 && !memcmp(download.uuid,config.uuid,sizeof(config.uuid)));
+    CHECK("vmess/download-keeps-independent-protection",!strcmp(download.security,"none") && !download.encryption_enabled && !download.flow[0] && download.ignore_server_ips);
     CHECK("download/stream-one-rejected",parent(extra,"&mode=stream-one",&config,error) != 0 && strstr(error,"stream-one"));
     CHECK("download/reality-auto-selects-stream-up",parent(extra,"&security=reality&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",&config,error) == 0 && !strcmp(config.xhttp_mode,"stream-up"));
     CHECK("download/explicit-query-overrides-extra",parent(extra,"&downloadSettings=%7B%22address%22%3A%22127.0.0.1%22%2C%22port%22%3A443%2C%22network%22%3A%22xhttp%22%7D",&config,error) == 0 && core_xhttp_download_config(&config,&download,error,sizeof(error)) == 0 && !download.ignore_server_ips);
