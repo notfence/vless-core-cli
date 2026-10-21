@@ -1,5 +1,6 @@
 #include "blake3.h"
 
+#include <openssl/crypto.h>
 #include <string.h>
 
 #define B3_CHUNK_START 1U
@@ -87,6 +88,7 @@ static void b3_compress(const uint32_t cv[8], const uint32_t block[16],
         out[i] = state[i] ^ state[i + 8];
         out[i + 8] = state[i + 8] ^ cv[i];
     }
+    OPENSSL_cleanse(state,sizeof(state));
 }
 
 static void b3_output_cv(const b3_output_t *output, uint32_t cv[8]) {
@@ -94,6 +96,7 @@ static void b3_output_cv(const b3_output_t *output, uint32_t cv[8]) {
     b3_compress(output->input_cv, output->block, output->counter,
                 output->block_len, output->flags, words);
     memcpy(cv, words, 8 * sizeof(uint32_t));
+    OPENSSL_cleanse(words,sizeof(words));
 }
 
 static void b3_output_root(const b3_output_t *output, uint8_t out[32]) {
@@ -103,6 +106,7 @@ static void b3_output_root(const b3_output_t *output, uint8_t out[32]) {
     for (int i = 0; i < 8; i++) {
         b3_store32(out + i * 4, words[i]);
     }
+    OPENSSL_cleanse(words,sizeof(words));
 }
 
 static void b3_load_block(const uint8_t *input, size_t input_len,
@@ -114,6 +118,7 @@ static void b3_load_block(const uint8_t *input, size_t input_len,
     for (int i = 0; i < 16; i++) {
         block[i] = b3_load32(bytes + i * 4);
     }
+    OPENSSL_cleanse(bytes,sizeof(bytes));
 }
 
 static b3_output_t b3_chunk_output(const uint8_t *input, size_t input_len,
@@ -130,6 +135,8 @@ static b3_output_t b3_chunk_output(const uint8_t *input, size_t input_len,
         b3_compress(cv, block, chunk_counter, 64,
                     flags | (i == 0 ? B3_CHUNK_START : 0), words);
         memcpy(cv, words, sizeof(cv));
+        OPENSSL_cleanse(block,sizeof(block));
+        OPENSSL_cleanse(words,sizeof(words));
     }
 
     size_t last_off = (blocks - 1) * 64;
@@ -141,6 +148,7 @@ static b3_output_t b3_chunk_output(const uint8_t *input, size_t input_len,
     output.block_len = (uint32_t)last_len;
     output.flags = flags | B3_CHUNK_END |
                    (blocks == 1 ? B3_CHUNK_START : 0);
+    OPENSSL_cleanse(cv,sizeof(cv));
     return output;
 }
 
@@ -161,7 +169,7 @@ static void b3_hash_internal(const uint8_t *input, size_t input_len,
                              const uint32_t key[8], uint32_t flags,
                              uint8_t out[32]) {
     uint32_t cv_stack[54][8];
-    size_t stack_len = 0;
+    size_t stack_len = 0,stack_used=0;
     uint64_t chunk_count = input_len == 0 ? 1 : (input_len + 1023) / 1024;
 
     for (uint64_t chunk = 0; chunk + 1 < chunk_count; chunk++) {
@@ -174,9 +182,13 @@ static void b3_hash_internal(const uint8_t *input, size_t input_len,
             b3_output_t parent =
                 b3_parent_output(cv_stack[--stack_len], cv, key, flags);
             b3_output_cv(&parent, cv);
+            OPENSSL_cleanse(&parent,sizeof(parent));
             total_chunks >>= 1;
         }
         memcpy(cv_stack[stack_len++], cv, sizeof(cv));
+        if (stack_len > stack_used) stack_used=stack_len;
+        OPENSSL_cleanse(cv,sizeof(cv));
+        OPENSSL_cleanse(&chunk_out,sizeof(chunk_out));
     }
 
     uint64_t last_chunk = chunk_count - 1;
@@ -189,8 +201,11 @@ static void b3_hash_internal(const uint8_t *input, size_t input_len,
         uint32_t right[8];
         b3_output_cv(&output, right);
         output = b3_parent_output(cv_stack[--stack_len], right, key, flags);
+        OPENSSL_cleanse(right,sizeof(right));
     }
     b3_output_root(&output, out);
+    OPENSSL_cleanse(&output,sizeof(output));
+    OPENSSL_cleanse(cv_stack,stack_used*sizeof(cv_stack[0]));
 }
 
 void blake3_hash(const uint8_t *input, size_t input_len, uint8_t out[32]) {
@@ -209,4 +224,6 @@ void blake3_derive_key(const uint8_t *context, size_t context_len,
     }
     b3_hash_internal(key_material, key_material_len, context_words,
                      B3_DERIVE_KEY_MATERIAL, out);
+    OPENSSL_cleanse(context_key,sizeof(context_key));
+    OPENSSL_cleanse(context_words,sizeof(context_words));
 }
