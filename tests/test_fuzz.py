@@ -79,6 +79,31 @@ def seeds():
         'dc01d6432a2b799bd7c4ca22575a36af9c91098c7e2039a172b928ce39c5223a9048fcda32fde30ab3778dd14b',
         '8e739d3ecdca9a91f13b0d502be14505dfbe2dd4de1d95f19597ba58acd8ab0183000102030405060708090a0b0c0d0e0f10')]
     vmess_frames.append(b'\x02\xbc\x91'+b'v'*16384)
+    ss_uris=[]; ss_frames=[]
+    ss_methods=('aes-128-gcm','aes-256-gcm','chacha20-poly1305','xchacha20-poly1305','2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm','2022-blake3-chacha20-poly1305')
+    for index,method in enumerate(ss_methods):
+        password=base64.b64encode(bytes(range(16 if index==4 else 32))).decode() if index>=4 else 'Exact+Pass:%@\x00Z'
+        raw=(method+':'+password).encode()
+        settings=('type=tcp','type=ws&security=tls&ed=16384','type=grpc&mode=multi','type=xhttp&mode=stream-up&extra='+quote(json.dumps({'downloadSettings':download,'xmux':{'maxConnections':1}}),safe=''))
+        for query in settings: ss_uris.append(('ss://'+method+':'+quote(password,safe='')+'@127.0.0.1:443?'+query).encode())
+        ss_uris.extend((b'ss://'+base64.urlsafe_b64encode(raw).rstrip(b'=')+b'@127.0.0.1:443',b'ss://'+base64.b64encode(raw+b'@127.0.0.1:443')))
+    ss_uris.extend((b'ss://aes-128-gcm:%GG@127.0.0.1:1',b'ss://aes-128-gcm:fixture@host:18446744073709551616',b'ss://aes-128-gcm:fixture@127.0.0.1:1?plugin=obfs-local',b'ss://aes-128-gcm:fixture@127.0.0.1:1?type=ws&host=bad%0D%0AInjected',b'ss://e3+_',b'ss://Zh==@host:1',b'ss://Zm9=@host:1'))
+    for method in (ss_methods[4],ss_methods[5]):
+        key=base64.b64encode(bytes(range(16 if method==ss_methods[4] else 32))).decode()
+        ss_uris.append(('ss://'+method+':'+quote(key+':'+key,safe='')+'@127.0.0.1:443?type=grpc').encode())
+    for index,body,response in (
+        (0,"266d2a80c7fd99dcfb3249967bd3313c87b484aba1bfca2a4f531230507f8c9a29cc6c1f2965dcd86e2c965e8072c5","404142434445464748494a4b4c4d4e4f266d2a80c7fd99dcfb3249967bd3313c87b484aba1bfca2a4f531230507f8c9a29cc6c1f2965dcd86e2c965e8072c5dfa53b96279ffa3143f473a0462602c5ebd29348ea83ef8091b9a031b6d9de1045955e660ab6bb5e90e265e429d9"),
+        (1,"97d9cda78b3058c4c80942593103c6be1ccfc0cabf16cf4b6c14c50609fdf2937d81f0cad506b0354484d5cba15bdd","404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f97d9cda78b3058c4c80942593103c6be1ccfc0cabf16cf4b6c14c50609fdf2937d81f0cad506b0354484d5cba15bdd47a6f6ce1e154b43753f109974a8ec8d15f130647b33547bb95c2d23e6baa70ceb1b35a223a27867315c0394ce70"),
+        (2,"dd1c85d79776394c72ca12d3c51cf04e1621df730e6229883f03a4d5773705f4d14be91717c769bd40f0f5f96df703","404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5fdd1c85d79776394c72ca12d3c51cf04e1621df730e6229883f03a4d5773705f4d14be91717c769bd40f0f5f96df7036daf866ee3d2612e3ea8c1b54352433cde51278f818b3613ee7c381f4909f3870a065210c2cf3dd3c179df20b4cf"),
+        (3,"20f2657210cfa465f93243672e22e04a1f817fb71e20f3f537840429124fbb18d804e65c599219403b6561e411e294","404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f20f2657210cfa465f93243672e22e04a1f817fb71e20f3f537840429124fbb18d804e65c599219403b6561e411e2946e7ae35f7efc725b8642b55d8909796c7642ab1ced2cee5024c72827d7edf4818d788ffa7fc60e18f83edfdd80e5"),
+        (4,"b3c1d115a289a7778ae5b585c21db9cbb8028d89307aff609adc567cf3332abade20c0087287def15fff9333c83a90","404142434445464748494a4b4c4d4e4fb2ccc846e965a2bc8775985da611ffac72d16ed35d9ee9508c17579870b357873c7c2d34fefcc1cae5b62d8d89307aff609adc567cf3332abade20c0087287def15fff9333c83a90a9baa63c07f795de3e3d985ed03519bacaef44ec5794369f1629e838ba7144e5beeb0b0239618cabcb2b217775be"),
+        (5,"6979367a806c4e71f5748fb987d37a087973ee3f9a95589ef11e29b1b4b65cd441ae72513e3fac4257631de3b76795","404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6874e6d351c385cfdec5657e74cdd8d6e213ca4c516d9791abe084c67b686072adf59e1ba989c7d388a03b55da9dfcc993414b06bea8bee33b128dee3f9a95589ef11e29b1b4b65cd441ae72513e3fac4257631de3b76795a76c2aaa26b57fb3828fa64012b40823a74903e5332a1f3edfb09d378774b75f7dd01d162838281094c8165e2b03"),
+        (6,"d9bb8965a13fff0a1358e72ebdf5ba789efabec84bf80917d441239339744abb0ace2a45e9ab49067441e83d293f8d","404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5fd8b69a4c76f623b46df89be78ef143d0ce97372ce44fdcedd8b829ca033b1b58b6769b8a7aabf76667ef716640327662ec5d470d461740c24e50f6bec84bf80917d441239339744abb0ace2a45e9ab49067441e83d293f8d98e8b3a9891e8c69f8ac91b93387aa1582d5aaaf75e3a70dfbfb03a1e6d3408558f744443dbb6912f69c76ca14ca"),
+    ):
+        for flag,wire in ((index|64,body),(index,response),(index|192,body),(index|224,body)):
+            value=bytes([flag])+bytes.fromhex(wire); ss_frames.extend((value,value[:-1],value[:-1]+bytes([value[-1]^1])))
+    ss_frames.extend((b'\x44'+bytes(16)+bytes(65535),b'\x86'+bytes(64),b'\xc0'+bytes(64),b'\xe0'+bytes(64)))
+
     return {
         "arguments":[b"--version",b"-v",b"--version\x00--version",
                      b"--uri\x00socks5://127.0.0.1:1080#vless-core\x00--listen-port\x001080",
@@ -89,7 +114,7 @@ def seeds():
                      b"--uri-fd\x000\x00--xray-version\x004294967296.6.27",
                      b"--uri-fd\x000\x00--xray-version\x001.2.18446744073709551616",
                      b"--uri-fd\x000\x00--xray-version\x001.+2.3"],
-        "uri":[*vmess_uris,b"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=auto",
+        "uri":[*ss_uris,*vmess_uris,b"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=auto",
                b"vmess://00000000-0000-0000-0000-000000000001@[::1]:65535?scy=zero&aid=0",
                b"vmess://"+base64.b64encode(b'{"v":"2","add":"127.0.0.1","port":443,"id":"00000000-0000-0000-0000-000000000001","aid":"0","scy":"auto","net":"tcp","tls":""}'),
                b"vmess://e31=",b"vmess://e3+_",b"vmess://e30===",
@@ -151,6 +176,7 @@ def seeds():
                b"\x04\x00\x00\x0e\x00\x00\x00\x3c\x00\x00\x00\x00\x00\x00\x01x\x00\x00\x18\x00\x00\x01\x01",
                b"\x18\x00\x00\x01\x01\x04\x00\x00\x0e\x00\x00\x00\x3c\x00\x00\x00\x00\x00\x00\x01x\x00\x00"],
         "encryption":[b"\x02vless-core",b"\x03vless-core",b"\x06vless-core",b"\x07vless-core",b"\x0bvless-core",b"\x12vless-core",b"\x16vless-core",bytes(21)],
+        "shadowsocks":ss_frames,
         "vmess":[bytes([index])+bytes.fromhex(wire) for index,wire in (
             (0,"8e739d3ecdca9a91f13b0d502be14505dfbe2dd4de1d95f19597ba58acd8ab0183000102030405060708090a0b0c0d0e0f10"),
             (1,"8e73e9de6f49187cc2fd3924770f46360c94c95a8bc51bb435194c8de1c431c87f000102030405060708090a0b0c0d0e0f10"),
@@ -171,7 +197,7 @@ class FuzzTests(unittest.TestCase):
                 for index, sample in enumerate(samples):
                     (corpus/str(index)).write_bytes(sample)
                 log = BUILD/f"fuzz-{parser}-{time.monotonic_ns()}.log"
-                command = [str(binary),str(corpus),f"-runs={runs}","-seed=13371337",f"-max_len={16400 if parser == 'vmess' else 4096}","-timeout=3",
+                command = [str(binary),str(corpus),f"-runs={runs}","-seed=13371337",f"-max_len={65536 if parser == 'shadowsocks' else 16400 if parser == 'vmess' else 4096}","-timeout=3",
                            "-rss_limit_mb=1024",f"-artifact_prefix={BUILD}/fuzz-{parser}-"]
                 environment = dict(os.environ,VC_FUZZ_PARSER=parser,ASAN_OPTIONS="detect_leaks=1",UBSAN_OPTIONS="halt_on_error=1",DEBUGINFOD_URLS="")
                 with log.open("wb") as output:

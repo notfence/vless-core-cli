@@ -83,6 +83,16 @@ int main(void) {
     config.protocol=CORE_PROTOCOL_VMESS; memset(config.uuid,0x5b,sizeof(config.uuid)); config.vmess_security=CORE_VMESS_CHACHA20_POLY1305;
     CHECK("vmess/download-preserves-protocol-uuid-and-cipher",!core_xhttp_download_config(&config,&download,error,sizeof(error)) && download.protocol == CORE_PROTOCOL_VMESS && download.vmess_security == CORE_VMESS_CHACHA20_POLY1305 && !memcmp(download.uuid,config.uuid,sizeof(config.uuid)));
     CHECK("vmess/download-keeps-independent-protection",!strcmp(download.security,"none") && !download.encryption_enabled && !download.flow[0] && download.ignore_server_ips);
+    config.protocol=CORE_PROTOCOL_SHADOWSOCKS; config.encryption_enabled=0; config.flow[0]=0;
+    for (unsigned method=0;method<7;method++) {
+        memset(config.encryption_relays,0,sizeof(config.encryption_relays)); config.ss.method=(core_ss_method_t)method;
+        size_t size=core_ss_key_size(config.ss.method);
+        config.ss.count=core_ss_is_2022(config.ss.method) && config.ss.method!=CORE_SS_2022_CHACHA20_POLY1305 ? 3 : 1;
+        memset(config.ss.keys,0x42,config.ss.count*size);
+        CHECK("ss/download-preserves-method-and-effective-key-chain",!core_xhttp_download_config(&config,&download,error,sizeof(error)) && download.protocol==CORE_PROTOCOL_SHADOWSOCKS && download.ss.method==config.ss.method && download.ss.count==config.ss.count && !memcmp(download.ss.keys,config.ss.keys,config.ss.count*size));
+        CHECK("ss/download-keeps-independent-protection-and-pins",!strcmp(download.security,"none") && !download.encryption_enabled && !download.flow[0] && download.ignore_server_ips && download.xhttp_download_only);
+    }
+    memset(config.encryption_relays,0,sizeof(config.encryption_relays)); memset(download.encryption_relays,0,sizeof(download.encryption_relays));
     CHECK("download/stream-one-rejected",parent(extra,"&mode=stream-one",&config,error) != 0 && strstr(error,"stream-one"));
     CHECK("download/reality-auto-selects-stream-up",parent(extra,"&security=reality&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",&config,error) == 0 && !strcmp(config.xhttp_mode,"stream-up"));
     CHECK("download/explicit-query-overrides-extra",parent(extra,"&downloadSettings=%7B%22address%22%3A%22127.0.0.1%22%2C%22port%22%3A443%2C%22network%22%3A%22xhttp%22%7D",&config,error) == 0 && core_xhttp_download_config(&config,&download,error,sizeof(error)) == 0 && !download.ignore_server_ips);

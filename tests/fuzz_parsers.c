@@ -8,12 +8,14 @@
 #include "vless.h"
 #include "trojan.h"
 #include "../src/vmess_internal.h"
+#include "../src/shadowsocks_internal.h"
 #include "xhttp_download.h"
 #include "xhttp_padding.h"
 #include "cli_args.h"
 
-static const char *const fuzz_names[] = {"uri", "hpack", "h2", "grpc", "http", "xhttp", "ws", "vision", "tls", "arguments", "vmess"};
+static const char *const fuzz_names[] = {"uri", "hpack", "h2", "grpc", "http", "xhttp", "ws", "vision", "tls", "arguments", "vmess", "shadowsocks"};
 static size_t fuzz_target;
+int64_t __wrap_core_ss_time(void) { return 1700000000; }
 
 int LLVMFuzzerInitialize(int *argc, char ***argv) {
     (void)argc;
@@ -54,6 +56,53 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                      .h2_peer_initial_window = H2_DEFAULT_WINDOW, .h2_peer_stream_window = H2_DEFAULT_WINDOW,
                      .h2_peer_conn_window = H2_DEFAULT_WINDOW};
     switch (fuzz_target) {
+    case 11: {
+        core_ss_method_t method=(core_ss_method_t)(size ? (data[0]&7)%7 : 0);
+        uint8_t master[32],salt[32],keys[96],wire[8192],plain[256];
+        for (unsigned i=0;i<32;i++) master[i]=(uint8_t)i,salt[i]=(uint8_t)(i+64);
+        for (unsigned i=0;i<sizeof(keys);i++) keys[i]=(uint8_t)i;
+        core_buffer_budget_t memory={0}; core_ss_body_t incoming={0},outgoing={0};
+        if (core_buffer_budget_init(&memory,CORE_BUFFER_RELAY,0) || core_ss_body_init(&incoming,method,master,0,master,&memory)) abort();
+        if (size && (data[0]&64)) {
+            if (core_ss_subkey(method,master,salt,incoming.key)) abort();
+            incoming.stage=CORE_SS_LENGTH; incoming.needed=18; incoming.started=incoming.response_ready=1;
+        }
+        if (size && (data[0]&128)) { memset(incoming.nonce,255,core_ss_nonce_size(method)); if (data[0]&32) incoming.nonce[0]=254; }
+        size_t offset=size ? 1 : 0;
+        while (offset<size || incoming.plain_length) {
+            size_t got=0;
+            if (incoming.plain_length) { if (core_ss_body_read(&incoming,plain,sizeof(plain),&got)) break; if (!got) abort(); continue; }
+            uint8_t *span=NULL; size_t capacity=0;
+            if (core_ss_body_prepare(&incoming,&span,&capacity) || !capacity) break;
+            size_t take=size-offset,fragment=1+(size ? data[size-1]%64 : 0);
+            if (take>capacity) take=capacity;
+            if (take>fragment) take=fragment;
+            memcpy(span,data+offset,take); offset+=take;
+            if (core_ss_body_commit(&incoming,take)) break;
+        }
+        (void)core_ss_body_eof(&incoming); core_ss_body_clear(&incoming);
+        if (core_buffer_budget_clear(&memory)) abort();
+        size_t count=core_ss_is_2022(method) && method!=CORE_SS_2022_CHACHA20_POLY1305 && size && (data[0]&16) ? 3 : 1;
+        if (core_ss_body_init(&outgoing,method,keys+(count-1)*core_ss_key_size(method),1,NULL,NULL)) abort();
+        size_t first=size ? size-1 : 0; if (first>512) first=512;
+        size_t written=0;
+        if (!core_ss_request(&outgoing,keys,count,"example.test",443,size ? data+1 : NULL,first,wire,sizeof(wire),&written)) {
+            if (written>sizeof(wire)) abort();
+            if (size && (data[0]&128)) { memset(outgoing.nonce,255,core_ss_nonce_size(method)); if (data[0]&32) outgoing.nonce[0]=254; }
+            offset=size ? 1 : 0;
+            while (offset<size) {
+                size_t consumed=0;
+                if (core_ss_body_encode(&outgoing,data+offset,size-offset,&consumed,wire,sizeof(wire),&written)) break;
+                if (!consumed || consumed>size-offset || written>sizeof(wire)) abort();
+                offset+=consumed;
+            }
+        }
+        core_ss_body_clear(&outgoing); OPENSSL_cleanse(master,sizeof(master)); OPENSSL_cleanse(keys,sizeof(keys)); OPENSSL_cleanse(wire,sizeof(wire)); OPENSSL_cleanse(plain,sizeof(plain));
+        size_t bytes,reserved; core_buffer_snapshot(CORE_BUFFER_RELAY,&bytes,&reserved);
+        if (bytes || reserved) abort();
+        break;
+    }
+
     case 10: {
         core_vmess_header_t header={.ready=1,.security=(core_vmess_security_t)(3+(size ? data[0]%4 : 0))};
         for (unsigned i=0;i<16;i++) header.request_key[i]=header.response_key[i]=(uint8_t)i,header.request_iv[i]=header.response_iv[i]=(uint8_t)(i+16);
@@ -138,6 +187,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 (void)core_vmess_request(&header,config.uuid,config.server_host,config.server_port,config.vmess_security,wire,capacity,&written);
                 if (written > capacity) abort();
                 core_vmess_header_clear(&header); OPENSSL_cleanse(wire,sizeof(wire));
+            }
+            if (config.protocol == CORE_PROTOCOL_SHADOWSOCKS) {
+                core_ss_body_t state={0}; uint8_t wire[8192]; size_t written=0,capacity=size>1 ? ((size_t)data[0]<<8|data[1])%8193 : 0;
+                size_t key_size=core_ss_key_size(config.ss.method);
+                if (!core_ss_body_init(&state,config.ss.method,config.ss.keys+(config.ss.count-1)*key_size,1,NULL,NULL)) {
+                    (void)core_ss_request(&state,config.ss.keys,config.ss.count,config.server_host,config.server_port,NULL,0,wire,capacity,&written);
+                    if (written>capacity) abort();
+                }
+                core_ss_body_clear(&state); OPENSSL_cleanse(wire,sizeof(wire));
             }
             if (config.xhttp_download_settings[0]) {
                 vless_config_t download;

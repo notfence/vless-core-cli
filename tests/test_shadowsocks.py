@@ -2,6 +2,7 @@ import base64
 import concurrent.futures
 import contextlib
 import hashlib
+import json
 import os
 import socket
 import subprocess
@@ -308,6 +309,194 @@ class ShadowsocksGRPCTests(unittest.TestCase):
                     return
             with self.subTest(trailers=trailers),f.Server(handler) as peer,f.cli(f.uri(peer.port,'grpc','none',protocol='shadowsocks')) as core:
                 with f.socks_connect(core.port,80) as tunnel:
-                    tunnel.sendall(b'payload'); self.assertEqual(tunnel.recv(1),b'')
+                    tunnel.sendall(b'payload')
+                    try: response=tunnel.recv(1)
+                    except ConnectionResetError: response=b''
+                    self.assertEqual(response,b'')
                 self.assertTrue(seen); self.assertNotIn('VLESS response',core.log)
                 self.assertRegex(core.wait_log('reset' if trailers is None else 'grpc-status'),r'reset|grpc-status')
+
+
+class ShadowsocksXHTTPTests(unittest.TestCase):
+    def test_inspect_download_is_private_offline_and_has_no_pin_side_effect(self):
+        import os
+        import subprocess
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method); pin=f.PRIVATE/('ss-inspect-'+method)
+            download=dict(address='download.invalid',port=8443,network='xhttp',security='tls',tlsSettings=dict(serverName='download.invalid'),xhttpSettings=dict(path='/download'))
+            value=f.uri(443,'xhttp','tls',protocol='shadowsocks',ss_method=method,password=password,mode='stream-up',extra=json.dumps(dict(downloadSettings=download))).replace('@127.0.0.1:','@upload.invalid:')
+            environment=dict(os.environ,VLESS_XHTTP_TLS_MODE='tofu',VLESS_XHTTP_PIN_FILE=str(pin))
+            result=subprocess.run([str(f.BUILD/'vless-core-test'),'--inspect-config','--uri-fd','0'],input=value,text=True,capture_output=True,timeout=3,env=environment)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(result.stdout,'CONFIG\t1\nPRIMARY\tupload.invalid\t443\nDOWNLOAD\tdownload.invalid\t8443\nEND\n')
+            self.assertNotIn(password,result.stdout+result.stderr); self.assertFalse(pin.exists())
+
+    def test_cancelled_clients_release_resources_and_keep_neighbors(self):
+        from pathlib import Path
+        import struct
+        certificate,_=f.certificate()
+        def handler(connection):
+            connection.settimeout(2)
+            try: connection.sendall(f.exact(connection,4))
+            except (ConnectionError,EOFError,TimeoutError): pass
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for transport,mode in (('tcp',None),('ws',None),('grpc','multi'),('xhttp','stream-one'),('xhttp','packet-up')):
+                settings=dict(protocol='shadowsocks',ss_method=method,password=password)
+                if mode: settings['mode']=mode
+                if transport=='xhttp': settings['extra']=json.dumps({'xmux':{'maxConnections':1}})
+                with self.subTest(method=method,transport=transport,mode=mode),f.Server(handler) as target,f.xray_server(transport,'tls',mode=mode,protocol='shadowsocks',ss_method=method,password=password) as reference,f.cli(f.uri(reference.port,transport,'tls',**settings),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    descriptors=Path(f'/proc/{core.process.pid}/fd'); tasks=Path(f'/proc/{core.process.pid}/task')
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        f.exchange(tunnel,b'ping'); self.assertEqual(tunnel.recv(1),b'')
+                    time.sleep(.2); baseline=(len(list(descriptors.iterdir())),len(list(tasks.iterdir())))
+                    for _ in range(16):
+                        tunnel=f.socks_connect(core.port,target.port)
+                        tunnel.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('ii',1,0)); tunnel.sendall(b'ping'); tunnel.close()
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        f.exchange(tunnel,b'ping'); self.assertEqual(tunnel.recv(1),b'')
+                    until=time.monotonic()+3
+                    while True:
+                        current=(len(list(descriptors.iterdir())),len(list(tasks.iterdir())))
+                        if current[0]<=baseline[0] and current[1]<=baseline[1]: break
+                        self.assertLess(time.monotonic(),until,f'cancelled SS clients retained resources: {baseline} -> {current}'); time.sleep(.01)
+
+    def test_direct_and_block_keep_routing_without_upstream(self):
+        payload=b'\x00\x00SS routing'+bytes(range(251))*128
+        def handler(connection):
+            received=bytearray()
+            while True:
+                data=connection.recv(65536)
+                if not data: break
+                received.extend(data)
+            self.assertEqual(bytes(received),payload); connection.sendall(hashlib.sha256(received).digest())
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for transport in ('tcp','ws','grpc','xhttp'):
+                value=f.uri(1,transport,'tls',protocol='shadowsocks',ss_method=method,password=password)
+                with self.subTest(method=method,transport=transport),f.Server(handler) as target:
+                    with f.cli(value,extra=['--routing','1;direct;0']) as core:
+                        with f.socks_connect(core.port,target.port) as tunnel:
+                            tunnel.sendall(payload); tunnel.shutdown(socket.SHUT_WR)
+                            self.assertEqual(f.exact(tunnel,32),hashlib.sha256(payload).digest()); self.assertEqual(tunnel.recv(1),b'')
+                    with f.cli(value,extra=['--routing','1;block;0']) as core:
+                        with self.assertRaisesRegex(AssertionError,'SOCKS CONNECT failed'): f.socks_connect(core.port,target.port)
+
+    def test_long_psk_normalization_matches_xray(self):
+        import base64
+        certificate,_=f.certificate()
+        for method in f.SHADOWSOCKS_METHODS[4:]:
+            size=16 if method.endswith('128-gcm') else 32
+            for length in (size+1,64):
+                password=base64.b64encode(bytes(range(length))).decode()
+                for transport,mode in (('tcp',None),('ws',None),('grpc','multi'),('xhttp','packet-up')):
+                    with self.subTest(method=method,length=length,transport=transport),f.Server() as target,f.xray_server(transport,'tls',mode=mode,protocol='shadowsocks',ss_method=method,password=password) as reference:
+                        parameters=dict(protocol='shadowsocks',ss_method=method,password=password)
+                        if mode: parameters['mode']=mode
+                        with f.cli(f.uri(reference.port,transport,'tls',**parameters),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                            with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'\x00\x00normalized PSK'+bytes(range(256))*256)
+
+    def test_sip023_chains_keep_identity_across_transports(self):
+        import base64
+        import contextlib
+        certificate,_=f.certificate()
+        for method in ('2022-blake3-aes-128-gcm','2022-blake3-aes-256-gcm'):
+            size=16 if method.endswith('128-gcm') else 32
+            keys=[base64.b64encode(bytes(range(i,i+size))).decode() for i in range(3)]
+            for transport,mode in (('ws',None),('grpc','gun'),('grpc','multi'),('xhttp','stream-up'),('xhttp','packet-up')):
+                for count in (2,3):
+                    with self.subTest(method=method,transport=transport,mode=mode,count=count),contextlib.ExitStack() as stack:
+                        target=stack.enter_context(f.Server())
+                        if count==3:
+                            leaf=stack.enter_context(f.xray_server('tcp','none',protocol='shadowsocks',ss_method=method,password=keys[1],ss_users=[{'password':keys[2]}]))
+                            users=[{'password':keys[1],'address':'127.0.0.1','port':leaf.port}]
+                        else: users=[{'password':keys[1]}]
+                        reference=stack.enter_context(f.xray_server(transport,'tls',mode=mode,protocol='shadowsocks',ss_method=method,password=keys[0],ss_users=users))
+                        parameters=dict(protocol='shadowsocks',ss_method=method,password=':'.join(keys[:count]))
+                        if mode: parameters['mode']=mode
+                        if transport=='xhttp': parameters['extra']=json.dumps({'xmux':{'maxConnections':1}})
+                        core=stack.enter_context(f.cli(f.uri(reference.port,transport,'tls',**parameters),environment={'VLESS_CA_BUNDLE':str(certificate)}))
+                        for _ in range(2):
+                            with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'\x00\x00SIP023 transport'+bytes(range(256))*512)
+
+    def test_xhttp_methods_modes_security_and_private_connections(self):
+        certificate,_=f.certificate(); data=b'\x00\x00SS XHTTP'+bytes(range(256))*512
+        for method in f.SHADOWSOCKS_METHODS:
+            password=f.shadowsocks_password(method)
+            for security,alpn in (('none',None),('tls','h2'),('tls','http/1.1'),('reality',None)):
+                for mode in ('stream-one','stream-up','packet-up'):
+                    for pooled in (False,True):
+                        options=dict(protocol='shadowsocks',ss_method=method,password=password,mode=mode,extra=json.dumps({'xmux':{'maxConnections':1}}) if pooled else '{}')
+                        if alpn: options['alpn']=alpn
+                        with self.subTest(method=method,security=security,alpn=alpn,mode=mode,pooled=pooled),f.Server() as target,f.xray_server('xhttp',security,mode=mode,protocol='shadowsocks',ss_method=method,password=password) as reference,f.CountingProxy(reference.port) as proxy,f.cli(f.uri(proxy.port,'xhttp',security,**options),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                            for index in range(2):
+                                with f.socks_connect(core.port,target.port) as tunnel:
+                                    f.exchange(tunnel,data+bytes([index])); f.exchange(tunnel,b'last XHTTP bytes')
+                            if not pooled: self.assertGreaterEqual(len(proxy.connections),2)
+                            self.assertNotIn('VLESS response',core.log)
+
+    def test_xhttp_server_first_last_bytes_and_reuse(self):
+        certificate,_=f.certificate()
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for mode in ('stream-one','stream-up','packet-up'):
+                for pooled in (False,True):
+                    def handler(connection):
+                        time.sleep(.1); connection.sendall(b'\x00\x00server-first')
+                        self.assertEqual(f.exact(connection,7),b'client!'); time.sleep(.1); connection.sendall(b'last')
+                    options=dict(protocol='shadowsocks',ss_method=method,password=password,mode=mode,extra=json.dumps({'xmux':{'maxConnections':1}}) if pooled else '{}')
+                    with self.subTest(method=method,mode=mode,pooled=pooled),f.Server(handler) as target,f.xray_server('xhttp','tls',mode=mode,protocol='shadowsocks',ss_method=method,password=password) as reference,f.CountingProxy(reference.port) as proxy,f.cli(f.uri(proxy.port,'xhttp','tls',**options),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        for _ in range(2):
+                            with f.socks_connect(core.port,target.port) as tunnel:
+                                self.assertEqual(f.exact(tunnel,14),b'\x00\x00server-first'); tunnel.sendall(b'client!')
+                                self.assertEqual(f.exact(tunnel,4),b'last'); self.assertEqual(tunnel.recv(1),b'')
+                        if pooled: self.assertEqual(len(proxy.connections),1)
+
+    def test_xhttp_independent_download_security_and_pins(self):
+        certificate,_=f.certificate(); shared=dict(sessionIDPlacement='header',seqPlacement='header')
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for mode in ('stream-up','packet-up'):
+                for upload_tls,download_tls in ((False,False),(True,False),(False,True)):
+                    for pooled in (False,True):
+                        with self.subTest(method=method,mode=mode,upload_tls=upload_tls,download_tls=download_tls,pooled=pooled),f.Server() as target,f.xray_server('xhttp','none',path='/',protocol='shadowsocks',ss_method=method,password=password,**shared) as reference,f.CountingProxy(reference.port,tls=upload_tls) as upload,f.CountingProxy(reference.port,address='127.0.0.2',tls=download_tls) as download:
+                            settings=dict(address='download.invalid',port=download.port,network='xhttp',security='tls' if download_tls else 'none',xhttpSettings=dict(path='/download',**shared))
+                            if download_tls: settings['tlsSettings']=dict(serverName='vless-core.test',alpn=['http/1.1'])
+                            extra=dict(downloadSettings=settings,**shared)
+                            if pooled: extra['xmux']=dict(maxConnections=1)
+                            options=dict(protocol='shadowsocks',ss_method=method,password=password,mode=mode,path='/upload',extra=json.dumps(extra))
+                            if upload_tls: options['alpn']='http/1.1'
+                            config=f.uri(upload.port,'xhttp','tls' if upload_tls else 'none',**options).replace('@127.0.0.1:','@upload.invalid:')
+                            with f.cli(config,extra=['--server-ips','127.0.0.1','--download-server-ips','127.0.0.2'],environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                                with f.socks_connect(core.port,target.port) as tunnel:
+                                    f.exchange(tunnel,b'\x00\x00independent SS download'+bytes(range(251))*1100)
+                                    f.exchange(tunnel,b'nonce state preserved between POSTs')
+                                self.assertTrue(upload.connections); self.assertTrue(download.connections)
+
+    def test_xhttp_reality_download_and_parallel_sessions(self):
+        shared=dict(sessionIDPlacement='header',seqPlacement='header')
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for mode in ('stream-up','packet-up'):
+                for pooled in (False,True):
+                    with self.subTest(method=method,mode=mode,pooled=pooled),f.Server() as target,f.xray_server('xhttp','reality',path='/',protocol='shadowsocks',ss_method=method,password=password,**shared) as reference,f.CountingProxy(reference.port) as upload,f.CountingProxy(reference.port,address='127.0.0.2') as download:
+                        settings=dict(address='download.invalid',port=download.port,network='xhttp',security='reality',realitySettings=dict(serverName='vless-core.test',publicKey=f.PUBLIC_KEY,shortId='01020304',fingerprint='firefox'),xhttpSettings=dict(path='/download',**shared))
+                        extra=dict(downloadSettings=settings,**shared)
+                        if pooled: extra['xmux']=dict(maxConnections=1)
+                        config=f.uri(upload.port,'xhttp','reality',protocol='shadowsocks',ss_method=method,password=password,mode=mode,path='/upload',extra=json.dumps(extra)).replace('@127.0.0.1:','@upload.invalid:')
+                        with f.cli(config,extra=['--server-ips','127.0.0.1','--download-server-ips','127.0.0.2']) as core:
+                            def transfer(index):
+                                with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'\x00\x00separate SS REALITY download'+bytes([index])+bytes(range(251))*1100)
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers: list(workers.map(transfer,range(4)))
+                            self.assertTrue(upload.connections); self.assertTrue(download.connections)
+
+    def test_xhttp_head_packet_responses(self):
+        certificate,_=f.certificate()
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for security,alpn in (('none',None),('tls','h2'),('tls','http/1.1')):
+                for pooled in (False,True):
+                    options=dict(protocol='shadowsocks',ss_method=method,password=password,mode='packet-up',uplinkHTTPMethod='HEAD',extra=json.dumps({'xmux':{'maxConnections':1}}) if pooled else '{}')
+                    if alpn: options['alpn']=alpn
+                    with self.subTest(method=method,security=security,alpn=alpn,pooled=pooled),f.Server() as target,f.xray_server('xhttp',security,mode='packet-up',protocol='shadowsocks',ss_method=method,password=password,uplinkHTTPMethod='HEAD') as reference,f.cli(f.uri(reference.port,'xhttp',security,**options),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'\x00\x00SS HEAD acknowledgement'+bytes(range(251))*1100)

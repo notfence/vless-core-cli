@@ -186,7 +186,7 @@ $(HOST_BUILD_DIR)/fuzz_encryption.o: $(ROOT)/tests/fuzz_encryption.c | requireme
 	$(FUZZ_CC) $(FUZZ_FLAGS) -MMD -MP -c $< -o $@
 
 $(FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_parsers.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(FUZZ_OBJ) $(HOST_LIB_FILES)
-	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
+	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS) -Wl,--wrap=core_ss_time
 
 $(ENCRYPTION_FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_encryption.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(filter-out $(HOST_BUILD_DIR)/fuzz-src/vless_encryption.o $(HOST_BUILD_DIR)/fuzz-src/vmess_stream.o $(HOST_BUILD_DIR)/fuzz-src/shadowsocks_stream.o $(HOST_BUILD_DIR)/fuzz-src/protocol_stream.o,$(FUZZ_OBJ)) $(HOST_LIB_FILES)
 	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
