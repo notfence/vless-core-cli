@@ -13,6 +13,13 @@ typedef enum {
     CORE_SS_2022_CHACHA20_POLY1305
 } core_ss_method_t;
 
+#define CORE_SS_KEY_BYTES 3072
+typedef struct {
+    core_ss_method_t method;
+    size_t count;
+    uint8_t keys[CORE_SS_KEY_BYTES];
+} core_ss_credentials_t;
+
 int core_ss_method(const char *,core_ss_method_t *);
 size_t core_ss_key_size(core_ss_method_t);
 size_t core_ss_nonce_size(core_ss_method_t);

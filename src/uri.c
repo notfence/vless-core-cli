@@ -324,6 +324,10 @@ int core_config_parameter(vless_config_t *cfg,const char *key,const char *decode
         int result=core_vmess_parameter(cfg,key,decoded,err,err_cap);
         if (result) return result < 0 ? -1 : 0;
     }
+    if (cfg->protocol == CORE_PROTOCOL_SHADOWSOCKS) {
+        int result=core_ss_parameter(cfg,key,decoded,err,err_cap);
+        if (result) return result < 0 ? -1 : 0;
+    }
     if (!strcmp(key,"extra")) return cfg->transport_mode == TRANSPORT_XHTTP ? core_xhttp_extra(cfg,decoded,err,err_cap) : 0;
     char decoded_lower[4096];
     copy_lower_trunc(decoded_lower, sizeof(decoded_lower), decoded);
@@ -949,6 +953,7 @@ int parse_core_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_c
         set_err(err, err_cap, "null input");
         return -1;
     }
+    if (starts_with_ci(uri, "ss://")) return core_ss_parse_uri(uri,cfg,err,err_cap);
     if (starts_with_ci(uri, "vmess://")) return core_vmess_parse_uri(uri,cfg,err,err_cap);
     if (starts_with_ci(uri, "trojan://")) return parse_trojan_uri(uri,cfg,err,err_cap);
     if (starts_with_ci(uri, "socks5://")) {
@@ -957,6 +962,6 @@ int parse_core_uri(const char *uri, vless_config_t *cfg, char *err, size_t err_c
     if (starts_with_ci(uri, "vless://")) {
         return parse_vless_uri(uri, cfg, err, err_cap);
     }
-    set_err(err, err_cap, "URI must start with vless://, vmess://, trojan://, or socks5://");
+    set_err(err, err_cap, "URI must start with vless://, vmess://, trojan://, ss://, or socks5://");
     return -1;
 }

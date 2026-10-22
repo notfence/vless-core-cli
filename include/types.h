@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "vmess.h"
+#include "shadowsocks.h"
 
 typedef enum {
     FP_CHROME = 0,
@@ -25,7 +26,8 @@ typedef enum {
     CORE_PROTOCOL_VLESS = 0,
     CORE_PROTOCOL_SOCKS5 = 1,
     CORE_PROTOCOL_TROJAN = 2,
-    CORE_PROTOCOL_VMESS = 3
+    CORE_PROTOCOL_VMESS = 3,
+    CORE_PROTOCOL_SHADOWSOCKS = 4
 } core_protocol_t;
 
 #define VLESS_ENCRYPTION_MAX_RELAYS 4
@@ -115,7 +117,10 @@ typedef struct {
     int encryption_zero_rtt;
     vless_encryption_padding_t encryption_padding[VLESS_ENCRYPTION_MAX_PADDING];
     size_t encryption_padding_count;
-    vless_encryption_relay_t encryption_relays[VLESS_ENCRYPTION_MAX_RELAYS];
+    union {
+        vless_encryption_relay_t encryption_relays[VLESS_ENCRYPTION_MAX_RELAYS];
+        core_ss_credentials_t ss;
+    };
     size_t encryption_relay_count;
 } vless_config_t;
 

@@ -36,7 +36,7 @@ class VersionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="vless-core-version-") as temporary:
             directory=Path(temporary)
             (directory/"src").mkdir()
-            for name in ("main.c","cli_args.c","vmess_stream.h"): shutil.copy2(ROOT/"src"/name,directory/"src"/name)
+            for name in ("main.c","cli_args.c","vmess_stream.h","protocol_stream.h"): shutil.copy2(ROOT/"src"/name,directory/"src"/name)
             shutil.copytree(ROOT/"include",directory/"include")
             (directory/".gitignore").write_text("build/\n")
             recipe=f"""CORE_VERSION_ROOT := $(abspath .)

@@ -140,6 +140,9 @@ $(HOST_BUILD_DIR)/test_vmess_body: $(HOST_BUILD_DIR)/test_vmess_body.o $(BASE_OB
 $(HOST_BUILD_DIR)/test_vmess_stream: $(HOST_BUILD_DIR)/test_vmess_stream.o $(filter-out $(HOST_BUILD_DIR)/src/vmess_stream.o,$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS)
 
+$(HOST_BUILD_DIR)/test_shadowsocks_stream: $(HOST_BUILD_DIR)/test_shadowsocks_stream.o $(filter-out $(HOST_BUILD_DIR)/src/shadowsocks_stream.o,$(BASE_OBJ)) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=calloc,--wrap=malloc,--wrap=realloc,--wrap=RAND_bytes,--wrap=EVP_CIPHER_CTX_new
+
 $(HOST_BUILD_DIR)/test_vmess_memory: $(HOST_BUILD_DIR)/test_vmess_memory.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=free,--wrap=realloc
 
@@ -152,7 +155,7 @@ $(HOST_BUILD_DIR)/test_random: $(HOST_BUILD_DIR)/test_random.o $(BASE_OBJ) $(NET
 $(HOST_BUILD_DIR)/test_xhttp_padding: $(HOST_BUILD_DIR)/test_xhttp_padding.o $(BASE_OBJ) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes
 
-$(HOST_BUILD_DIR)/test_encryption: $(HOST_BUILD_DIR)/test_encryption.o $(filter-out $(HOST_BUILD_DIR)/src/vless_encryption.o $(HOST_BUILD_DIR)/src/vmess_stream.o $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
+$(HOST_BUILD_DIR)/test_encryption: $(HOST_BUILD_DIR)/test_encryption.o $(filter-out $(HOST_BUILD_DIR)/src/vless_encryption.o $(HOST_BUILD_DIR)/src/vmess_stream.o $(HOST_BUILD_DIR)/src/shadowsocks_stream.o $(HOST_BUILD_DIR)/src/protocol_stream.o $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes
 
 $(HOST_BUILD_DIR)/test_tls12: $(HOST_BUILD_DIR)/test_tls12.o $(filter-out $(HOST_BUILD_DIR)/src/tls12.o,$(BASE_OBJ)) $(NETWORK_GUARD)
@@ -185,14 +188,14 @@ $(HOST_BUILD_DIR)/fuzz_encryption.o: $(ROOT)/tests/fuzz_encryption.c | requireme
 $(FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_parsers.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(FUZZ_OBJ) $(HOST_LIB_FILES)
 	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
 
-$(ENCRYPTION_FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_encryption.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(filter-out $(HOST_BUILD_DIR)/fuzz-src/vless_encryption.o $(HOST_BUILD_DIR)/fuzz-src/vmess_stream.o,$(FUZZ_OBJ)) $(HOST_LIB_FILES)
+$(ENCRYPTION_FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_encryption.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(filter-out $(HOST_BUILD_DIR)/fuzz-src/vless_encryption.o $(HOST_BUILD_DIR)/fuzz-src/vmess_stream.o $(HOST_BUILD_DIR)/fuzz-src/shadowsocks_stream.o $(HOST_BUILD_DIR)/fuzz-src/protocol_stream.o,$(FUZZ_OBJ)) $(HOST_LIB_FILES)
 	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
 
 $(HOST_BUILD_DIR)/fuzz_http2_pool.o: $(ROOT)/tests/fuzz_http2_pool.c | requirements
 	mkdir -p $(dir $@)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -MMD -MP -c $< -o $@
 
-$(POOL_FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_http2_pool.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(filter-out $(HOST_BUILD_DIR)/fuzz-src/http2_pool.o $(HOST_BUILD_DIR)/fuzz-src/vless.o $(HOST_BUILD_DIR)/fuzz-src/vless_encryption.o $(HOST_BUILD_DIR)/fuzz-src/vmess_stream.o,$(FUZZ_OBJ)) $(HOST_LIB_FILES)
+$(POOL_FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_http2_pool.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(filter-out $(HOST_BUILD_DIR)/fuzz-src/http2_pool.o $(HOST_BUILD_DIR)/fuzz-src/vless.o $(HOST_BUILD_DIR)/fuzz-src/vless_encryption.o $(HOST_BUILD_DIR)/fuzz-src/vmess_stream.o $(HOST_BUILD_DIR)/fuzz-src/shadowsocks_stream.o $(HOST_BUILD_DIR)/fuzz-src/protocol_stream.o,$(FUZZ_OBJ)) $(HOST_LIB_FILES)
 	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
 
 fuzz: requirements $(FUZZ_BIN) $(ENCRYPTION_FUZZ_BIN) $(POOL_FUZZ_BIN)

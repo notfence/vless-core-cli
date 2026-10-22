@@ -95,7 +95,7 @@ int core_ss_request(core_ss_body_t *body,const uint8_t *keys,size_t count,const 
     if (!body || !body->initialized || !body->writing || body->failed || body->started || !output || !keys || !count || (!first && first_length)) { errno=EINVAL; return -1; }
     size_t size=core_ss_key_size(body->method),address_length=0,offset=0,encrypted=0;
     uint8_t destination[260],fixed[11],length[2]; uint32_t padding=0;
-    if (count > 3072/size || ((!core_ss_is_2022(body->method) || body->method == CORE_SS_2022_CHACHA20_POLY1305) && count != 1) ||
+    if (count > CORE_SS_KEY_BYTES/size || ((!core_ss_is_2022(body->method) || body->method == CORE_SS_2022_CHACHA20_POLY1305) && count != 1) ||
         CRYPTO_memcmp(body->master,keys+(count-1)*size,size) || address(target,port,destination,&address_length)) { errno=EINVAL; goto failure; }
     if (first_length > maximum(body)-address_length-(core_ss_is_2022(body->method) ? 2 : 0) || capacity < size) { errno=EMSGSIZE; goto failure; }
     if (core_random_fill(body->salt,size) || core_ss_subkey(body->method,body->master,body->salt,body->key)) goto failure;

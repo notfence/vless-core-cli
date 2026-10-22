@@ -20,6 +20,11 @@ UUID = "00000000-0000-0000-0000-000000000001"
 KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHl8"
 PUBLIC_KEY = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8"
 TROJAN_PASSWORD = "trojan-core+fixture:@%"
+SHADOWSOCKS_METHODS = ("aes-128-gcm","aes-256-gcm","chacha20-poly1305","xchacha20-poly1305",
+                      "2022-blake3-aes-128-gcm","2022-blake3-aes-256-gcm","2022-blake3-chacha20-poly1305")
+
+def shadowsocks_password(method):
+    return base64.b64encode(bytes(range(16 if method == "2022-blake3-aes-128-gcm" else 32))).decode() if method.startswith("2022-") else TROJAN_PASSWORD
 
 def exact(connection, length):
     data = bytearray()
@@ -38,11 +43,13 @@ def port():
         connection.bind(("127.0.0.1", 0))
         return connection.getsockname()[1]
 
-def uri(server_port, transport="tcp", security="none", protocol="vless", password=TROJAN_PASSWORD, **parameters):
+def uri(server_port, transport="tcp", security="none", protocol="vless", password=TROJAN_PASSWORD, ss_method="aes-128-gcm", **parameters):
     query = dict(type=transport, security=security, sni="vless-core.test", path="/vless-core", serviceName="vless-core")
     query.update(parameters)
     if security == "reality":
         query.update(pbk=PUBLIC_KEY, sid="01020304")
+    if protocol == "shadowsocks":
+        return f"ss://{ss_method}:{urllib.parse.quote(password,safe='')}@127.0.0.1:{server_port}?{urllib.parse.urlencode(query)}#vless-core"
     if protocol not in ("vless","trojan","vmess"): raise ValueError("unsupported fixture protocol")
     credential=urllib.parse.quote(password,safe="") if protocol == "trojan" else UUID
     return f"{protocol}://{credential}@127.0.0.1:{server_port}?{urllib.parse.urlencode(query)}#vless-core"
@@ -295,7 +302,7 @@ def xray_tls_target(groups=None):
         yield process
 
 @contextlib.contextmanager
-def xray_server(transport, security, mode=None, flow="", decryption="none", tls_certificate=None, reality_target_groups=None, tls_settings=None, protocol="vless", password=TROJAN_PASSWORD, **transport_parameters):
+def xray_server(transport, security, mode=None, flow="", decryption="none", tls_certificate=None, reality_target_groups=None, tls_settings=None, protocol="vless", password=TROJAN_PASSWORD, ss_method="aes-128-gcm", ss_users=None, **transport_parameters):
     cert, key = certificate()
     cert = tls_certificate or cert
     with contextlib.ExitStack() as stack:
@@ -320,6 +327,10 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
         elif protocol == "vmess":
             config["inbounds"][0]["protocol"]="vmess"
             config["inbounds"][0]["settings"]={"clients":[{"id":UUID,"alterId":0}]}
+        elif protocol == "shadowsocks":
+            config["inbounds"][0]["protocol"]="shadowsocks"
+            config["inbounds"][0]["settings"]={"method":ss_method,"password":password,"network":"tcp"}
+            if ss_users is not None: config["inbounds"][0]["settings"]["clients"]=ss_users
         elif protocol != "vless": raise ValueError("unsupported fixture protocol")
         config["outbounds"][0]["settings"]["finalRules"] = [{"action":"allow","ip":["127.0.0.0/8","::1/128"]}]
         config["routing"]["rules"].insert(1,{"type":"field","domain":["full:localhost"],"outboundTag":"local"})
@@ -339,13 +350,13 @@ def xray_server(transport, security, mode=None, flow="", decryption="none", tls_
             health_settings=dict(transport_parameters)
             if transport == "xhttp" and "path" in health_settings:
                 health_settings["path"]=urllib.parse.urlsplit(health_settings["path"]).path
-            with Server() as health, xray_client(process.port,transport,security,mode,flow,encryption,health_settings,protocol=protocol,password=password) as client:
+            with Server() as health, xray_client(process.port,transport,security,mode,flow,encryption,health_settings,protocol=protocol,password=password,ss_method=ss_method) as client:
                 with socks_connect(client.port,health.port) as connection:
                     exchange(connection,b"vless-core reference readiness")
         yield process
 
 @contextlib.contextmanager
-def xray_client(server_port, transport="tcp", security="reality", mode=None, flow="", encryption="none", extra=None, fingerprint="firefox", alpn=None, protocol="vless", password=TROJAN_PASSWORD, vmess_security="auto"):
+def xray_client(server_port, transport="tcp", security="reality", mode=None, flow="", encryption="none", extra=None, fingerprint="firefox", alpn=None, protocol="vless", password=TROJAN_PASSWORD, vmess_security="auto", ss_method="aes-128-gcm"):
     cert, _ = certificate()
     stream = {"network":"raw" if transport == "tcp" else transport, "security":security}
     if security == "reality":
@@ -364,6 +375,8 @@ def xray_client(server_port, transport="tcp", security="reality", mode=None, flo
         config["outbounds"][0]={"protocol":"trojan","settings":{"address":"127.0.0.1","port":server_port,"password":password},"streamSettings":stream}
     elif protocol == "vmess":
         config["outbounds"][0]={"protocol":"vmess","settings":{"vnext":[{"address":"127.0.0.1","port":server_port,"users":[{"id":UUID,"alterId":0,"security":vmess_security}]}]},"streamSettings":stream}
+    elif protocol == "shadowsocks":
+        config["outbounds"][0]={"protocol":"shadowsocks","settings":{"address":"127.0.0.1","port":server_port,"method":ss_method,"password":password},"streamSettings":stream}
     elif protocol != "vless": raise ValueError("unsupported fixture protocol")
     def command(listen_port):
         config["inbounds"][0]["port"] = listen_port
