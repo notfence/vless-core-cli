@@ -326,7 +326,7 @@ static int start_request(mux_actor_t *actor, core_http2_stream_t *stream, int ro
     size_t consumed=payload,body=payload;
     const vless_config_t *config=role == 0 ? &actor->manager->config : &stream->config;
     int result=actor->manager->backend->request(actor->physical,config,stream->session,stream->sequence,role,data,payload,&request->id,actor->peer_header_limit,&consumed,&body);
-    if (copy && (stream->config.protocol == CORE_PROTOCOL_TROJAN || stream->config.protocol == CORE_PROTOCOL_VMESS)) OPENSSL_cleanse(copy,payload);
+    if (copy && (stream->config.protocol == CORE_PROTOCOL_TROJAN || stream->config.protocol == CORE_PROTOCOL_VMESS || stream->config.protocol == CORE_PROTOCOL_SHADOWSOCKS)) OPENSSL_cleanse(copy,payload);
     core_buffer_free(&actor->output_memory,copy,payload);
     core_buffer_budget_init(&actor->output_memory,CORE_BUFFER_UPLOAD,minimum);
     if (!result && (role == 4 ? consumed || body != SIZE_MAX : consumed > payload || (payload && !consumed) || (body && body != consumed))) result=-1;
@@ -471,6 +471,26 @@ static mux_actor_t *choose_actor(mux_manager_t *manager, int budget, core_http2_
     return group ? group_channel(group,budget,source,1) : NULL;
 }
 
+static void clear_protocol_credential(vless_config_t *);
+
+static int pool_identity(const vless_config_t *config,uint8_t pins[32]) {
+    if (config->protocol != CORE_PROTOCOL_SHADOWSOCKS) return 0;
+    size_t size=core_ss_key_size(config->ss.method),count=config->ss.count;
+    if (!size || !count || count>CORE_SS_KEY_BYTES/size ||
+        ((!core_ss_is_2022(config->ss.method) || config->ss.method == CORE_SS_2022_CHACHA20_POLY1305) && count!=1)) { errno=EINVAL; return -1; }
+    uint8_t material[73];
+    memcpy(material,pins,32); blake3_hash(config->ss.keys,size*count,material+32);
+    material[64]=(uint8_t)config->ss.method;
+    for (unsigned i=0;i<8;i++) material[65+i]=(uint8_t)((uint64_t)count>>(i*8));
+    blake3_hash(material,sizeof(material),pins); OPENSSL_cleanse(material,sizeof(material)); return 0;
+}
+
+static int pool_config_equal(const vless_config_t *first,const vless_config_t *second) {
+    if (first->protocol != CORE_PROTOCOL_SHADOWSOCKS || second->protocol != CORE_PROTOCOL_SHADOWSOCKS) return !memcmp(first,second,sizeof(*first));
+    size_t prefix=offsetof(vless_config_t,encryption_relays),suffix=offsetof(vless_config_t,encryption_relay_count);
+    return !memcmp(first,second,prefix) && !memcmp((const uint8_t *)first+suffix,(const uint8_t *)second+suffix,sizeof(*first)-suffix);
+}
+
 static mux_manager_t *get_manager(const vless_config_t *config, const core_http2_backend_t *backend) {
     uint8_t pins[32]={0};
     int source=core_config_ip_source(config);
@@ -480,15 +500,17 @@ static mux_manager_t *get_manager(const vless_config_t *config, const core_http2
         uint8_t material[32+sizeof(address)]; memcpy(material,pins,32); memcpy(material+32,&address,length);
         blake3_hash(material,32+length,pins);
     }
+    if (pool_identity(config,pins)) return NULL;
     size_t count=0;
     for (mux_manager_t *manager=managers;manager;manager=manager->next) {
-        if (manager->backend == backend && !memcmp(&manager->config,config,sizeof(*config)) && !memcmp(manager->pins,pins,32)) return manager;
+        if (manager->backend == backend && pool_config_equal(&manager->config,config) && !memcmp(manager->pins,pins,32)) return manager;
         count++;
     }
     if (count >= 64) { errno=EAGAIN; return NULL; }
     mux_manager_t *manager=calloc(1,sizeof(*manager));
     if (!manager) return NULL;
     manager->config=*config; manager->backend=backend;
+    if (config->protocol == CORE_PROTOCOL_SHADOWSOCKS) clear_protocol_credential(&manager->config);
     memcpy(manager->pins,pins,32);
     manager->concurrency=random_range(config->xmux.max_concurrency); manager->connections=random_range(config->xmux.max_connections);
     if (manager->concurrency < 0 || manager->connections < 0) { OPENSSL_cleanse(manager,sizeof(*manager)); free(manager); return NULL; }
@@ -1049,6 +1071,7 @@ static int allocate_channels(core_http2_stream_t *stream, mux_manager_t *manager
 static void clear_protocol_credential(vless_config_t *config) {
     OPENSSL_cleanse(config->trojan_hash,sizeof(config->trojan_hash));
     if (config->protocol == CORE_PROTOCOL_VMESS) OPENSSL_cleanse(config->uuid,sizeof(config->uuid));
+    if (config->protocol == CORE_PROTOCOL_SHADOWSOCKS) OPENSSL_cleanse(config->encryption_relays,sizeof(config->encryption_relays));
 }
 
 core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core_http2_backend_t *backend, char *error, size_t capacity) {
@@ -1058,9 +1081,8 @@ core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core
     core_http2_stream_t *stream=calloc(1,sizeof(*stream));
     if (!stream) { if (independent) clear_protocol_credential(&download_config); if (error && capacity) snprintf(error,capacity,"XHTTP client allocation failed"); return NULL; }
     stream->config=*config; stream->references=1;
-    OPENSSL_cleanse(stream->config.trojan_hash,sizeof(stream->config.trojan_hash));
-    if (stream->config.protocol == CORE_PROTOCOL_VMESS) OPENSSL_cleanse(stream->config.uuid,sizeof(stream->config.uuid));
-    stream->tx.cleanse=config->protocol == CORE_PROTOCOL_TROJAN || config->protocol == CORE_PROTOCOL_VMESS;
+    clear_protocol_credential(&stream->config);
+    stream->tx.cleanse=config->protocol == CORE_PROTOCOL_TROJAN || config->protocol == CORE_PROTOCOL_VMESS || config->protocol == CORE_PROTOCOL_SHADOWSOCKS;
     stream->packet_limit=config->transport_mode == TRANSPORT_GRPC ? 0 : core_xhttp_post_limit(config);
     if (stream->packet_limit < 0) { if (independent) clear_protocol_credential(&download_config); if (error && capacity) snprintf(error,capacity,"XHTTP packet size sampling failed"); free(stream); return NULL; }
     stream->trace_present=core_trace_snapshot(&stream->trace);

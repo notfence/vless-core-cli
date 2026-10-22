@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 import contextlib
 import hashlib
 import os
@@ -234,3 +235,79 @@ class ShadowsocksWebSocketTests(unittest.TestCase):
             with self.assertRaises((AssertionError,EOFError,ConnectionError)):
                 with f.socks_connect(core.port,80) as tunnel: tunnel.recv(1)
             core.wait_log('invalid WebSocket upgrade response')
+
+
+class ShadowsocksGRPCTests(unittest.TestCase):
+    def test_grpc_methods_security_and_modes(self):
+        certificate,_=f.certificate(); data=b'\x00\x00SS gRPC'+bytes(range(256))*512
+        for method in f.SHADOWSOCKS_METHODS:
+            password=f.shadowsocks_password(method)
+            for security in ('none','tls','reality'):
+                for mode in ('gun','multi'):
+                    def handler(connection):
+                        self.assertEqual(f.exact(connection,len(data)),data); connection.sendall(data)
+                        self.assertEqual(f.exact(connection,4),b'last'); connection.sendall(b'last')
+                    with self.subTest(method=method,security=security,mode=mode),f.Server(handler) as target,f.xray_server('grpc',security,mode=mode,protocol='shadowsocks',ss_method=method,password=password) as reference,f.cli(f.uri(reference.port,'grpc',security,protocol='shadowsocks',ss_method=method,password=password,mode=mode,initialWindowsSize=1024),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        with f.socks_connect(core.port,target.port) as tunnel:
+                            f.exchange(tunnel,data); f.exchange(tunnel,b'last'); tunnel.shutdown(socket.SHUT_WR)
+                            self.assertEqual(tunnel.recv(1),b'')
+                        self.assertNotIn('VLESS response',core.log)
+
+    def test_grpc_reuse_parallel_rpc_and_slow_sibling(self):
+        certificate,_=f.certificate(); data=bytes(range(256))*1024
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for mode in ('gun','multi'):
+                def handler(connection):
+                    self.assertEqual(f.exact(connection,len(data)),data); connection.sendall(data)
+                with self.subTest(method=method,mode=mode),f.Server(handler) as target,f.xray_server('grpc','tls',mode=mode,protocol='shadowsocks',ss_method=method,password=password) as reference,f.CountingProxy(reference.port) as proxy,f.cli(f.uri(proxy.port,'grpc','tls',protocol='shadowsocks',ss_method=method,password=password,mode=mode),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,data)
+                    physical=len(proxy.connections)
+                    slow=f.socks_connect(core.port,target.port); slow.sendall(data)
+                    try:
+                        def exchange(index):
+                            with f.socks_connect(core.port,target.port) as tunnel:
+                                f.exchange(tunnel,data); self.assertEqual(tunnel.recv(1),b'')
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers: list(workers.map(exchange,range(4)))
+                        self.assertEqual(f.exact(slow,len(data)),data); self.assertEqual(slow.recv(1),b'')
+                        self.assertEqual(len(proxy.connections),physical)
+                    finally: slow.close()
+
+    def test_grpc_server_first_and_backpressure(self):
+        certificate,_=f.certificate(); payload=bytes(range(251))*16384
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for mode in ('gun','multi'):
+                def handler(connection):
+                    time.sleep(.15); connection.sendall(b'\x00\x00server-first')
+                    digest=hashlib.sha256(f.exact(connection,len(payload))).digest(); connection.sendall(digest)
+                with self.subTest(method=method,mode=mode),f.Server(handler) as target,f.xray_server('grpc','tls',mode=mode,protocol='shadowsocks',ss_method=method,password=password) as reference,f.cli(f.uri(reference.port,'grpc','tls',protocol='shadowsocks',ss_method=method,password=password,mode=mode),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        def upload(): tunnel.sendall(payload); tunnel.shutdown(socket.SHUT_WR)
+                        sender=threading.Thread(target=upload,daemon=True); sender.start()
+                        self.assertEqual(f.exact(tunnel,14),b'\x00\x00server-first')
+                        self.assertEqual(f.exact(tunnel,32),hashlib.sha256(payload).digest()); self.assertEqual(tunnel.recv(1),b'')
+                        sender.join(3); self.assertFalse(sender.is_alive())
+
+    def test_grpc_reset_and_trailers_do_not_hide_transport_errors(self):
+        from test_grpc import frame,envelope,GRPC_HEADERS,literal
+        for trailers in (None,'7'):
+            seen=[]
+            def handler(connection):
+                self.assertEqual(f.exact(connection,24),b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n')
+                connection.sendall(frame(4))
+                while True:
+                    header=f.exact(connection,9); size=int.from_bytes(header[:3],'big'); kind,flags=header[3:5]; stream=int.from_bytes(header[5:],'big')&0x7fffffff
+                    data=f.exact(connection,size)
+                    if kind==4 and not flags&1: connection.sendall(frame(4,1))
+                    if kind!=0 or not size: continue
+                    seen.append(stream)
+                    if trailers is None: connection.sendall(frame(3,stream=stream,payload=(8).to_bytes(4,'big')))
+                    else: connection.sendall(frame(1,4,stream,GRPC_HEADERS)+frame(0,stream=stream,payload=envelope(b'\x00'))+frame(1,5,stream,literal('grpc-status',trailers)))
+                    while connection.recv(65536): pass
+                    return
+            with self.subTest(trailers=trailers),f.Server(handler) as peer,f.cli(f.uri(peer.port,'grpc','none',protocol='shadowsocks')) as core:
+                with f.socks_connect(core.port,80) as tunnel:
+                    tunnel.sendall(b'payload'); self.assertEqual(tunnel.recv(1),b'')
+                self.assertTrue(seen); self.assertNotIn('VLESS response',core.log)
+                self.assertRegex(core.wait_log('reset' if trailers is None else 'grpc-status'),r'reset|grpc-status')

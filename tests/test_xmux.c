@@ -935,6 +935,27 @@ static void protocol_pool_identity(void) {
     mux_manager_t *different_cipher=get_manager(&config,&fixture_backend);
     REQUIRE("vmess/pool-managers-created",vmess && vmess_same && different_uuid && different_cipher && same_fields_vless);
     CHECK("vmess/pool-protocol-uuid-and-cipher-isolation",vmess == vmess_same && vmess != same_fields_vless && vmess != first && vmess != vless && vmess != different_uuid && vmess != different_cipher && different_uuid != different_cipher);
+    config.protocol=CORE_PROTOCOL_SHADOWSOCKS;
+    config.ss.method=CORE_SS_2022_AES128_GCM; config.ss.count=2;
+    for (unsigned i=0;i<32;i++) config.ss.keys[i]=(uint8_t)i;
+    mux_manager_t *ss=get_manager(&config,&fixture_backend),*ss_same=get_manager(&config,&fixture_backend);
+    config.ss.keys[31]^=1; mux_manager_t *ss_key=get_manager(&config,&fixture_backend);
+    config.ss.keys[31]^=1; config.ss.keys[32]=0xa5;
+    mux_manager_t *ss_unused=get_manager(&config,&fixture_backend);
+    config.ss.keys[32]=0; config.ss.count=1; mux_manager_t *ss_count=get_manager(&config,&fixture_backend);
+    config.ss.count=2;
+    uint8_t swap[16]; memcpy(swap,config.ss.keys,16); memcpy(config.ss.keys,config.ss.keys+16,16); memcpy(config.ss.keys+16,swap,16);
+    mux_manager_t *ss_order=get_manager(&config,&fixture_backend);
+    memcpy(config.ss.keys+16,config.ss.keys,16); memcpy(config.ss.keys,swap,16); OPENSSL_cleanse(swap,sizeof(swap));
+    config.ss.method=CORE_SS_AES128_GCM; config.ss.count=1; mux_manager_t *ss_classic=get_manager(&config,&fixture_backend);
+    REQUIRE("ss/pool-managers-created",ss && ss_key && ss_count && ss_order && ss_classic);
+    CHECK("ss/pool-effective-key-identity",ss==ss_same && ss==ss_unused && ss!=ss_key && ss!=ss_count && ss!=ss_order && ss_count!=ss_classic && ss!=vmess && ss!=vless && ss!=first);
+    CHECK("ss/pool-keeps-only-identity",!memcmp(ss->config.encryption_relays,(uint8_t[sizeof(ss->config.encryption_relays)]){0},sizeof(ss->config.encryption_relays)));
+    config.ss.count=CORE_SS_KEY_BYTES/16+1; CHECK("ss/pool-rejects-invalid-key-count",!get_manager(&config,&fixture_backend) && errno==EINVAL);
+    config.ss.count=2; config.ss.method=CORE_SS_2022_CHACHA20_POLY1305;
+    CHECK("ss/pool-rejects-chacha-chain",!get_manager(&config,&fixture_backend) && errno==EINVAL);
+    clear_protocol_credential(&config);
+    CHECK("ss/pool-clears-full-mutually-exclusive-storage",!memcmp(config.encryption_relays,(uint8_t[sizeof(config.encryption_relays)]){0},sizeof(config.encryption_relays)));
     while (managers != saved) { mux_manager_t *next=managers->next; OPENSSL_cleanse(managers,sizeof(*managers)); free(managers); managers=next; }
     OPENSSL_cleanse(&config,sizeof(config));
     mux_actor_t actor={0}; core_http2_stream_t stream={.upload=&actor};
@@ -963,8 +984,38 @@ static void protocol_pool_identity(void) {
     core_http2_queue_clear(&secret); core_http2_queue_cache_clear();
 }
 
+static int ss_physical_open(const vless_config_t *config,void **physical,int *http2,char *error,size_t capacity) {
+    CHECK("ss/physical-backend-receives-no-keys",config->protocol==CORE_PROTOCOL_SHADOWSOCKS && !memcmp(config->encryption_relays,(uint8_t[sizeof(config->encryption_relays)]){0},sizeof(config->encryption_relays)));
+    return scheduling_open(config,physical,http2,error,capacity);
+}
+
+static void ss_stream_credentials(void) {
+    mux_manager_t *saved=managers;
+    static core_http2_backend_t backend;
+    backend=finish_backend; backend.open=ss_physical_open; backend.close=scheduling_close; backend.fd=scheduling_fd;
+    backend.collect=scheduling_collect; backend.read_frame=scheduling_frame; backend.flush=scheduling_flush;
+    backend.request=pacing_request; backend.session=fixture_session; scheduling_wire=(wire_t){0};
+    vless_config_t config; core_config_defaults(&config);
+    config.protocol=CORE_PROTOCOL_SHADOWSOCKS; config.transport_mode=TRANSPORT_XHTTP; config.server_port=1;
+    strcpy(config.server_host,"127.0.0.1"); strcpy(config.security,"none"); strcpy(config.xhttp_mode,"stream-one");
+    config.ss.method=CORE_SS_2022_AES128_GCM; config.ss.count=2; memset(config.ss.keys,0x42,32);
+    char error[160]; core_http2_stream_t *stream=core_http2_connect(&config,&backend,error,sizeof(error));
+    REQUIRE("ss/private-stream-created",stream);
+    CHECK("ss/stream-keeps-no-key-copy",stream->tx.cleanse && !memcmp(stream->config.encryption_relays,(uint8_t[sizeof(stream->config.encryption_relays)]){0},sizeof(stream->config.encryption_relays)));
+    CHECK("ss/logical-owner-retains-keys",config.ss.count==2 && config.ss.keys[0]==0x42 && config.ss.keys[31]==0x42);
+    core_http2_close(stream); OPENSSL_cleanse(&config,sizeof(config)); core_http2_queue_cache_clear();
+    pthread_mutex_lock(&mux_lock);
+    while (managers!=saved) {
+        mux_manager_t *next=managers->next;
+        REQUIRE("ss/private-worker-cleaned-up",!managers->actors && !managers->groups);
+        OPENSSL_cleanse(managers,sizeof(*managers)); free(managers); managers=next;
+    }
+    pthread_mutex_unlock(&mux_lock);
+}
+
 int main(void) {
     protocol_pool_identity();
+    ss_stream_credentials();
     final_stream_credit();
     partial_parts_policy();
     reset_after_response();

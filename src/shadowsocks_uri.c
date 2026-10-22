@@ -115,7 +115,7 @@ int core_ss_parse_uri(const char *uri,vless_config_t *config,char *error,size_t 
     snprintf(config->sni,sizeof(config->sni),"%s",config->server_host);
     if (query && *query && core_config_query(config,query,error,capacity)) goto cleanup;
     if (core_config_finalize(config,error,capacity)) goto cleanup;
-    if (config->transport_mode!=TRANSPORT_VISION && config->transport_mode!=TRANSPORT_WS) { invalid(error,capacity,"transport-not-yet-supported"); goto cleanup; }
+    if (config->transport_mode!=TRANSPORT_VISION && config->transport_mode!=TRANSPORT_WS && config->transport_mode!=TRANSPORT_GRPC) { invalid(error,capacity,"transport-not-yet-supported"); goto cleanup; }
     result=0;
 cleanup:
     OPENSSL_cleanse(work,sizeof(work)); OPENSSL_cleanse(decoded,sizeof(decoded)); OPENSSL_cleanse(raw,sizeof(raw)); OPENSSL_cleanse(key,sizeof(key));
