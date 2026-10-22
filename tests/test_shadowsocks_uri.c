@@ -108,4 +108,10 @@ static void invalid(void) {
     }
 }
 
-int main(void) { forms(); keys(); invalid(); OPENSSL_cleanse(&config,sizeof(config)); OPENSSL_cleanse(&reference,sizeof(reference)); return test_result(); }
+static void websocket(void) {
+    REQUIRE("ss/uri-websocket",!parse("ss://aes-128-gcm:secret@localhost:443?type=ws&security=tls&fp=firefox&host=ws.test%3A8443&path=%2Fss&ed=4096&heartbeatPeriod=1&headers=%7B%22X-SS-Fixture%22%3A%22present%22%7D"));
+    CHECK("ss/uri-websocket-effective-settings",config.transport_mode==TRANSPORT_WS && config.fp_mode==FP_FIREFOX && !strcmp(config.security,"tls") && !strcmp(config.xhttp_host,"ws.test:8443") && !strcmp(config.xhttp_path,"/ss") && config.ws_early_data==4096 && config.ws_heartbeat_period==1 && strstr(config.ws_headers,"x-ss-fixture: present\r\n"));
+    CHECK("ss/uri-websocket-reality-rejected",parse("ss://aes-128-gcm:secret@localhost:443?type=ws&security=reality")<0);
+}
+
+int main(void) { forms(); keys(); invalid(); websocket(); OPENSSL_cleanse(&config,sizeof(config)); OPENSSL_cleanse(&reference,sizeof(reference)); return test_result(); }

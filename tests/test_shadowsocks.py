@@ -163,3 +163,74 @@ class ShadowsocksTests(unittest.TestCase):
                         with f.socks_connect(core.port,target.port) as tunnel: f.exchange(tunnel,b'pinned SS channel')
                         self.assertNotIn(password,core.log)
                 finally: os.close(read)
+
+
+class ShadowsocksWebSocketTests(unittest.TestCase):
+    def test_websocket_reality_rejected_before_listener(self):
+        import subprocess
+        value=f.uri(443,'ws','reality',protocol='shadowsocks')
+        for inspect in (False,True):
+            arguments=[str(f.BUILD/'vless-core-test'),'--uri-fd','0']
+            if inspect: arguments.append('--inspect-config')
+            result=subprocess.run(arguments,input=value,text=True,capture_output=True,timeout=3)
+            self.assertNotEqual(result.returncode,0); self.assertNotIn('listening',result.stdout+result.stderr)
+
+    def test_websocket_methods_security_and_early_data(self):
+        import json
+        certificate,_=f.certificate(); payload=b'\x00\x00Shadowsocks websocket'+bytes(range(256))*512
+        for method in f.SHADOWSOCKS_METHODS:
+            password=f.shadowsocks_password(method)
+            for security in ('none','tls'):
+                for early in (0,16384):
+                    with self.subTest(method=method,security=security,early=early),f.Server() as target,f.xray_server('ws',security,protocol='shadowsocks',ss_method=method,password=password) as reference,f.cli(f.uri(reference.port,'ws',security,protocol='shadowsocks',ss_method=method,password=password,ed=early,headers=json.dumps({'X-SS-Fixture':'custom'})),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                        with f.socks_connect(core.port,target.port) as tunnel:
+                            f.exchange(tunnel,payload); f.exchange(tunnel,b'last websocket bytes')
+                        self.assertNotIn(password,core.log)
+                        self.assertNotIn('VLESS response',core.log)
+
+    def test_websocket_first_flight_early_data_boundaries(self):
+        import io
+        import json
+        from test_websocket import client_frame
+        certificate,_=f.certificate()
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for outer_tls in (False,True):
+                for early in (0,1,56,57,58,127,128,1024,16384):
+                    with self.subTest(method=method,tls=outer_tls,early=early),f.Server() as target,f.xray_server('ws','none',protocol='shadowsocks',ss_method=method,password=password) as reference,f.CountingProxy(reference.port,tls=outer_tls) as proxy:
+                        settings=dict(protocol='shadowsocks',ss_method=method,password=password,ed=early,headers=json.dumps({'X-SS-Fixture':'custom'}),host='ss-host.test:8443')
+                        with f.cli(f.uri(proxy.port,'ws','tls' if outer_tls else 'none',**settings),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                            with f.socks_connect(core.port,target.port) as tunnel:
+                                f.exchange(tunnel,b'\x00\x00first block'); f.exchange(tunnel,b'not a repeated header')
+                            raw=bytes(proxy.client_data[0]); headers,_,frames=raw.partition(b'\r\n\r\n')
+                            fields=dict(line.split(b':',1) for line in headers.split(b'\r\n')[1:])
+                            fields={key.lower():value.strip() for key,value in fields.items()}
+                            encoded=fields.get(b'sec-websocket-protocol')
+                            if encoded: first=base64.urlsafe_b64decode(encoded+b'='*(-len(encoded)%4))
+                            else:
+                                reader=type('Reader',(),{'recv':lambda self,size:self.source.read(size)})(); reader.source=io.BytesIO(frames)
+                                opcode,first=client_frame(reader); self.assertEqual(opcode,2)
+                            self.assertEqual(bool(encoded),early>=len(first))
+                            self.assertEqual(fields[b'host'],b'ss-host.test:8443')
+                            self.assertEqual(fields[b'x-ss-fixture'],b'custom')
+
+    def test_websocket_server_first_close_and_heartbeat(self):
+        certificate,_=f.certificate()
+        for method in ('aes-128-gcm','2022-blake3-aes-128-gcm'):
+            password=f.shadowsocks_password(method)
+            for security in ('none','tls'):
+                def handler(connection):
+                    time.sleep(.1); connection.sendall(b'\x00\x00server-first')
+                    self.assertEqual(f.exact(connection,4),b'ping'); connection.sendall(b'pong')
+                with self.subTest(method=method,security=security),f.Server(handler) as target,f.xray_server('ws',security,protocol='shadowsocks',ss_method=method,password=password) as reference,f.cli(f.uri(reference.port,'ws',security,protocol='shadowsocks',ss_method=method,password=password,ed=16384,heartbeatPeriod=1),environment={'VLESS_CA_BUNDLE':str(certificate)}) as core:
+                    with f.socks_connect(core.port,target.port) as tunnel:
+                        self.assertEqual(f.exact(tunnel,14),b'\x00\x00server-first'); time.sleep(1.05)
+                        tunnel.sendall(b'ping'); self.assertEqual(f.exact(tunnel,4),b'pong')
+                        self.assertEqual(tunnel.recv(1),b'')
+        def invalid(connection):
+            from test_websocket import upgrade
+            upgrade(connection,lambda reply,headers,accept:reply.replace(accept,b'invalid'))
+        with f.Server(invalid) as peer,f.cli(f.uri(peer.port,'ws','none',protocol='shadowsocks')) as core:
+            with self.assertRaises((AssertionError,EOFError,ConnectionError)):
+                with f.socks_connect(core.port,80) as tunnel: tunnel.recv(1)
+            core.wait_log('invalid WebSocket upgrade response')
