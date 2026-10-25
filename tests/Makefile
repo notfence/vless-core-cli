@@ -7,7 +7,7 @@ TEST_XRAY_BIN ?= $(abspath $(ROOT)/../tools/xray-v26.6.27-linux-64/xray)
 FUZZ_CC ?= clang
 FUZZ_RUNS ?= 10000
 FUZZ_FLAGS := -O1 -g -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE -I$(ROOT)/include -I$(TEST_OPENSSL_PREFIX)/include -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
-TLS_INTERNAL_SRC := $(addprefix $(ROOT)/src/,tls_client_hello.c tls_certificate.c tls_records.c tls_handshake.c tls_transport.c tls_websocket.c tls_xhttp.c tls_http2.c)
+TLS_INTERNAL_SRC := $(addprefix $(ROOT)/src/,tls_client_hello.c tls_certificate.c tls_records.c tls_handshake.c tls_transport.c tls_websocket.c tls_httpupgrade.c tls_xhttp.c tls_http2.c)
 TLS_INTERNAL_OBJ = $(patsubst $(ROOT)/src/%.c,$(HOST_BUILD_DIR)/src/%.o,$(TLS_INTERNAL_SRC))
 FUZZ_SRC = $(filter-out $(ROOT)/src/tls13_reality.c $(TLS_INTERNAL_SRC),$(BASE_SRC))
 FUZZ_OBJ = $(patsubst $(ROOT)/src/%.c,$(HOST_BUILD_DIR)/fuzz-src/%.o,$(FUZZ_SRC))
@@ -76,6 +76,9 @@ $(HOST_BUILD_DIR)/test_tls: $(HOST_BUILD_DIR)/test_tls.o $(filter-out $(HOST_BUI
 
 $(HOST_BUILD_DIR)/test_transport_wire: $(HOST_BUILD_DIR)/test_transport_wire.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=RAND_bytes,--wrap=malloc
+
+$(HOST_BUILD_DIR)/test_httpupgrade_io: $(HOST_BUILD_DIR)/test_httpupgrade_io.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
+	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=realloc
 
 $(HOST_BUILD_DIR)/test_tls_handshake: $(HOST_BUILD_DIR)/test_tls_handshake.o $(filter-out $(HOST_BUILD_DIR)/src/tls13_reality.o $(TLS_INTERNAL_OBJ),$(BASE_OBJ)) $(NETWORK_GUARD)
 	$(HOST_CC) $(filter %.o,$^) -o $@ $(HOST_LIBS) $(NETWORK_FLAGS) -Wl,--wrap=send,--wrap=EVP_CIPHER_CTX_new

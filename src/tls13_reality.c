@@ -81,7 +81,7 @@ void tls13_set_request_fence(tls13_conn_t *c) {
 }
 
 int tls13_request_pending(const tls13_conn_t *c) {
-    return c && (c->xmux_stream ? core_http2_write_pending(c->xmux_stream) : c->request_wire_left != 0);
+    return c && (c->httpupgrade_pending || (c->xmux_stream ? core_http2_write_pending(c->xmux_stream) : c->request_wire_left != 0));
 }
 
 int tls13_write_raw(tls13_conn_t *c, const uint8_t *buf, size_t len) {
@@ -116,6 +116,7 @@ int tls13_has_pending_input(const tls13_conn_t *c) {
     if (c->app_cache.len > 0) {
         return 1;
     }
+    if (c->httpupgrade && !c->httpupgrade_pending && c->ws_net_cache.len) return 1;
     if (c->tls_stream_input.len) return 1;
     if (c->relay_async && c->tls_md) {
         if (c->receive_closed) return 1;
@@ -314,6 +315,11 @@ int tls13_connect_budgeted(const vless_config_t *cfg, tls13_conn_t **out, char *
         }
         *out = c;
         return 0;
+    }
+
+    if (cfg->transport_mode == TRANSPORT_HTTPUPGRADE) {
+        if (httpupgrade_connect(cfg,c,err,err_cap)) { tls13_reality_close(c); return -1; }
+        *out=c; return 0;
     }
 
     if (strcmp(cfg->security, "none") == 0) {
@@ -517,6 +523,7 @@ int tls13_write_app(tls13_conn_t *c, const uint8_t *buf, size_t len) {
 }
 
 int tls13_read_app(tls13_conn_t *c, uint8_t *buf, size_t cap, size_t *out_len) {
+    if (c->httpupgrade) return httpupgrade_read_app(c,buf,cap,out_len);
     if (c->xmux_stream && c->grpc_transport) return grpc_pool_read(c,buf,cap,out_len);
     if (c->xmux_stream) return core_xmux_read(c->xmux_stream, buf, cap, out_len);
     *out_len = 0;

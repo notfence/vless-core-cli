@@ -134,7 +134,12 @@ def seeds():
                b"vless://00000000-0000-0000-0000-000000000001@[not-ip]:443?type=tcp",
                b"socks5://[::1]:18446744073709551616",b"socks5://vless-core.test:+1080",
                prefix+b"type=ws&host=%5B%3A%3A1%5D%3A65535",prefix+b"type=ws&host=bad%20host",
-               prefix+b"type=ws&host=%5B%3A%3A1%5Dextra"],
+               prefix+b"type=ws&host=%5B%3A%3A1%5Dextra",
+               prefix+b"type=httpupgrade&security=none&ed=4294967295",
+               prefix+b"type=httpupgrade&security=tls&path=%2Ffixture%3Fed%3D1%26keep%3Da%252Fb",
+               prefix+b"type=httpupgrade&security=none&path=%2Fwith%20space%3Fz%3D2%26ed%3D0%26a%3D1%23fragment",
+               prefix+b"type=httpupgrade&host=bad%0D%0AInjected",
+               prefix+b"type=httpupgrade&ed=4294967296"],
         "hpack":[b"\x88",bytes.fromhex("48826402"),bytes.fromhex("4883680cff"),bytes.fromhex("488410000000"),
                  b"\x00\x07:status\x03200",b"\x00\x0bgrpc-status\x010",b"\xff"*8,
                  bytes.fromhex("828684410f7777772e6578616d706c652e636f6d"),
@@ -165,6 +170,10 @@ def seeds():
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\nvless-core\r\n0\r\n\r\n",
                 b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: vless-core\r\n\r\n"],
         "xhttp":[b"a\r\nvless-core\r\n0\r\n\r\n",b"a;vless-core=value\r\nvless-core\r\n0\r\nTrailer: value\r\n\r\n",b"ffffffffffffffff\r\n",b"0\r\n\r\n"],
+        "httpupgrade":[b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n\x00\x00last",
+                       b"HTTP/1.1 101 Switching Protocols\r\nConnection: close\r\nUpgrade: websocket\r\n\r\n",
+                       b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nX-Large: "+b"x"*32768,
+                       b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"*2],
         "ws":[b"\x82\x0avless-core",b"\x02\x05vless\x80\x05-core",b"\x89\x00",b"\x88\x00",b"\x82\x7e\x00\x0avless-core",b"\x82\x7f"+bytes(7)+b"\x0avless-core",
               b"\x01\x02\xf0\x9f\x89\x00\x80\x02\x98\x80",b"\xc2\x00",b"\x80\x00",b"\x82\x80"+bytes(4),b"\x88\x03\x03\xe8\xff"],
         "vision":[*[bytes(16)+bytes([command,0,10,0,0])+b"vless-core" for command in (0,1,2)],
@@ -197,7 +206,7 @@ class FuzzTests(unittest.TestCase):
                 for index, sample in enumerate(samples):
                     (corpus/str(index)).write_bytes(sample)
                 log = BUILD/f"fuzz-{parser}-{time.monotonic_ns()}.log"
-                command = [str(binary),str(corpus),f"-runs={runs}","-seed=13371337",f"-max_len={65536 if parser == 'shadowsocks' else 16400 if parser == 'vmess' else 4096}","-timeout=3",
+                command = [str(binary),str(corpus),f"-runs={runs}","-seed=13371337",f"-max_len={65536 if parser == 'shadowsocks' else 32769 if parser == 'httpupgrade' else 16400 if parser == 'vmess' else 4096}","-timeout=3",
                            "-rss_limit_mb=1024",f"-artifact_prefix={BUILD}/fuzz-{parser}-"]
                 environment = dict(os.environ,VC_FUZZ_PARSER=parser,ASAN_OPTIONS="detect_leaks=1",UBSAN_OPTIONS="halt_on_error=1",DEBUGINFOD_URLS="")
                 with log.open("wb") as output:

@@ -76,6 +76,8 @@ int h2_input_ready(const tls13_conn_t *c);
 int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap);
 int ws_upgrade(tls13_conn_t *c, const uint8_t *early, size_t early_length, char *err, size_t err_cap);
 int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap);
+int httpupgrade_connect(const vless_config_t *, tls13_conn_t *, char *, size_t);
+int httpupgrade_read_app(tls13_conn_t *, uint8_t *, size_t, size_t *);
 int xhttp_configure(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap);
 int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap);
 int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err_cap);

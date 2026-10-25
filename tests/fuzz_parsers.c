@@ -13,7 +13,7 @@
 #include "xhttp_padding.h"
 #include "cli_args.h"
 
-static const char *const fuzz_names[] = {"uri", "hpack", "h2", "grpc", "http", "xhttp", "ws", "vision", "tls", "arguments", "vmess", "shadowsocks"};
+static const char *const fuzz_names[] = {"uri", "hpack", "h2", "grpc", "http", "xhttp", "ws", "vision", "tls", "arguments", "vmess", "shadowsocks", "httpupgrade"};
 static size_t fuzz_target;
 int64_t __wrap_core_ss_time(void) { return 1700000000; }
 
@@ -56,6 +56,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                      .h2_peer_initial_window = H2_DEFAULT_WINDOW, .h2_peer_stream_window = H2_DEFAULT_WINDOW,
                      .h2_peer_conn_window = H2_DEFAULT_WINDOW};
     switch (fuzz_target) {
+    case 12: {
+        c.mode=CONN_MODE_PLAIN; c.httpupgrade=c.httpupgrade_pending=c.relay_async=1; c.ws_net_cache.limit=32768;
+        (void)core_httpupgrade_validate(data,size);
+        size_t split=size ? data[0]%size : 0;
+        if (!db_append(&c.ws_net_cache,data,split)) (void)httpupgrade_response(&c);
+        if (!db_append(&c.ws_net_cache,data+split,size-split)) {
+            uint8_t plain[256]; size_t received;
+            (void)httpupgrade_read_app(&c,plain,sizeof(plain),&received);
+        }
+        break;
+    }
     case 11: {
         core_ss_method_t method=(core_ss_method_t)(size ? (data[0]&7)%7 : 0);
         uint8_t master[32],salt[32],keys[96],wire[8192],plain[256];
@@ -289,6 +300,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
     }
     case 4: {
+        (void)core_httpupgrade_validate(data,size);
         core_http1_response_t response={0}; core_http1_event_t event; size_t offset=0;
         for (size_t iteration=0;iteration<size+8;iteration++) {
             int result=core_http1_next(&response,data+offset,size-offset,1,4096,&event);

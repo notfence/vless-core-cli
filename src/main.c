@@ -1131,9 +1131,10 @@ static void *client_worker_run(void *arg,core_relay_memory_t *memory,uint8_t fir
         return NULL;
     }
     int trojan=cfg->protocol == CORE_PROTOCOL_TROJAN;
+    if (cfg->transport_mode==TRANSPORT_HTTPUPGRADE && !trojan && !stream) tls13_set_request_fence(tls);
     int waiting_initial_payload=first_payload_len == 0 && !trojan;
-    int waiting_request_fence=stream && waiting_initial_payload;
-    if (waiting_initial_payload && !stream) core_deadline_pause();
+    int waiting_request_fence=waiting_initial_payload && (stream || cfg->transport_mode==TRANSPORT_HTTPUPGRADE);
+    if (waiting_initial_payload && !waiting_request_fence) core_deadline_pause();
     uint8_t tbuf[8192];
     int protocol_ready = 0;
     int received_reply = 0;
@@ -1732,6 +1733,8 @@ int main(int argc, char **argv) {
             transport_label = "ws";
         } else if (cfg.transport_mode == TRANSPORT_GRPC) {
             transport_label = "grpc";
+        } else if (cfg.transport_mode == TRANSPORT_HTTPUPGRADE) {
+            transport_label = "httpupgrade";
         }
         vc_log_info("core", "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)",
                     prog, listen_port, cfg.server_host, (unsigned)cfg.server_port,

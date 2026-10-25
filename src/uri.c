@@ -11,6 +11,7 @@
 #include "xhttp_config.h"
 #include "core_log.h"
 #include "websocket.h"
+#include "httpupgrade.h"
 #include "grpc.h"
 #include "trojan.h"
 #include "config_internal.h"
@@ -343,7 +344,8 @@ int core_config_parameter(vless_config_t *cfg,const char *key,const char *decode
         return -1;
     }
     int common=!strcmp(key,"path") || !strcmp(key,"host") || !strcmp(key,"mode");
-    int ws_parameter=cfg->transport_mode == TRANSPORT_WS ? core_ws_parameter(cfg,key,decoded,err,err_cap) : 0;
+    int ws_parameter=cfg->transport_mode == TRANSPORT_WS ? core_ws_parameter(cfg,key,decoded,err,err_cap) :
+        cfg->transport_mode == TRANSPORT_HTTPUPGRADE ? core_httpupgrade_parameter(cfg,key,decoded,err,err_cap) : 0;
     if (ws_parameter < 0) return -1;
     int grpc_parameter=cfg->transport_mode == TRANSPORT_GRPC ? core_grpc_parameter(cfg,key,decoded,err,err_cap) : 0;
     if (grpc_parameter < 0) return -1;
@@ -397,6 +399,8 @@ int core_config_parameter(vless_config_t *cfg,const char *key,const char *decode
             cfg->transport_mode = TRANSPORT_WS;
         } else if (strcmp(decoded_lower, "grpc") == 0) {
             cfg->transport_mode = TRANSPORT_GRPC;
+        } else if (!strcmp(decoded_lower,"httpupgrade")) {
+            cfg->transport_mode = TRANSPORT_HTTPUPGRADE;
         } else if (decoded_lower[0] == '\0' || strcmp(decoded_lower, "tcp") == 0 || !strcmp(decoded_lower,"raw")) {
             cfg->transport_mode = TRANSPORT_VISION;
         } else { set_err(err,err_cap,"unsupported transport"); return -1; }
@@ -439,6 +443,7 @@ int core_config_query(vless_config_t *cfg, char *query, char *err, size_t err_ca
                 else if (!strcmp(value,"xhttp") || !strcmp(value,"splithttp")) cfg->transport_mode=TRANSPORT_XHTTP;
                 else if (!strcmp(value,"ws") || !strcmp(value,"websocket")) cfg->transport_mode=TRANSPORT_WS;
                 else if (!strcmp(value,"grpc")) cfg->transport_mode=TRANSPORT_GRPC;
+                else if (!strcmp(value,"httpupgrade")) cfg->transport_mode=TRANSPORT_HTTPUPGRADE;
                 else { set_err(err,err_cap,"unsupported transport"); free(scan); return -1; }
             }
         }
@@ -701,6 +706,7 @@ static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, siz
 }
 
 int core_config_finalize(vless_config_t *cfg, char *err, size_t err_cap) {
+    if (cfg->transport_mode == TRANSPORT_HTTPUPGRADE && core_httpupgrade_configure(cfg,err,err_cap)) return -1;
     if (cfg->transport_mode == TRANSPORT_WS && core_ws_configure(cfg,err,err_cap)) return -1;
     if (cfg->transport_mode == TRANSPORT_WS) {
         char authority[sizeof(cfg->xhttp_host)+2];
@@ -803,6 +809,8 @@ int core_config_finalize(vless_config_t *cfg, char *err, size_t err_cap) {
         if (cfg->xhttp_path[0] == '\0') {
             snprintf(cfg->xhttp_path, sizeof(cfg->xhttp_path), "/");
         }
+    } else if (cfg->transport_mode == TRANSPORT_HTTPUPGRADE) {
+        cfg->pbk_len=0; cfg->short_id_len=0;
     } else if (strcmp(cfg->security, "reality") == 0) {
         if (cfg->pbk_len != 32) {
             set_err(err, err_cap, "pbk is required and must decode to 32 bytes");

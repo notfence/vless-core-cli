@@ -19,7 +19,8 @@ typedef enum {
     TRANSPORT_VISION = 0,
     TRANSPORT_XHTTP = 1,
     TRANSPORT_WS = 2,
-    TRANSPORT_GRPC = 3
+    TRANSPORT_GRPC = 3,
+    TRANSPORT_HTTPUPGRADE = 4
 } transport_mode_t;
 
 typedef enum {
@@ -85,6 +86,8 @@ typedef struct {
     int grpc_idle_timeout, grpc_health_timeout, grpc_permit_without_stream, grpc_initial_window, grpc_physical_only;
     char ws_headers[4096];
     int ws_early_data, ws_early_explicit, ws_heartbeat_period;
+    uint32_t httpupgrade_early_data;
+    int httpupgrade_early_explicit;
     char xhttp_session_placement[16];
     char xhttp_session_key[64];
     char xhttp_session_id_table[256];
