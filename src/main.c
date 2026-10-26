@@ -1476,7 +1476,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --routing <rules>        Optional Proxy, Direct and Block rules\n");
     fprintf(stderr, "  --route-control-port <p> Direct-route controller port\n");
     fprintf(stderr, "  --route-control-socket <path> Direct-route controller Unix socket\n");
-    fprintf(stderr, "  --server-ips <list>      Pre-resolved server IPv4 addresses\n");
+    fprintf(stderr, "  --server-ips <list>      Pre-resolved primary-server IPv4/IPv6 addresses\n");
     fprintf(stderr, "  --xray-version <x.y.z>   Xray version reported by vless-core-cli\n");
     fprintf(stderr, "  -h, --help               Show help\n");
     fprintf(stderr, "  -v, --version            Show version\n");
