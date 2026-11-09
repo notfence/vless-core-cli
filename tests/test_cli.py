@@ -12,6 +12,20 @@ import fixtures
 from fixtures import BUILD, Server, cli, exact, exchange, socks_connect, uri
 
 class CliTests(unittest.TestCase):
+    def test_socket_options_protocol_transport_matrix(self):
+        settings=json.dumps({"tcpUserTimeout":3000,"tcpKeepAliveIdle":17,"tcpKeepAliveInterval":9})
+        cert,_=fixtures.certificate()
+        for protocol in ("vless","trojan","vmess","shadowsocks"):
+            for transport in ("tcp","ws","grpc","xhttp","httpupgrade"):
+                for security in ("none","tls","reality"):
+                    if security=="reality" and transport in ("ws","httpupgrade"): continue
+                    with self.subTest(protocol=protocol,transport=transport,security=security), Server() as target, fixtures.xray_server(transport,security,protocol=protocol) as reference:
+                        config=uri(reference.port,transport,security,protocol=protocol,sockopt=settings)
+                        with cli(config,environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
+                            with socks_connect(core.port,target.port) as tunnel:
+                                exchange(tunnel,b"socket options"+bytes(range(256))*64)
+                        self.assertFalse(target.errors)
+
     def test_invalid_endpoint_never_starts_listener(self):
         configs=("vless://00000000-0000-0000-0000-000000000001@vless-core.test\r\nX-Audit: injected:443?type=ws&security=none",
             uri(443,"ws","none",host="vless-core.test:+80"),

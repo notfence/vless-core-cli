@@ -1014,6 +1014,13 @@ static void ss_stream_credentials(void) {
 }
 
 int main(void) {
+    {
+    vless_config_t first,second; core_config_defaults(&first); core_config_defaults(&second);
+    second.sockopt=(core_sockopt_t){.present=1,.user_timeout=1234};
+    CHECK("xmux/socket-options-separate-pools",!pool_config_equal(&first,&second));
+    first.protocol=second.protocol=CORE_PROTOCOL_SHADOWSOCKS;
+    CHECK("xmux/socket-options-separate-ss-pools",!pool_config_equal(&first,&second));
+    }
     protocol_pool_identity();
     ss_stream_credentials();
     final_stream_credit();

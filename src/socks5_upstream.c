@@ -54,8 +54,8 @@ static int write_exact(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-static int connect_tcp_host(const char *host, uint16_t port, char *err, size_t err_cap) {
-    int fd = core_dial_host(host, port, 1, SOCKS5_UPSTREAM_TIMEOUT_MS);
+static int connect_tcp_host(const char *host, uint16_t port, const core_sockopt_t *options, char *err, size_t err_cap) {
+    int fd = core_dial_host_options(host, port, 1, SOCKS5_UPSTREAM_TIMEOUT_MS,options);
     if (fd < 0) set_errf(err, err_cap, "SOCKS5 TCP connect failed for %s:%u: errno=%d", host, (unsigned)port, errno);
     else core_set_socket_io_timeout(fd, SOCKS5_UPSTREAM_TIMEOUT_MS);
     return fd;
@@ -224,7 +224,7 @@ int socks5_upstream_connect(const vless_config_t *cfg, const char *target_host, 
         return -1;
     }
 
-    int fd = connect_tcp_host(cfg->server_host, cfg->server_port, err, err_cap);
+    int fd = connect_tcp_host(cfg->server_host, cfg->server_port, &cfg->sockopt, err, err_cap);
     if (fd < 0) {
         if (failure) *failure=socks5_error_reply(errno);
         return -1;

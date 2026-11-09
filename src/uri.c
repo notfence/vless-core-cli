@@ -320,6 +320,7 @@ static int normalize_query_key(const char *encoded, char *normalized, size_t nor
 }
 
 int core_config_parameter(vless_config_t *cfg,const char *key,const char *decoded,char *err,size_t err_cap) {
+    if (!strcmp(key,"sockopt")) return core_sockopt_json(decoded,&cfg->sockopt,err,err_cap);
     if (strcmp(key,"extra") && strcmp(key,"headers") && strcmp(key,"downloadsettings") && !query_value_is_valid_utf8((const unsigned char *)decoded)) { set_err(err,err_cap,"invalid configuration parameter value"); return -1; }
     if (cfg->protocol == CORE_PROTOCOL_VMESS) {
         int result=core_vmess_parameter(cfg,key,decoded,err,err_cap);
@@ -506,7 +507,9 @@ int core_config_query(vless_config_t *cfg, char *query, char *err, size_t err_ca
             return -1;
         }
         if (cfg->protocol == CORE_PROTOCOL_SOCKS5) {
-            if (!strcmp(key,"security")) {
+            if (!strcmp(key,"sockopt")) {
+                if (core_sockopt_json(decoded,&cfg->sockopt,err,err_cap)) return -1;
+            } else if (!strcmp(key,"security")) {
                 if (strcasecmp(decoded,"none")) { set_err(err,err_cap,"SOCKS5 security supports only none"); return -1; }
             } else vc_log_warning("uri","field query.%s is not applied to SOCKS5",key);
             if (!next) break;

@@ -151,6 +151,10 @@ static int json_config(vless_config_t *config,const char *text,char *error,size_
         if (seen == 128) { invalid(error,capacity,"field count"); goto cleanup; }
         strcpy(seen_keys[seen],key); seen_values[seen++]=node;
         if (!strcmp(key,"extra")) continue;
+        if (!strcmp(key,"sockopt")) {
+            if (core_sockopt_parse(node,&config->sockopt,error,capacity)) goto cleanup;
+            continue;
+        }
         if (!strcmp(key,"xmux")) {
             if (node->type != CORE_JSON_OBJECT || config->transport_mode != TRANSPORT_XHTTP) { invalid(error,capacity,"xmux"); goto cleanup; }
             core_json_t field=*node,object={.type=CORE_JSON_OBJECT,.child=&field}; field.key="xmux"; field.next=NULL;

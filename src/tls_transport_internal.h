@@ -31,11 +31,11 @@ enum {
 #define H2_GRPC_INPUT_DRAIN_LIMIT 64
 #define H2_WRITE_BATCH_SIZE (64U * 1024U)
 
-int tcp_connect_host(const char *host, uint16_t port, int use_server_ips);
+int tcp_connect_host(const char *host, uint16_t port, int use_server_ips, const core_sockopt_t *options);
 int ssl_write_all(SSL *ssl, const void *buf, size_t len);
 int ssl_read_some(SSL *ssl, uint8_t *buf, size_t cap, size_t *out_len);
 int fd_read_some(int fd, uint8_t *buf, size_t cap, size_t *out_len);
-int open_tls_socket(int use_server_ips, const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
+int open_tls_socket(const core_sockopt_t *options, int use_server_ips, const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
                            const unsigned char *alpn_protos, unsigned int alpn_protos_len, SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd,
                            int *use_aes_fallback, char *err, size_t err_cap);
 size_t find_double_crlf(const uint8_t *buf, size_t len);

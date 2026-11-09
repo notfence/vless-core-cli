@@ -83,7 +83,7 @@ static int security_settings(const core_json_t *settings, int reality, vless_con
 
 int core_xhttp_download_parse(const core_json_t *root, vless_config_t *config, char *error, size_t capacity) {
     if (!root || root->type != CORE_JSON_OBJECT || !config) return invalid("object",error,capacity);
-    const char *names[]={"address","port","network","security","xhttpSettings","splithttpSettings","tlsSettings","realitySettings","downloadSettings"};
+    const char *names[]={"address","port","network","security","xhttpSettings","splithttpSettings","tlsSettings","realitySettings","downloadSettings","sockopt"};
     if (duplicate_fields(root,names,sizeof(names)/sizeof(*names),error,capacity) != 0) return -1;
     core_config_defaults(config); config->transport_mode=TRANSPORT_XHTTP; config->xhttp_download_only=1;
     const core_json_t *xhttp=NULL,*tls=NULL,*reality=NULL;
@@ -108,6 +108,8 @@ int core_xhttp_download_parse(const core_json_t *root, vless_config_t *config, c
         } else if (!strcasecmp(entry->key,"xhttpSettings") || !strcasecmp(entry->key,"splithttpSettings")) {
             if (xhttp && !core_json_equal(xhttp,entry)) return invalid("xhttpSettings/splithttpSettings collision",error,capacity);
             xhttp=entry;
+        } else if (!strcmp(entry->key,"sockopt")) {
+            if (core_sockopt_parse(entry,&config->sockopt,error,capacity)) return -1;
         } else if (!strcasecmp(entry->key,"tlsSettings")) tls=entry;
         else if (!strcasecmp(entry->key,"realitySettings")) reality=entry;
         else if (!strcasecmp(entry->key,"downloadSettings")) return invalid("recursive downloadSettings",error,capacity);

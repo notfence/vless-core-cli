@@ -20,7 +20,7 @@ static int get_cached_tls_endpoint(const vless_config_t *cfg, const char *sni, s
 static void cache_tls_endpoint(const vless_config_t *cfg, const char *sni, const struct sockaddr *address, socklen_t address_len);
 static void invalidate_cached_tls_endpoint(const vless_config_t *cfg, const char *sni, const struct sockaddr *address,
                                            socklen_t address_len);
-static int tcp_connect_address(int family, int socktype, int protocol, const struct sockaddr *address, socklen_t address_len);
+static int tcp_connect_address(const core_sockopt_t *options, int family, int socktype, int protocol, const struct sockaddr *address, socklen_t address_len);
 static void set_connect_err(char *err, size_t err_cap, const char *prefix);
 static int ssl_budget_call(SSL *ssl, void *buffer, int length, int operation);
 static int append_alpn_token(unsigned char *out, unsigned int cap, unsigned int *len, const char *token);
@@ -214,16 +214,16 @@ static void invalidate_cached_tls_endpoint(const vless_config_t *cfg, const char
     pthread_mutex_unlock(&g_tls_state_lock);
 }
 
-int tcp_connect_host(const char *host, uint16_t port, int use_server_ips) {
-    return core_dial_host(host, port, use_server_ips, CORE_CONNECT_TIMEOUT_MS);
+int tcp_connect_host(const char *host, uint16_t port, int use_server_ips, const core_sockopt_t *options) {
+    return core_dial_host_options(host, port, use_server_ips, CORE_CONNECT_TIMEOUT_MS,options);
 }
 
-static int tcp_connect_address(int family, int socktype, int protocol, const struct sockaddr *address, socklen_t address_len) {
+static int tcp_connect_address(const core_sockopt_t *options, int family, int socktype, int protocol, const struct sockaddr *address, socklen_t address_len) {
     int fd = socket(family, socktype, protocol);
     if (fd < 0) {
         return -1;
     }
-    core_tune_tcp_socket(fd);
+    core_tune_upstream_socket(fd,options);
     if (core_connect_with_timeout(fd, address, address_len, CORE_CONNECT_TIMEOUT_MS) == 0) {
         return fd;
     }
@@ -519,13 +519,14 @@ static int open_tls_socket_once(int fd, const char *connect_host, const char *sn
     return 0;
 }
 
-int open_tls_socket(int use_server_ips, const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
+int open_tls_socket(const core_sockopt_t *options, int use_server_ips, const char *connect_host, uint16_t connect_port, const char *sni, int verify_peer,
                            const unsigned char *alpn_protos, unsigned int alpn_protos_len, SSL_CTX **out_ctx, SSL **out_ssl, int *out_fd,
                            int *use_aes_fallback, char *err, size_t err_cap) {
     *out_ctx=NULL; *out_ssl=NULL; *out_fd=-1;
     core_dialer_t *dialer=core_dialer_start(connect_host,connect_port,use_server_ips,CORE_CONNECT_TIMEOUT_MS,NULL,0);
     if (!dialer) { set_connect_err(err,err_cap,"tcp address resolution failed"); return -1; }
     struct sockaddr_storage address; socklen_t length=0;
+    core_dialer_set_sockopt(dialer,options);
     int fd,first=1,failed_handshake=0;
     core_connection_error_t failure={0};
     while ((fd=core_dialer_next(dialer,&address,&length)) >= 0) {
@@ -544,7 +545,7 @@ int open_tls_socket(int use_server_ips, const char *connect_host, uint16_t conne
             failure=core_connection_error(CORE_TRACE_TRANSPORT,CORE_FAILURE_TLS,errno ? errno : EPROTO);
             if (attempt || !retry || (core_deadline_active() && !core_deadline_remaining())) break;
             offer=offer == TLS_CIPHER_OFFER_CHACHA ? TLS_CIPHER_OFFER_AES : TLS_CIPHER_OFFER_CHACHA;
-            fd=tcp_connect_address(address.ss_family,SOCK_STREAM,IPPROTO_TCP,(const struct sockaddr *)&address,length);
+            fd=tcp_connect_address(options,address.ss_family,SOCK_STREAM,IPPROTO_TCP,(const struct sockaddr *)&address,length);
             if (fd < 0) break;
         }
     }
@@ -687,7 +688,7 @@ static int connect_manual_tls_endpoint(const vless_config_t *cfg, tls13_conn_t *
     for (size_t i = first_offer; i < sizeof(offer_order) / sizeof(offer_order[0]); i++) {
         tls_cipher_offer_t offer = offer_order[i];
         reset_manual_tls_handshake(c);
-        c->fd = i == first_offer ? initial_fd : tcp_connect_address(address->sa_family, socktype, protocol, address, address_len);
+        c->fd = i == first_offer ? initial_fd : tcp_connect_address(&cfg->sockopt,address->sa_family, socktype, protocol, address, address_len);
         if (c->fd < 0) {
             if (failure.kind && errno != ETIMEDOUT) { core_trace_error_set(failure); errno=failure.system_error; return -1; }
             set_connect_err(err, err_cap, "tcp connect failed");
@@ -733,6 +734,7 @@ int connect_manual_tls(const vless_config_t *cfg, tls13_conn_t *c, char *err, si
     core_dialer_t *dialer = core_dialer_start(cfg->server_host, cfg->server_port, core_config_ip_source(cfg), CORE_CONNECT_TIMEOUT_MS,
         cached ? (const struct sockaddr *)&cached_address : NULL, cached_length);
     if (!dialer) { set_connect_err(err, err_cap, "tcp resolve failed"); return -1; }
+    core_dialer_set_sockopt(dialer,&cfg->sockopt);
     char last_err[256] = {0};
     core_connection_error_t failure={0};
     struct sockaddr_storage address; socklen_t length;

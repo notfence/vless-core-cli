@@ -210,7 +210,7 @@ int ws_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t err
             set_err(err,err_cap,"WebSocket server selected incompatible ALPN"); return -1;
         }
     } else {
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source,&c->sockopt);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;

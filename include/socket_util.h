@@ -5,6 +5,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <stdint.h>
+#include "sockopt.h"
 struct addrinfo;
 
 uint64_t core_now_ms(void);
@@ -15,6 +16,7 @@ ssize_t core_send(int fd, const void *buffer, size_t length, int flags);
 int core_notify_socket(int);
 void core_drain_socket(int);
 void core_tune_tcp_socket(int fd);
+void core_tune_upstream_socket(int, const core_sockopt_t *);
 void core_set_socket_io_timeout(int fd, int timeout_ms);
 int core_connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t addr_len, int timeout_ms);
 int core_getaddrinfo(const char *host, const char *service, const struct addrinfo *hints, struct addrinfo **addresses);

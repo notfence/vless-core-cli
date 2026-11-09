@@ -190,6 +190,10 @@ static void check_base64(void) {
 }
 
 int main(void) {
+    CHECK("sockopt/invalid-object-rejected",parse(PREFIX "sockopt=%5B%5D") < 0);
+    CHECK("sockopt/invalid-type-rejected",parse(PREFIX "sockopt=%7B%22tcpUserTimeout%22%3Atrue%7D") < 0);
+    CHECK("sockopt/unknown-option-rejected",parse(PREFIX "sockopt=%7B%22mark%22%3A1%7D") < 0);
+    CHECK("sockopt/conflicting-keepalive-rejected",parse(PREFIX "sockopt=%7B%22tcpKeepAliveIdle%22%3A-1%2C%22tcpKeepAliveInterval%22%3A30%7D") < 0);
     check_endpoint_validation();
     check_xmux_empty_ranges();
     const char *invalid_options[]={

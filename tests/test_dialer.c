@@ -3,6 +3,7 @@
 #include "check.h"
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <netinet/tcp.h>
 
 static int fixture_mode, stalled_fd=-1;
 static uint64_t ipv4_delay, ipv6_delay, connect_times[8];
@@ -71,10 +72,16 @@ static void numeric_without_resolver(void) {
         int server=listener(family,&port); connect_count=0; core_deadline_begin(150);
         core_dialer_t *dialer=core_dialer_start(i ? "::1" : "127.0.0.1",port,0,150,NULL,0);
         REQUIRE("dial/numeric-start",dialer);
+        core_sockopt_t settings={.present=7,.user_timeout=1234,.keepalive_idle=17,.keepalive_interval=9};
+        core_dialer_set_sockopt(dialer,&settings);
         CHECK("dial/numeric-does-not-queue-dns",!dialer->queries[0] && !dialer->queries[1] && dialer->resolved[0] && dialer->resolved[1] && dialer->count == 1);
         int fd=core_dialer_next(dialer,NULL,NULL);
         CHECK("dial/numeric-connects-with-all-dns-workers-busy",fd >= 0 && connect_count == 1 && connect_families[0] == family);
-        if (fd >= 0) close(fd);
+        if (fd >= 0) {
+            int value=0; socklen_t length=sizeof(value);
+            CHECK("dial/socket-options-reach-physical-socket",!getsockopt(fd,IPPROTO_TCP,TCP_USER_TIMEOUT,&value,&length) && value==1234);
+            close(fd);
+        }
         core_dialer_free(dialer); core_deadline_end(); close(server);
     }
     uint16_t port; int server=listener(AF_INET6,&port);

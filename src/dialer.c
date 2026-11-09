@@ -21,6 +21,7 @@ typedef struct {
 } dialer_address_t;
 typedef struct { int fd, flags; size_t index; } dialer_attempt_t;
 struct core_dialer {
+    core_sockopt_t sockopt;
     core_resolver_query_t *queries[2];
     int resolved[2], dns_error[2], dns_system_error[2];
     dialer_address_t addresses[DIALER_ADDRESS_LIMIT];
@@ -149,7 +150,7 @@ int core_dialer_next(core_dialer_t *dialer, struct sockaddr_storage *address, so
             dialer->started_tcp=1; core_trace_stage(CORE_TRACE_TCP);
             int fd=socket(entry->address.ss_family,SOCK_STREAM,IPPROTO_TCP);
             if (fd < 0) { entry->state=2; dialer->last_error=errno; continue; }
-            core_tune_tcp_socket(fd);
+            core_tune_upstream_socket(fd,&dialer->sockopt);
             int flags=fcntl(fd,F_GETFL,0);
             dialer->attempts[slot]=(dialer_attempt_t){.fd=fd,.flags=flags,.index=candidate};
             if (flags < 0 || fcntl(fd,F_SETFL,flags|O_NONBLOCK) != 0) {
@@ -200,8 +201,17 @@ void core_dialer_free(core_dialer_t *dialer) {
 }
 
 int core_dial_host(const char *host, uint16_t port, int use_server_ips, int timeout_ms) {
+    return core_dial_host_options(host,port,use_server_ips,timeout_ms,NULL);
+}
+
+void core_dialer_set_sockopt(core_dialer_t *dialer, const core_sockopt_t *options) {
+    if (dialer && options) dialer->sockopt=*options;
+}
+
+int core_dial_host_options(const char *host, uint16_t port, int use_server_ips, int timeout_ms, const core_sockopt_t *options) {
     core_dialer_t *dialer=core_dialer_start(host,port,use_server_ips,timeout_ms,NULL,0);
     if (!dialer) return -1;
+    core_dialer_set_sockopt(dialer,options);
     int fd=core_dialer_next(dialer,NULL,NULL);
     core_dialer_free(dialer);
     return fd;

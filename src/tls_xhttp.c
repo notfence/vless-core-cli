@@ -502,7 +502,7 @@ int xhttp_http1_packet_request(tls13_conn_t *connection, const char *path, const
 
 static int xhttp_post_packet_plain(tls13_conn_t *c, const uint8_t *buf, size_t *length, char *err, size_t err_cap) {
     if (xhttp_wait_post(c,err,err_cap) != 0) return -1;
-    int fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
+    int fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source,&c->sockopt);
     if (fd < 0) {
         set_err(err, err_cap, "tcp connect failed");
         return -1;
@@ -556,7 +556,7 @@ int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length, char 
             set_err(err, err_cap, "failed to build TOFU pin key");
             return -1;
         }
-        if (open_tls_socket(c->ip_source, c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd, &c->tls_use_aes_fallback, err,
+        if (open_tls_socket(&c->sockopt,c->ip_source, c->remote_host, c->remote_port, c->remote_sni, 0, NULL, 0, &ctx, &ssl, &fd, &c->tls_use_aes_fallback, err,
                             err_cap) != 0) {
             return -1;
         }
@@ -570,7 +570,7 @@ int xhttp_post_packet(tls13_conn_t *c, const uint8_t *buf, size_t *length, char 
         c->xhttp_tls_insecure = 1;
     } else {
         int verify_peer = c->xhttp_tls_insecure ? 0 : tls_verify_peer(mode);
-        if (open_tls_socket(c->ip_source, c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &ctx, &ssl, &fd,
+        if (open_tls_socket(&c->sockopt,c->ip_source, c->remote_host, c->remote_port, c->remote_sni, verify_peer, NULL, 0, &ctx, &ssl, &fd,
                             &c->tls_use_aes_fallback, err, err_cap) != 0) {
             return -1;
         }
@@ -675,7 +675,7 @@ int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t 
 
     if (strcmp(cfg->security, "none") == 0) {
         c->mode = CONN_MODE_XHTTP_PLAIN;
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source,&c->sockopt);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;
@@ -690,7 +690,7 @@ int xhttp_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t 
             return -1;
         }
         if (strcmp(c->xhttp_transport_mode, "stream-up") == 0) {
-            c->xhttp_upload_fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
+            c->xhttp_upload_fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source,&c->sockopt);
             if (c->xhttp_upload_fd < 0) {
                 set_err(err, err_cap, "xhttp upload tcp connect failed");
                 return -1;

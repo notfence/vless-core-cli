@@ -224,6 +224,7 @@ struct tls13_conn {
     SSL *ssl;
 
     char remote_host[256];
+    core_sockopt_t sockopt;
     uint16_t remote_port;
     char remote_sni[256];
 

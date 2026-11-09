@@ -114,7 +114,7 @@ def seeds():
                      b"--uri-fd\x000\x00--xray-version\x004294967296.6.27",
                      b"--uri-fd\x000\x00--xray-version\x001.2.18446744073709551616",
                      b"--uri-fd\x000\x00--xray-version\x001.+2.3"],
-        "uri":[*ss_uris,*vmess_uris,b"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=auto",
+        "uri":[prefix+b"sockopt="+quote(value,safe="").encode() for value in ('{}','{"tcpUserTimeout":1001,"tcpKeepAliveIdle":17,"tcpKeepAliveInterval":9}','{"tcpUserTimeout":2147483648}','{"tcpKeepAliveIdle":-2147483648}','{"tcpUserTimeout":1,"tcpUserTimeout":2}')]+[*ss_uris,*vmess_uris,b"vmess://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=auto",
                b"vmess://00000000-0000-0000-0000-000000000001@[::1]:65535?scy=zero&aid=0",
                b"vmess://"+base64.b64encode(b'{"v":"2","add":"127.0.0.1","port":443,"id":"00000000-0000-0000-0000-000000000001","aid":"0","scy":"auto","net":"tcp","tls":""}'),
                b"vmess://e31=",b"vmess://e3+_",b"vmess://e30===",

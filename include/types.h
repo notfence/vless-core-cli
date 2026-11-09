@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "vmess.h"
 #include "shadowsocks.h"
+#include "sockopt.h"
 
 typedef enum {
     FP_CHROME = 0,
@@ -56,6 +57,7 @@ typedef struct {
 
     char server_host[256];
     uint16_t server_port;
+    core_sockopt_t sockopt;
 
     char socks5_user[256];
     char socks5_pass[256];

@@ -7,6 +7,8 @@
 #include "connection_trace.h"
 #include "deadline.h"
 #include "resolver.h"
+#include "core_log.h"
+#include <pthread.h>
 
 #include <errno.h>
 #include <arpa/inet.h>
@@ -103,6 +105,28 @@ void core_set_socket_io_timeout(int fd, int timeout_ms) {
     }
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+void core_tune_upstream_socket(int fd, const core_sockopt_t *options) {
+    core_tune_tcp_socket(fd);
+    core_sockopt_result_t result=core_sockopt_apply(fd,options);
+    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    static unsigned warned_unavailable, warned_adapted;
+    pthread_mutex_lock(&lock);
+    unsigned unavailable=result.unavailable & ~warned_unavailable, adapted=result.adapted & ~warned_adapted;
+    warned_unavailable|=unavailable; warned_adapted|=adapted;
+    pthread_mutex_unlock(&lock);
+    for (unsigned bit=1;bit<=4;bit<<=1) {
+        char message[192];
+        if (unavailable & bit) {
+            core_sockopt_notice(bit,0,result.errors[bit == 1 ? 0 : bit == 2 ? 1 : 2],message,sizeof(message));
+            vc_log_warning("sockopt","%s",message);
+        }
+        if (adapted & bit) {
+            core_sockopt_notice(bit,1,0,message,sizeof(message));
+            vc_log_warning("sockopt","%s",message);
+        }
+    }
 }
 
 static int connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t addr_len, int timeout_ms) {

@@ -64,7 +64,7 @@ int httpupgrade_connect(const vless_config_t *config,tls13_conn_t *connection,ch
             set_err(error,capacity,"HTTPUpgrade server selected incompatible ALPN"); errno=EPROTO; return -1;
         }
     } else {
-        connection->fd=tcp_connect_host(config->server_host,config->server_port,connection->ip_source);
+        connection->fd=tcp_connect_host(config->server_host,config->server_port,connection->ip_source,&config->sockopt);
         if (connection->fd<0) { set_err(error,capacity,"HTTPUpgrade tcp connect failed"); return -1; }
     }
     const char *host=config->xhttp_host[0] ? config->xhttp_host : connection->mode==CONN_MODE_TLS ? connection->remote_sni : config->server_host;

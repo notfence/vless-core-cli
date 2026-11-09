@@ -1381,7 +1381,7 @@ int grpc_connect(const vless_config_t *cfg, tls13_conn_t *c, char *err, size_t e
 
     if (strcmp(cfg->security, "none") == 0) {
         c->mode = CONN_MODE_GRPC_PLAIN;
-        c->fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source);
+        c->fd = tcp_connect_host(c->remote_host, c->remote_port, c->ip_source,&c->sockopt);
         if (c->fd < 0) {
             set_err(err, err_cap, "tcp connect failed");
             return -1;
