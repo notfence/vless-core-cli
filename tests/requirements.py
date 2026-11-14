@@ -1,19 +1,30 @@
 import hashlib
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 
 XRAY_VERSION = "26.6.27"
 XRAY_SHA256 = "8ef87ac07f95617e094b8e9302ea3e0c2d0edaa7045d57b455fdee28b3c9e41e"
+
+def openssl_library_dir(prefix):
+    prefix = Path(prefix)
+    candidates = [prefix / "lib", prefix / "lib64"]
+    host_multiarch = sysconfig.get_config_var("MULTIARCH")
+    if host_multiarch and re.fullmatch(r"[A-Za-z0-9_-]+", host_multiarch):
+        candidates.append(prefix / "lib" / host_multiarch)
+    return next((directory for directory in candidates if all((directory / name).is_file() for name in ("libssl.a", "libcrypto.a"))), prefix / "lib")
 
 def verify():
     compiler = os.environ.get("TEST_FUZZ_CC","clang")
     if not shutil.which(compiler):
         raise RuntimeError(f"Missing local fuzz compiler: {compiler}. Clang with libFuzzer, ASan and UBSan is required; make never installs dependencies.")
     prefix = Path(os.environ["TEST_OPENSSL_PREFIX"])
-    required = [prefix / "include/openssl/evp.h", prefix / "lib/libssl.a", prefix / "lib/libcrypto.a", prefix / "bin/openssl"]
+    directory = openssl_library_dir(prefix)
+    required = [prefix / "include/openssl/evp.h", directory / "libssl.a", directory / "libcrypto.a", prefix / "bin/openssl"]
     for path in required:
         if not path.is_file():
             raise RuntimeError(f"Missing test OpenSSL dependency: {path}. Set TEST_OPENSSL_PREFIX to a prepared OpenSSL 3.5 prefix; make never installs dependencies.")
@@ -34,7 +45,9 @@ def verify():
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) > 1 and sys.argv[1] == "settings":
+        if len(sys.argv) > 1 and sys.argv[1] == "libdir":
+            print(openssl_library_dir(sys.argv[2]))
+        elif len(sys.argv) > 1 and sys.argv[1] == "settings":
             path = Path(sys.argv[2]); path.parent.mkdir(parents=True,exist_ok=True)
             content = "\n".join(sys.argv[3:])+"\n"
             if not path.exists() or path.read_text() != content:

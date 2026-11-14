@@ -10,6 +10,9 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
+
+import requirements
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -77,6 +80,49 @@ def verify_release(directory):
         verify_archive(directory/name,name.removesuffix(".tar.gz"),architecture)
 
 class BuildTests(unittest.TestCase):
+    def test_system_openssl_default(self):
+        environment = dict(os.environ)
+        for name in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "TEST_OPENSSL_PREFIX"):
+            environment.pop(name, None)
+        result = subprocess.run(["make", "-s", "--eval=print-openssl-prefix:;@printf '%s' '$(TEST_OPENSSL_PREFIX)'", "print-openssl-prefix"], cwd=ROOT / "tests", env=environment, capture_output=True, text=True, timeout=10, check=True)
+        self.assertEqual(result.stdout, "/usr")
+
+    def test_openssl_library_layouts(self):
+        with tempfile.TemporaryDirectory(prefix="vless-openssl-layout-") as temporary:
+            prefix = Path(temporary)
+            for relative in ("lib", "lib64", "lib/x86_64-linux-gnu"):
+                directory = prefix / relative
+                directory.mkdir(parents=True, exist_ok=True)
+                for name in ("libssl.a", "libcrypto.a"):
+                    (directory / name).touch()
+                with mock.patch.object(requirements.sysconfig, "get_config_var", return_value="x86_64-linux-gnu"):
+                    self.assertEqual(requirements.openssl_library_dir(prefix), directory)
+                for name in ("libssl.a", "libcrypto.a"):
+                    (directory / name).unlink()
+            for multiarch in ("../outside", None):
+                with mock.patch.object(requirements.sysconfig, "get_config_var", return_value=multiarch):
+                    self.assertEqual(requirements.openssl_library_dir(prefix), prefix / "lib")
+
+    def test_static_openssl_dependency_flags(self):
+        with tempfile.TemporaryDirectory(prefix="vless-openssl-pkgconfig-") as temporary:
+            prefix = Path(temporary)
+            directory = prefix / "lib"
+            (directory / "pkgconfig").mkdir(parents=True)
+            for name in ("libssl.a", "libcrypto.a"):
+                (directory / name).touch()
+            (directory / "pkgconfig/openssl.pc").write_text("Name: OpenSSL\nDescription: Test OpenSSL\nVersion: 3.5.7\nLibs: -lssl -lcrypto\nLibs.private: -lz -lzstd\n")
+            environment = dict(os.environ)
+            for name in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "HOST_LIBS"):
+                environment.pop(name, None)
+            result = subprocess.run(["make", "-s", "--eval=print-host-libs:;@printf '%s' '$(HOST_LIBS)'", "print-host-libs", f"TEST_OPENSSL_PREFIX={prefix}"], cwd=ROOT / "tests", env=environment, capture_output=True, text=True, timeout=10, check=True)
+            flags = result.stdout.split()
+            self.assertIn(str(directory / "libssl.a"), flags)
+            self.assertIn(str(directory / "libcrypto.a"), flags)
+            self.assertIn("-lz", flags)
+            self.assertIn("-lzstd", flags)
+            self.assertNotIn("-lssl", flags)
+            self.assertNotIn("-lcrypto", flags)
+
     def binary_fixture(self, architecture):
         if architecture == "linux":
             data = bytearray(64); data[:6] = b"\x7fELF\x02\x01"; struct.pack_into("<HH",data,16,2,62)

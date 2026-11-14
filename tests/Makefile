@@ -2,7 +2,9 @@ ROOT := $(abspath ..)
 .DEFAULT_GOAL := test
 HOST_CC ?= cc
 HOST_BUILD_DIR ?= $(ROOT)/build/host-tests
-TEST_OPENSSL_PREFIX ?= $(HOME)/.local/openssl-3.5
+TEST_OPENSSL_PREFIX ?= /usr
+TEST_OPENSSL_LIBDIR := $(shell python3 $(ROOT)/tests/requirements.py libdir "$(TEST_OPENSSL_PREFIX)")
+TEST_OPENSSL_EXTRA_LIBS := $(filter-out -lssl -lcrypto,$(shell PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$(TEST_OPENSSL_LIBDIR)/pkgconfig" pkg-config --static --libs openssl 2>/dev/null))
 TEST_XRAY_BIN ?= $(abspath $(ROOT)/../tools/xray-v26.6.27-linux-64/xray)
 FUZZ_CC ?= clang
 FUZZ_RUNS ?= 10000
@@ -15,8 +17,8 @@ FUZZ_BIN := $(HOST_BUILD_DIR)/fuzz-parsers
 ENCRYPTION_FUZZ_BIN := $(HOST_BUILD_DIR)/fuzz-encryption
 POOL_FUZZ_BIN := $(HOST_BUILD_DIR)/fuzz-http2-pool
 HOST_FLAGS := -O1 -g -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE -I$(ROOT)/include -I$(TEST_OPENSSL_PREFIX)/include $(SANITIZE)
-HOST_LIBS := $(TEST_OPENSSL_PREFIX)/lib/libssl.a $(TEST_OPENSSL_PREFIX)/lib/libcrypto.a -lpthread -ldl $(SANITIZE)
-HOST_LIB_FILES := $(TEST_OPENSSL_PREFIX)/lib/libssl.a $(TEST_OPENSSL_PREFIX)/lib/libcrypto.a
+HOST_LIBS := $(TEST_OPENSSL_LIBDIR)/libssl.a $(TEST_OPENSSL_LIBDIR)/libcrypto.a $(TEST_OPENSSL_EXTRA_LIBS) -lpthread -ldl $(SANITIZE)
+HOST_LIB_FILES := $(TEST_OPENSSL_LIBDIR)/libssl.a $(TEST_OPENSSL_LIBDIR)/libcrypto.a
 BASE_SRC := $(filter-out $(ROOT)/src/main.c,$(wildcard $(ROOT)/src/*.c))
 BASE_OBJ := $(patsubst $(ROOT)/src/%.c,$(HOST_BUILD_DIR)/src/%.o,$(BASE_SRC))
 NETWORK_GUARD := $(HOST_BUILD_DIR)/network_guard.o
@@ -189,17 +191,17 @@ $(HOST_BUILD_DIR)/fuzz_encryption.o: $(ROOT)/tests/fuzz_encryption.c | requireme
 	$(FUZZ_CC) $(FUZZ_FLAGS) -MMD -MP -c $< -o $@
 
 $(FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_parsers.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(FUZZ_OBJ) $(HOST_LIB_FILES)
-	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS) -Wl,--wrap=core_ss_time
+	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) $(TEST_OPENSSL_EXTRA_LIBS) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS) -Wl,--wrap=core_ss_time
 
 $(ENCRYPTION_FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_encryption.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(filter-out $(HOST_BUILD_DIR)/fuzz-src/vless_encryption.o $(HOST_BUILD_DIR)/fuzz-src/vmess_stream.o $(HOST_BUILD_DIR)/fuzz-src/shadowsocks_stream.o $(HOST_BUILD_DIR)/fuzz-src/protocol_stream.o,$(FUZZ_OBJ)) $(HOST_LIB_FILES)
-	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
+	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) $(TEST_OPENSSL_EXTRA_LIBS) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
 
 $(HOST_BUILD_DIR)/fuzz_http2_pool.o: $(ROOT)/tests/fuzz_http2_pool.c | requirements
 	mkdir -p $(dir $@)
 	$(FUZZ_CC) $(FUZZ_FLAGS) -MMD -MP -c $< -o $@
 
 $(POOL_FUZZ_BIN): $(HOST_BUILD_DIR)/fuzz_http2_pool.o $(HOST_BUILD_DIR)/fuzz_network_guard.o $(filter-out $(HOST_BUILD_DIR)/fuzz-src/http2_pool.o $(HOST_BUILD_DIR)/fuzz-src/vless.o $(HOST_BUILD_DIR)/fuzz-src/vless_encryption.o $(HOST_BUILD_DIR)/fuzz-src/vmess_stream.o $(HOST_BUILD_DIR)/fuzz-src/shadowsocks_stream.o $(HOST_BUILD_DIR)/fuzz-src/protocol_stream.o,$(FUZZ_OBJ)) $(HOST_LIB_FILES)
-	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
+	$(FUZZ_CC) $(filter %.o,$^) -o $@ $(HOST_LIB_FILES) $(TEST_OPENSSL_EXTRA_LIBS) -lpthread -ldl -fsanitize=fuzzer,address,undefined $(NETWORK_FLAGS)
 
 fuzz: requirements $(FUZZ_BIN) $(ENCRYPTION_FUZZ_BIN) $(POOL_FUZZ_BIN)
 	TEST_BUILD_DIR="$(HOST_BUILD_DIR)" TEST_FUZZ_RUNS="$(FUZZ_RUNS)" python3 $(ROOT)/tests/test_fuzz.py

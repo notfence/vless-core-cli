@@ -13,7 +13,7 @@ import time
 import urllib.parse
 
 BUILD = Path(os.environ.get("TEST_BUILD_DIR", Path(__file__).resolve().parents[1] / "build/host-tests"))
-OPENSSL = Path(os.environ.get("TEST_OPENSSL_PREFIX", Path.home() / ".local/openssl-3.5")) / "bin/openssl"
+OPENSSL = Path(os.environ.get("TEST_OPENSSL_PREFIX", "/usr")) / "bin/openssl"
 XRAY = Path(os.environ.get("TEST_XRAY_BIN", Path(__file__).resolve().parents[2] / "tools/xray-v26.6.27-linux-64/xray"))
 PRIVATE = Path(os.environ["TEST_PRIVATE_ROOT"])
 UUID = "00000000-0000-0000-0000-000000000001"

@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from requirements import openssl_library_dir
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = Path(os.environ.get("TEST_BUILD_DIR",ROOT/"build/host-tests"))
@@ -28,9 +29,10 @@ class VersionTests(unittest.TestCase):
 
     def test_revision_dependencies_and_missing_history(self):
         self.assertTrue((ROOT/"include/build_version.mk").is_file())
-        prefix=Path(os.environ.get("TEST_OPENSSL_PREFIX",Path.home()/".local/openssl-3.5"))
+        prefix=Path(os.environ.get("TEST_OPENSSL_PREFIX","/usr"))
         flags=os.environ.get("TEST_HOST_FLAGS",f"-O1 -g -std=c11 -D_DEFAULT_SOURCE -I{ROOT}/include -I{prefix}/include")
-        libs=os.environ.get("TEST_HOST_LIBS",f"{prefix}/lib/libssl.a {prefix}/lib/libcrypto.a -lpthread -ldl")
+        library_dir=openssl_library_dir(prefix)
+        libs=os.environ.get("TEST_HOST_LIBS",f"{library_dir}/libssl.a {library_dir}/libcrypto.a -lpthread -ldl")
         objects=[path for path in sorted((BUILD/"src").glob("*.o")) if path.name not in ("main.o","cli_args.o")]
         self.assertTrue(objects)
         with tempfile.TemporaryDirectory(prefix="vless-core-version-") as temporary:
