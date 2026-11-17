@@ -35,7 +35,7 @@
 #include "protocol_stream.h"
 #include "relay_memory.h"
 
-#define VLESS_CORE_VERSION "2.0.0"
+#define VLESS_CORE_VERSION "2.0.1"
 #ifndef VLESS_CORE_COMMIT
 #define VLESS_CORE_COMMIT "unknown"
 #endif

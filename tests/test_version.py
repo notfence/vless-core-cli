@@ -20,7 +20,7 @@ class VersionTests(unittest.TestCase):
                 dirty=subprocess.check_output(["git","status","--porcelain","--untracked-files=normal","--","."],cwd=ROOT,text=True,stderr=subprocess.DEVNULL)
                 if dirty: revision+="-dirty"
         except (OSError,subprocess.CalledProcessError): revision="unknown"
-        expected=f"vless-core 2.0.0 ({revision})\n"
+        expected=f"vless-core 2.0.1 ({revision})\n"
         for option in ("--version","-v"):
             with self.subTest(option=option):
                 result=subprocess.run([str(BUILD/"vless-core-test"),option],capture_output=True,text=True,timeout=5)
@@ -66,7 +66,7 @@ include include/build_version.mk
 
             def build(expected):
                 command("make","-j4")
-                for option in ("--version","-v"): self.assertEqual(command(str(directory/"build/vless-core"),option),f"vless-core 2.0.0 ({expected})")
+                for option in ("--version","-v"): self.assertEqual(command(str(directory/"build/vless-core"),option),f"vless-core 2.0.1 ({expected})")
                 return tuple((directory/path).stat().st_mtime_ns for path in ("build/build_version.h","build/main.o","build/cli_args.o","build/vless-core"))
 
             original=build("unknown")
