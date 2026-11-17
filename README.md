@@ -63,8 +63,8 @@ body without that framing. Their protocol headers still use AEAD.
   WebSocket heartbeat are not supported. Vision requires VLESS Encryption
   when using HTTPUpgrade.
 
-Supported `fp` values are `chrome`, `firefox`, `edge`, `random`,
-`randomized`, and `qq`.
+Supported `fp` values are `chrome`, `firefox`, `edge`, `ios`, `safari`,
+`360`, `random`, `randomized`, and `qq`.
 
 ## Platform Support
 
@@ -87,15 +87,27 @@ Build outputs:
 ## Build
 
 Linux builds need a C compiler, Make, Python 3, and OpenSSL development files.
-Build preflight also requires Clang with sanitizers/libFuzzer, a separate test
-OpenSSL 3.5 installation, and unchanged Xray 26.6.27. Tests run locally on Linux.
+Build preflight also requires:
+
+- Clang with ASan, UBSan, and libFuzzer (compiler-rt).
+- OpenSSL 3.5: the `openssl` executable, headers under `include/openssl/`,
+  and static libraries `libssl.a` and `libcrypto.a`. Install the development
+  and static-library packages provided by your system's package manager.
+- Unchanged Xray 26.6.27.
+  Extract the `xray` executable to `../tools/xray-v26.6.27-linux-64/xray`.
+
+Tests run locally on Linux.
 Set `TEST_OPENSSL_PREFIX` and `TEST_XRAY_BIN` if their default paths do not apply.
 
 ```bash
 cd vless-core-cli
 make clean
+make tls-decoders
 make all
 ```
+
+`make tls-decoders` downloads `brotli-v1.2.1.tar.gz` and `zstd-v1.5.7.tar.gz`
+when missing.
 
 Build only Linux (amd64):
 
