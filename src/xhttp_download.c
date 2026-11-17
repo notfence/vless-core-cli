@@ -26,11 +26,10 @@ static int string(const core_json_t *value, char *destination, size_t capacity, 
     memcpy(destination,value->text,strlen(value->text)+1); return 0;
 }
 
-static int fingerprint(const core_json_t *value, fingerprint_mode_t *mode, char *error, size_t capacity) {
-    const char *names[]={"chrome","random","qq","randomized","firefox","edge"};
+static int fingerprint(const core_json_t *value, vless_config_t *config, char *error, size_t capacity) {
     if (value->type != CORE_JSON_STRING) return invalid("fingerprint",error,capacity);
-    for (size_t i=0;i<sizeof(names)/sizeof(*names);i++) if (!strcasecmp(value->text,names[i])) { *mode=(fingerprint_mode_t)i; return 0; }
-    return invalid("fingerprint",error,capacity);
+    if (core_fingerprint_parse(value->text,&config->fp_mode)) return invalid("fingerprint",error,capacity);
+    return string(value,config->fp_name,sizeof(config->fp_name),"fingerprint",error,capacity);
 }
 
 static int duplicate_fields(const core_json_t *object, const char *const *names, size_t count, char *error, size_t capacity) {
@@ -56,7 +55,7 @@ static int security_settings(const core_json_t *settings, int reality, vless_con
             if (entry->type != CORE_JSON_BOOL) return invalid("tlsSettings.allowInsecure",error,capacity);
             config->allow_insecure=!strcmp(entry->text,"true");
         } else if (!strcasecmp(entry->key,"fingerprint")) {
-            if (fingerprint(entry,&config->fp_mode,error,capacity) != 0) return -1;
+            if (fingerprint(entry,config,error,capacity) != 0) return -1;
         } else if ((!strcasecmp(entry->key,"publicKey") || !strcasecmp(entry->key,"password")) && reality) {
             uint8_t key[32]; size_t length;
             if (entry->type != CORE_JSON_STRING || base64url_decode(entry->text,key,sizeof(key),&length) != 0 || length != 32) return invalid("realitySettings.publicKey",error,capacity);
@@ -122,6 +121,7 @@ int core_xhttp_download_parse(const core_json_t *root, vless_config_t *config, c
     if (reality && security_settings(reality,1,config,error,capacity) != 0) return -1;
     if ((tls && strcmp(config->security,"tls")) || (reality && strcmp(config->security,"reality"))) return invalid("security settings do not match security",error,capacity);
     if (!strcmp(config->security,"reality") && config->pbk_len != 32) return invalid("realitySettings.publicKey required",error,capacity);
+    if (!strcmp(config->security,"reality") && !core_fingerprint_tls13(config->fp_mode)) return invalid("fingerprint requires TLS 1.3 for REALITY",error,capacity);
     if (xhttp) {
         if (xhttp->type != CORE_JSON_OBJECT) return invalid("xhttpSettings",error,capacity);
         const char *extra_names[]={"extra"};

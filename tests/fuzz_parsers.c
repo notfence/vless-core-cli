@@ -420,6 +420,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&hello_length,&sid,NULL,NULL)) abort();
         }
         core_tls_hello_t server;
+        tls13_conn_t compressed={0}; dynbuf_t decoded={0};
+        if (db_append(&compressed.tls_client_hello,hello,hello_length)) abort();
+        (void)tls_certificate_decompress(&compressed,data,size,&decoded);
+        db_free(&decoded); db_free(&compressed.tls_client_hello);
+        if (compressed.tls_handshake_bytes) abort();
         if (!core_tls_hello_parse(data,size,hello,hello_length,&server) && server.retry) {
             uint8_t *retry=NULL; size_t retry_length=0; EVP_PKEY *key=NULL;
             (void)core_tls_hello_retry(hello,hello_length,&server,&retry,&retry_length,&key);

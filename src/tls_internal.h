@@ -76,6 +76,10 @@ typedef struct {
     core_buffer_budget_t *memory;
 } dynbuf_t;
 
+void *tls_handshake_allocate(void *,size_t);
+void tls_handshake_deallocate(void *,void *);
+int tls_certificate_decompress(tls13_conn_t *,const uint8_t *,size_t,dynbuf_t *);
+
 
 typedef enum {
     CONN_MODE_REALITY = 0,
@@ -99,6 +103,8 @@ typedef enum {
     TLS_CIPHER_OFFER_CHACHA = 0,
     TLS_CIPHER_OFFER_AES = 1
 } tls_cipher_offer_t;
+
+const char *tls_fingerprint_alpn(fingerprint_mode_t);
 
 #define CORE_CONNECT_TIMEOUT_MS 12000
 #define CORE_TLS_HANDSHAKE_TIMEOUT_MS 12000
@@ -195,6 +201,7 @@ struct tls13_conn {
     char tls_offered_alpn[128], tls_selected_alpn[128];
     int tls_h2_required, tls_is_reality;
     int tls_alps_received;
+    uint16_t tls_alps_codepoint;
     core_http2_settings_t tls_alps_settings;
     dynbuf_t tls_client_hello;
     EVP_PKEY *tls_retry_key;

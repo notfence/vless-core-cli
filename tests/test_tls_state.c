@@ -389,7 +389,7 @@ static void alps_vectors(void) {
         tls13_reality_close(connection); close(pair[1]);
     }
     int pair[2]; REQUIRE("alps/fragmented-flight-pair",!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
-    tls13_conn_t sender={.fd=pair[0],.tls_alps_received=1,.tls_client_certificate_requested=1,.tls_send_record_limit=64},peer={0};
+    tls13_conn_t sender={.fd=pair[0],.tls_alps_received=1,.tls_alps_codepoint=0x4469,.tls_client_certificate_requested=1,.tls_send_record_limit=64},peer={0};
     REQUIRE("alps/fragmented-flight-cipher",!configure_tls_cipher(&sender,0x1302) && !configure_tls_cipher(&peer,0x1302));
     REQUIRE("alps/fragmented-flight-transcript",!db_append(&sender.transcript,"vless-core server Finished",26));
     char error[128]; REQUIRE("alps/fragmented-client-flight",!tls_send_client_finished(&sender,error,sizeof(error)));
@@ -448,8 +448,10 @@ int main(int argc, char **argv) {
     for (unsigned fingerprint=0;fingerprint<3;fingerprint++) {
         config.fp_mode=(fingerprint_mode_t[]){FP_CHROME,FP_FIREFOX,FP_QQ}[fingerprint]; hello=NULL;
         REQUIRE("tls/advertised-certificate-capabilities-build",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&length,&sid,NULL,NULL) == 0);
-        CHECK("tls/no-unsupported-certificate-compression",hello_extension(hello,length,27,&extension,&extension_length) != 0);
-        CHECK("tls/no-unsupported-delegated-credentials",hello_extension(hello,length,34,&extension,&extension_length) != 0);
+        CHECK("tls/certificate-compression-matches-profile",hello_extension(hello,length,27,&extension,&extension_length) == 0 &&
+            (config.fp_mode == FP_FIREFOX ? extension_length == 7 && !memcmp(extension,"\x06\x00\x01\x00\x02\x00\x03",7) :
+             extension_length == 3 && !memcmp(extension,"\x02\x00\x02",3)));
+        CHECK("tls/delegated-credentials-match-profile",(hello_extension(hello,length,34,&extension,&extension_length) == 0) == (config.fp_mode == FP_FIREFOX));
         free(hello);
     }
     tls13_conn_t negotiated={.tls_h2_required=1}; strcpy(negotiated.tls_offered_alpn,"h2,http/1.1");

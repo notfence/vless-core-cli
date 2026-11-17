@@ -1571,8 +1571,11 @@ class XrayTests(unittest.TestCase):
         cert,key = certificate(); listen_port = port()
         command = [str(OPENSSL),"s_server","-accept",f"127.0.0.1:{listen_port}","-cert",str(cert),"-key",str(key),"-tls1_3","-groups","X25519","-ciphersuites","TLS_AES_128_GCM_SHA256","-www"]
         with Process(command,"aes-server",{"OPENSSL_CONF":"/dev/null"},ready="ACCEPT") as server:
-            result = subprocess.run([str(BUILD/"test_tls"),uri(listen_port,"tcp","tls")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=15)
-            self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
+            for fingerprint in ("randomized","chrome","firefox","edge","qq"):
+                with self.subTest(fingerprint=fingerprint), CountingProxy(listen_port) as proxy:
+                    result = subprocess.run([str(BUILD/"test_tls"),uri(proxy.port,"tcp","tls",fp=fingerprint)],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=15)
+                    self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
+                    self.assertEqual(len(proxy.client_data),4 if fingerprint == "randomized" else 3)
 
     def test_optional_tls_client_certificate_request(self):
         cert,key=certificate(); listen_port=port()

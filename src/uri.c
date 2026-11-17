@@ -91,6 +91,7 @@ void core_config_defaults(vless_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->protocol = CORE_PROTOCOL_VLESS;
     cfg->fp_mode = FP_CHROME;
+    snprintf(cfg->fp_name,sizeof(cfg->fp_name),"chrome");
     cfg->transport_mode = TRANSPORT_VISION;
     cfg->flow[0] = '\0';
     snprintf(cfg->encryption, sizeof(cfg->encryption), "none");
@@ -368,19 +369,8 @@ int core_config_parameter(vless_config_t *cfg,const char *key,const char *decode
     } else if (strcmp(key, "sni") == 0) {
         copy_trunc(cfg->sni, sizeof(cfg->sni), decoded);
     } else if (strcmp(key, "fp") == 0) {
-        if (strcmp(decoded_lower, "random") == 0) {
-            cfg->fp_mode = FP_RANDOM;
-        } else if (strcmp(decoded_lower, "randomized") == 0) {
-            cfg->fp_mode = FP_RANDOMIZED;
-        } else if (strcmp(decoded_lower, "qq") == 0) {
-            cfg->fp_mode = FP_QQ;
-        } else if (strcmp(decoded_lower, "firefox") == 0) {
-            cfg->fp_mode = FP_FIREFOX;
-        } else if (strcmp(decoded_lower, "edge") == 0) {
-            cfg->fp_mode = FP_EDGE;
-        } else if (!strcmp(decoded_lower,"chrome")) {
-            cfg->fp_mode = FP_CHROME;
-        } else { set_err(err,err_cap,"unsupported fp"); return -1; }
+        if (core_fingerprint_parse(decoded_lower,&cfg->fp_mode)) { set_err(err,err_cap,"unsupported fp"); return -1; }
+        copy_trunc(cfg->fp_name,sizeof(cfg->fp_name),decoded);
     } else if (strcmp(key, "flow") == 0) {
         copy_trunc(cfg->flow, sizeof(cfg->flow), decoded_lower);
     } else if (strcmp(key, "encryption") == 0) {
@@ -709,6 +699,12 @@ static int parse_socks5_uri(const char *uri, vless_config_t *cfg, char *err, siz
 }
 
 int core_config_finalize(vless_config_t *cfg, char *err, size_t err_cap) {
+    if (cfg->transport_mode == TRANSPORT_GRPC && strcmp(cfg->security,"none") && cfg->fp_mode == FP_360_7_5) {
+        set_err(err,err_cap,"fingerprint is incompatible with gRPC TLS"); return -1;
+    }
+    if (!strcmp(cfg->security,"reality") && !core_fingerprint_tls13(cfg->fp_mode)) {
+        set_err(err,err_cap,"fingerprint requires TLS 1.3 for REALITY"); return -1;
+    }
     if (cfg->transport_mode == TRANSPORT_HTTPUPGRADE && core_httpupgrade_configure(cfg,err,err_cap)) return -1;
     if (cfg->transport_mode == TRANSPORT_WS && core_ws_configure(cfg,err,err_cap)) return -1;
     if (cfg->transport_mode == TRANSPORT_WS) {

@@ -4,12 +4,16 @@ ROOT_DIR := $(abspath .)
 
 COMMON_CFLAGS ?= -O2 -Wall -Wextra -std=c11
 DEPFLAGS := -MMD -MP
-INCLUDES := -Iinclude
+INCLUDES := -Iinclude -Ithird_party/brotli-1.2.1/c/include
 
 SRC := $(wildcard src/*.c)
+include include/tls_decoders.mk
 OBJ_LINUX := $(patsubst src/%.c,build/linux/%.o,$(SRC))
 OBJ_IOS := $(patsubst src/%.c,build/ios/%.o,$(SRC))
 OBJ_IOS_ARM64 := $(patsubst src/%.c,build/ios-arm64/%.o,$(SRC))
+OBJ_LINUX += $(patsubst %.c,build/linux/%.o,$(DECODER_SRC))
+OBJ_IOS += $(patsubst %.c,build/ios/%.o,$(DECODER_SRC))
+OBJ_IOS_ARM64 += $(patsubst %.c,build/ios-arm64/%.o,$(DECODER_SRC))
 
 BIN_LINUX ?= vless-core-linux-amd64
 BIN_IOS ?= vless-core-darwin-armv7
@@ -21,6 +25,7 @@ RELEASE_IOS_ARM64_ARCHIVE := $(RELEASE_DIR)/vless-core-darwin-arm64.tar.gz
 
 LDFLAGS ?=
 LDLIBS ?= -lssl -lcrypto -lpthread
+LDLIBS += -lz
 
 IOS_TOOLCHAIN ?= $(abspath ../toolchains/ios6)
 IOS_SDK ?= $(IOS_TOOLCHAIN)/SDK/iPhoneOS6.1.sdk
@@ -47,6 +52,7 @@ IOS_OPENSSL_PATCH_STATUS ?= $(shell cat "$(IOS_OPENSSL_PATCH_STATUS_FILE)" 2>/de
 IOS_CFLAGS ?= $(COMMON_CFLAGS) $(INCLUDES) -I$(IOS_OPENSSL_PREFIX)/include -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=$(IOS_MIN_VERSION) -DVLESS_OPENSSL_PATCH_STATUS=\"$(IOS_OPENSSL_PATCH_STATUS)\"
 IOS_LDFLAGS ?= -arch armv7 -isysroot $(IOS_SDK) -miphoneos-version-min=$(IOS_MIN_VERSION) -Wl,-pie
 IOS_LDLIBS ?= $(IOS_OPENSSL_PREFIX)/lib/libssl.a $(IOS_OPENSSL_PREFIX)/lib/libcrypto.a -lpthread
+IOS_LDLIBS += $(IOS_ZLIB_PREFIX)/lib/libz.a
 IOS_ARM64_SDK ?= $(abspath ../toolchains/sdks/iPhoneOS11.4.sdk)
 IOS_ARM64_MIN_VERSION ?= 11.0
 IOS_ARM64_OPENSSL_PREFIX ?= third_party/openssl-ios-arm64
@@ -56,6 +62,7 @@ IOS_ARM64_OPENSSL_PATCH_STATUS ?= $(shell cat "$(IOS_ARM64_OPENSSL_PATCH_STATUS_
 IOS_ARM64_CFLAGS ?= $(COMMON_CFLAGS) $(INCLUDES) -I$(IOS_ARM64_OPENSSL_PREFIX)/include -arch arm64 -isysroot $(IOS_ARM64_SDK) -miphoneos-version-min=$(IOS_ARM64_MIN_VERSION) -DVLESS_OPENSSL_PATCH_STATUS=\"$(IOS_ARM64_OPENSSL_PATCH_STATUS)\"
 IOS_ARM64_LDFLAGS ?= -arch arm64 -isysroot $(IOS_ARM64_SDK) -miphoneos-version-min=$(IOS_ARM64_MIN_VERSION) -Wl,-pie
 IOS_ARM64_LDLIBS ?= $(IOS_ARM64_OPENSSL_PREFIX)/lib/libssl.a $(IOS_ARM64_OPENSSL_PREFIX)/lib/libcrypto.a -lpthread
+IOS_ARM64_LDLIBS += $(IOS_ARM64_ZLIB_PREFIX)/lib/libz.a
 CA_BUNDLE ?= third_party/cacert.pem
 CURL_IOS_BIN ?= third_party/curl-ios6-armv7/bin/curl
 CURL_IOS_ARM64_PREFIX ?= third_party/curl-ios-arm64
@@ -68,6 +75,9 @@ test:
 	$(MAKE) -C tests test
 
 preflight: test
+
+tls-decoders:
+	bash scripts/prepare_tls_decoders.sh
 
 test-asan:
 	$(MAKE) -C tests asan
@@ -118,6 +128,18 @@ $(BIN_IOS_ARM64): $(OBJ_IOS_ARM64) $(IOS_ARM64_OPENSSL_PREFIX)/lib/libssl.a $(IO
 
 build/linux/%.o: src/%.c | preflight build/linux
 	$(CC) $(COMMON_CFLAGS) $(DEPFLAGS) $(INCLUDES) $(if $(filter main,$*),-include build/linux/build_version.h) -c $< -o $@
+
+build/linux/third_party/%.o: third_party/%.c $(DECODER_HEADERS) | preflight
+	mkdir -p $(dir $@)
+	$(CC) $(COMMON_CFLAGS) $(DEPFLAGS) $(DECODER_FLAGS) -c $< -o $@
+
+build/ios/third_party/%.o: third_party/%.c $(DECODER_HEADERS) | preflight
+	mkdir -p $(dir $@)
+	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_CFLAGS) $(DEPFLAGS) $(DECODER_FLAGS) -c $< -o $@
+
+build/ios-arm64/third_party/%.o: third_party/%.c $(DECODER_HEADERS) | preflight
+	mkdir -p $(dir $@)
+	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_ARM64_CFLAGS) $(DEPFLAGS) $(DECODER_FLAGS) -c $< -o $@
 
 build/ios/%.o: src/%.c | preflight build/ios
 	PATH="$(IOS_TOOLCHAIN)/bin:$$PATH" $(IOS_RUNTIME_ENV) $(IOS_CC) $(IOS_CFLAGS) $(DEPFLAGS) $(if $(filter main,$*),-include build/ios/build_version.h) -c $< -o $@
@@ -236,7 +258,7 @@ clean:
 
 -include $(OBJ_LINUX:.o=.d) $(OBJ_IOS:.o=.d) $(OBJ_IOS_ARM64:.o=.d)
 
-.PHONY: all linux ios ios-arm64 test preflight test-asan test-sanitizers test-fuzz test-coverage check-ios-toolchain check-ios-arm64-toolchain clean openssl-ios6 openssl-ios-arm64 zlib-ios6 zlib-ios-arm64 curl-ios6 curl-ios-arm64 curl-ios6-package release-packages
+.PHONY: all linux ios ios-arm64 test preflight tls-decoders test-asan test-sanitizers test-fuzz test-coverage check-ios-toolchain check-ios-arm64-toolchain clean openssl-ios6 openssl-ios-arm64 zlib-ios6 zlib-ios-arm64 curl-ios6 curl-ios-arm64 curl-ios6-package release-packages
 
 CORE_VERSION_ROOT := $(ROOT_DIR)
 CORE_VERSION_FILES := build/linux/build_version.h build/ios/build_version.h build/ios-arm64/build_version.h

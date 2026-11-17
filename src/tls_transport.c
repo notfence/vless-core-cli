@@ -682,10 +682,11 @@ static int connect_manual_tls_endpoint(const vless_config_t *cfg, tls13_conn_t *
         TLS_CIPHER_OFFER_CHACHA,
         TLS_CIPHER_OFFER_AES,
     };
-    size_t first_offer = start_with_aes ? 1 : 0;
+    size_t first_offer = cfg->fp_mode == FP_RANDOMIZED && start_with_aes ? 1 : 0;
+    size_t offer_count = cfg->fp_mode == FP_RANDOMIZED ? sizeof(offer_order)/sizeof(*offer_order) : 1;
     core_connection_error_t failure={0};
 
-    for (size_t i = first_offer; i < sizeof(offer_order) / sizeof(offer_order[0]); i++) {
+    for (size_t i = first_offer; i < offer_count; i++) {
         tls_cipher_offer_t offer = offer_order[i];
         reset_manual_tls_handshake(c);
         c->fd = i == first_offer ? initial_fd : tcp_connect_address(&cfg->sockopt,address->sa_family, socktype, protocol, address, address_len);

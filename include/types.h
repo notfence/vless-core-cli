@@ -6,15 +6,7 @@
 #include "vmess.h"
 #include "shadowsocks.h"
 #include "sockopt.h"
-
-typedef enum {
-    FP_CHROME = 0,
-    FP_RANDOM = 1,
-    FP_QQ = 2,
-    FP_RANDOMIZED = 3,
-    FP_FIREFOX = 4,
-    FP_EDGE = 5
-} fingerprint_mode_t;
+#include "fingerprint.h"
 
 typedef enum {
     TRANSPORT_VISION = 0,
@@ -127,6 +119,7 @@ typedef struct {
         core_ss_credentials_t ss;
     };
     size_t encryption_relay_count;
+    char fp_name[32];
 } vless_config_t;
 
 typedef struct {

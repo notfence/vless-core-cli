@@ -80,6 +80,69 @@ def verify_release(directory):
         verify_archive(directory/name,name.removesuffix(".tar.gz"),architecture)
 
 class BuildTests(unittest.TestCase):
+    def decoder_environment(self, directory):
+        marker = directory/"download-called"
+        downloader = directory/"curl"
+        downloader.write_text(f'#!/bin/sh\nprintf called >"{marker}"\nexit 91\n')
+        downloader.chmod(0o700)
+        return dict(os.environ, TLS_DECODER_OUTPUT_DIR=str(directory/"sources"),
+                    TLS_DECODER_CACHE_DIR=str(directory/"cache"), TLS_DECODER_OFFLINE="1",
+                    PATH=str(directory)+os.pathsep+os.environ["PATH"]), marker
+
+    def test_decoder_check_is_read_only_and_offline(self):
+        with tempfile.TemporaryDirectory(prefix="decoder-check-") as temporary:
+            directory = Path(temporary)
+            environment, marker = self.decoder_environment(directory)
+            result = subprocess.run(["bash", str(ROOT/"scripts/prepare_tls_decoders.sh"), "--check"],
+                                    env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertFalse(marker.exists())
+            self.assertFalse((directory/"sources").exists())
+            self.assertFalse((directory/"cache").exists())
+
+    def test_decoder_missing_and_corrupt_archive_do_not_download(self):
+        for corrupted in (False, True):
+            with self.subTest(corrupted=corrupted), tempfile.TemporaryDirectory(prefix="decoder-cache-") as temporary:
+                directory = Path(temporary)
+                environment, marker = self.decoder_environment(directory)
+                cache = directory/"cache"; cache.mkdir()
+                archive = cache/"brotli-v1.2.1.tar.gz"
+                if corrupted: archive.write_bytes(b"invalid archive")
+                result = subprocess.run(["bash", str(ROOT/"scripts/prepare_tls_decoders.sh")],
+                                        env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("checksum mismatch" if corrupted else "Missing cached archive", result.stderr)
+                self.assertFalse(marker.exists())
+                self.assertEqual(list((directory/"sources").iterdir()), [])
+                if corrupted: self.assertEqual(archive.read_bytes(), b"invalid archive")
+
+    def test_decoder_preparation_preserves_modified_sources(self):
+        with tempfile.TemporaryDirectory(prefix="decoder-preserve-") as temporary:
+            directory = Path(temporary)
+            environment, marker = self.decoder_environment(directory)
+            source = directory/"sources/brotli-1.2.1"; source.mkdir(parents=True)
+            sentinel = source/"local-change"; sentinel.write_text("keep this file")
+            result = subprocess.run(["bash", str(ROOT/"scripts/prepare_tls_decoders.sh")],
+                                    env=environment, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Modified sources", result.stderr)
+            self.assertEqual(sentinel.read_text(), "keep this file")
+            self.assertFalse(marker.exists())
+
+    def test_decoder_preparation_rejects_source_symlink(self):
+        with tempfile.TemporaryDirectory(prefix="decoder-symlink-") as temporary:
+            directory = Path(temporary)
+            environment, marker = self.decoder_environment(directory)
+            source = directory/"sources"; source.mkdir()
+            link = source/"brotli-1.2.1"
+            link.symlink_to(ROOT/"third_party/brotli-1.2.1", target_is_directory=True)
+            result = subprocess.run(["bash", str(ROOT/"scripts/prepare_tls_decoders.sh")],
+                                    env=environment, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Missing prepared sources", result.stderr)
+            self.assertTrue(link.is_symlink())
+            self.assertFalse(marker.exists())
+
     def test_system_openssl_default(self):
         environment = dict(os.environ)
         for name in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "TEST_OPENSSL_PREFIX"):
@@ -230,6 +293,8 @@ class BuildTests(unittest.TestCase):
             shutil.copy2(ROOT/"Makefile",project/"Makefile")
             for name in ("src","include","tests"):
                 shutil.copytree(ROOT/name,project/name,ignore=shutil.ignore_patterns("__pycache__"))
+            (project/"scripts").mkdir()
+            shutil.copy2(ROOT/"scripts/prepare_tls_decoders.sh",project/"scripts")
             (project/"third_party").symlink_to(ROOT/"third_party",target_is_directory=True)
             marker = directory/"compiler-called"
             compiler = directory/"compiler"

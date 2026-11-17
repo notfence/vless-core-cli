@@ -242,7 +242,7 @@ int main(void) {
     check_session_identifiers();
     check_base64();
     CHECK("uri/tcp-defaults", parse(PREFIX "type=tcp") == 0 && strcmp(config.security, "none") == 0 && config.flow[0] == 0 && config.fp_mode == FP_CHROME);
-    const char *unsupported[]={"type=http","type=quic","type=not-a-transport","fp=safari","fp=not-a-fingerprint","allowInsecure=maybe","sid=zz","type=ws&flow=invalid","type=xhttp&flow=invalid"};
+    const char *unsupported[]={"type=http","type=quic","type=not-a-transport","fp=android","fp=not-a-fingerprint","allowInsecure=maybe","sid=zz","type=ws&flow=invalid","type=xhttp&flow=invalid"};
     for (size_t i=0;i<sizeof(unsupported)/sizeof(*unsupported);i++) {
         char value[512]; snprintf(value,sizeof(value),PREFIX "%s",unsupported[i]); CHECK("uri/unsupported-value-rejected",parse(value) != 0);
     }
@@ -289,7 +289,14 @@ int main(void) {
     CHECK("uri/xhttp-auto-tls", parse(PREFIX "type=xhttp&security=tls") == 0 && strcmp(config.xhttp_mode, "packet-up") == 0);
     CHECK("uri/xhttp-auto-reality", parse(PREFIX "type=xhttp&security=reality&pbk=" PBK) == 0 && strcmp(config.xhttp_mode, "stream-one") == 0);
     const char *fps[] = {"chrome", "random", "qq", "randomized", "firefox", "edge"};
-    for (int i = 0; i < 6; i++) { char uri[512]; snprintf(uri, sizeof(uri), PREFIX "fp=%s", fps[i]); CHECK("uri/fingerprint", parse(uri) == 0 && config.fp_mode == (fingerprint_mode_t)i); }
+    for (int i = 0; i < 6; i++) { char uri[512]; snprintf(uri, sizeof(uri), PREFIX "fp=%s", fps[i]); CHECK("uri/fingerprint", parse(uri) == 0 && config.fp_mode == (fingerprint_mode_t)i && !strcmp(config.fp_name,fps[i])); }
+    CHECK("uri/default-fingerprint-name",parse(PREFIX "type=tcp") == 0 && !strcmp(config.fp_name,"chrome"));
+    CHECK("uri/explicit-fingerprint-name",parse(PREFIX "fp=hellofirefox_148") == 0 && config.fp_mode == FP_FIREFOX && !strcmp(config.fp_name,"hellofirefox_148"));
+    CHECK("uri/auto-fingerprint-name",parse(PREFIX "fp=hellofirefox_auto") == 0 && config.fp_mode == FP_FIREFOX && !strcmp(config.fp_name,"hellofirefox_auto"));
+    char encoded_fingerprint[]=PREFIX "fp=%46IREFOX";
+    REQUIRE("uri/encoded-fingerprint-name",parse(encoded_fingerprint) == 0 && config.fp_mode == FP_FIREFOX);
+    memset(encoded_fingerprint,0,sizeof(encoded_fingerprint));
+    CHECK("uri/fingerprint-name-owned-and-case-preserved",!strcmp(config.fp_name,"FIREFOX"));
     CHECK("uri/ipv6", parse("vless://00000000-0000-0000-0000-000000000001@[::1]:443") == 0 && strcmp(config.server_host, "::1") == 0);
     CHECK("uri/socks-default", parse("socks5://127.0.0.1#vless-core") == 0 && config.protocol == CORE_PROTOCOL_SOCKS5 && config.server_port == 1080);
     CHECK("uri/socks-auth", parse("socks5://vless%2Dcore:p%40ss@[::1]:1081#vless-core") == 0 && strcmp(config.socks5_user, "vless-core") == 0 && strcmp(config.socks5_pass, "p@ss") == 0);

@@ -14,6 +14,17 @@ BUILD = Path(os.environ.get("TEST_BUILD_DIR", Path(__file__).resolve().parents[1
 def frame(kind, flags, stream, payload):
     return len(payload).to_bytes(3,"big")+bytes([kind,flags])+stream.to_bytes(4,"big")+payload
 
+def compressed_certificates():
+    encoded = (
+        "789c0af10956484e2d2ac94ccb4c4e2c495548cbac28292d4a553030343236313533b7b0e41a5532aa6454c9a812b29400020000ffff563e5e90",
+        "1b5f0400c4cf1bdfafa417e27d7d42d708954d3536054e8565718ed6d150f7b1f6bfef4cb0a879a45c2a31",
+        "28b52ffd6460036d01003402544c53206365727469666963617465206669787475726520303132333435363738390a015416052ed3c104f27e4fa1",
+    )
+    for algorithm, value in enumerate(encoded, 1):
+        value = bytes.fromhex(value)
+        body = algorithm.to_bytes(2,"big") + (1120).to_bytes(3,"big") + len(value).to_bytes(3,"big") + value
+        yield b"\x19" + len(body).to_bytes(3,"big") + body
+
 def seeds():
     prefix = b"vless://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=none&"
     hello = b"\x03\x03"+bytes(32)+b"\x00\x13\x01\x00\x00\x28\x00\x33\x00\x24\x00\x1d\x00\x20"+bytes(range(32))
@@ -178,7 +189,7 @@ def seeds():
               b"\x01\x02\xf0\x9f\x89\x00\x80\x02\x98\x80",b"\xc2\x00",b"\x80\x00",b"\x82\x80"+bytes(4),b"\x88\x03\x03\xe8\xff"],
         "vision":[*[bytes(16)+bytes([command,0,10,0,0])+b"vless-core" for command in (0,1,2)],
                   b"\x00\x00vless-core",b"\x00\x0avless-coretail",b"\x00\xff",b"\x01\x00",b"short tail",*vision_records],
-        "tls":[b"\x02"+len(hello).to_bytes(3,"big")+hello,b"\x02\x00\x00\x26\x03\x03"+bytes(32)+b"\x00\xcc\xa9\x00",
+        "tls":[*compressed_certificates(),b"\x02"+len(hello).to_bytes(3,"big")+hello,b"\x02\x00\x00\x26\x03\x03"+bytes(32)+b"\x00\xcc\xa9\x00",
                b"\x16\x03\x03\x00\x0avless-core",b"\x0b\x00\x00\x05\x00\x00\x00\x01\x00",
                b"",b"\x18\x00\x00\x01\x00",b"\x18\x00\x00\x01\x01",b"\x18\x00\x00\x01\x02",
                b"\x18\x00\x00\x01\x01\x00",b"\x18\x00\x00\x01\x00"*2,

@@ -10,7 +10,7 @@ static int tls_encrypted_extensions(tls13_conn_t *c, const uint8_t *data, size_t
         if (size > length-offset) return -1;
         for (size_t i=0;i<count;i++) if (seen[i] == type) return -1;
         seen[count++]=type;
-        if (type != 0 && type != 1 && type != 10 && type != 16 && type != 28 && type != 0x4469) return -1;
+        if (type != 0 && type != 1 && type != 10 && type != 16 && type != 28 && type != 0x4469 && type != 0x44cd) return -1;
         size_t offered_size=0;
         const uint8_t *offered=core_tls_hello_extension(c->tls_client_hello.data,c->tls_client_hello.len,type,&offered_size);
         if (!offered && (type != 16 || c->tls_client_hello.len)) return -1;
@@ -35,9 +35,10 @@ static int tls_encrypted_extensions(tls13_conn_t *c, const uint8_t *data, size_t
             memcpy(c->tls_selected_alpn,data+offset+3,size-3); c->tls_selected_alpn[size-3]=0;
             if (strlen(c->tls_selected_alpn) != size-3 || !alpn_csv_has_token(c->tls_offered_alpn,c->tls_selected_alpn)) return -1;
         }
-        if (type == 0x4469) {
-            if (c->tls12_suite || offered_size != 5 || memcmp(offered,"\x00\x03\x02h2",5) || core_http2_alps_parse(data+offset,size,&settings)) return -1;
+        if (type == 0x4469 || type == 0x44cd) {
+            if (alps || c->tls12_suite || offered_size != 5 || memcmp(offered,"\x00\x03\x02h2",5) || core_http2_alps_parse(data+offset,size,&settings)) return -1;
             alps=1;
+            c->tls_alps_codepoint=(uint16_t)type;
         }
         offset+=size;
     }
@@ -104,9 +105,33 @@ static int tls_certificate_request(const uint8_t *body, size_t length) {
     return signatures ? 0 : -1;
 }
 
+static int tls_server_certificate(const vless_config_t *cfg,tls13_conn_t *c,const uint8_t *message,size_t length,char *err,size_t err_cap) {
+    const uint8_t *der=NULL; size_t der_length=0;
+    if (parse_first_cert_der(message,length,&der,&der_length)) { set_err(err,err_cap,"invalid TLS Certificate"); return -1; }
+    const unsigned char *cursor=der;
+    c->tls_peer_certificate=d2i_X509(NULL,&cursor,(long)der_length);
+    if (!c->tls_peer_certificate || cursor != der+der_length) { set_err(err,err_cap,"invalid TLS leaf certificate"); return -1; }
+    if (tls_certificate_key_usage(c->tls_peer_certificate,1)) { set_err(err,err_cap,"TLS certificate KeyUsage forbids signing"); return -1; }
+    if (!strcmp(cfg->security,"reality")) {
+        if (verify_reality_cert(c->auth_key,der,der_length)) { set_err(err,err_cap,"REALITY cert verify failed"); return -1; }
+    } else if (c->tls_verify_policy == TLS_VERIFY_MODE_STRICT &&
+        verify_tls_cert_message(cfg->sni[0] ? cfg->sni : cfg->server_host,message,length,err,err_cap)) return -1;
+    return db_append(&c->tls_certificate_message,message,length);
+}
+
 static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, const uint8_t *message, size_t length, char *err, size_t err_cap) {
     if (length < 4) return -1;
     unsigned type=message[0]; size_t body_length=length-4;
+    if (type == 25) {
+        dynbuf_t decoded={0};
+        if (c->tls_auth_state != 1 || tls_certificate_decompress(c,message,length,&decoded)) {
+            db_free(&decoded); set_err(err,err_cap,"invalid or oversized compressed TLS Certificate"); return -1;
+        }
+        int result=tls_server_certificate(cfg,c,decoded.data,decoded.len,err,err_cap);
+        db_free(&decoded);
+        if (result || append_transcript(c,message,length)) return -1;
+        c->tls_auth_state++; return 0;
+    }
     if (type == 13) {
         if (c->tls_auth_state != 1 || c->tls_client_certificate_requested || tls_certificate_request(message+4,body_length)) {
             set_err(err,err_cap,"invalid or unexpected TLS CertificateRequest"); return -1;
@@ -123,17 +148,7 @@ static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, 
             set_err(err,err_cap,"invalid TLS EncryptedExtensions"); return -1;
         }
     } else if (type == 11) {
-        const uint8_t *der=NULL; size_t der_length=0;
-        if (parse_first_cert_der(message,length,&der,&der_length)) { set_err(err,err_cap,"invalid TLS Certificate"); return -1; }
-        const unsigned char *cursor=der;
-        c->tls_peer_certificate=d2i_X509(NULL,&cursor,(long)der_length);
-        if (!c->tls_peer_certificate || cursor != der+der_length) { set_err(err,err_cap,"invalid TLS leaf certificate"); return -1; }
-        if (tls_certificate_key_usage(c->tls_peer_certificate,1)) { set_err(err,err_cap,"TLS certificate KeyUsage forbids signing"); return -1; }
-        if (!strcmp(cfg->security,"reality")) {
-            if (verify_reality_cert(c->auth_key,der,der_length)) { set_err(err,err_cap,"REALITY cert verify failed"); return -1; }
-        } else if (c->tls_verify_policy == TLS_VERIFY_MODE_STRICT &&
-            verify_tls_cert_message(cfg->sni[0] ? cfg->sni : cfg->server_host,message,length,err,err_cap)) return -1;
-        if (db_append(&c->tls_certificate_message,message,length)) return -1;
+        if (tls_server_certificate(cfg,c,message,length,err,err_cap)) return -1;
     } else if (type == 15) {
         if (verify_server_signature(c,message+4,body_length)) { set_err(err,err_cap,"TLS CertificateVerify signature failed"); return -1; }
     } else {
@@ -150,13 +165,16 @@ static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, 
 static unsigned tls12_word(const uint8_t *data) { return ((unsigned)data[0]<<8)|data[1]; }
 static int tls12_server_hello(tls13_conn_t *c,const uint8_t *message,size_t length) {
     if (length < 42 || message[0] != 2 || tls12_word(message+4) != 0x0303 || message[38] > 32 ||
-        (((size_t)message[1]<<16)|((size_t)message[2]<<8)|message[3]) != length-4 ||
-        !memcmp(message+30,"DOWNGRD\x01",8) || !memcmp(message+30,"DOWNGRD\x00",8)) return -1;
+        (((size_t)message[1]<<16)|((size_t)message[2]<<8)|message[3]) != length-4) return -1;
     size_t offset=39+message[38];
     if (offset+3 > length || message[offset+2]) return -1;
     unsigned suite=tls12_word(message+offset);
     const uint8_t *client=c->tls_client_hello.data; size_t client_length=c->tls_client_hello.len;
     if (client_length < 42) return -1;
+    size_t versions_length=0;
+    const uint8_t *versions=core_tls_hello_extension(client,client_length,43,&versions_length);
+    for (size_t i=1;versions && i+2<=versions_length;i+=2) if (tls12_word(versions+i) == 0x0304 &&
+        (!memcmp(message+30,"DOWNGRD\x01",8) || !memcmp(message+30,"DOWNGRD\x00",8))) return -1;
     if (message[38] && message[38] == client[38] && !memcmp(message+39,client+39,message[38])) return -1;
     size_t offered=39+client[38],count=offered+2 <= client_length ? tls12_word(client+offered) : 0;
     if (!count || count > client_length-offered-2) return -1;
@@ -516,7 +534,7 @@ cleanup: {
 
 static int tls_send_client_finished(tls13_conn_t *c,char *err,size_t err_cap) {
     static const uint8_t empty_certificate[]={11,0,0,4,0,0,0,0};
-    static const uint8_t client_extensions[]={8,0,0,6,0,4,0x44,0x69,0,0};
+    const uint8_t client_extensions[]={8,0,0,6,0,4,(uint8_t)(c->tls_alps_codepoint>>8),(uint8_t)c->tls_alps_codepoint,0,0};
     if (c->tls_alps_received && append_transcript(c,client_extensions,sizeof(client_extensions))) return -1;
     if (c->tls_client_certificate_requested && append_transcript(c,empty_certificate,sizeof(empty_certificate))) return -1;
     uint8_t thash[64],client_verify[64];
@@ -576,11 +594,12 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
     c->tls_verify_policy = verify_mode;
     snprintf(c->tls_verify_mode, sizeof(c->tls_verify_mode), "%s",
              use_reality ? "reality" : tls_verify_mode_name(verify_mode));
-    snprintf(c->tls_offered_alpn,sizeof(c->tls_offered_alpn),"%s",cfg->alpn[0] ? cfg->alpn :
-        (cfg->fp_mode == FP_RANDOM || cfg->fp_mode == FP_RANDOMIZED ? "http/1.1,h2" : "h2,http/1.1"));
+    fingerprint_mode_t effective;
+    if (core_fingerprint_resolve(cfg->fp_mode,&effective)) { set_err(err,err_cap,"failed to select TLS fingerprint"); return -1; }
+    snprintf(c->tls_offered_alpn,sizeof(c->tls_offered_alpn),"%s",cfg->alpn[0] ? cfg->alpn : tls_fingerprint_alpn(effective));
     c->tls_h2_required=cfg->transport_mode == TRANSPORT_GRPC || (cfg->transport_mode == TRANSPORT_XHTTP && use_reality);
     c->tls_is_reality=use_reality;
-    c->tls_alps_received=0; memset(&c->tls_alps_settings,0,sizeof(c->tls_alps_settings));
+    c->tls_alps_received=0; c->tls_alps_codepoint=0; memset(&c->tls_alps_settings,0,sizeof(c->tls_alps_settings));
     c->tls_receive_record_limit=c->tls_send_record_limit=0; c->tls_receive_update_requested=0;
     if (tls_buffer_init(&c->tls_client_hello,65536,&c->tls_handshake_bytes) ||
         tls_buffer_init(&c->tls_certificate_message,TLS_HANDSHAKE_LIMIT,&c->tls_handshake_bytes)) {
@@ -869,9 +888,10 @@ handshake_failure: {
 int run_tls_handshake(const vless_config_t *cfg, tls13_conn_t *c, tls_cipher_offer_t cipher_offer, char *err, size_t err_cap) {
     EVP_PKEY *hybrid_key = NULL;
     uint8_t hybrid_pub[TLS_MLKEM768_PUBLIC_KEY_SIZE];
+    fingerprint_mode_t effective;
+    if (core_fingerprint_resolve(cfg->fp_mode,&effective)) { set_err(err,err_cap,"failed to select TLS fingerprint"); return -1; }
 #if OPENSSL_VERSION_NUMBER >= 0x30500000L
-    if (strcmp(cfg->security, "reality") == 0 &&
-        (cfg->fp_mode == FP_CHROME || cfg->fp_mode == FP_EDGE || cfg->fp_mode == FP_FIREFOX)) {
+    if (core_fingerprint_hybrid(effective)) {
         hybrid_key = EVP_PKEY_Q_keygen(NULL, NULL, "ML-KEM-768");
         unsigned char *encoded = NULL;
         size_t encoded_len = hybrid_key != NULL ? EVP_PKEY_get1_encoded_public_key(hybrid_key, &encoded) : 0;

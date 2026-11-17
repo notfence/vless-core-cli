@@ -1,4 +1,6 @@
 #include "tls_internal.h"
+#include "core_random.h"
+#include "tls_fingerprint_profiles.h"
 
 static uint8_t g_xray_version[3] = {
     XRAY_DEFAULT_VERSION_X,
@@ -173,41 +175,9 @@ static int ext_server_name(dynbuf_t *exts, const char *sni) {
     return add_ext(exts, 0x0000, data, off);
 }
 
-static int ext_supported_groups(dynbuf_t *exts, uint16_t grease, int random_mode, int hybrid) {
-    uint8_t data[32];
-    uint16_t groups[5];
-    size_t gcount = 0;
-    if (!random_mode) groups[gcount++] = grease;
-    if (hybrid) groups[gcount++] = TLS_GROUP_X25519MLKEM768;
-    groups[gcount++] = 0x001d;
-    groups[gcount++] = 0x0017;
-    if (!random_mode) groups[gcount++] = 0x0018;
-
-    size_t off = 0;
-    size_t glen = gcount * 2;
-    data[off++] = (uint8_t)(glen >> 8);
-    data[off++] = (uint8_t)(glen & 0xFF);
-    for (size_t i = 0; i < gcount; i++) {
-        data[off++] = (uint8_t)(groups[i] >> 8);
-        data[off++] = (uint8_t)(groups[i] & 0xFF);
-    }
-
-    return add_ext(exts, 0x000a, data, off);
-}
-
-static int ext_supported_groups_firefox(dynbuf_t *exts, int hybrid) {
-    uint16_t groups[] = {TLS_GROUP_X25519MLKEM768, 0x001d, 0x0017, 0x0018, 0x0019};
-    uint8_t data[32];
-    size_t off = 0;
-    size_t start = hybrid ? 0 : 1;
-    size_t glen = sizeof(groups) - start * sizeof(groups[0]);
-    data[off++] = (uint8_t)(glen >> 8);
-    data[off++] = (uint8_t)(glen & 0xFF);
-    for (size_t i = start; i < sizeof(groups) / sizeof(groups[0]); i++) {
-        data[off++] = (uint8_t)(groups[i] >> 8);
-        data[off++] = (uint8_t)(groups[i] & 0xFF);
-    }
-    return add_ext(exts, 0x000a, data, off);
+static int ext_supported_groups(dynbuf_t *exts) {
+    static const uint8_t data[] = {0x00, 0x04, 0x00, 0x1d, 0x00, 0x17};
+    return add_ext(exts, 0x000a, data, sizeof(data));
 }
 
 static int ext_ec_point_formats(dynbuf_t *exts) {
@@ -229,83 +199,13 @@ static int ext_sig_algs(dynbuf_t *exts) {
     return add_ext(exts, 0x000d, data, off);
 }
 
-static int ext_sig_algs_qq(dynbuf_t *exts) {
-    uint16_t sigs[] = {0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0807, 0x0601, 0x0809, 0x080a, 0x080b, 0x0603};
-    uint8_t data[64];
-    size_t off = 0;
-    size_t slen = sizeof(sigs);
-    data[off++] = (uint8_t)(slen >> 8);
-    data[off++] = (uint8_t)(slen & 0xFF);
-    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
-        data[off++] = (uint8_t)(sigs[i] >> 8);
-        data[off++] = (uint8_t)(sigs[i] & 0xFF);
-    }
-    return add_ext(exts, 0x000d, data, off);
+static int ext_alpn(dynbuf_t *exts) {
+    static const uint8_t data[] = "\000\014\010http/1.1\002h2";
+    return add_ext(exts, 0x0010, data, sizeof(data)-1);
 }
 
-static int ext_sig_algs_firefox(dynbuf_t *exts) {
-    uint16_t sigs[] = {0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0807, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201, 0x0809, 0x080a, 0x080b};
-    uint8_t data[64];
-    size_t off = 0;
-    size_t slen = sizeof(sigs);
-    data[off++] = (uint8_t)(slen >> 8);
-    data[off++] = (uint8_t)(slen & 0xFF);
-    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
-        data[off++] = (uint8_t)(sigs[i] >> 8);
-        data[off++] = (uint8_t)(sigs[i] & 0xFF);
-    }
-    return add_ext(exts, 0x000d, data, off);
-}
-
-static int ext_alpn(dynbuf_t *exts, int random_mode) {
-    const char *p1 = random_mode ? "http/1.1" : "h2";
-    const char *p2 = random_mode ? "h2" : "http/1.1";
-    size_t l1 = strlen(p1);
-    size_t l2 = strlen(p2);
-
-    uint8_t data[64];
-    size_t off = 0;
-    size_t list_len = 1 + l1 + 1 + l2;
-    data[off++] = (uint8_t)(list_len >> 8);
-    data[off++] = (uint8_t)(list_len & 0xFF);
-    data[off++] = (uint8_t)l1;
-    memcpy(data + off, p1, l1);
-    off += l1;
-    data[off++] = (uint8_t)l2;
-    memcpy(data + off, p2, l2);
-    off += l2;
-
-    return add_ext(exts, 0x0010, data, off);
-}
-
-static int ext_supported_versions(dynbuf_t *exts, uint16_t grease, int random_mode) {
-    uint8_t data[8];
-    size_t off = 0;
-    if (random_mode) {
-        data[off++] = 0x04;
-        data[off++] = 0x03;
-        data[off++] = 0x04;
-        data[off++] = 0x03;
-        data[off++] = 0x03;
-    } else {
-        data[off++] = 0x06;
-        data[off++] = (uint8_t)(grease >> 8);
-        data[off++] = (uint8_t)(grease & 0xFF);
-        data[off++] = 0x03;
-        data[off++] = 0x04;
-        data[off++] = 0x03;
-        data[off++] = 0x03;
-    }
-    return add_ext(exts, 0x002b, data, off);
-}
-
-static int ext_supported_versions_qq(dynbuf_t *exts, uint16_t grease) {
-    uint8_t data[] = {0x06, (uint8_t)(grease >> 8), (uint8_t)(grease & 0xFF), 0x03, 0x04, 0x03, 0x03};
-    return add_ext(exts, 0x002b, data, sizeof(data));
-}
-
-static int ext_supported_versions_firefox(dynbuf_t *exts) {
-    uint8_t data[] = {0x04, 0x03, 0x04, 0x03, 0x03};
+static int ext_supported_versions(dynbuf_t *exts) {
+    static const uint8_t data[] = {0x04, 0x03, 0x04, 0x03, 0x03};
     return add_ext(exts, 0x002b, data, sizeof(data));
 }
 
@@ -314,67 +214,10 @@ static int ext_psk_modes(dynbuf_t *exts) {
     return add_ext(exts, 0x002d, data, sizeof(data));
 }
 
-static size_t append_x25519_key_shares(uint8_t *data, size_t off, const uint8_t pubkey[32], const uint8_t *hybrid_pub) {
-    if (hybrid_pub != NULL) {
-        data[off++] = (uint8_t)(TLS_GROUP_X25519MLKEM768 >> 8);
-        data[off++] = (uint8_t)TLS_GROUP_X25519MLKEM768;
-        data[off++] = (uint8_t)(TLS_HYBRID_CLIENT_SHARE_SIZE >> 8);
-        data[off++] = (uint8_t)TLS_HYBRID_CLIENT_SHARE_SIZE;
-        memcpy(data + off, hybrid_pub, TLS_MLKEM768_PUBLIC_KEY_SIZE);
-        off += TLS_MLKEM768_PUBLIC_KEY_SIZE;
-        memcpy(data + off, pubkey, 32);
-        off += 32;
-    }
-
-    data[off++] = 0x00;
-    data[off++] = 0x1d;
-    data[off++] = 0x00;
-    data[off++] = 0x20;
-    memcpy(data + off, pubkey, 32);
-    off += 32;
-    return off;
-}
-
-static int ext_key_share(dynbuf_t *exts, uint16_t grease, const uint8_t pubkey[32], int random_mode, const uint8_t *hybrid_pub) {
-    uint8_t data[2 + 5 + 4 + TLS_HYBRID_CLIENT_SHARE_SIZE + 4 + 32];
-    size_t off = 2;
-
-    if (!random_mode) {
-        data[off++] = (uint8_t)(grease >> 8);
-        data[off++] = (uint8_t)(grease & 0xFF);
-        data[off++] = 0x00;
-        data[off++] = 0x01;
-        data[off++] = 0x00;
-    }
-    off = append_x25519_key_shares(data, off, pubkey, hybrid_pub);
-
-    size_t list_len = off - 2;
-    data[0] = (uint8_t)(list_len >> 8);
-    data[1] = (uint8_t)(list_len & 0xFF);
-
-    return add_ext(exts, 0x0033, data, off);
-}
-
-static int ext_key_share_firefox(dynbuf_t *exts, const uint8_t x25519_pub[32], const uint8_t *hybrid_pub, EVP_PKEY **retained) {
-    uint8_t p256_pub[65];
-    if (p256_generate_public(p256_pub,retained) != 0) {
-        return -1;
-    }
-
-    uint8_t data[2 + 4 + TLS_HYBRID_CLIENT_SHARE_SIZE + 4 + 32 + 4 + 65];
-    size_t off = append_x25519_key_shares(data, 2, x25519_pub, hybrid_pub);
-
-    data[off++] = 0x00;
-    data[off++] = 0x17;
-    data[off++] = 0x00;
-    data[off++] = 0x41;
-    memcpy(data + off, p256_pub, sizeof(p256_pub));
-    off += sizeof(p256_pub);
-
-    size_t list_len = off - 2;
-    data[0] = (uint8_t)(list_len >> 8);
-    data[1] = (uint8_t)(list_len & 0xFF);
-    return add_ext(exts, 0x0033, data, off);
+static int ext_key_share(dynbuf_t *exts, const uint8_t pubkey[32]) {
+    uint8_t data[38] = {0x00, 0x24, 0x00, 0x1d, 0x00, 0x20};
+    memcpy(data+6, pubkey, 32);
+    return add_ext(exts, 0x0033, data, sizeof(data));
 }
 
 static int ext_padding(dynbuf_t *exts, size_t pad_len) {
@@ -387,78 +230,8 @@ static int ext_padding(dynbuf_t *exts, size_t pad_len) {
     return rc;
 }
 
-static int ext_grease(dynbuf_t *exts, uint16_t grease) {
-    return add_ext(exts, grease, NULL, 0);
-}
-
-static int ext_grease_1byte_zero(dynbuf_t *exts, uint16_t grease) {
-    uint8_t zero = 0;
-    return add_ext(exts, grease, &zero, 1);
-}
-
 static int ext_extended_master_secret(dynbuf_t *exts) {
     return add_ext(exts, 0x0017, NULL, 0);
-}
-
-static int ext_renegotiation_info(dynbuf_t *exts) {
-    uint8_t data[] = {0x00};
-    return add_ext(exts, 0xff01, data, sizeof(data));
-}
-
-static int ext_session_ticket(dynbuf_t *exts) {
-    return add_ext(exts, 0x0023, NULL, 0);
-}
-
-static int ext_status_request(dynbuf_t *exts) {
-    /* status_type=ocsp, empty responder_id_list and request_extensions */
-    uint8_t data[] = {0x01, 0x00, 0x00, 0x00, 0x00};
-    return add_ext(exts, 0x0005, data, sizeof(data));
-}
-
-static int ext_sct(dynbuf_t *exts) {
-    return add_ext(exts, 0x0012, NULL, 0);
-}
-
-static int ext_record_size_limit_firefox(dynbuf_t *exts) {
-    uint8_t data[] = {0x40, 0x01};
-    return add_ext(exts, 0x001c, data, sizeof(data));
-}
-
-static int ext_ech_grease_firefox(dynbuf_t *exts) {
-    enum { ECH_PAYLOAD_LEN = 239 };
-    uint8_t data[1 + 2 + 2 + 1 + 2 + 32 + 2 + ECH_PAYLOAD_LEN];
-    size_t off = 0;
-
-    data[off++] = 0x00;
-    data[off++] = 0x00;
-    data[off++] = 0x01;
-    data[off++] = 0x00;
-    data[off++] = 0x01;
-    if (RAND_bytes(data + off, 1) != 1) {
-        return -1;
-    }
-    off += 1;
-    data[off++] = 0x00;
-    data[off++] = 0x20;
-    if (RAND_bytes(data + off, 32) != 1) {
-        return -1;
-    }
-    off += 32;
-    data[off++] = (uint8_t)(ECH_PAYLOAD_LEN >> 8);
-    data[off++] = (uint8_t)(ECH_PAYLOAD_LEN & 0xFF);
-    if (RAND_bytes(data + off, ECH_PAYLOAD_LEN) != 1) {
-        return -1;
-    }
-    off += ECH_PAYLOAD_LEN;
-
-    return add_ext(exts, 0xfe0d, data, off);
-}
-
-static int ext_application_settings_h2(dynbuf_t *exts,const char *alpn) {
-    if (alpn && *alpn && !alpn_csv_has_token(alpn,"h2")) return 0;
-    /* ALPS (0x4469): protocol_name_list with single entry "h2". */
-    uint8_t data[] = {0x00, 0x03, 0x02, 'h', '2'};
-    return add_ext(exts, 0x4469, data, sizeof(data));
 }
 
 static size_t boring_padding_len(size_t unpadded_client_hello_len) {
@@ -489,242 +262,221 @@ static int shuffle_indices(size_t *idx, size_t n) {
     return 0;
 }
 
-static int build_client_hello_impl(const vless_config_t *cfg, int use_reality, tls_cipher_offer_t cipher_offer, uint8_t client_priv[32],
+static const tls_profile_t *tls_fingerprint_profile(fingerprint_mode_t mode) {
+    for (size_t i=0;i<sizeof(tls_profiles)/sizeof(*tls_profiles);i++)
+        if (tls_profiles[i].mode == mode) return tls_profiles+i;
+    return NULL;
+}
+
+const char *tls_fingerprint_alpn(fingerprint_mode_t mode) {
+    if (mode == FP_360_7_5) return "spdy/2,spdy/3,spdy/3.1,http/1.1";
+    return mode == FP_RANDOMIZED ? "http/1.1,h2" : "h2,http/1.1";
+}
+
+static int tls_profile_ech(dynbuf_t *extensions, fingerprint_mode_t mode) {
+    uint8_t data[282]={0,0,1,0,1}; uint32_t choice;
+    size_t payload=239;
+    if (mode == FP_FIREFOX || mode == FP_FIREFOX_120) {
+        if (core_random_range(0,1,&choice)) return -1;
+        data[4]=choice ? 3 : 1;
+    } else {
+        if (core_random_range(0,3,&choice)) return -1;
+        payload=144+32*choice;
+    }
+    uint8_t private_key[32];
+    int generated=x25519_generate(private_key,data+8);
+    OPENSSL_cleanse(private_key,sizeof(private_key));
+    if (generated || core_random_fill(data+5,1) || core_random_fill(data+42,payload)) return -1;
+    data[6]=0; data[7]=32; data[40]=(uint8_t)(payload>>8); data[41]=(uint8_t)payload;
+    return add_ext(extensions,0xfe0d,data,42+payload);
+}
+
+static int tls_profile_key_share(dynbuf_t *extensions, const tls_profile_extension_t *entry,
+                                  uint16_t grease, const uint8_t public_key[32], const uint8_t *hybrid,
+                                  EVP_PKEY **retained) {
+    dynbuf_t data={0}; uint8_t length[2]={0}; int result=-1;
+    if (db_append(&data,length,2)) goto done;
+    for (size_t offset=0;offset+2<=entry->length;offset+=2) {
+        unsigned group=((unsigned)entry->data[offset]<<8)|entry->data[offset+1];
+        uint8_t point[65],zero=0; const uint8_t *value=NULL; size_t count=0;
+        if (group == 0x0a0a) { group=grease; value=&zero; count=1; }
+        else if (group == 29) { value=public_key; count=32; }
+        else if (group == 23) {
+            if (p256_generate_public(point,retained)) goto done;
+            value=point; count=sizeof(point);
+        } else if (group == TLS_GROUP_X25519MLKEM768 && hybrid) { value=hybrid; count=TLS_HYBRID_CLIENT_SHARE_SIZE; }
+        else { errno=EINVAL; goto done; }
+        uint8_t header[]={(uint8_t)(group>>8),(uint8_t)group,(uint8_t)(count>>8),(uint8_t)count};
+        if (db_append(&data,header,sizeof(header))) goto done;
+        if (group == TLS_GROUP_X25519MLKEM768) {
+            if (db_append(&data,hybrid,TLS_MLKEM768_PUBLIC_KEY_SIZE) || db_append(&data,public_key,32)) goto done;
+        } else if (db_append(&data,value,count)) goto done;
+    }
+    data.data[0]=(uint8_t)((data.len-2)>>8); data.data[1]=(uint8_t)(data.len-2);
+    result=add_ext(extensions,51,data.data,data.len);
+done:
+    db_free(&data); return result;
+}
+
+static int tls_profile_extensions(dynbuf_t *extensions, const tls_profile_t *profile, const vless_config_t *cfg,
+                                 const uint16_t grease[4], const uint8_t public_key[32], const uint8_t *hybrid,
+                                 EVP_PKEY **retained, size_t prefix_length) {
+    dynbuf_t pieces[24]={{0}}; size_t order[24],grease_index=0,padding=SIZE_MAX;
+    if (profile->extension_count > 24) { errno=EINVAL; return -1; }
+    int result=-1;
+    for (size_t i=0;i<profile->extension_count;i++) {
+        const tls_profile_extension_t *entry=profile->extensions+i;
+        unsigned kind=entry->type; order[i]=i;
+        if (kind == 0) { if (ext_server_name(pieces+i,cfg->sni)) goto done; }
+        else if (kind == 21) padding=i;
+        else if (kind == 51) {
+            if (tls_profile_key_share(pieces+i,entry,grease[2],public_key,hybrid,retained)) goto done;
+        } else if (kind == 0xfe0d) {
+            if (tls_profile_ech(pieces+i,profile->mode)) goto done;
+        } else if (kind == 16 && cfg->alpn[0]) {
+            uint8_t data[130]; unsigned length=0;
+            if (build_xhttp_tls_alpn(cfg->alpn,data+2,sizeof(data)-2,&length)) goto done;
+            data[0]=(uint8_t)(length>>8); data[1]=(uint8_t)length;
+            if (add_ext(pieces+i,16,data,(size_t)length+2)) goto done;
+        } else if ((kind == 0x4469 || kind == 0x44cd) && cfg->alpn[0] && !alpn_csv_has_token(cfg->alpn,"h2")) {
+            continue;
+        } else {
+            uint8_t data[128];
+            if (entry->length > sizeof(data)) { errno=EINVAL; goto done; }
+            if (entry->length) memcpy(data,entry->data,entry->length);
+            if (kind == 0x0a0a) kind=grease[grease_index++ ? 3 : 1];
+            if (kind == 10 || kind == 43) {
+                for (size_t j=kind == 43 ? 1 : 2;j+2<=entry->length;j+=2) if (data[j] == 0x0a && data[j+1] == 0x0a) {
+                    uint16_t value=grease[kind == 10 ? 2 : 3]; data[j]=(uint8_t)(value>>8); data[j+1]=(uint8_t)value;
+                }
+            }
+            if (add_ext(pieces+i,(uint16_t)kind,data,entry->length)) goto done;
+        }
+    }
+    if (padding != SIZE_MAX) {
+        size_t length=prefix_length+2;
+        for (size_t i=0;i<profile->extension_count;i++) length+=pieces[i].len;
+        size_t count=boring_padding_len(length);
+        if (count && ext_padding(pieces+padding,count)) goto done;
+    }
+    if (profile->shuffle) {
+        size_t eligible[24],count=0;
+        for (size_t i=0;i<profile->extension_count;i++)
+            if (profile->extensions[i].type != 0x0a0a && profile->extensions[i].type != 21) eligible[count++]=i;
+        for (size_t i=count;i>1;i--) {
+            uint32_t index; if (core_random_range(0,(uint32_t)i-1,&index)) goto done;
+            size_t a=eligible[i-1],b=eligible[index],value=order[a]; order[a]=order[b]; order[b]=value;
+        }
+    }
+    for (size_t i=0;i<profile->extension_count;i++) if (db_append(extensions,pieces[order[i]].data,pieces[order[i]].len)) goto done;
+    result=0;
+done:
+    for (size_t i=0;i<24;i++) db_free(pieces+i);
+    return result;
+}
+
+static int build_client_hello_impl(const vless_config_t *cfg, fingerprint_mode_t mode, int use_reality, tls_cipher_offer_t cipher_offer, uint8_t client_priv[32],
                               uint8_t client_pub[32], uint8_t client_random[32], uint8_t auth_key[32], uint8_t **out, size_t *out_len,
                               size_t *sid_pos, const uint8_t *hybrid_pub, EVP_PKEY **retained) {
-    dynbuf_t hs = {0};
+    dynbuf_t hs = {0}, exts = {0};
+    const tls_profile_t *profile=tls_fingerprint_profile(mode);
+    if (!profile && mode != FP_RANDOMIZED) { errno=EINVAL; return -1; }
 
-    if (x25519_generate(client_priv, client_pub) != 0) {
-        return -1;
-    }
-    if (RAND_bytes(client_random, 32) != 1) {
-        return -1;
-    }
+    if (x25519_generate(client_priv, client_pub) != 0 || RAND_bytes(client_random, 32) != 1) goto fail;
 
     uint8_t head4[4] = {0x01, 0x00, 0x00, 0x00};
-    if (db_append(&hs, head4, 4) != 0) {
-        db_free(&hs);
-        return -1;
-    }
+    if (db_append(&hs, head4, 4) != 0) goto fail;
 
     uint8_t legacy_ver[] = {0x03, 0x03};
-    if (db_append(&hs, legacy_ver, sizeof(legacy_ver)) != 0 || db_append(&hs, client_random, 32) != 0) {
-        db_free(&hs);
-        return -1;
-    }
+    if (db_append(&hs, legacy_ver, sizeof(legacy_ver)) != 0 || db_append(&hs, client_random, 32) != 0) goto fail;
 
     uint8_t sid_len = 32;
-    if (db_append(&hs, &sid_len, 1) != 0) {
-        db_free(&hs);
-        return -1;
-    }
+    if (db_append(&hs, &sid_len, 1) != 0) goto fail;
 
     *sid_pos = hs.len;
     uint8_t session_id[32] = {0};
-    if (!use_reality && RAND_bytes(session_id, sizeof(session_id)) != 1) {
-        db_free(&hs);
-        return -1;
-    }
-    if (db_append(&hs, session_id, sizeof(session_id)) != 0) {
-        db_free(&hs);
-        return -1;
-    }
+    if (!use_reality && RAND_bytes(session_id, sizeof(session_id)) != 1) goto fail;
+    if (db_append(&hs, session_id, sizeof(session_id)) != 0) goto fail;
 
     uint16_t grease_values[4];
-    if (random_grease_values(grease_values) != 0) { db_free(&hs); return -1; }
+    if (random_grease_values(grease_values) != 0) goto fail;
     uint16_t grease=grease_values[0],boring_grease_cipher=grease_values[1];
     uint16_t boring_grease_group=grease_values[2],boring_grease_vers=grease_values[3];
-    uint16_t boring_grease_ext1 = boring_grease_cipher;
-    uint16_t boring_grease_ext2 = boring_grease_vers;
     uint8_t suites[128];
     size_t soff = 0;
-    if (cfg->fp_mode == FP_QQ || cfg->fp_mode == FP_CHROME || cfg->fp_mode == FP_EDGE) {
-        suites[soff++] = (uint8_t)(boring_grease_cipher >> 8);
-        suites[soff++] = (uint8_t)(boring_grease_cipher & 0xFF);
-    }
-    if (cipher_offer == TLS_CIPHER_OFFER_CHACHA) {
-        suites[soff++] = 0x13;
-        suites[soff++] = 0x03;
+    if (profile) {
+        for (size_t i=0;i<profile->cipher_count;i++) {
+            uint16_t suite=profile->ciphers[i] == 0x0a0a ? boring_grease_cipher : profile->ciphers[i];
+            suites[soff++]=(uint8_t)(suite>>8); suites[soff++]=(uint8_t)suite;
+        }
     } else {
-        suites[soff++] = 0x13;
-        suites[soff++] = 0x01;
-        suites[soff++] = 0x13;
-        suites[soff++] = 0x02;
-    }
-    if (!use_reality) for (size_t index=0;core_tls12_suite_at(index);index++) {
-        const core_tls12_suite_t *suite=core_tls12_suite_at(index);
-        if ((suite->cipher == CORE_TLS12_CHACHA) != (cipher_offer == TLS_CIPHER_OFFER_CHACHA)) continue;
-        suites[soff++]=(uint8_t)(suite->id>>8); suites[soff++]=(uint8_t)suite->id;
+        if (cipher_offer == TLS_CIPHER_OFFER_CHACHA) {
+            suites[soff++] = 0x13;
+            suites[soff++] = 0x03;
+        } else {
+            suites[soff++] = 0x13;
+            suites[soff++] = 0x01;
+            suites[soff++] = 0x13;
+            suites[soff++] = 0x02;
+        }
+        if (!use_reality) for (size_t index=0;core_tls12_suite_at(index);index++) {
+            const core_tls12_suite_t *suite=core_tls12_suite_at(index);
+            if ((suite->cipher == CORE_TLS12_CHACHA) != (cipher_offer == TLS_CIPHER_OFFER_CHACHA)) continue;
+            suites[soff++]=(uint8_t)(suite->id>>8); suites[soff++]=(uint8_t)suite->id;
+        }
     }
 
     uint8_t slen[2] = {(uint8_t)(soff >> 8), (uint8_t)(soff & 0xFF)};
-    if (db_append(&hs, slen, 2) != 0 || db_append(&hs, suites, soff) != 0) {
-        db_free(&hs);
-        return -1;
-    }
+    if (db_append(&hs, slen, 2) != 0 || db_append(&hs, suites, soff) != 0) goto fail;
 
     uint8_t comp[] = {0x01, 0x00};
-    if (db_append(&hs, comp, sizeof(comp)) != 0) {
-        db_free(&hs);
-        return -1;
-    }
+    if (db_append(&hs, comp, sizeof(comp)) != 0) goto fail;
 
-    dynbuf_t exts = {0};
-
-    if (cfg->fp_mode == FP_QQ) {
-        size_t header_len = hs.len - 4;
-        if (ext_grease(&exts, boring_grease_ext1) != 0 || ext_server_name(&exts, cfg->sni) != 0 ||
-            ext_extended_master_secret(&exts) != 0 || ext_renegotiation_info(&exts) != 0 ||
-            ext_supported_groups(&exts, boring_grease_group, 0, hybrid_pub != NULL) != 0 || ext_ec_point_formats(&exts) != 0 ||
-            ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
-            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0, hybrid_pub) != 0 ||
-            ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, boring_grease_vers) != 0 ||
-            ext_application_settings_h2(&exts,cfg->alpn) != 0 ||
-            ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
-            db_free(&exts);
-            db_free(&hs);
-            return -1;
-        }
-        size_t unpadded_len = header_len + 4 + exts.len + 2;
-        size_t pad_len = boring_padding_len(unpadded_len);
-        if (pad_len > 0 && ext_padding(&exts, pad_len) != 0) {
-            db_free(&exts);
-            db_free(&hs);
-            return -1;
-        }
-    } else if (cfg->fp_mode == FP_CHROME || cfg->fp_mode == FP_EDGE) {
-        size_t header_len = hs.len - 4;
-        if (ext_grease(&exts, boring_grease_ext1) != 0 || ext_server_name(&exts, cfg->sni) != 0 ||
-            ext_extended_master_secret(&exts) != 0 || ext_renegotiation_info(&exts) != 0 ||
-            ext_supported_groups(&exts, boring_grease_group, 0, hybrid_pub != NULL) != 0 || ext_ec_point_formats(&exts) != 0 ||
-            ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 || ext_status_request(&exts) != 0 ||
-            ext_sig_algs_qq(&exts) != 0 || ext_sct(&exts) != 0 || ext_key_share(&exts, boring_grease_group, client_pub, 0, hybrid_pub) != 0 ||
-            ext_psk_modes(&exts) != 0 || ext_supported_versions_qq(&exts, boring_grease_vers) != 0 ||
-            ext_grease_1byte_zero(&exts, boring_grease_ext2) != 0) {
-            db_free(&exts);
-            db_free(&hs);
-            return -1;
-        }
-        size_t unpadded_len = header_len + 4 + exts.len + 2;
-        size_t pad_len = boring_padding_len(unpadded_len);
-        if (pad_len > 0 && ext_padding(&exts, pad_len) != 0) {
-            db_free(&exts);
-            db_free(&hs);
-            return -1;
-        }
-    } else if (cfg->fp_mode == FP_FIREFOX) {
-        if (ext_server_name(&exts, cfg->sni) != 0 || ext_extended_master_secret(&exts) != 0 ||
-            ext_renegotiation_info(&exts) != 0 || ext_supported_groups_firefox(&exts, hybrid_pub != NULL) != 0 ||
-            ext_ec_point_formats(&exts) != 0 || ext_session_ticket(&exts) != 0 || ext_alpn(&exts, 0) != 0 ||
-            ext_status_request(&exts) != 0 ||
-            ext_key_share_firefox(&exts, client_pub, hybrid_pub,retained) != 0 || ext_supported_versions_firefox(&exts) != 0 ||
-            ext_sig_algs_firefox(&exts) != 0 || ext_psk_modes(&exts) != 0 || ext_record_size_limit_firefox(&exts) != 0 ||
-            ext_ech_grease_firefox(&exts) != 0) {
-            db_free(&exts);
-            db_free(&hs);
-            return -1;
-        }
+    if (profile) {
+        uint16_t values[]={grease,boring_grease_cipher,boring_grease_group,boring_grease_vers};
+        if (tls_profile_extensions(&exts,profile,cfg,values,client_pub,hybrid_pub,retained,hs.len)) goto fail;
     } else {
         enum { EX_SNI, EX_GROUPS, EX_SIGS, EX_ALPN, EX_VERS, EX_PSK, EX_KEYSHARE, EX_ECPF, EX_COUNT };
         size_t order[EX_COUNT];
-        if (shuffle_indices(order, EX_COUNT) != 0) { db_free(&exts); db_free(&hs); return -1; }
+        if (shuffle_indices(order, EX_COUNT) != 0) goto fail;
         for (size_t i = 0; i < EX_COUNT; i++) {
+            int result = 0;
             switch (order[i]) {
-                case EX_SNI:
-                    if (ext_server_name(&exts, cfg->sni) != 0) {
-                        db_free(&exts);
-                        db_free(&hs);
-                        return -1;
-                    }
-                    break;
-                case EX_GROUPS:
-                    if (ext_supported_groups(&exts, grease, 1, 0) != 0) {
-                        db_free(&exts);
-                        db_free(&hs);
-                        return -1;
-                    }
-                    break;
-                case EX_SIGS:
-                    if (ext_sig_algs(&exts) != 0) {
-                        db_free(&exts);
-                        db_free(&hs);
-                        return -1;
-                    }
-                    break;
-                case EX_ALPN:
-                    if (ext_alpn(&exts, 1) != 0) {
-                        db_free(&exts);
-                        db_free(&hs);
-                        return -1;
-                    }
-                    break;
-                case EX_VERS:
-                    if (ext_supported_versions(&exts, grease, 1) != 0) {
-                        db_free(&exts);
-                        db_free(&hs);
-                        return -1;
-                    }
-                    break;
-                case EX_PSK:
-                    if (ext_psk_modes(&exts) != 0) {
-                        db_free(&exts);
-                        db_free(&hs);
-                        return -1;
-                    }
-                    break;
-                case EX_KEYSHARE:
-                    if (ext_key_share(&exts, grease, client_pub, 1, NULL) != 0) {
-                        db_free(&exts);
-                        db_free(&hs);
-                        return -1;
-                    }
-                    break;
-                case EX_ECPF:
-                    if (ext_ec_point_formats(&exts) != 0) {
-                        db_free(&exts);
-                        db_free(&hs);
-                        return -1;
-                    }
-                    break;
-                default:
-                    break;
+                case EX_SNI: result = ext_server_name(&exts, cfg->sni); break;
+                case EX_GROUPS: result = ext_supported_groups(&exts); break;
+                case EX_SIGS: result = ext_sig_algs(&exts); break;
+                case EX_ALPN: result = ext_alpn(&exts); break;
+                case EX_VERS: result = ext_supported_versions(&exts); break;
+                case EX_PSK: result = ext_psk_modes(&exts); break;
+                case EX_KEYSHARE: result = ext_key_share(&exts, client_pub); break;
+                case EX_ECPF: result = ext_ec_point_formats(&exts); break;
             }
+            if (result) goto fail;
         }
     }
 
-    if (!use_reality) {
-        int present=0;
-        for (size_t offset=0;offset+4 <= exts.len;) {
-            unsigned type=((unsigned)exts.data[offset]<<8)|exts.data[offset+1];
-            if (type == 23) present=1;
-            offset+=4+((size_t)exts.data[offset+2]<<8)+exts.data[offset+3];
-        }
-        if (!present && ext_extended_master_secret(&exts)) { db_free(&exts); db_free(&hs); return -1; }
-        if (add_ext(&exts,22,NULL,0)) { db_free(&exts); db_free(&hs); return -1; }
+    if (!use_reality && !profile) {
+        if (ext_extended_master_secret(&exts) || add_ext(&exts,22,NULL,0)) goto fail;
     }
-    if (cfg->alpn[0]) {
+    if (cfg->alpn[0] && !profile) {
         dynbuf_t replaced={0}; unsigned char protocols[128]; unsigned int protocol_length=0;
-        if (build_xhttp_tls_alpn(cfg->alpn,protocols,sizeof(protocols),&protocol_length) != 0) { db_free(&exts); db_free(&hs); return -1; }
+        if (build_xhttp_tls_alpn(cfg->alpn,protocols,sizeof(protocols),&protocol_length) != 0) goto fail;
         for (size_t offset=0;offset+4 <= exts.len;) {
             unsigned type=((unsigned)exts.data[offset]<<8)|exts.data[offset+1];
             size_t count=4+((size_t)exts.data[offset+2]<<8)+exts.data[offset+3];
-            if (count > exts.len-offset) { db_free(&replaced); db_free(&exts); db_free(&hs); return -1; }
+            if (count > exts.len-offset) { db_free(&replaced); goto fail; }
             int result;
             if (type == 16) {
                 uint8_t value[130]={(uint8_t)(protocol_length>>8),(uint8_t)protocol_length};
                 memcpy(value+2,protocols,protocol_length); result=add_ext(&replaced,16,value,protocol_length+2);
             } else result=db_append(&replaced,exts.data+offset,count);
-            if (result) { db_free(&replaced); db_free(&exts); db_free(&hs); return -1; }
+            if (result) { db_free(&replaced); goto fail; }
             offset+=count;
         }
         db_free(&exts); exts=replaced;
     }
     uint8_t elen[2] = {(uint8_t)(exts.len >> 8), (uint8_t)(exts.len & 0xFF)};
-    if (db_append(&hs, elen, 2) != 0 || db_append(&hs, exts.data, exts.len) != 0) {
-        db_free(&exts);
-        db_free(&hs);
-        return -1;
-    }
+    if (db_append(&hs, elen, 2) != 0 || db_append(&hs, exts.data, exts.len) != 0) goto fail;
     db_free(&exts);
 
     size_t body_len = hs.len - 4;
@@ -759,23 +511,14 @@ static int build_client_hello_impl(const vless_config_t *cfg, int use_reality, t
     }
 
     uint8_t shared[32];
-    if (x25519_shared(client_priv, cfg->pbk, shared) != 0) {
-        db_free(&hs);
-        return -1;
-    }
+    if (x25519_shared(client_priv, cfg->pbk, shared) != 0) goto fail;
 
     uint8_t prk[32];
     if (hkdf_extract_md(EVP_sha256(), client_random, 20, shared, 32, prk, sizeof(prk)) != 0 ||
-        hkdf_expand_md(EVP_sha256(), prk, sizeof(prk), (const uint8_t *)"REALITY", 7, auth_key, 32) != 0) {
-        db_free(&hs);
-        return -1;
-    }
+        hkdf_expand_md(EVP_sha256(), prk, sizeof(prk), (const uint8_t *)"REALITY", 7, auth_key, 32) != 0) goto fail;
 
     EVP_CIPHER_CTX *ectx = EVP_CIPHER_CTX_new();
-    if (ectx == NULL) {
-        db_free(&hs);
-        return -1;
-    }
+    if (ectx == NULL) goto fail;
 
     uint8_t ct[16];
     uint8_t tag[16];
@@ -793,10 +536,7 @@ static int build_client_hello_impl(const vless_config_t *cfg, int use_reality, t
     }
     EVP_CIPHER_CTX_free(ectx);
 
-    if (!ok) {
-        db_free(&hs);
-        return -1;
-    }
+    if (!ok) goto fail;
 
     memcpy(hs.data + *sid_pos, ct, 16);
     memcpy(hs.data + *sid_pos + 16, tag, 16);
@@ -804,6 +544,13 @@ static int build_client_hello_impl(const vless_config_t *cfg, int use_reality, t
     *out = hs.data;
     *out_len = hs.len;
     return 0;
+fail: {
+    int saved = errno;
+    db_free(&exts);
+    db_free(&hs);
+    errno = saved;
+    return -1;
+}
 }
 
 int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_offer_t cipher_offer, uint8_t client_priv[32],
@@ -811,7 +558,9 @@ int build_client_hello(const vless_config_t *cfg, int use_reality, tls_cipher_of
                       size_t *sid_pos, const uint8_t *hybrid_pub, EVP_PKEY **retained) {
     *out=NULL; *out_len=0; *sid_pos=0;
     if (retained) *retained=NULL;
-    int result=build_client_hello_impl(cfg,use_reality,cipher_offer,client_priv,client_pub,client_random,auth_key,out,out_len,sid_pos,hybrid_pub,retained);
+    fingerprint_mode_t mode;
+    int result=core_fingerprint_resolve(cfg->fp_mode,&mode);
+    if (!result) result=build_client_hello_impl(cfg,mode,use_reality,cipher_offer,client_priv,client_pub,client_random,auth_key,out,out_len,sid_pos,hybrid_pub,retained);
     if (result) {
         int saved=errno;
         OPENSSL_cleanse(client_priv,32); OPENSSL_cleanse(client_pub,32);

@@ -34,6 +34,7 @@ class VersionTests(unittest.TestCase):
         library_dir=openssl_library_dir(prefix)
         libs=os.environ.get("TEST_HOST_LIBS",f"{library_dir}/libssl.a {library_dir}/libcrypto.a -lpthread -ldl")
         objects=[path for path in sorted((BUILD/"src").glob("*.o")) if path.name not in ("main.o","cli_args.o")]
+        objects.extend(sorted((BUILD/"third_party").rglob("*.o")))
         self.assertTrue(objects)
         with tempfile.TemporaryDirectory(prefix="vless-core-version-") as temporary:
             directory=Path(temporary)

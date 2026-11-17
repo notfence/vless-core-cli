@@ -1,0 +1,16 @@
+--- a/lib/common/zstd_internal.h
++++ b/lib/common/zstd_internal.h
+@@ -43,0 +44 @@
++#undef ZSTD_isError
+@@ -44,0 +46 @@
++#undef FSE_isError
+@@ -45,0 +48 @@
++#undef HUF_isError
+--- a/lib/common/fse_decompress.c
++++ b/lib/common/fse_decompress.c
+@@ -31,0 +32 @@
++#undef FSE_isError
+--- a/lib/common/zstd_common.c
++++ b/lib/common/zstd_common.c
+@@ -32,0 +33 @@
++#define ZSTD_isError vc_tls_ZSTD_isError

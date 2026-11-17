@@ -4,6 +4,7 @@
 #include "uri.h"
 #include <openssl/pem.h>
 #include <signal.h>
+#include <zlib.h>
 
 static _Thread_local int client_flight_variant,client_cipher_calls;
 static _Thread_local core_deadline_t *client_flight_deadline;
@@ -125,7 +126,8 @@ static void *peer_run(void *opaque) {
     uint8_t record_header[]={22,3,3,(uint8_t)(server_hello.len>>8),(uint8_t)server_hello.len};
     if (write_exact(peer->fd,record_header,5) || write_exact(peer->fd,server_hello.data,server_hello.len) || derive_handshake_keys(&server,shared,32)) goto done;
     const uint8_t empty_extensions[]={0,0};
-    const uint8_t alps_extensions[]={0,13,0x44,0x69,0,0,0,16,0,5,0,3,2,'h','2'};
+    uint8_t alps_extensions[]={0,13,0x44,0x69,0,0,0,16,0,5,0,3,2,'h','2'};
+    if (peer->variant == 22) alps_extensions[3]=0xcd;
     if (peer_message(&flight,8,peer->alps ? alps_extensions : empty_extensions,peer->alps ? sizeof(alps_extensions) : 2)) goto done;
     const uint8_t request[]={0,0,8,0,13,0,4,0,2,8,7};
     if (peer->variant == 7 || peer->variant == 8) {
@@ -138,7 +140,14 @@ static void *peer_run(void *opaque) {
         (uint8_t)(peer->certificate_length>>16),(uint8_t)(peer->certificate_length>>8),(uint8_t)peer->certificate_length};
     if (db_append(&certificate,cert_header,sizeof(cert_header)) || db_append(&certificate,peer->certificate,peer->certificate_length) || db_append(&certificate,empty_extensions,2)) goto done;
     if (peer->variant == 3 && peer_message(&flight,15,(const uint8_t *)"\x08\x07\x00\x01x",5)) goto done;
-    if (peer_message(&flight,11,certificate.data,certificate.len)) goto done;
+    if (peer->variant == 21) {
+        uint8_t compressed[4096]; uLongf size=sizeof(compressed)-8;
+        if (compress2(compressed+8,&size,certificate.data,certificate.len,Z_BEST_COMPRESSION) != Z_OK) goto done;
+        compressed[0]=0; compressed[1]=1;
+        compressed[2]=(uint8_t)(certificate.len>>16); compressed[3]=(uint8_t)(certificate.len>>8); compressed[4]=(uint8_t)certificate.len;
+        compressed[5]=(uint8_t)(size>>16); compressed[6]=(uint8_t)(size>>8); compressed[7]=(uint8_t)size;
+        if (peer_message(&flight,25,compressed,(size_t)size+8)) goto done;
+    } else if (peer_message(&flight,11,certificate.data,certificate.len)) goto done;
     if (peer->variant == 9 && peer_message(&flight,13,request,sizeof(request))) goto done;
     if (peer->variant == 4 && peer_message(&flight,11,certificate.data,certificate.len)) goto done;
     if (db_append(&server.transcript,flight.data,flight.len)) goto done;
@@ -205,7 +214,8 @@ static void *peer_run(void *opaque) {
             size_t length=4+((size_t)plain[offset+1]<<16)+((size_t)plain[offset+2]<<8)+plain[offset+3];
             if (length > plain_size-offset) break;
             if (plain[offset] == 8) {
-                const uint8_t expected[]={8,0,0,6,0,4,0x44,0x69,0,0};
+                uint8_t expected[]={8,0,0,6,0,4,0x44,0x69,0,0};
+                if (peer->variant == 22) expected[7]=0xcd;
                 peer->client_alps=offset == 0 && length == sizeof(expected) && !memcmp(plain+offset,expected,sizeof(expected));
             } else if (plain[offset] == 11) {
                 const uint8_t expected[]={11,0,0,4,0,0,0,0};
@@ -226,7 +236,7 @@ done:
 }
 
 static void certificate_operation_cases(EVP_PKEY *key, X509 *certificate, int usage) {
-    vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); config.fp_mode=FP_FIREFOX;
+    vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); config.fp_mode=FP_RANDOMIZED;
     uint8_t private_key[32],public_key[32],random[32],auth[32],*hello=NULL; size_t hello_size=0,sid=0;
     REQUIRE("usage/client-hello",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&hello_size,&sid,NULL,NULL) == 0);
     int kind=EVP_PKEY_base_id(key),ed=kind == EVP_PKEY_ED25519,rsa=kind == EVP_PKEY_RSA;
@@ -311,12 +321,15 @@ int main(void) {
         FILE *file=fopen(ca,"w"); REQUIRE("auth/ca-write",file && PEM_write_X509(file,certificate)); fclose(file);
         setenv("VLESS_CA_BUNDLE",ca,1); setenv("VLESS_XHTTP_PIN_FILE",pins,1);
         const char *modes[]={"strict","insecure","tofu"};
-        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 21);variant++) for (int alps=0;alps<2;alps++) {
+        for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 23);variant++) for (int alps=0;alps<2;alps++) {
             if (variant == 20 && mode != 2) continue;
+            if ((variant == 21 && alps) || (variant == 22 && !alps) || (variant >= 21 && kind == 1)) continue;
             unlink(pins); int pair[2]; REQUIRE("auth/socketpair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
             peer_t peer={.fd=pair[1],.variant=variant,.key=key,.certificate=der,.certificate_length=(size_t)length,.alps=alps}; pthread_t thread;
             REQUIRE("auth/peer-thread",pthread_create(&thread,NULL,peer_run,&peer) == 0);
             vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls"); strcpy(config.sni,"vless-core.test"); config.server_port=443; config.fp_mode=FP_QQ;
+            if (variant == 21) config.fp_mode=FP_FIREFOX;
+            if (variant == 22) config.fp_mode=FP_CHROME;
             setenv("VLESS_TLS_MODE",modes[mode],1);
             tls13_conn_t connection={.fd=pair[0]}; char error[256]={0};
             int existing_pin=mode == 2 && !usage && ((alps && variant >= 14 && variant <= 18) || variant == 20 || (!variant && alps));
@@ -336,8 +349,10 @@ int main(void) {
             client_flight_variant=0;
             CHECK("auth/handshake-memory-released",connection.tls_handshake_bytes == 0);
             if (!variant && usage != 2 && result) fprintf(stderr,"valid handshake %d/%s: %s\n",kind,modes[mode],error);
-            if ((variant == 0 || variant == 7 || variant == 19) && usage != 2) CHECK("auth/valid-signature",result == 0);
+            if ((variant == 0 || variant == 7 || variant == 19 || variant >= 21) && usage != 2) CHECK("auth/valid-signature",result == 0);
             else CHECK("auth/malformed-handshake-rejected",result != 0);
+            if (variant == 21) CHECK("auth/compressed-certificate-transcript",result == 0);
+            if (variant == 22) CHECK("alps/new-codepoint-authenticated",result == 0);
             if (variant == 16) CHECK("auth/client-finished-send-failure",result < 0 && strstr(error,"send client Finished"));
             if (variant == 18) CHECK("auth/client-finished-allocation-failure",result < 0 && strstr(error,"encrypt client Finished"));
             if (variant == 17) CHECK("auth/client-finished-expired-deadline",result < 0 && errno == ETIMEDOUT);
@@ -346,9 +361,9 @@ int main(void) {
                 int fd=open(pins,O_RDONLY); char retained[65];
                 CHECK("auth/existing-pin-preserved",fd >= 0 && find_pin_in_fd(fd,"vless-core.test:443",retained) == 0 && !strcmp(retained,previous_pin));
                 if (fd >= 0) close(fd);
-            } else if (((variant && variant != 7 && variant != 19) || usage == 2) && mode == 2) CHECK("auth/failed-handshake-no-tofu-pin",access(pins,F_OK) != 0);
+            } else if (((variant && variant != 7 && variant != 19 && variant < 21) || usage == 2) && mode == 2) CHECK("auth/failed-handshake-no-tofu-pin",access(pins,F_OK) != 0);
             shutdown(pair[0],SHUT_RDWR); close(pair[0]); pthread_join(thread,NULL); db_free(&connection.transcript);
-            if (alps) CHECK("alps/authenticated-client-settings-and-finished",((variant == 0 || variant == 7 || variant == 17 || variant == 19 || variant == 20) && usage != 2) ? peer.client_alps && peer.client_finished : !peer.client_alps);
+            if (alps) CHECK("alps/authenticated-client-settings-and-finished",((variant == 0 || variant == 7 || variant == 17 || variant == 19 || variant == 20 || variant == 22) && usage != 2) ? peer.client_alps && peer.client_finished : !peer.client_alps);
             if (variant == 7) {
                 CHECK("auth/requested-empty-client-certificate",peer.empty_certificate);
                 CHECK("auth/requested-client-finished-transcript",peer.client_finished);

@@ -1020,6 +1020,16 @@ int main(void) {
     CHECK("xmux/socket-options-separate-pools",!pool_config_equal(&first,&second));
     first.protocol=second.protocol=CORE_PROTOCOL_SHADOWSOCKS;
     CHECK("xmux/socket-options-separate-ss-pools",!pool_config_equal(&first,&second));
+    const core_protocol_t protocols[]={CORE_PROTOCOL_VLESS,CORE_PROTOCOL_TROJAN,CORE_PROTOCOL_VMESS,CORE_PROTOCOL_SHADOWSOCKS};
+    for (size_t i=0;i<sizeof(protocols)/sizeof(*protocols);i++) {
+        core_config_defaults(&first); core_config_defaults(&second);
+        first.protocol=second.protocol=protocols[i];
+        first.fp_mode=second.fp_mode=FP_FIREFOX;
+        strcpy(first.fp_name,"firefox"); strcpy(second.fp_name,"hellofirefox_148");
+        CHECK("xmux/fingerprint-label-does-not-separate-pools",pool_config_equal(&first,&second));
+        second.fp_mode=FP_FIREFOX_120;
+        CHECK("xmux/different-fingerprint-still-separates-pools",!pool_config_equal(&first,&second));
+    }
     }
     protocol_pool_identity();
     ss_stream_credentials();

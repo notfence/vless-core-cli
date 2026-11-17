@@ -1661,6 +1661,9 @@ int main(int argc, char **argv) {
     if (arguments.download_server_ips && (!cfg.xhttp_download_settings[0] || strlen(arguments.download_server_ips) > SERVER_IP_LIST_MAX_LENGTH || core_set_download_server_ips(arguments.download_server_ips))) {
         vc_log_error("startup","invalid --download-server-ips or missing downloadSettings"); goto startup_failure;
     }
+    if (core_fingerprint_resolve(cfg.fp_mode,&cfg.fp_mode)) {
+        vc_log_error("startup","failed to select TLS fingerprint"); goto startup_failure;
+    }
     if (server_ips != NULL) {
         if (core_set_server_ips(server_ips) != 0) {
             vc_log_error("startup", "invalid pre-resolved server IP list");
@@ -1714,18 +1717,6 @@ int main(int argc, char **argv) {
                     (unsigned)cfg.server_port,
                     (cfg.socks5_user[0] != '\0' ? "userpass" : "none"));
     } else {
-        const char *fp_label = "chrome";
-        if (cfg.fp_mode == FP_RANDOM) {
-            fp_label = "random";
-        } else if (cfg.fp_mode == FP_RANDOMIZED) {
-            fp_label = "randomized";
-        } else if (cfg.fp_mode == FP_QQ) {
-            fp_label = "qq";
-        } else if (cfg.fp_mode == FP_FIREFOX) {
-            fp_label = "firefox";
-        } else if (cfg.fp_mode == FP_EDGE) {
-            fp_label = "edge";
-        }
         const char *transport_label = strcmp(cfg.flow, "xtls-rprx-vision") == 0 ? "vision" : "tcp";
         if (cfg.transport_mode == TRANSPORT_XHTTP) {
             transport_label = "xhttp";
@@ -1738,7 +1729,7 @@ int main(int argc, char **argv) {
         }
         vc_log_info("core", "%s listening on 127.0.0.1:%d (server=%s:%u, sni=%s, security=%s, transport=%s, fp=%s)",
                     prog, listen_port, cfg.server_host, (unsigned)cfg.server_port,
-                    cfg.sni, cfg.security, transport_label, fp_label);
+                    cfg.sni, cfg.security, transport_label, cfg.fp_name);
         if ((cfg.transport_mode == TRANSPORT_XHTTP || cfg.transport_mode == TRANSPORT_GRPC) && strcmp(cfg.security, "tls") == 0) {
             vc_log_info(transport_label, "tls_mode=%s", tls_mode_startup_label(cfg.allow_insecure));
         }

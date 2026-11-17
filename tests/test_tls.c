@@ -11,8 +11,10 @@ static uint32_t pacing_random;
 static int pacing_waits,pacing_interrupted,pacing_timeouts[4];
 static int asynchronous_probe,asynchronous_waits;
 static int hello_random_probe,hello_random_calls,hello_random_failure,hello_random_constant;
+static int hello_allocation_probe,hello_allocation_calls,hello_allocation_failure;
 uint64_t __real_core_now_ms(void);
 int __real_RAND_bytes(unsigned char *,int);
+void *__real_realloc(void *,size_t);
 int __real_poll(struct pollfd *,nfds_t,int);
 int __real_clock_gettime(clockid_t,struct timespec *);
 uint64_t __wrap_core_now_ms(void) { return pacing_clock ? pacing_clock : __real_core_now_ms(); }
@@ -30,6 +32,10 @@ int __wrap_RAND_bytes(unsigned char *data,int length) {
     if (length != (int)sizeof(pacing_random)) return 0;
     memcpy(data,&pacing_random,sizeof(pacing_random)); return 1;
 }
+void *__wrap_realloc(void *memory,size_t length) {
+    if (hello_allocation_probe && ++hello_allocation_calls == hello_allocation_failure) { errno=ENOMEM; return NULL; }
+    return __real_realloc(memory,length);
+}
 
 static int cleared_bytes(const uint8_t *data,size_t length) {
     uint8_t combined=0;
@@ -41,6 +47,8 @@ static void client_hello_random_failures(void) {
     vless_config_t config={.server_port=443}; strcpy(config.server_host,"vless-core.test"); strcpy(config.sni,"vless-core.test");
     for (int fp=0;fp<6;fp++) {
         config.fp_mode=fp;
+        fingerprint_mode_t effective;
+        REQUIRE("tls/random-profile-initialized",!core_fingerprint_resolve(config.fp_mode,&effective));
         uint8_t private[32],public[32],random[32],auth[32],*hello=NULL; size_t length=0,sid=0; EVP_PKEY *retained=NULL;
         hello_random_probe=1; hello_random_failure=0; hello_random_calls=0;
         REQUIRE("tls/random-baseline-profile",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private,public,random,auth,&hello,&length,&sid,NULL,&retained) == 0);
@@ -61,7 +69,8 @@ static void client_hello_random_failures(void) {
         if (!child) {
             alarm(1); hello_random_failure=0; hello_random_constant=1; hello_random_calls=0; hello=NULL; retained=NULL;
             int result=build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private,public,random,auth,&hello,&length,&sid,NULL,&retained);
-            free(hello); EVP_PKEY_free(retained); _exit(!result && hello_random_calls < 64 ? 0 : 1);
+            int valid=(!result || (errno == EIO && cleared_bytes(private,sizeof(private)))) && (unsigned)hello_random_calls < CORE_RANDOM_MAX_ATTEMPTS+64;
+            free(hello); EVP_PKEY_free(retained); _exit(valid ? 0 : 1);
         }
         int status=0; REQUIRE("tls/random-constant-wait",waitpid(child,&status,0) == child);
         CHECK("tls/random-constant-terminates",WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -69,6 +78,57 @@ static void client_hello_random_failures(void) {
         REQUIRE("tls/random-recovery-after-failure",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private,public,random,auth,&hello,&length,&sid,NULL,&retained) == 0);
         free(hello); EVP_PKEY_free(retained); hello_random_probe=0;
     }
+}
+static void randomized_hello_contract(void) {
+    static const struct { const char *alpn,*encoded; size_t length; } cases[]={
+        {"","\000\014\010http/1.1\002h2",14},{"h2","\000\003\002h2",5},{"http/1.1","\000\011\010http/1.1",11}
+    };
+    static const unsigned types[]={10,13,16,43,45,51,11,0,23,22};
+    vless_config_t config={.fp_mode=FP_RANDOMIZED,.server_port=443};
+    strcpy(config.server_host,"vless-core.test"); strcpy(config.sni,"vless-core.test");
+    uint8_t peer_private[32]; REQUIRE("tls/randomized-peer-key",!x25519_generate(peer_private,config.pbk));
+    OPENSSL_cleanse(peer_private,sizeof(peer_private));
+    for (int reality=0;reality<2;reality++) for (int offer=0;offer<2;offer++) for (size_t i=0;i<sizeof(cases)/sizeof(*cases);i++) {
+        strcpy(config.alpn,cases[i].alpn);
+        uint8_t private[32],public[32],random[32],auth[32],*hello=NULL; size_t length=0,sid=0,size=0; EVP_PKEY *retained=NULL;
+        hello_random_probe=hello_random_constant=hello_allocation_probe=1;
+        hello_random_calls=hello_allocation_calls=hello_allocation_failure=0;
+        int result=build_client_hello(&config,reality,offer,private,public,random,auth,&hello,&length,&sid,NULL,&retained);
+        int allocations=hello_allocation_calls; hello_allocation_probe=0;
+        REQUIRE("tls/randomized-contract-build",!result);
+        CHECK("tls/randomized-rng-request-count",hello_random_calls == 10-reality);
+        CHECK("tls/randomized-buffer-allocations",allocations >= 2);
+        const uint8_t *value=core_tls_hello_extension(hello,length,10,&size);
+        CHECK("tls/randomized-groups-no-grease-or-hybrid",value && size == 6 && !memcmp(value,"\000\004\000\035\000\027",6));
+        value=core_tls_hello_extension(hello,length,43,&size);
+        CHECK("tls/randomized-versions-no-grease",value && size == 5 && !memcmp(value,"\004\003\004\003\003",5));
+        value=core_tls_hello_extension(hello,length,51,&size);
+        CHECK("tls/randomized-single-x25519-share",value && size == 38 && !memcmp(value,"\000\044\000\035\000\040",6) && !memcmp(value+6,public,32));
+        value=core_tls_hello_extension(hello,length,16,&size);
+        CHECK("tls/randomized-alpn-contract",value && size == cases[i].length && !memcmp(value,cases[i].encoded,size));
+        size_t offset=39+hello[38]; offset+=2+(((size_t)hello[offset]<<8)|hello[offset+1]);
+        offset+=1+hello[offset]; offset+=2;
+        for (size_t index=0;index<sizeof(types)/sizeof(*types)-(reality ? 2 : 0);index++) {
+            REQUIRE("tls/randomized-extension-header",offset+4 <= length);
+            unsigned type=((unsigned)hello[offset]<<8)|hello[offset+1]; size_t count=((size_t)hello[offset+2]<<8)|hello[offset+3];
+            CHECK("tls/randomized-extension-order-and-ems-once",type == types[index]);
+            REQUIRE("tls/randomized-extension-length",count <= length-offset-4); offset+=4+count;
+        }
+        CHECK("tls/randomized-no-extra-extensions",offset == length);
+        free(hello); EVP_PKEY_free(retained);
+        for (int failure=1;failure<=allocations;failure++) {
+            memset(private,0xcc,sizeof(private)); memset(public,0xcc,sizeof(public));
+            memset(random,0xcc,sizeof(random)); memset(auth,0xcc,sizeof(auth));
+            hello_allocation_calls=0; hello_allocation_failure=failure; hello_allocation_probe=1; errno=0;
+            result=build_client_hello(&config,reality,offer,private,public,random,auth,&hello,&length,&sid,NULL,&retained);
+            int error=errno; hello_allocation_probe=0;
+            CHECK("tls/randomized-allocation-failure-empty-result",result < 0 && error == ENOMEM && !hello && !length && !sid && !retained);
+            CHECK("tls/randomized-allocation-failure-clears-keys",cleared_bytes(private,32) && cleared_bytes(public,32) && cleared_bytes(random,32) && cleared_bytes(auth,32));
+            free(hello); EVP_PKEY_free(retained);
+        }
+        hello_allocation_failure=0;
+    }
+    hello_random_probe=hello_random_constant=0;
 }
 int __wrap_poll(struct pollfd *descriptors,nfds_t count,int timeout) {
     if (asynchronous_probe) { asynchronous_waits++; pacing_clock+=(unsigned)timeout; return 0; }
@@ -514,13 +574,19 @@ static void hybrid_vectors(void) {
     for (size_t i = 0; i < sizeof(public_key); i++) public_key[i] = (uint8_t)i;
     memset(point, 0x42, sizeof(point));
     dynbuf_t extension = {0};
-    REQUIRE("tls/hybrid-share-build", ext_key_share_firefox(&extension, point, public_key,NULL) == 0);
+    const tls_profile_t *profile=tls_fingerprint_profile(FP_FIREFOX);
+    const tls_profile_extension_t *share=NULL,*groups=NULL;
+    for (size_t i=0;i<profile->extension_count;i++) {
+        if (profile->extensions[i].type == 51) share=profile->extensions+i;
+        if (profile->extensions[i].type == 10) groups=profile->extensions+i;
+    }
+    REQUIRE("tls/hybrid-share-build",share && groups && tls_profile_key_share(&extension,share,0x0a0a,point,public_key,NULL) == 0);
     CHECK("tls/hybrid-share-size", extension.len == 4 + 2 + 4 + 1216 + 4 + 32 + 4 + 65);
     CHECK("tls/hybrid-share-group", extension.data[6] == 0x11 && extension.data[7] == 0xec && extension.data[8] == 4 && extension.data[9] == 0xc0);
     CHECK("tls/hybrid-share-public-key", memcmp(extension.data + 10, public_key, sizeof(public_key)) == 0);
     CHECK("tls/hybrid-share-x25519", memcmp(extension.data + 1194, point, sizeof(point)) == 0 && memcmp(extension.data + 1230, point, sizeof(point)) == 0);
     db_free(&extension);
-    REQUIRE("tls/hybrid-groups-build", ext_supported_groups_firefox(&extension, 1) == 0);
+    REQUIRE("tls/hybrid-groups-build",add_ext(&extension,10,groups->data,groups->length) == 0);
     CHECK("tls/hybrid-groups-first", extension.data[6] == 0x11 && extension.data[7] == 0xec);
     db_free(&extension);
     const size_t lengths[] = {32, 1120};
@@ -966,8 +1032,11 @@ int main(int argc, char **argv) {
             tls13_conn_t *connection = NULL;
             int result = tls13_reality_connect(&cfg, &connection, error, sizeof(error));
             if (result) fprintf(stderr, "live handshake error: %s\n", error);
-            REQUIRE("tls/live-aes-fallback", result == 0);
-            CHECK("tls/live-aes-cached", connection->tls_use_aes_fallback && tls_aes_fallback_cached(cfg.server_host, cfg.server_port, cfg.sni));
+            REQUIRE("tls/live-aes-negotiation", result == 0);
+            CHECK("tls/live-aes-selected",connection->tls_cipher_suite == 0x1301);
+            CHECK("tls/live-aes-fallback-policy",cfg.fp_mode == FP_RANDOMIZED ?
+                connection->tls_use_aes_fallback && tls_aes_fallback_cached(cfg.server_host,cfg.server_port,cfg.sni) :
+                !connection->tls_use_aes_fallback && !tls_aes_fallback_cached(cfg.server_host,cfg.server_port,cfg.sni));
             tls13_reality_close(connection);
         }
         return test_result();
@@ -1044,6 +1113,7 @@ int main(int argc, char **argv) {
     CHECK("tls/alpn-capacity", build_xhttp_tls_alpn(NULL, alpn, 2, &alpn_length) != 0);
     xray_version_cases();
     client_hello_random_failures();
+    randomized_hello_contract();
     cache_tls_aes_fallback(cfg.server_host, 443, cfg.sni);
     CHECK("tls/aes-cache-isolation", tls_aes_fallback_cached(cfg.server_host, 443, cfg.sni) && !tls_aes_fallback_cached(cfg.server_host, 444, cfg.sni) && !tls_aes_fallback_cached(cfg.server_host, 443, "other.test"));
     struct sockaddr_in address = {.sin_family=AF_INET,.sin_port=htons(443),.sin_addr.s_addr=htonl(INADDR_LOOPBACK)}; struct sockaddr_storage found; socklen_t found_size;

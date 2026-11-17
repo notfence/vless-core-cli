@@ -51,6 +51,12 @@ static void extra_precedence_cases(void) {
 int main(void) {
     extra_precedence_cases();
     vless_config_t config,download; char error[256];
+    const char *fingerprints[]={"firefox","hellofirefox_148","hellofirefox_auto","random","FIREFOX"};
+    for (size_t i=0;i<sizeof(fingerprints)/sizeof(*fingerprints);i++) {
+        char json[512];
+        snprintf(json,sizeof(json),"{\"address\":\"127.0.0.1\",\"port\":443,\"network\":\"xhttp\",\"security\":\"tls\",\"tlsSettings\":{\"fingerprint\":\"%s\"}}",fingerprints[i]);
+        CHECK("download/fingerprint-name-retained",parse(json,&config,error) == 0 && !strcmp(config.fp_name,fingerprints[i]));
+    }
     for (unsigned alias=0;alias<2;alias++) for (unsigned nested=0;nested<2;nested++) {
         char json[1024];
         snprintf(json,sizeof(json),"{\"address\":\"127.0.0.2\",\"port\":8080,\"network\":\"xhttp\",\"%s\":{\"path\":\"/download\",%s\"xmux\":{\"maxConcurrency\":\"\",\"maxConnections\":3,\"cMaxReuseTimes\":\"\",\"hMaxRequestTimes\":\"600-900\",\"hMaxReusableSecs\":\"1800-3000\",\"hKeepAlivePeriod\":0}%s}}",alias ? "splithttpSettings" : "xhttpSettings",nested ? "\"extra\":{" : "",nested ? "}" : "");

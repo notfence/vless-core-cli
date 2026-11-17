@@ -108,6 +108,26 @@ int tls_buffer_init(dynbuf_t *buffer, size_t limit, size_t *owner) {
     buffer->limit=limit; buffer->handshake_bytes=owner; buffer->tls_budget=1; return 0;
 }
 
+typedef union { dynbuf_t buffer; long double alignment; uint8_t padding[64]; } tls_allocation_t;
+_Static_assert(sizeof(tls_allocation_t)%16 == 0,"decoder allocation alignment");
+
+void *tls_handshake_allocate(void *context,size_t length) {
+    tls13_conn_t *connection=context;
+    if (!connection || length > TLS_HANDSHAKE_LIMIT-sizeof(tls_allocation_t)) { errno=ENOBUFS; return NULL; }
+    dynbuf_t buffer={0};
+    if (tls_buffer_init(&buffer,TLS_HANDSHAKE_LIMIT,&connection->tls_handshake_bytes) || db_reserve(&buffer,length+sizeof(tls_allocation_t))) return NULL;
+    tls_allocation_t *header=(tls_allocation_t *)buffer.data; header->buffer=buffer;
+    return header+1;
+}
+
+void tls_handshake_deallocate(void *context,void *memory) {
+    (void)context;
+    if (memory) {
+        tls_allocation_t *header=(tls_allocation_t *)memory-1;
+        dynbuf_t buffer=header->buffer; db_free(&buffer);
+    }
+}
+
 void tls_handshake_material_clear(tls13_conn_t *connection) {
     if (connection->record_encrypt) EVP_CIPHER_CTX_reset(connection->record_encrypt);
     if (connection->record_decrypt) EVP_CIPHER_CTX_reset(connection->record_decrypt);

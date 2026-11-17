@@ -486,9 +486,10 @@ static int pool_identity(const vless_config_t *config,uint8_t pins[32]) {
 }
 
 static int pool_config_equal(const vless_config_t *first,const vless_config_t *second) {
-    if (first->protocol != CORE_PROTOCOL_SHADOWSOCKS || second->protocol != CORE_PROTOCOL_SHADOWSOCKS) return !memcmp(first,second,sizeof(*first));
+    size_t length=offsetof(vless_config_t,fp_name);
+    if (first->protocol != CORE_PROTOCOL_SHADOWSOCKS || second->protocol != CORE_PROTOCOL_SHADOWSOCKS) return !memcmp(first,second,length);
     size_t prefix=offsetof(vless_config_t,encryption_relays),suffix=offsetof(vless_config_t,encryption_relay_count);
-    return !memcmp(first,second,prefix) && !memcmp((const uint8_t *)first+suffix,(const uint8_t *)second+suffix,sizeof(*first)-suffix);
+    return !memcmp(first,second,prefix) && !memcmp((const uint8_t *)first+suffix,(const uint8_t *)second+suffix,length-suffix);
 }
 
 static mux_manager_t *get_manager(const vless_config_t *config, const core_http2_backend_t *backend) {
@@ -1078,6 +1079,11 @@ core_http2_stream_t *core_http2_connect(const vless_config_t *config, const core
     vless_config_t download_config;
     int independent=config->transport_mode == TRANSPORT_XHTTP && config->xhttp_download_settings[0] != 0;
     if (independent && core_xhttp_download_config(config,&download_config,error,capacity) != 0) return NULL;
+    if (independent && core_fingerprint_resolve(download_config.fp_mode,&download_config.fp_mode)) {
+        clear_protocol_credential(&download_config);
+        if (error && capacity) snprintf(error,capacity,"failed to select download TLS fingerprint");
+        return NULL;
+    }
     core_http2_stream_t *stream=calloc(1,sizeof(*stream));
     if (!stream) { if (independent) clear_protocol_credential(&download_config); if (error && capacity) snprintf(error,capacity,"XHTTP client allocation failed"); return NULL; }
     stream->config=*config; stream->references=1;

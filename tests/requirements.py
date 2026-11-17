@@ -7,6 +7,7 @@ import subprocess
 import sys
 import sysconfig
 
+
 XRAY_VERSION = "26.6.27"
 XRAY_SHA256 = "8ef87ac07f95617e094b8e9302ea3e0c2d0edaa7045d57b455fdee28b3c9e41e"
 
@@ -19,6 +20,10 @@ def openssl_library_dir(prefix):
     return next((directory for directory in candidates if all((directory / name).is_file() for name in ("libssl.a", "libcrypto.a"))), prefix / "lib")
 
 def verify():
+    preparation = Path(__file__).resolve().parents[1] / "scripts/prepare_tls_decoders.sh"
+    result = subprocess.run(["bash", str(preparation), "--check"], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Missing prepared TLS decoders; run make tls-decoders.")
     compiler = os.environ.get("TEST_FUZZ_CC","clang")
     if not shutil.which(compiler):
         raise RuntimeError(f"Missing local fuzz compiler: {compiler}. Clang with libFuzzer, ASan and UBSan is required; make never installs dependencies.")

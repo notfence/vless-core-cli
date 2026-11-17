@@ -44,10 +44,13 @@ class TlsCompatibilityTests(unittest.TestCase):
             self.assertEqual(generated.returncode,0,generated.stderr)
             listen=port()
             with Process([str(OPENSSL),"s_server","-accept",f"127.0.0.1:{listen}","-cert",str(cert),"-key",str(key),"-tls1_3","-www"],"tls-curve",{"OPENSSL_CONF":"/dev/null"},ready="ACCEPT") as server:
-                for fingerprint in FINGERPRINTS:
+                for fingerprint in tuple(value for value in FINGERPRINTS if value != "random"):
                     with self.subTest(curve=curve,fingerprint=fingerprint):
                         result=subprocess.run([str(BUILD/"test_tls_state"),"--http",uri(listen,"tcp","tls",fp=fingerprint)],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=10)
-                        self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
+                        if curve == "secp521r1" and fingerprint not in ("firefox","randomized"):
+                            self.assertNotEqual(result.returncode,0,result.stdout+result.stderr+server.log)
+                            self.assertIn("no suitable signature algorithm",server.log)
+                        else: self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
 
     def test_tls12_parallel_transfers_and_recovery(self):
         cert,_=certificate(); payload=bytes(range(251))*523
@@ -101,7 +104,7 @@ class TlsCompatibilityTests(unittest.TestCase):
                         command=[str(OPENSSL),"s_server","-accept",f"127.0.0.1:{listen}","-cert",str(cert),"-key",str(key),f"-tls{version}","-www"]
                         if authentication: command += ["-Verify" if authentication == "required" else "-verify","1"]
                         with Process(command,"tls-signature",{"OPENSSL_CONF":"/dev/null"},ready="ACCEPT") as server:
-                            result=subprocess.run([str(BUILD/"test_tls_state"),"--http",uri(listen,"tcp","tls",fp="firefox")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=10)
+                            result=subprocess.run([str(BUILD/"test_tls_state"),"--http",uri(listen,"tcp","tls",fp="randomized")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=10)
                             if authentication == "required": self.assertNotEqual(result.returncode,0,result.stdout+result.stderr+server.log)
                             else: self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
 
@@ -117,19 +120,33 @@ class TlsCompatibilityTests(unittest.TestCase):
         return hello_layout(captured[0])
 
     def test_ordinary_tls_uses_selected_fingerprint(self):
+        from test_fingerprint_profiles import client_hello, FingerprintProfileTests, VECTORS, MODERN
         cert,_=certificate()
         for fingerprint in FINGERPRINTS:
-            expected=self.profile_layout(fingerprint)
+            expected=self.profile_layout(fingerprint) if fingerprint != "random" else None
             for transport in ("ws","xhttp","grpc"):
                 with self.subTest(fingerprint=fingerprint,transport=transport), Server() as target, xray_server(transport,"tls") as reference, CountingProxy(reference.port) as wire:
                     with cli(uri(wire.port,transport,"tls",fp=fingerprint),environment={"VLESS_CA_BUNDLE":str(cert)}) as core:
                         with socks_connect(core.port,target.port) as tunnel: exchange(tunnel,b"vless-core fingerprint")
                         self.assertTrue(wire.client_data)
                         actual=hello_layout(bytes(wire.client_data[0]))
+                        if fingerprint == "random":
+                            matched=0
+                            for profile in VECTORS["profiles"]:
+                                if profile["name"] not in MODERN: continue
+                                candidate=client_hello(wire.client_data[0])
+                                if transport == "ws":
+                                    candidate["extensions"]=[entry for entry in candidate["extensions"] if entry["type"] not in (0x4469,0x44cd)]
+                                    profile=dict(profile,extensions=[dict(entry,data="000908687474702f312e31") if entry["type"] == 16 else entry for entry in profile["extensions"] if entry["type"] not in (0x4469,0x44cd)])
+                                try: FingerprintProfileTests().assert_profile(candidate,profile); matched+=1
+                                except AssertionError: pass
+                            self.assertEqual(matched,1,core.log)
+                            continue
                         self.assertEqual(actual[0],expected[0],core.log)
-                        expected_extensions=tuple(value for value in expected[1] if not (transport == "ws" and value == 0x4469))
+                        expected_extensions=tuple(value for value in expected[1] if value != 21 and not (transport == "ws" and value in (0x4469,0x44cd)))
+                        actual=(actual[0],tuple(value for value in actual[1] if value != 21))
                         if fingerprint == "qq": self.assertEqual(0x4469 in actual[1],transport != "ws",core.log)
-                        if fingerprint in ("random","randomized"):
+                        if fingerprint in ("chrome","randomized"):
                             self.assertCountEqual(actual[1],expected_extensions,core.log)
                         else:
                             self.assertEqual(actual[1],expected_extensions,core.log)
@@ -166,5 +183,5 @@ class TlsCompatibilityTests(unittest.TestCase):
                         command=[str(OPENSSL),"s_server","-accept",f"127.0.0.1:{listen}","-cert",str(cert),"-key",str(key),"-tls1_2","-cipher",cipher,"-www"]
                         if mac_then_encrypt: command.append("-no_etm")
                         with Process(command,"tls12-cipher",{"OPENSSL_CONF":"/dev/null"},ready="ACCEPT") as server:
-                            result=subprocess.run([str(BUILD/"test_tls_state"),"--http",uri(listen,"tcp","tls",fp="firefox")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=10)
+                            result=subprocess.run([str(BUILD/"test_tls_state"),"--http",uri(listen,"tcp","tls",fp="randomized")],env=dict(os.environ,VLESS_CA_BUNDLE=str(cert)),capture_output=True,text=True,timeout=10)
                             self.assertEqual(result.returncode,0,result.stdout+result.stderr+server.log)
