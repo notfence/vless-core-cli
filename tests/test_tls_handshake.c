@@ -31,6 +31,7 @@ typedef struct {
     size_t certificate_length;
     int empty_certificate, client_finished;
     int alps,client_alps;
+    int ech_reply,ech_decode_error;
 } peer_t;
 
 static int peer_message(dynbuf_t *buffer, uint8_t type, const uint8_t *body, size_t length) {
@@ -127,8 +128,11 @@ static void *peer_run(void *opaque) {
     if (write_exact(peer->fd,record_header,5) || write_exact(peer->fd,server_hello.data,server_hello.len) || derive_handshake_keys(&server,shared,32)) goto done;
     const uint8_t empty_extensions[]={0,0};
     uint8_t alps_extensions[]={0,13,0x44,0x69,0,0,0,16,0,5,0,3,2,'h','2'};
+    uint8_t ech_extensions[]={0,10,0xfe,0x0d,0,6,0,4,0xab,0xcd,0,0};
     if (peer->variant == 22) alps_extensions[3]=0xcd;
-    if (peer_message(&flight,8,peer->alps ? alps_extensions : empty_extensions,peer->alps ? sizeof(alps_extensions) : 2)) goto done;
+    if (peer->ech_reply < 0) ech_extensions[7]++;
+    if (peer_message(&flight,8,peer->ech_reply ? ech_extensions : peer->alps ? alps_extensions : empty_extensions,
+        peer->ech_reply ? sizeof(ech_extensions) : peer->alps ? sizeof(alps_extensions) : 2)) goto done;
     const uint8_t request[]={0,0,8,0,13,0,4,0,2,8,7};
     if (peer->variant == 7 || peer->variant == 8) {
         if (peer_message(&flight,13,request,sizeof(request))) goto done;
@@ -204,12 +208,13 @@ static void *peer_run(void *opaque) {
     }
     if (encrypt_record(&server,server.s_hs_key,server.s_hs_iv,&server.s_hs_seq,22,flight.data,flight.len,&encrypted,&encrypted_length)) goto done;
     (void)write_exact(peer->fd,encrypted,encrypted_length); free(encrypted);
-    if (peer->variant == 7 || peer->variant == 19 || peer->alps) {
+    if (peer->variant == 7 || peer->variant == 19 || peer->alps || peer->ech_reply) {
         uint8_t *record=NULL,*plain=NULL,inner=0; size_t record_size=0,plain_size=0;
         if (peer_message(&server.transcript,20,finished,32) || read_record(peer->fd,&type,&record,&record_size)) goto done;
         if (type == 20) { free(record); record=NULL; if (read_record(peer->fd,&type,&record,&record_size)) goto done; }
         int result=decrypt_record(&server,server.c_hs_key,server.c_hs_iv,&server.c_hs_seq,type,record,record_size,&plain,&plain_size,&inner);
         free(record);
+        if (!result && inner == 21 && plain_size == 2 && plain[0] == 2 && plain[1] == 50) peer->ech_decode_error=1;
         if (!result && inner == 22) for (size_t offset=0;offset+4 <= plain_size;) {
             size_t length=4+((size_t)plain[offset+1]<<16)+((size_t)plain[offset+2]<<8)+plain[offset+3];
             if (length > plain_size-offset) break;
@@ -233,6 +238,33 @@ static void *peer_run(void *opaque) {
     uint8_t remaining[512]; while (recv(peer->fd,remaining,sizeof(remaining),0) > 0) {}
 done:
     free(hello); db_free(&flight); db_free(&certificate); db_free(&server_hello); db_free(&server.transcript); close(peer->fd); return NULL;
+}
+
+static void ech_auth_cases(EVP_PKEY *key,uint8_t *der,size_t length,const char *trusted,const char *untrusted) {
+    const struct { int reply; const char *name,*ca,*error; } cases[]={
+        {1,"vless-core.test",trusted,NULL},
+        {-1,"vless-core.test",trusted,"invalid TLS EncryptedExtensions"},
+        {1,"wrong.test",trusted,"certificate"},
+        {1,"vless-core.test",untrusted,"certificate"}
+    };
+    setenv("VLESS_TLS_MODE","strict",1);
+    for (size_t i=0;i<sizeof(cases)/sizeof(*cases);i++) {
+        setenv("VLESS_CA_BUNDLE",cases[i].ca,1);
+        int pair[2]; REQUIRE("ech/auth-pair",socketpair(AF_UNIX,SOCK_STREAM,0,pair) == 0);
+        core_set_socket_io_timeout(pair[0],1000); core_set_socket_io_timeout(pair[1],1000);
+        peer_t peer={.fd=pair[1],.key=key,.certificate=der,.certificate_length=length,.ech_reply=cases[i].reply};
+        pthread_t thread; REQUIRE("ech/auth-peer",pthread_create(&thread,NULL,peer_run,&peer) == 0);
+        vless_config_t config; core_config_defaults(&config);
+        strcpy(config.security,"tls"); strcpy(config.sni,cases[i].name); config.server_port=443; config.fp_mode=FP_CHROME;
+        tls13_conn_t connection={.fd=pair[0]}; char error[256]={0};
+        int result=run_tls_handshake(&config,&connection,TLS_CIPHER_OFFER_CHACHA,error,sizeof(error));
+        CHECK("ech/auth-result",cases[i].error ? result < 0 && strstr(error,cases[i].error) : result == 0);
+        CHECK("ech/auth-handshake-memory-released",connection.tls_handshake_bytes == 0);
+        shutdown(pair[0],SHUT_RDWR); close(pair[0]); pthread_join(thread,NULL);
+        CHECK("ech/auth-client-finished",peer.client_finished == !cases[i].error);
+        CHECK("ech/auth-encrypted-decode-alert",peer.ech_decode_error == (cases[i].reply < 0));
+    }
+    setenv("VLESS_CA_BUNDLE",trusted,1);
 }
 
 static void certificate_operation_cases(EVP_PKEY *key, X509 *certificate, int usage) {
@@ -320,6 +352,10 @@ int main(void) {
         char ca[PATH_MAX],pins[PATH_MAX]; snprintf(ca,sizeof(ca),"%s/auth-ca.pem",root); snprintf(pins,sizeof(pins),"%s/auth-pins",root);
         FILE *file=fopen(ca,"w"); REQUIRE("auth/ca-write",file && PEM_write_X509(file,certificate)); fclose(file);
         setenv("VLESS_CA_BUNDLE",ca,1); setenv("VLESS_XHTTP_PIN_FILE",pins,1);
+        if (!kind && !usage) {
+            char other_ca[PATH_MAX]; snprintf(other_ca,sizeof(other_ca),"%s/identity-ca.pem",root);
+            ech_auth_cases(key,der,(size_t)length,ca,other_ca);
+        }
         const char *modes[]={"strict","insecure","tofu"};
         for (size_t mode=0;mode<3;mode++) for (int variant=0;variant<(usage ? 1 : 23);variant++) for (int alps=0;alps<2;alps++) {
             if (variant == 20 && mode != 2) continue;

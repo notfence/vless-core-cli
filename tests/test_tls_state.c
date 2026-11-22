@@ -28,7 +28,7 @@ static int hello_extension(const uint8_t *hello, size_t length, unsigned kind, c
 
 static void retry_vectors(const uint8_t *client,size_t length) {
     static const uint8_t random[]={0xcf,0x21,0xad,0x74,0xe5,0x9a,0x61,0x11,0xbe,0x1d,0x8c,0x02,0x1e,0x65,0xb8,0x91,0xc2,0xa2,0x11,0x16,0x7a,0xbb,0x8c,0x5e,0x07,0x9e,0x09,0xe2,0xc8,0xa8,0x33,0x9c};
-    uint8_t hello[96]={2,0,0,92,3,3}; memcpy(hello+6,random,32); hello[38]=32; memcpy(hello+39,client+39,32);
+    uint8_t hello[136]={2,0,0,0,3,3}; memcpy(hello+6,random,32); hello[38]=32; memcpy(hello+39,client+39,32);
     const uint8_t tail[]={0x13,3,0,0,19,0,43,0,2,3,4,0,51,0,2,0,23,0,44,0,3,0,1,65};
     memcpy(hello+71,tail,sizeof(tail)); hello[3]=(uint8_t)(71+sizeof(tail)-4); size_t size=71+sizeof(tail);
     core_tls_hello_t parsed;
@@ -43,6 +43,89 @@ static void retry_vectors(const uint8_t *client,size_t length) {
     hello[87]=25; CHECK("tls/retry-unadvertised-group",core_tls_hello_parse(hello,size,client,length,&parsed) != 0);
     hello[87]=23; hello[39]^=1; CHECK("tls/retry-wrong-session",core_tls_hello_parse(hello,size,client,length,&parsed) != 0); hello[39]^=1;
     for (size_t cut=0;cut<size;cut++) CHECK("tls/retry-truncation",core_tls_hello_parse(hello,cut,client,length,&parsed) != 0);
+
+    const uint8_t ech[]={0xfe,0x0d,0,8,1,2,3,4,5,6,7,8};
+    const uint8_t *offered=NULL;
+    size_t offered_size=0;
+    REQUIRE("ech/retry-offer-present",hello_extension(client,length,0xfe0d,&offered,&offered_size) == 0 && offered_size);
+    memcpy(hello+size,ech,sizeof(ech));
+    hello[3]+=sizeof(ech); hello[75]+=sizeof(ech);
+    uint8_t *without=malloc(length); REQUIRE("ech/retry-without-offer-fixture",without);
+    memcpy(without,client,length);
+    without[offered-client-4]=0xab; without[offered-client-3]=0xcd;
+    CHECK("ech/retry-unoffered-confirmation",core_tls_hello_parse(hello,size+sizeof(ech),without,length,&parsed) != 0);
+    free(without);
+    int accepted=core_tls_hello_parse(hello,size+sizeof(ech),client,length,&parsed) == 0;
+    CHECK("ech/retry-confirmation-accepted",accepted);
+    if (accepted) {
+        REQUIRE("ech/retry-second-hello",core_tls_hello_retry(client,length,&parsed,&retry,&retry_length,&key) == 0);
+        CHECK("ech/retry-offer-preserved",hello_extension(retry,retry_length,0xfe0d,&value,&count) == 0 &&
+            count == offered_size && !memcmp(value,offered,count));
+        free(retry); EVP_PKEY_free(key);
+    }
+    hello[3]--; hello[75]--; hello[size+3]=7;
+    CHECK("ech/retry-malformed-confirmation",core_tls_hello_parse(hello,size+sizeof(ech)-1,client,length,&parsed) == CORE_TLS_ECH_DECODE_ERROR);
+    hello[3]++; hello[75]++; hello[size+3]=8;
+    memcpy(hello+size+sizeof(ech),ech,sizeof(ech)); hello[3]+=sizeof(ech); hello[75]+=sizeof(ech);
+    CHECK("ech/retry-duplicate-confirmation",core_tls_hello_parse(hello,size+2*sizeof(ech),client,length,&parsed) != 0);
+
+    memset(hello+6,0,32);
+    const uint8_t server_tail[]={0x13,3,0,0,46,0,43,0,2,3,4,0,51,0,36,0,29,0,32};
+    memcpy(hello+71,server_tail,sizeof(server_tail));
+    size=71+sizeof(server_tail)+32; hello[3]=(uint8_t)(size-4);
+    memset(hello+size-32,1,32);
+    REQUIRE("ech/normal-server-hello-fixture",core_tls_hello_parse(hello,size,client,length,&parsed) == 0 && !parsed.retry);
+    memcpy(hello+size,ech,sizeof(ech)); hello[3]+=sizeof(ech); hello[75]+=sizeof(ech);
+    CHECK("ech/extension-forbidden-in-normal-server-hello",core_tls_hello_parse(hello,size+sizeof(ech),client,length,&parsed) != 0);
+}
+
+static void ech_reply_vectors(void) {
+    const uint8_t valid[]={
+        0,31, 0xfe,0x0d,0,27, 0,25, 0xfe,0x0d,0,21,
+        1,0xab,0xcd, 0,1,0xaa, 0,4,0,1,0,1, 0,1,'a', 0,4,0x12,0x34,0,0
+    };
+    vless_config_t config; core_config_defaults(&config); strcpy(config.security,"tls");
+    strcpy(config.sni,"vless-core.test");
+    uint8_t private_key[32],public_key[32],random[32],auth[32],*hello=NULL;
+    size_t length=0,sid=0;
+    tls13_conn_t connection={0};
+    config.fp_mode=FP_SAFARI_26_3;
+    REQUIRE("ech/build-without-grease",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&length,&sid,NULL,NULL) == 0);
+    REQUIRE("ech/store-without-grease",db_append(&connection.tls_client_hello,hello,length) == 0);
+    free(hello);
+    CHECK("ech/unoffered-reply-rejected",tls_encrypted_extensions(&connection,valid,sizeof(valid)) != 0);
+    db_free(&connection.tls_client_hello);
+    config.fp_mode=FP_FIREFOX;
+    REQUIRE("ech/build-with-grease",build_client_hello(&config,0,TLS_CIPHER_OFFER_CHACHA,private_key,public_key,random,auth,&hello,&length,&sid,NULL,NULL) == 0);
+    REQUIRE("ech/store-with-grease",db_append(&connection.tls_client_hello,hello,length) == 0);
+    free(hello);
+    CHECK("ech/valid-retry-configs",tls_encrypted_extensions(&connection,valid,sizeof(valid)) == 0);
+    for (size_t cut=0;cut<sizeof(valid);cut++) CHECK("ech/truncated-reply",tls_encrypted_extensions(&connection,valid,cut) != 0);
+
+    uint8_t changed[2*sizeof(valid)]; memcpy(changed,valid,sizeof(valid));
+    const size_t fields[]={7,11,16,19,25,28,32};
+    for (size_t i=0;i<sizeof(fields)/sizeof(*fields);i++) {
+        changed[fields[i]]++;
+        CHECK("ech/malformed-retry-config-field",tls_encrypted_extensions(&connection,changed,sizeof(valid)) == CORE_TLS_ECH_DECODE_ERROR);
+        changed[fields[i]]--;
+    }
+    const uint8_t empty[]={0,6,0xfe,0x0d,0,2,0,0};
+    CHECK("ech/empty-retry-config-list",tls_encrypted_extensions(&connection,empty,sizeof(empty)) != 0);
+
+    const uint8_t unknown[]={0xab,0xcd,0,1,0x99};
+    memcpy(changed+sizeof(valid),unknown,sizeof(unknown));
+    changed[1]+=sizeof(unknown); changed[5]+=sizeof(unknown); changed[7]+=sizeof(unknown);
+    CHECK("ech/multiple-configs-with-unknown-version",tls_encrypted_extensions(&connection,changed,sizeof(valid)+sizeof(unknown)) == 0);
+    changed[sizeof(valid)+3]++;
+    CHECK("ech/truncated-unknown-version",tls_encrypted_extensions(&connection,changed,sizeof(valid)+sizeof(unknown)) != 0);
+
+    memcpy(changed,valid,sizeof(valid)); memcpy(changed+sizeof(valid),valid+29,4);
+    changed[1]+=4; changed[5]+=4; changed[7]+=4; changed[11]+=4; changed[28]+=4;
+    CHECK("ech/duplicate-config-extension",tls_encrypted_extensions(&connection,changed,sizeof(valid)+4) != 0);
+    memcpy(changed,valid,sizeof(valid)); memcpy(changed+sizeof(valid),valid+2,sizeof(valid)-2);
+    changed[1]+=sizeof(valid)-2;
+    CHECK("ech/duplicate-reply-extension",tls_encrypted_extensions(&connection,changed,2*sizeof(valid)-2) != 0);
+    db_free(&connection.tls_client_hello);
 }
 
 static void initial_share_vectors(void) {
@@ -430,6 +513,7 @@ int main(int argc, char **argv) {
         tls13_reality_close(connection); return test_result();
     }
     record_limit_vectors();
+    ech_reply_vectors();
     alps_vectors();
     buffered_http_progress();
     physical_tls_close_notify();

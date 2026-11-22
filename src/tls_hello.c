@@ -40,6 +40,40 @@ const uint8_t *core_tls_hello_extension(const uint8_t *hello,size_t length,unsig
     if (!hello || !size || client_fields(hello,length,&ciphers,&start)) return NULL;
     *size=0; return extension(hello,length,start,type,size);
 }
+static int ech_config_contents(const uint8_t *data,size_t length,uint8_t *seen) {
+    if (length < 5) return -1;
+    size_t key=word(data+3); data+=5; length-=5;
+    if (!key || key > length || length-key < 2) return -1;
+    data+=key; length-=key;
+    size_t suites=word(data);
+    if (suites < 4 || suites%4 || suites > length-2 || length-2-suites < 2) return -1;
+    data+=2+suites; length-=2+suites;
+    size_t name=data[1];
+    if (!name || name > length-2 || length-2-name < 2) return -1;
+    data+=2+name; length-=2+name;
+    if (word(data) != length-2) return -1;
+    for (size_t offset=2;offset<length;) {
+        if (length-offset < 4 || word(data+offset+2) > length-offset-4) return -1;
+        unsigned type=word(data+offset), bit=1U<<(type%8);
+        if (seen[type/8]&bit) return -1;
+        seen[type/8]|=(uint8_t)bit;
+        offset+=4+word(data+offset+2);
+    }
+    for (size_t offset=2;offset<length;offset+=4+word(data+offset+2)) seen[word(data+offset)/8]=0;
+    return 0;
+}
+int core_tls_ech_retry_configs(const uint8_t *data,size_t length) {
+    if (length < 6 || word(data) != length-2) return -1;
+    uint8_t seen[UINT16_MAX/8+1]={0};
+    for (size_t offset=2;offset<length;) {
+        if (length-offset < 4) return -1;
+        unsigned version=word(data+offset);
+        size_t size=word(data+offset+2); offset+=4;
+        if (size > length-offset || (version == CORE_TLS_EXT_ECH && ech_config_contents(data+offset,size,seen))) return -1;
+        offset+=size;
+    }
+    return 0;
+}
 int core_tls_hello_parse(const uint8_t *message,size_t length,const uint8_t *client,size_t client_length,core_tls_hello_t *result) {
     static const uint8_t retry_random[]={0xcf,0x21,0xad,0x74,0xe5,0x9a,0x61,0x11,0xbe,0x1d,0x8c,0x02,0x1e,0x65,0xb8,0x91,0xc2,0xa2,0x11,0x16,0x7a,0xbb,0x8c,0x5e,0x07,0x9e,0x09,0xe2,0xc8,0xa8,0x33,0x9c};
     size_t ciphers,start;
@@ -55,7 +89,7 @@ int core_tls_hello_parse(const uint8_t *message,size_t length,const uint8_t *cli
     while (offset < length) {
         if (length-offset < 4 || count == 4) return -1;
         unsigned type=word(message+offset); size_t size=word(message+offset+2); offset+=4;
-        if (size > length-offset) return -1;
+        if (size > length-offset) return result->retry && type == CORE_TLS_EXT_ECH ? CORE_TLS_ECH_DECODE_ERROR : -1;
         for (size_t i=0;i<count;i++) if (seen[i] == type) return -1;
         seen[count++]=type;
         if (type == 43) { if (size != 2 || word(message+offset) != 0x0304) return -1; version=1; }
@@ -67,6 +101,11 @@ int core_tls_hello_parse(const uint8_t *message,size_t length,const uint8_t *cli
             result->group=(uint16_t)word(message+offset);
             if (!client_group(client,client_length,start,result->group,0) || (result->retry && client_group(client,client_length,start,result->group,1))) return -1;
             if (!result->retry) { result->share=message+offset+4; result->share_length=size-4; }
+        } else if (type == CORE_TLS_EXT_ECH && result->retry) {
+            size_t offered_size=0;
+            const uint8_t *offered_ech=extension(client,client_length,start,type,&offered_size);
+            if (!core_tls_ech_outer(offered_ech,offered_size)) return -1;
+            if (size != 8) return CORE_TLS_ECH_DECODE_ERROR;
         } else return -1;
         offset+=size;
     }

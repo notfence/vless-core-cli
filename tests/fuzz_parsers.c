@@ -423,6 +423,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         tls13_conn_t compressed={0}; dynbuf_t decoded={0};
         if (db_append(&compressed.tls_client_hello,hello,hello_length)) abort();
         (void)tls_certificate_decompress(&compressed,data,size,&decoded);
+        (void)tls_encrypted_extensions(&compressed,data,size);
+        (void)core_tls_ech_retry_configs(data,size);
         db_free(&decoded); db_free(&compressed.tls_client_hello);
         if (compressed.tls_handshake_bytes) abort();
         if (!core_tls_hello_parse(data,size,hello,hello_length,&server) && server.retry) {

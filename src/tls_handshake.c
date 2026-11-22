@@ -7,13 +7,18 @@ static int tls_encrypted_extensions(tls13_conn_t *c, const uint8_t *data, size_t
     for (size_t offset=2;offset < length;) {
         if (length-offset < 4 || count == 32) return -1;
         unsigned type=((unsigned)data[offset]<<8)|data[offset+1]; size_t size=((size_t)data[offset+2]<<8)|data[offset+3]; offset+=4;
-        if (size > length-offset) return -1;
+        if (size > length-offset) return type == CORE_TLS_EXT_ECH ? CORE_TLS_ECH_DECODE_ERROR : -1;
         for (size_t i=0;i<count;i++) if (seen[i] == type) return -1;
         seen[count++]=type;
-        if (type != 0 && type != 1 && type != 10 && type != 16 && type != 28 && type != 0x4469 && type != 0x44cd) return -1;
+        if (type != 0 && type != 1 && type != 10 && type != 16 && type != 28 && type != 0x4469 && type != 0x44cd &&
+            type != CORE_TLS_EXT_ECH) return -1;
         size_t offered_size=0;
         const uint8_t *offered=core_tls_hello_extension(c->tls_client_hello.data,c->tls_client_hello.len,type,&offered_size);
         if (!offered && (type != 16 || c->tls_client_hello.len)) return -1;
+        if (type == CORE_TLS_EXT_ECH) {
+            if (!core_tls_ech_outer(offered,offered_size)) return -1;
+            if (core_tls_ech_retry_configs(data+offset,size)) return CORE_TLS_ECH_DECODE_ERROR;
+        }
         if (type == 0 && size) return -1;
         if (type == 28) {
             if (size != 2) return -1;
@@ -144,8 +149,9 @@ static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, 
         set_err(err,err_cap,"unexpected TLS server handshake message"); return -1;
     }
     if (type == 8) {
-        if (tls_encrypted_extensions(c,message+4,body_length)) {
-            set_err(err,err_cap,"invalid TLS EncryptedExtensions"); return -1;
+        int result=tls_encrypted_extensions(c,message+4,body_length);
+        if (result) {
+            set_err(err,err_cap,"invalid TLS EncryptedExtensions"); return result;
         }
     } else if (type == 11) {
         if (tls_server_certificate(cfg,c,message,length,err,err_cap)) return -1;
@@ -160,6 +166,18 @@ static int server_handshake_message(const vless_config_t *cfg, tls13_conn_t *c, 
     }
     if (append_transcript(c,message,length)) return -1;
     c->tls_auth_state++; return type == 20 ? 1 : 0;
+}
+
+static void tls_ech_decode_alert(tls13_conn_t *c,int encrypted) {
+    int saved=errno;
+    const uint8_t alert[]={21,3,3,0,2,2,50};
+    if (encrypted) {
+        uint8_t *record=NULL; size_t length=0;
+        if (!encrypt_record(c,c->c_hs_key,c->c_hs_iv,&c->c_hs_seq,21,alert+5,2,&record,&length))
+            (void)write_exact(c->fd,record,length);
+        free(record);
+    } else (void)write_exact(c->fd,alert,sizeof(alert));
+    errno=saved;
 }
 
 static unsigned tls12_word(const uint8_t *data) { return ((unsigned)data[0]<<8)|data[1]; }
@@ -692,7 +710,9 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
                         goto handshake_complete;
                     }
                     core_tls_hello_t server;
-                    if (core_tls_hello_parse(plain_hs.data,4+mlen,c->tls_client_hello.data,c->tls_client_hello.len,&server)) {
+                    int parsed=core_tls_hello_parse(plain_hs.data,4+mlen,c->tls_client_hello.data,c->tls_client_hello.len,&server);
+                    if (parsed) {
+                        if (parsed == CORE_TLS_ECH_DECODE_ERROR) tls_ech_decode_alert(c,0);
                         db_free(&plain_hs); set_err(err,err_cap,"invalid TLS ServerHello parameters"); goto handshake_failure;
                     }
                     if (server.retry) {
@@ -841,6 +861,7 @@ static int run_tls_handshake_with_key(const vless_config_t *cfg, tls13_conn_t *c
                 }
                 int result=server_handshake_message(cfg,c,enc_hs.data,4+hlen,err,err_cap);
                 if (result < 0) {
+                    if (result == CORE_TLS_ECH_DECODE_ERROR) tls_ech_decode_alert(c,1);
                     db_free(&enc_hs);
                     goto handshake_failure;
                 }

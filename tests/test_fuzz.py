@@ -28,6 +28,7 @@ def compressed_certificates():
 def seeds():
     prefix = b"vless://00000000-0000-0000-0000-000000000001@127.0.0.1:443?encryption=none&"
     hello = b"\x03\x03"+bytes(32)+b"\x00\x13\x01\x00\x00\x28\x00\x33\x00\x24\x00\x1d\x00\x20"+bytes(range(32))
+    ech_retry = bytes.fromhex("00 19 fe 0d 00 15 01 ab cd 00 01 aa 00 04 00 01 00 01 00 01 61 00 04 12 34 00 00")
     vision_client=b"\x03\x03"+bytes(32)+b"\x00\x00\x02\x13\x03\x01\x00\x00\x07\x00\x2b\x00\x03\x02\x03\x04"
     vision_client=b"\x01"+len(vision_client).to_bytes(3,"big")+vision_client
     vision_client=b"\x16\x03\x03"+len(vision_client).to_bytes(2,"big")+vision_client
@@ -190,6 +191,7 @@ def seeds():
         "vision":[*[bytes(16)+bytes([command,0,10,0,0])+b"vless-core" for command in (0,1,2)],
                   b"\x00\x00vless-core",b"\x00\x0avless-coretail",b"\x00\xff",b"\x01\x00",b"short tail",*vision_records],
         "tls":[*compressed_certificates(),b"\x02"+len(hello).to_bytes(3,"big")+hello,b"\x02\x00\x00\x26\x03\x03"+bytes(32)+b"\x00\xcc\xa9\x00",
+               ech_retry,b"\x00\x1f\xfe\x0d\x00\x1b"+ech_retry,
                b"\x16\x03\x03\x00\x0avless-core",b"\x0b\x00\x00\x05\x00\x00\x00\x01\x00",
                b"",b"\x18\x00\x00\x01\x00",b"\x18\x00\x00\x01\x01",b"\x18\x00\x00\x01\x02",
                b"\x18\x00\x00\x01\x01\x00",b"\x18\x00\x00\x01\x00"*2,
